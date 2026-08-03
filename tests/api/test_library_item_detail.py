@@ -405,10 +405,12 @@ async def test_item_detail_assembles_local_scrape(db, tmp_path, monkeypatch) -> 
     assert view.backdrop_url.startswith(f"{art_base}?kind=fanart&v=")
     assert int(view.poster_url.rsplit("v=", 1)[1]) > 0
     assert view.entry_dirs == [str(entry)]
-    # NFO 元数据
+    # NFO 元数据——2026-08-04 对齐语义：扫描收尾的资产镜像已把第三方 NFO
+    # 重写为与库内档案一致（rating 8.2/121 的旧值被 TMDB 档案 7.2/118 取代），
+    # 详情读到的 NFO 层与 media_metadata 同源（docs/design/metadata.md 6.2）
     assert view.local_meta is not None
-    assert view.local_meta.rating == 8.2 and view.local_meta.runtime_minutes == 121
-    assert [a.name for a in view.local_meta.actors] == ["演员甲", "演员乙"]
+    assert view.local_meta.rating == 7.2 and view.local_meta.runtime_minutes == 118
+    assert [a.name for a in view.local_meta.actors] == ["线上演员甲", "线上演员乙"]
     # 详情页不再触发补探：音轨保持"尚未探测"（前端据此提示重新扫描），
     # 浏览不碰媒体文件本体（云盘挂载上读文件就是流量与延迟）
     file = view.files[0]
