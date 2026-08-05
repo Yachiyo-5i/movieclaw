@@ -277,6 +277,36 @@ async def test_scan_identifies_by_name_and_flags_unknown(db, tmp_path) -> None:
     assert summary2.retried == 1 and summary2.unidentified == 1
 
 
+async def test_scan_persists_file_mtime(db, tmp_path) -> None:
+    """扫描落 mtime（issue #88）：入账时随 stat 顺手记录 file_mtime_ns，
+    播放接口的 ETag 由它派生，浏览请求不再对媒体文件本体做文件系统调用。
+    特性上线前的旧行（NULL）由重扫的秒过分支一次性回填。"""
+    root = _make_tv_library(tmp_path)
+    async with db.session() as session:
+        library = await LibraryRepository(session).create(
+            name="剧集库", kind="tv", root_paths=[str(root)]
+        )
+    await scan_library(library.id)
+
+    async with db.session() as session:
+        files = list((await session.execute(select(LibraryFile))).scalars().all())
+        assert files and all(f.file_mtime_ns is not None for f in files)
+        for f in files:
+            assert f.file_mtime_ns == Path(f.file_path).stat().st_mtime_ns
+        # 模拟特性上线前的旧行：清掉 mtime
+        for f in files:
+            f.file_mtime_ns = None
+        await session.commit()
+
+    # 重扫：已识别行仍秒过，但 NULL 的 mtime 被顺手回填
+    summary = await scan_library(library.id)
+    assert summary.skipped_known == 2
+    async with db.session() as session:
+        files = list((await session.execute(select(LibraryFile))).scalars().all())
+        identified = [f for f in files if f.media_item_id is not None]
+        assert all(f.file_mtime_ns is not None for f in identified)
+
+
 async def test_scan_survives_paths_ledgered_under_another_library(db, tmp_path) -> None:
     """事故回归：路径已挂在另一个库名下时，扫描不得整轮崩掉。
 

@@ -286,9 +286,10 @@ async def _query_items(request: Request) -> JSONResponse:
     ids_raw = parse_comma(q.get("ids"))
     search_term = q.get("searchTerm")
 
+    include_people = options.has("People")
     async with get_database().session() as session:
         if ids_raw:
-            entries = await _entries_for_ids(session, ids_raw)
+            entries = await _entries_for_ids(session, ids_raw, include_people=include_people)
         else:
             entries = await _entries_for_parent(
                 session,
@@ -296,6 +297,7 @@ async def _query_items(request: Request) -> JSONResponse:
                 include_types=include_types,
                 recursive=recursive,
                 has_search=bool(search_term),
+                include_people=include_people,
             )
             if entries is None:
                 # 根级：返回视图列表
@@ -359,10 +361,12 @@ async def _query_items(request: Request) -> JSONResponse:
     return JSONResponse(query_result(dtos, total, start_index))
 
 
-async def _entries_for_ids(session: AsyncSession, ids_raw: list[str]) -> list[Entry]:
+async def _entries_for_ids(
+    session: AsyncSession, ids_raw: list[str], *, include_people: bool = False
+) -> list[Entry]:
     refs = [r for r in (decode_guid(i) for i in ids_raw) if r is not None]
     scoped = {r.entity_id for r in refs if r.kind != EntityKind.LIBRARY}
-    bundles = await load_bundles(session, list(scoped))
+    bundles = await load_bundles(session, list(scoped), include_people=include_people)
     entries: list[Entry] = []
     for ref in refs:
         bundle = bundles.get(ref.entity_id)
@@ -386,6 +390,7 @@ async def _entries_for_parent(
     include_types: set[str],
     recursive: bool | None,
     has_search: bool,
+    include_people: bool = False,
 ) -> list[Entry] | None:
     """按 parentId 语义展开候选。返回 None 表示"根级 → 视图列表"。"""
     if not parent_raw or is_empty_guid(parent_raw):
@@ -393,7 +398,7 @@ async def _entries_for_parent(
             # 无 parent 的全局搜索/类型查询：跨全部库递归
             types = include_types or {"Movie", "Series"}
             ids = await item_ids_with_files(session)
-            bundles = await load_bundles(session, ids)
+            bundles = await load_bundles(session, ids, include_people=include_people)
             return _build_entries(bundles, types)
         return None
 
@@ -421,16 +426,18 @@ async def _entries_for_parent(
             # 非递归 = 只看直接子级，includeItemTypes 在其上做过滤（可为空集）
             types = (include_types & default_types) if include_types else default_types
         ids = await item_ids_with_files(session, library_id=ref.entity_id)
-        bundles = await load_bundles(session, ids, library_id=ref.entity_id)
+        bundles = await load_bundles(
+            session, ids, library_id=ref.entity_id, include_people=include_people
+        )
         return _build_entries(bundles, types)
 
     if ref.kind == EntityKind.ITEM:
-        bundles = await load_bundles(session, [ref.entity_id])
+        bundles = await load_bundles(session, [ref.entity_id], include_people=include_people)
         types = include_types or {"Season"}
         return _build_entries(bundles, types)
 
     if ref.kind == EntityKind.SEASON:
-        bundles = await load_bundles(session, [ref.entity_id])
+        bundles = await load_bundles(session, [ref.entity_id], include_people=include_people)
         return _build_entries(bundles, {"Episode"}, season_scope=ref.season)
 
     raise not_found()
@@ -474,7 +481,9 @@ async def items_latest(
 
     async with get_database().session() as session:
         ids = await item_ids_with_files(session, library_id=library_id)
-        bundles = await load_bundles(session, ids, library_id=library_id)
+        bundles = await load_bundles(
+            session, ids, library_id=library_id, include_people=options.has("People")
+        )
 
     # 每个"最新单元"= 文件入库时间最大的 (bundle, season, episode)
     latest_units: list[tuple[Any, ItemBundle, int, int]] = []
@@ -537,7 +546,7 @@ async def items_resume(request: Request, user_id: str | None = None) -> JSONResp
 
     async with get_database().session() as session:
         ids = await item_ids_with_files(session)
-        bundles = await load_bundles(session, ids)
+        bundles = await load_bundles(session, ids, include_people=options.has("People"))
 
     entries = _build_entries(bundles, {"Movie", "Episode"})
     if media_types and "Video" not in media_types:
@@ -687,7 +696,8 @@ async def get_item(request: Request, item_id: str, user_id: str | None = None) -
                     ctx, library, stats.get(library.id), await _cover_tag(library.id)
                 )
             )
-        bundles = await load_bundles(session, [ref.entity_id])
+        # 单条目是全字段语义，People 恒输出
+        bundles = await load_bundles(session, [ref.entity_id], include_people=True)
 
     bundle = bundles.get(ref.entity_id)
     if bundle is None:
@@ -732,7 +742,7 @@ async def shows_next_up(request: Request) -> JSONResponse:
 
     async with get_database().session() as session:
         ids = await item_ids_with_files(session, kind="tv")
-        bundles = await load_bundles(session, ids)
+        bundles = await load_bundles(session, ids, include_people=options.has("People"))
 
     candidates: list[tuple[Any, dict[str, Any]]] = []
     for bundle in bundles.values():
@@ -791,7 +801,9 @@ async def shows_seasons(request: Request, series_id: str) -> JSONResponse:
     if ref is None or ref.kind != EntityKind.ITEM:
         raise not_found()
     async with get_database().session() as session:
-        bundles = await load_bundles(session, [ref.entity_id])
+        bundles = await load_bundles(
+            session, [ref.entity_id], include_people=options.has("People")
+        )
     bundle = bundles.get(ref.entity_id)
     if bundle is None or bundle.item.kind != "tv":
         raise not_found()
@@ -831,7 +843,9 @@ async def shows_episodes(request: Request, series_id: str) -> JSONResponse:
             season_scope = int(season_param)
 
     async with get_database().session() as session:
-        bundles = await load_bundles(session, [target_item_id])
+        bundles = await load_bundles(
+            session, [target_item_id], include_people=options.has("People")
+        )
     bundle = bundles.get(target_item_id)
     if bundle is None or bundle.item.kind != "tv":
         raise not_found_message("Series not found")

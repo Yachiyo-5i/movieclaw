@@ -339,3 +339,72 @@ def test_person_item_and_filter(client: TestClient, seeded: dict) -> None:
     # 头像：测试环境图床离线 → 404 优雅降级（生产为图片代理缓存直出）
     avatar = client.get(f"/Items/{pguid}/Images/Primary", params={"ApiKey": token})
     assert avatar.status_code == 404
+
+
+def test_browse_never_touches_media_files(client: TestClient, seeded: dict) -> None:
+    """issue #88 回归：浏览类请求（列表/详情）不碰媒体文件本体。
+
+    把磁盘上的媒体文件全部删掉后再浏览——若代码仍在请求期 stat 文件或
+    现读 strm，这里的形态就会变（ETag 现身/消失、strm 源被剔除）。契约：
+
+    - strm 版本**不现读**：Path 保持 .strm 占位路径、Protocol=Http、
+      IsRemote=true，真实直链等 PlaybackInfo 播放协商时现读；
+    - 本地版本的 ETag 只来自台账 ``file_mtime_ns``（未回填时省略）。
+    """
+    import os
+    import sqlite3
+    from pathlib import Path
+
+    token = jf_login(client)
+    guid = item_guid(seeded["movie"])
+
+    db_path = os.environ["DATABASE_URL"].split("///", 1)[1]
+    with sqlite3.connect(db_path) as conn:
+        paths = [r[0] for r in conn.execute("SELECT file_path FROM library_file")]
+    for p in paths:
+        Path(p).unlink()
+
+    # 全字段单条目：MediaSources 两个版本俱在，strm 未被解析/剔除
+    body = client.get(f"/Items/{guid}", params={"ApiKey": token}).json()
+    sources = body["MediaSources"]
+    assert len(sources) == 2
+    remote = next(s for s in sources if s["Protocol"] == "Http")
+    assert remote["Path"].endswith(".strm")  # 占位路径，未现读云端直链
+    assert remote["IsRemote"] is True
+    local = next(s for s in sources if s["Protocol"] == "File")
+    assert "ETag" not in local  # mtime 未回填 → 省略，而不是现场 stat
+
+    # 列表带 fields=MediaSources 同样不碰文件
+    listing = client.get(
+        "/Items",
+        params={
+            "ApiKey": token,
+            "parentId": library_guid(seeded["movie_lib"]),
+            "recursive": "true",
+            "includeItemTypes": "Movie",
+            "fields": "MediaSources",
+        },
+    ).json()
+    assert len(listing["Items"][0]["MediaSources"]) == 2
+
+
+def test_media_source_etag_comes_from_ledger(client: TestClient, seeded: dict) -> None:
+    """ETag 由台账 file_mtime_ns 派生（扫描时落库），请求期零文件系统调用。"""
+    import hashlib
+    import os
+    import sqlite3
+
+    token = jf_login(client)
+    guid = item_guid(seeded["movie"])
+
+    db_path = os.environ["DATABASE_URL"].split("///", 1)[1]
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "UPDATE library_file SET file_mtime_ns = 1723800000123456789 "
+            "WHERE file_path LIKE '%.mkv'"
+        )
+        conn.commit()
+
+    body = client.get(f"/Items/{guid}", params={"ApiKey": token}).json()
+    local = next(s for s in body["MediaSources"] if s["Protocol"] == "File")
+    assert local["ETag"] == hashlib.md5(b"1723800000123456789").hexdigest()

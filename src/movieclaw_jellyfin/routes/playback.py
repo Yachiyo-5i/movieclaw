@@ -88,9 +88,14 @@ async def playback_info(request: Request, item_id: str) -> JSONResponse:
         return JSONResponse(
             {"MediaSources": [], "ErrorCode": "NoCompatibleStream"}
         )
+    # 播放协商是唯一现读 strm 的场景：直链多带时效签名，须现读现用；
+    # 解析失败的版本剔除，全部失败按"无可播源"应答
+    sources = [s for f in selected if (s := media_source_dto(f, resolve_strm=True))]
+    if not sources:
+        return JSONResponse({"MediaSources": [], "ErrorCode": "NoCompatibleStream"})
     return JSONResponse(
         {
-            "MediaSources": [media_source_dto(f) for f in selected],
+            "MediaSources": sources,
             "PlaySessionId": secrets.token_hex(16),
         }
     )
