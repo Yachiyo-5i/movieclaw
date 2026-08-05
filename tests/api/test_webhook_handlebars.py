@@ -78,6 +78,32 @@ def test_json_template_end_to_end():
     assert parsed == {"event": "PlaybackStop", "title": "权力的游戏", "done": "True"}
 
 
+def test_tilde_scoped_to_adjacent_source_text():
+    """{{~ 只修剪紧邻标签的源文本段，不越过前一个标签（对齐真 Handlebars）。"""
+    assert (
+        render("Hello {{#if_exist Name}}{{~Name}}{{/if_exist}} World", VALUES)
+        == "Hello 权力的游戏 World"
+    )
+
+
+def test_tilde_in_hidden_branch_keeps_visible_output():
+    """隐藏分支里的 {{~ 不得吃掉块外已产出的可见文本。"""
+    assert (
+        render("Hello {{#if_exist NoSuchVar}}{{~NoSuchVar}}{{/if_exist}}World", VALUES)
+        == "Hello World"
+    )
+
+
+def test_duplicate_else_raises():
+    with pytest.raises(TemplateError, match="重复的"):
+        render("{{#if_exist Name}}t{{else}}f1{{else}}f2{{/if_exist}}", VALUES)
+
+
+def test_mismatched_close_raises():
+    with pytest.raises(TemplateError, match="不匹配"):
+        render("{{#if_equals Name Name}}x{{/if_exist}}", VALUES)
+
+
 def test_errors_are_chinese():
     with pytest.raises(TemplateError, match="不支持的助手"):
         render("{{substring Name 0 3}}", VALUES)

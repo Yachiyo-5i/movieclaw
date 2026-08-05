@@ -139,8 +139,10 @@ export function WebhookSection() {
 
   async function handleToggleGlobal(enabled: boolean) {
     if (config == null) return;
-    setConfig({ ...config, enabled }); // 乐观更新，save 失败时响应会纠正
-    await save({ enabled, endpoints: currentPayloads() });
+    const previous = config;
+    setConfig({ ...config, enabled }); // 乐观更新
+    const view = await save({ enabled, endpoints: currentPayloads() });
+    if (view == null) setConfig(previous); // 保存失败回滚，避免开关停在与后端不一致的状态
   }
 
   async function handleToggleEndpoint(id: string, enabled: boolean) {
@@ -175,17 +177,17 @@ export function WebhookSection() {
       return;
     }
     const rest = currentPayloads().filter((p) => p.id !== draft.id);
-    const isNew = !draft.id;
     const view = await save({
       enabled: config.enabled,
       endpoints: [...rest, { ...draft, url: draft.url.trim(), name: draft.name.trim() }],
     });
     if (view == null) return;
     setDraft(null);
-    if (isNew) {
-      // 新建：后端仅本次返回 secret 明文，立刻交给一次性展示条
-      const created = view.endpoints.find((ep) => ep.secret);
-      if (created?.secret) setRevealed({ name: created.name || created.url, secret: created.secret });
+    // 响应里带明文 secret 的两种来路都要展示：新建 movieclaw endpoint，
+    // 以及既有 endpoint 从 jellyfin 切换到 movieclaw（后端补发密钥）
+    const revealedEp = view.endpoints.find((ep) => ep.secret);
+    if (revealedEp?.secret) {
+      setRevealed({ name: revealedEp.name || revealedEp.url, secret: revealedEp.secret });
     }
   }
 
@@ -356,6 +358,10 @@ export function WebhookSection() {
 
       {draft != null && (
         <EndpointEditor
+          // key 保证切换编辑对象时整卡重挂载：headers 输入框是非受控的
+          // （defaultValue，避免"输到一半被解析结果覆盖"），不重挂载会残留上一个
+          // endpoint 的文本，用户一触碰就把 A 的请求头写进 B
+          key={draft.id || "__new__"}
           draft={draft}
           catalog={config.catalog}
           busy={busy}

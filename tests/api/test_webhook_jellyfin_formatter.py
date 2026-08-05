@@ -104,3 +104,19 @@ def test_merge_completed_absorbs_stopped():
     assert [e.event for e in merged] == ["playback.started", "playback.completed"]
     # 没有 completed 时 stopped 原样保留
     assert merge_for_jellyfin([stopped]) == [stopped]
+
+
+def test_merge_only_absorbs_same_unit():
+    """去重按单元比对：其他条目/其他集的 stopped 不受 completed 牵连。"""
+
+    def _ev(event: str, item_id: int, episode: int) -> OutboundEvent:
+        return OutboundEvent(
+            event=event,
+            data={"media": {"item_id": item_id, "season_number": 1, "episode_number": episode}},
+        )
+
+    completed_a = _ev("playback.completed", 1, 1)
+    stopped_a = _ev("playback.stopped", 1, 1)
+    stopped_b = _ev("playback.stopped", 2, 5)
+    merged = merge_for_jellyfin([completed_a, stopped_a, stopped_b])
+    assert merged == [completed_a, stopped_b]

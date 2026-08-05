@@ -17,7 +17,6 @@ import pytest
 from movieclaw_api.services.webhook import deliveries, dispatcher
 from movieclaw_api.settings.webhook import WebhookEndpoint, WebhookSetting
 from movieclaw_events import OutboundEvent
-from movieclaw_net import CircuitOpenError
 
 SERVER = {"id": "srv01", "name": "MovieClaw", "version": "0.0.0-test"}
 
@@ -55,7 +54,9 @@ def _clean(monkeypatch):
 
 def _mock_transport(monkeypatch, handler):
     monkeypatch.setattr(
-        dispatcher, "egress_transport", lambda service, scope: httpx.MockTransport(handler)
+        dispatcher,
+        "egress_transport",
+        lambda service, **kwargs: httpx.MockTransport(handler),
     )
 
 
@@ -110,15 +111,19 @@ async def test_network_error_exhausts_attempts(monkeypatch):
     assert "请求失败" in record.error
 
 
-async def test_circuit_open_fails_fast(monkeypatch):
-    def handler(request: httpx.Request) -> httpx.Response:
-        raise CircuitOpenError("webhook", 30.0)
+async def test_transport_created_without_breaker(monkeypatch):
+    """熔断键按服务标签共享，webhook 必须关闭熔断避免坏 endpoint 连坐健康 endpoint。"""
+    seen: list[dict] = []
 
-    _mock_transport(monkeypatch, handler)
+    def fake_transport(service, **kwargs):
+        seen.append({"service": service, **kwargs})
+        return httpx.MockTransport(lambda request: httpx.Response(200))
+
+    monkeypatch.setattr(dispatcher, "egress_transport", fake_transport)
     record = await dispatcher._deliver_one(_endpoint(), _event(), SERVER)
-    assert not record.ok
-    assert record.attempts == 1  # 熔断快速失败，不重试
-    assert "熔断" in record.error
+    assert record.ok
+    assert seen[0]["service"] == "webhook"
+    assert seen[0]["use_breaker"] is False
 
 
 async def test_jellyfin_format_without_template_records_error(monkeypatch):

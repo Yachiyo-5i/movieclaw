@@ -76,9 +76,9 @@ def _block_truth(name: str, args: list[str], values: dict) -> bool:
 def render(template: str, values: dict) -> str:
     """用变量字典渲染模板；语法错误抛 ``TemplateError``。"""
     out: list[str] = []
-    # 块栈：每层 = (助手判断结果, 是否已进入 else 分支)；输出仅在所有层都
-    # "当前分支成立"时写入
-    stack: list[list[bool]] = []
+    # 块栈：每层 = [助手名, 判断结果, 是否已进入 else 分支]；助手名用于校验
+    # 闭合标签配对，输出仅在所有层都"当前分支成立"时写入
+    stack: list[list] = []
     pos = 0
     pending_trim = False  # 上一个标签带 ~}}：吞掉后续空白
 
@@ -87,25 +87,27 @@ def render(template: str, values: dict) -> str:
         if pending_trim:
             text = text.lstrip()
             pending_trim = False
-        if text and all(layer[0] != layer[1] for layer in stack):
-            # layer = [判断结果, 在else分支]：真分支且未进 else，或假分支且已进 else
+        if text and all(layer[1] != layer[2] for layer in stack):
+            # layer = [助手名, 判断结果, 在else分支]：
+            # 真分支且未进 else，或假分支且已进 else，才可见
             out.append(text)
 
     for match in _TAG_RE.finditer(template):
-        emit(template[pos : match.start()])
+        literal = template[pos : match.start()]
         raw_inner = match.group(1) if match.group(1) is not None else match.group(2)
         escape = match.group(1) is None  # {{ }} 转义，{{{ }}} 原样
         inner = raw_inner.strip()
+        # {{~ ：只修剪**紧邻本标签之前的源文本段**的尾部空白——不回头改动
+        # 已产出的输出（隐藏分支里的标签不该影响可见文本，也不该越过前一个标签）
         if inner.startswith("~"):
-            # {{~ ：回头吞掉已输出文本的尾部空白
-            if out:
-                out[-1] = out[-1].rstrip()
+            literal = literal.rstrip()
             inner = inner[1:].strip()
         # ~}}：吞掉标签**之后**文本的前导空白——标签自身的输出不受影响，
         # 所以先记在本地，待本标签输出完毕再置位 pending_trim
         trim_after = inner.endswith("~")
         if trim_after:
             inner = inner[:-1].strip()
+        emit(literal)
 
         if inner.startswith("!"):  # 注释
             pending_trim = pending_trim or trim_after
@@ -116,16 +118,20 @@ def render(template: str, values: dict) -> str:
             name, args = parts[0], parts[1:]
             if name not in _BLOCK_HELPERS:
                 raise TemplateError(f"模板使用了不支持的块助手：{name}")
-            stack.append([_block_truth(name, args, values), False])
+            stack.append([name, _block_truth(name, args, values), False])
         elif inner.startswith("/"):
             name = inner[1:].strip()
-            if name not in _BLOCK_HELPERS or not stack:
-                raise TemplateError(f"模板存在多余的闭合标签：{{{{/{name}}}}}")
+            if not stack or stack[-1][0] != name:
+                raise TemplateError(
+                    f"模板的闭合标签 {{{{/{name}}}}} 与当前打开的块不匹配"
+                )
             stack.pop()
         elif inner == "else":
             if not stack:
                 raise TemplateError("模板的 {{else}} 不在任何块助手内")
-            stack[-1][1] = True
+            if stack[-1][2]:
+                raise TemplateError("同一个块助手里出现了重复的 {{else}}")
+            stack[-1][2] = True
         else:
             parts = _ARG_RE.findall(inner)
             if len(parts) > 1:

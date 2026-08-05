@@ -128,12 +128,29 @@ def jellyfin_variables(event: OutboundEvent, server: dict) -> dict | None:
     return values
 
 
+def _unit_key(event: OutboundEvent) -> tuple:
+    media = event.data.get("media") or {}
+    return (
+        media.get("item_id"),
+        media.get("season_number"),
+        media.get("episode_number"),
+    )
+
+
 def merge_for_jellyfin(events: list[OutboundEvent]) -> list[OutboundEvent]:
-    """去重规则（§3.2）：同批出现 stopped + completed 时，completed 吸收
-    stopped——两者都映射到 PlaybackStop，双发会让下游收到重复事件。"""
-    if any(e.event == "playback.completed" for e in events):
-        return [e for e in events if e.event != "playback.stopped"]
-    return events
+    """去重规则（§3.2）：同批出现**同一单元**的 stopped + completed 时，
+    completed 吸收 stopped——两者都映射到 PlaybackStop，双发会让下游收到
+    重复事件。按单元比对：其他条目的 stopped 不受牵连。"""
+    completed_units = {
+        _unit_key(e) for e in events if e.event == "playback.completed"
+    }
+    if not completed_units:
+        return events
+    return [
+        e
+        for e in events
+        if not (e.event == "playback.stopped" and _unit_key(e) in completed_units)
+    ]
 
 
 def format_jellyfin(

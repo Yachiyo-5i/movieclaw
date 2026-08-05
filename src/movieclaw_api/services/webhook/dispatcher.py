@@ -9,8 +9,10 @@ fire-and-forget，任何失败只记日志，绝不影响业务主链路（与
 - 超时 10s，失败重试 2 次（间隔 5s / 30s），共 3 次尝试；
 - at-least-once 但不承诺必达（无持久队列，进程重启丢弃在途任务）；
 - 不保证顺序；重试时 event_id 不变，消费端按 X-MovieClaw-Delivery 幂等去重；
-- 出站走 ``movieclaw_net.egress_transport``（服务标签 ``webhook``），命中
-  熔断时快速失败；不跟随重定向（httpx 默认）。
+- 出站走 ``movieclaw_net.egress_transport``（服务标签 ``webhook``，供代理
+  路由），但**关闭熔断**：熔断器按服务标签全进程共享，而 webhook 的目标是
+  逐 endpoint 的——一个宕机的 endpoint 会把熔断打开，拖垮其他健康 endpoint
+  的投递。重试本身有界（3 次），失败代价可控；不跟随重定向（httpx 默认）。
 """
 
 from __future__ import annotations
@@ -32,7 +34,7 @@ from movieclaw_api.services.webhook.jellyfin_formatter import (
 )
 from movieclaw_api.settings import WebhookEndpoint, WebhookSetting, get_setting_store
 from movieclaw_events import OutboundEvent
-from movieclaw_net import CircuitOpenError, EgressScope, egress_transport
+from movieclaw_net import EgressScope, egress_transport
 
 logger = logging.getLogger("movieclaw_api.webhook")
 
@@ -189,7 +191,9 @@ async def _deliver_one(
     for attempt in range(1, attempts + 1):
         record.attempts = attempt
         try:
-            transport = egress_transport("webhook", scope=scope)
+            # use_breaker=False：熔断键按服务标签共享，会让坏 endpoint 连坐
+            # 健康 endpoint（模块 docstring 有完整理由）
+            transport = egress_transport("webhook", scope=scope, use_breaker=False)
             async with httpx.AsyncClient(
                 timeout=REQUEST_TIMEOUT, transport=transport
             ) as client:
@@ -199,11 +203,6 @@ async def _deliver_one(
                 record.error = ""
                 break
             record.error = f"目标返回 HTTP {response.status_code}"
-        except CircuitOpenError:
-            # 熔断打开：线路已知不通，快速失败不再重试
-            record.status_code = None
-            record.error = "出站熔断已打开（目标近期持续不可达），本次投递快速失败"
-            break
         except Exception as exc:  # noqa: BLE001 -- 网络错误统一进投递记录
             record.status_code = None
             record.error = f"请求失败：{exc}"[:200]

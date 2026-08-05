@@ -53,10 +53,16 @@ EVENT_CATALOG: list[EventSpec] = [
 ]
 
 _KNOWN_EVENTS = {spec.event for spec in EVENT_CATALOG}
+_JELLYFIN_MAPPABLE = {spec.event for spec in EVENT_CATALOG if spec.jellyfin_type}
 
 
 def is_known_event(event: str) -> bool:
     return event in _KNOWN_EVENTS
+
+
+def is_jellyfin_mappable(event: str) -> bool:
+    """该事件是否有 Jellyfin NotificationType 对应物（jellyfin 格式可订阅）。"""
+    return event in _JELLYFIN_MAPPABLE
 
 
 def catalog_view() -> list[dict]:

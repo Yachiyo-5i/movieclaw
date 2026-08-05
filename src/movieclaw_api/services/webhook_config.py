@@ -16,7 +16,7 @@ from movieclaw_api.schemas.webhook import (
     WebhookEndpointView,
 )
 from movieclaw_api.services.webhook import catalog_view, deliver_test, recent_deliveries
-from movieclaw_api.services.webhook.catalog import is_known_event
+from movieclaw_api.services.webhook.catalog import is_jellyfin_mappable, is_known_event
 from movieclaw_api.settings import (
     WebhookEndpoint,
     WebhookSetting,
@@ -78,14 +78,26 @@ async def save_config(payload: WebhookConfigPayload) -> WebhookConfigView:
         unknown = [e for e in item.events if not is_known_event(e)]
         if unknown:
             raise BadRequestException(f"未知的订阅事件：{'、'.join(unknown)}")
+        if item.format == "jellyfin":
+            # 前端会禁用勾选，这里兜底：无 Jellyfin 对应物的事件投递必失败，
+            # 与其每次事件都记一条失败记录，不如保存时就拒绝
+            unmappable = [e for e in item.events if not is_jellyfin_mappable(e)]
+            if unmappable:
+                raise BadRequestException(
+                    f"以下事件没有 Jellyfin 对应物，jellyfin 格式 endpoint 不能订阅："
+                    f"{'、'.join(unmappable)}"
+                )
         if item.id and item.id in existing:
             secret = existing[item.id].secret  # 编辑：secret 不经前端往返
             endpoint_id = item.id
         else:
             endpoint_id = new_ulid()
-            secret = generate_webhook_secret() if item.format == "movieclaw" else ""
-            if secret:
-                reveal[endpoint_id] = secret
+            secret = ""
+        if item.format == "movieclaw" and not secret:
+            # 覆盖两种来路：新建 movieclaw endpoint；以及从 jellyfin 切换过来的
+            # 存量 endpoint（原本无密钥）——否则会静默发出无签名报文
+            secret = generate_webhook_secret()
+            reveal[endpoint_id] = secret
         endpoints.append(
             WebhookEndpoint(
                 id=endpoint_id,
