@@ -121,14 +121,48 @@ async def test_circuit_open_fails_fast(monkeypatch):
     assert "熔断" in record.error
 
 
-async def test_jellyfin_format_records_unsupported(monkeypatch):
+async def test_jellyfin_format_without_template_records_error(monkeypatch):
     def handler(request: httpx.Request) -> httpx.Response:  # pragma: no cover
-        raise AssertionError("jellyfin 格式不应发出请求")
+        raise AssertionError("未配置模板时不应发出请求")
 
     _mock_transport(monkeypatch, handler)
     record = await dispatcher._deliver_one(_endpoint(format="jellyfin"), _event(), SERVER)
     assert not record.ok
-    assert "尚未支持" in record.error
+    assert "未配置模板" in record.error
+
+
+async def test_jellyfin_format_renders_template(monkeypatch):
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(200)
+
+    _mock_transport(monkeypatch, handler)
+    endpoint = _endpoint(
+        format="jellyfin",
+        template='{"type": "{{NotificationType}}", "server": "{{ServerId}}"}',
+        headers={"Authorization": "Bearer xyz"},
+    )
+    event = _event("playback.started")
+    record = await dispatcher._deliver_one(endpoint, event, SERVER)
+    assert record.ok
+    body = json.loads(captured[0].content)
+    assert body == {"type": "PlaybackStart", "server": "srv01"}
+    assert captured[0].headers["Authorization"] == "Bearer xyz"
+    # jellyfin 格式不签名（对齐插件行为）
+    assert "X-MovieClaw-Signature" not in captured[0].headers
+
+
+async def test_jellyfin_template_error_recorded(monkeypatch):
+    def handler(request: httpx.Request) -> httpx.Response:  # pragma: no cover
+        raise AssertionError("渲染失败不应发出请求")
+
+    _mock_transport(monkeypatch, handler)
+    endpoint = _endpoint(format="jellyfin", template="{{substring Name 0 3}}")
+    record = await dispatcher._deliver_one(endpoint, _event(), SERVER)
+    assert not record.ok
+    assert "模板渲染失败" in record.error
 
 
 async def test_emit_events_filters_subscription(monkeypatch):

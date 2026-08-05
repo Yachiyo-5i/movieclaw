@@ -60,12 +60,31 @@ function emptyDraft(catalog: WebhookCatalogEntry[]): WebhookEndpointPayload {
     url: "",
     format: "movieclaw",
     enabled: true,
-    // 默认全选：订阅收窄是低频操作，比逐个勾选更省事
-    events: catalog.map((c) => c.event),
+    // 默认勾选 default_on 的事件：progress 这类高频事件按目录约定默认关闭
+    events: catalog.filter((c) => c.default_on).map((c) => c.event),
     template: "",
     headers: {},
     egress_scope: "lan",
   };
+}
+
+/** headers 编辑框的双向换行文本形态："Key: Value" 每行一条。 */
+function headersToText(headers: Record<string, string>): string {
+  return Object.entries(headers)
+    .map(([k, v]) => `${k}: ${v}`)
+    .join("\n");
+}
+
+function textToHeaders(text: string): Record<string, string> {
+  const headers: Record<string, string> = {};
+  for (const line of text.split("\n")) {
+    const idx = line.indexOf(":");
+    if (idx <= 0) continue;
+    const key = line.slice(0, idx).trim();
+    const value = line.slice(idx + 1).trim();
+    if (key) headers[key] = value;
+  }
+  return headers;
 }
 
 export function WebhookSection() {
@@ -513,8 +532,12 @@ function EndpointEditor({
     onChange({ ...draft, events });
   }
 
+  function selectable(entry: WebhookCatalogEntry): boolean {
+    return draft.format !== "jellyfin" || entry.jellyfin_supported;
+  }
+
   function toggleGroup(entries: WebhookCatalogEntry[], checked: boolean) {
-    const ids = entries.map((e) => e.event);
+    const ids = entries.filter(selectable).map((e) => e.event);
     const events = checked
       ? [...new Set([...draft.events, ...ids])]
       : draft.events.filter((e) => !ids.includes(e));
@@ -553,61 +576,118 @@ function EndpointEditor({
       <div>
         <span className="mb-1.5 block text-caption text-[var(--text-muted)]">外发格式</span>
         <div className="flex gap-1.5">
-          <button
-            type="button"
-            aria-pressed={draft.format === "movieclaw"}
-            onClick={() => onChange({ ...draft, format: "movieclaw" })}
-            className={`rounded-full px-3.5 py-1.5 text-sub font-medium transition-colors ${
-              draft.format === "movieclaw"
-                ? "bg-white/[0.14] text-white"
-                : "text-[var(--text-muted)] hover:bg-white/[0.07]"
-            }`}
-          >
-            自有协议（HMAC 签名）
-          </button>
-          <button
-            type="button"
-            disabled
-            title="Jellyfin Webhook 插件兼容模式将在后续版本提供"
-            className="cursor-not-allowed rounded-full px-3.5 py-1.5 text-sub font-medium text-[var(--text-faint)] opacity-60"
-          >
-            Jellyfin 兼容（即将支持）
-          </button>
+          {(
+            [
+              ["movieclaw", "自有协议（HMAC 签名）"],
+              ["jellyfin", "Jellyfin 兼容（模板渲染）"],
+            ] as const
+          ).map(([format, label]) => (
+            <button
+              key={format}
+              type="button"
+              aria-pressed={draft.format === format}
+              onClick={() => {
+                if (format === draft.format) return;
+                // 切到 jellyfin 时剔除没有 Jellyfin 对应物的已选事件
+                const events =
+                  format === "jellyfin"
+                    ? draft.events.filter(
+                        (e) => catalog.find((c) => c.event === e)?.jellyfin_supported,
+                      )
+                    : draft.events;
+                onChange({ ...draft, format, events });
+              }}
+              className={`rounded-full px-3.5 py-1.5 text-sub font-medium transition-colors ${
+                draft.format === format
+                  ? "bg-white/[0.14] text-white"
+                  : "text-[var(--text-muted)] hover:bg-white/[0.07]"
+              }`}
+            >
+              {label}
+            </button>
+          ))}
         </div>
+        {draft.format === "jellyfin" && (
+          <p className="mt-1.5 text-caption text-[var(--text-faint)]">
+            与 Jellyfin Webhook 插件同一套模板变量：下游文档里「贴进 Jellyfin
+            插件」的模板可直接贴到下方，实现免适配接入。此格式不签名，鉴权用附加请求头。
+          </p>
+        )}
       </div>
+
+      {draft.format === "jellyfin" && (
+        <>
+          <label className="block">
+            <span className="mb-1.5 block text-caption text-[var(--text-muted)]">
+              Handlebars 模板（支持 {"{{Var}}"} 与 if_equals / if_exist / link_to /
+              url_encode / json_encode）
+            </span>
+            <textarea
+              value={draft.template}
+              onChange={(e) => onChange({ ...draft, template: e.target.value })}
+              rows={6}
+              placeholder={'{\n  "event": "{{NotificationType}}",\n  "title": {{json_encode Name}}\n}'}
+              className={`${INPUT_CLASS} resize-y font-mono`}
+            />
+          </label>
+          <label className="block">
+            <span className="mb-1.5 block text-caption text-[var(--text-muted)]">
+              附加请求头（每行一条，如 Authorization: Bearer xxx；可留空）
+            </span>
+            <textarea
+              defaultValue={headersToText(draft.headers)}
+              onChange={(e) => onChange({ ...draft, headers: textToHeaders(e.target.value) })}
+              rows={2}
+              className={`${INPUT_CLASS} resize-y font-mono`}
+            />
+          </label>
+        </>
+      )}
 
       <div>
         <span className="mb-1.5 block text-caption text-[var(--text-muted)]">订阅事件</span>
         <div className="space-y-3">
           {[...groups.entries()].map(([group, entries]) => {
-            const allOn = entries.every((e) => draft.events.includes(e.event));
+            const usable = entries.filter(selectable);
+            const allOn =
+              usable.length > 0 && usable.every((e) => draft.events.includes(e.event));
             return (
               <div key={group}>
                 <label className="flex cursor-pointer items-center gap-2 text-sub font-medium text-[var(--text)]">
                   <input
                     type="checkbox"
                     checked={allOn}
+                    disabled={usable.length === 0}
                     onChange={(e) => toggleGroup(entries, e.target.checked)}
                     className="size-4 accent-[var(--accent)]"
                   />
                   {group}
                 </label>
                 <div className="mt-1.5 flex flex-wrap gap-x-5 gap-y-1.5 pl-6">
-                  {entries.map((entry) => (
-                    <label
-                      key={entry.event}
-                      className="flex cursor-pointer items-center gap-1.5 text-sub text-[var(--text-muted)]"
-                    >
-                      <input
-                        type="checkbox"
-                        checked={draft.events.includes(entry.event)}
-                        onChange={(e) => toggleEvent(entry.event, e.target.checked)}
-                        className="size-4 accent-[var(--accent)]"
-                      />
-                      {entry.label}
-                      <code className="text-caption text-[var(--text-faint)]">{entry.event}</code>
-                    </label>
-                  ))}
+                  {entries.map((entry) => {
+                    const enabled = selectable(entry);
+                    return (
+                      <label
+                        key={entry.event}
+                        title={enabled ? undefined : "该事件没有 Jellyfin 对应物，仅自有协议可订阅"}
+                        className={`flex items-center gap-1.5 text-sub ${
+                          enabled
+                            ? "cursor-pointer text-[var(--text-muted)]"
+                            : "cursor-not-allowed text-[var(--text-faint)] opacity-60"
+                        }`}
+                      >
+                        <input
+                          type="checkbox"
+                          checked={enabled && draft.events.includes(entry.event)}
+                          disabled={!enabled}
+                          onChange={(e) => toggleEvent(entry.event, e.target.checked)}
+                          className="size-4 accent-[var(--accent)]"
+                        />
+                        {entry.label}
+                        <code className="text-caption text-[var(--text-faint)]">{entry.event}</code>
+                      </label>
+                    );
+                  })}
                 </div>
               </div>
             );
@@ -641,7 +721,7 @@ function EndpointEditor({
         </div>
       </div>
 
-      {draft.id && (
+      {draft.id && draft.format === "movieclaw" && (
         <div className="flex items-center justify-between gap-3 rounded-xl bg-white/[0.04] px-3.5 py-2.5">
           <p className="min-w-0 text-caption text-[var(--text-muted)]">
             签名密钥 <code className="font-mono">{secretMasked || "（无）"}</code>

@@ -15,9 +15,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from sqlalchemy import select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
-from movieclaw_db.models import MediaItem, PlaybackState
+from movieclaw_db.models import MediaEpisode, MediaItem, PlaybackState
 from movieclaw_events import OutboundEvent, new_ulid
 from movieclaw_playback.state import Unit, get_states
 
@@ -46,6 +47,9 @@ def _client_payload(client: ClientInfo | None) -> dict | None:
 
 def _base_media(item: MediaItem) -> dict:
     return {
+        # item_id 是 MovieClaw 内部条目 ID：Jellyfin 兼容格式用它构造 ItemId，
+        # 自有协议消费端可拿它回调 Jellyfin 兼容 API 查详情
+        "item_id": item.id,
         "tmdb_id": item.tmdb_id,
         "imdb_id": item.imdb_id,
         "title": item.title,
@@ -54,19 +58,52 @@ def _base_media(item: MediaItem) -> dict:
     }
 
 
-def _playback_media(item: MediaItem, unit: Unit) -> dict:
+async def _episode_titles(
+    session: AsyncSession, item_id: int, units: list[Unit]
+) -> dict[tuple[int, int], str]:
+    """批量取各 (season, episode) 的单集标题；查不到的键缺席。"""
+    pairs = {(u[1], u[2]) for u in units}
+    if not pairs:
+        return {}
+    rows = (
+        await session.execute(
+            select(
+                MediaEpisode.season_number, MediaEpisode.episode_number, MediaEpisode.name
+            ).where(MediaEpisode.media_item_id == item_id)
+        )
+    ).all()
+    return {(s, e): name for s, e, name in rows if (s, e) in pairs and name}
+
+
+def _playback_media(
+    item: MediaItem, unit: Unit, episode_title: str | None = None
+) -> dict:
     """播放事件的 media：电影不外泄 (0,0) 哨兵，剧集带真实季集号。"""
     media = _base_media(item)
     if item.kind == "movie":
-        media.update({"type": "movie", "season_number": None, "episode_number": None})
+        media.update(
+            {
+                "type": "movie",
+                "season_number": None,
+                "episode_number": None,
+                "episode_title": None,
+            }
+        )
     else:
         media.update(
-            {"type": "episode", "season_number": unit[1], "episode_number": unit[2]}
+            {
+                "type": "episode",
+                "season_number": unit[1],
+                "episode_number": unit[2],
+                "episode_title": episode_title,
+            }
         )
     return media
 
 
-def _favorite_media(item: MediaItem, unit: Unit) -> dict:
+def _favorite_media(
+    item: MediaItem, unit: Unit, episode_title: str | None = None
+) -> dict:
     """收藏事件的 media：哨兵单元 → 收藏目标层级。"""
     _, season, episode = unit
     media = _base_media(item)
@@ -79,7 +116,12 @@ def _favorite_media(item: MediaItem, unit: Unit) -> dict:
     else:
         level, season_out, episode_out = "episode", season, episode
     media.update(
-        {"type": level, "season_number": season_out, "episode_number": episode_out}
+        {
+            "type": level,
+            "season_number": season_out,
+            "episode_number": episode_out,
+            "episode_title": episode_title if level == "episode" else None,
+        }
     )
     return media
 
@@ -106,10 +148,13 @@ async def build_playback_event(
     item = await session.get(MediaItem, unit[0])
     if item is None:
         return None
+    titles = (
+        await _episode_titles(session, unit[0], [unit]) if item.kind != "movie" else {}
+    )
     return OutboundEvent(
         event=event,
         data={
-            "media": _playback_media(item, unit),
+            "media": _playback_media(item, unit, titles.get((unit[1], unit[2]))),
             "playback": _playback_payload(state, duration_ms=duration_ms),
             "client": _client_payload(client),
         },
@@ -130,6 +175,9 @@ async def build_marked_events(
     if item is None:
         return []
     states = await get_states(session, [u[0] for u in units])
+    titles = (
+        await _episode_titles(session, units[0][0], units) if item.kind != "movie" else {}
+    )
     batch_id = new_ulid() if len(units) > 1 else None
     events: list[OutboundEvent] = []
     for unit in units:
@@ -141,7 +189,7 @@ async def build_marked_events(
                 event=event,
                 batch_id=batch_id,
                 data={
-                    "media": _playback_media(item, unit),
+                    "media": _playback_media(item, unit, titles.get((unit[1], unit[2]))),
                     "playback": _playback_payload(state, duration_ms=None),
                     "client": _client_payload(client),
                 },
@@ -161,10 +209,14 @@ async def build_favorite_event(
     item = await session.get(MediaItem, unit[0])
     if item is None:
         return None
+    is_episode_level = item.kind != "movie" and unit[1] >= 0 and unit[2] >= 0
+    titles = (
+        await _episode_titles(session, unit[0], [unit]) if is_episode_level else {}
+    )
     return OutboundEvent(
         event="item.favorited" if favorite else "item.unfavorited",
         data={
-            "media": _favorite_media(item, unit),
+            "media": _favorite_media(item, unit, titles.get((unit[1], unit[2]))),
             "favorite": favorite,
             "client": _client_payload(client),
         },

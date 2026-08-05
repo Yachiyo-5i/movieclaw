@@ -62,6 +62,7 @@ class EventCatalogEntry(BaseModel):
     group: str
     label: str
     jellyfin_supported: bool
+    default_on: bool = True
 
 
 class WebhookConfigView(BaseModel):

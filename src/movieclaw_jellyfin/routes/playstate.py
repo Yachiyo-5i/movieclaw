@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import time
 from datetime import datetime
 from typing import Any
 
@@ -196,6 +197,22 @@ async def playing_start(
     return Response(status_code=204)
 
 
+#: playback.progress 事件的节流：每单元最多 30 秒一条（避免播放期间刷屏，
+#: 设计文档 §1.1）。键是 (item, season, episode)，量级 = 库内在播单元数
+_PROGRESS_EMIT_INTERVAL = 30.0
+_progress_last_emit: dict[playback_state.Unit, float] = {}
+
+
+def _progress_throttled(unit: playback_state.Unit) -> bool:
+    """True = 本次进度不发事件；未被节流时顺带记下本次时间。"""
+    now = time.monotonic()
+    last = _progress_last_emit.get(unit)
+    if last is not None and now - last < _PROGRESS_EMIT_INTERVAL:
+        return True
+    _progress_last_emit[unit] = now
+    return False
+
+
 async def _apply_progress(
     ref: EntityRef,
     position_ms: int | None,
@@ -205,7 +222,8 @@ async def _apply_progress(
 ) -> None:
     """进度落库；commit 后按语义装配 webhook 事件：
     Stopped 上报发 ``playback.stopped``；played 本次翻转为 True 追加
-    ``playback.completed``（Progress 与 Stopped 都可能触发翻转）。"""
+    ``playback.completed``（Progress 与 Stopped 都可能触发翻转）；
+    普通进度上报按单元节流发 ``playback.progress``。"""
     unit = _leaf_unit(ref)
     runtime_ms = await _unit_runtime_ms(unit)
     async with get_database().session() as session:
@@ -213,10 +231,14 @@ async def _apply_progress(
             session, unit, position_ms=position_ms, runtime_ms=runtime_ms
         )
         await session.commit()
+        emit_progress = (
+            not stopped and not newly_played and not _progress_throttled(unit)
+        )
         events = []
         for name, hit in (
             ("playback.stopped", stopped),
             ("playback.completed", newly_played),
+            ("playback.progress", emit_progress),
         ):
             if not hit:
                 continue

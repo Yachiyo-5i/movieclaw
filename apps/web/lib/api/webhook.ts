@@ -34,6 +34,8 @@ export interface WebhookCatalogEntry {
   label: string;
   /** false = 该事件没有 Jellyfin 对应物，jellyfin 格式 endpoint 不可订阅 */
   jellyfin_supported: boolean;
+  /** false = 高频事件（如 playback.progress），新建 endpoint 时默认不勾选 */
+  default_on: boolean;
 }
 
 export interface WebhookEndpointView {

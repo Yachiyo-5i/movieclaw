@@ -1,7 +1,8 @@
 # 通用事件 Webhook 设计
 
-> 状态：**v1.1 P1 已实施**（2026-08-05）。P2（Jellyfin 兼容格式、progress 事件）
-> 与 P3（订阅域接入）待实施。
+> 状态：**v1.1 P1/P2/P3 全部已实施**（2026-08-05）。P1 = 自有协议闭环（播放 +
+> 收藏域）；P2 = Jellyfin 兼容格式 + `playback.progress`；P3 = 订阅域接入
+>（首个非播放域，验证了「builder + 目录一行 + emit 一行」的扩展承诺）。
 >
 > 版本演进：v1.0 定名「播放事件 Webhook」；v1.1（2026-08-05 用户决策）① 收藏事件
 > 确认纳入 P1；② 架构泛化为**全系统通用的事件出站通道**——播放域只是首发域，
@@ -174,6 +175,29 @@ data:
 收藏层级由内部哨兵单元翻译而来（`(0,0)`→movie、`(s,-1)`→season、
 `(-1,-1)`→series、其余→episode），哨兵数值**不外泄**。
 
+### 1.5 订阅域的 `data` 结构（P3 定稿）
+
+builder 在 `src/movieclaw_api/services/subscription/events.py`，纯装配不查库。
+订阅域事件描述**已发生的外部动作**（种子已提交下载器 / 库存对账确认入库），
+不依赖当前事务落库，产生点与 IM 推送相邻调用（这是对硬决策 3 的域内澄清，
+不是偏离——「commit 之后」针对的是描述数据库状态的事件）。
+
+`subscription.download_started`：
+
+```
+data:
+  media:
+    item_id / tmdb_id / imdb_id / title / original_title / year
+    type: "movie" | "series"     # 订阅是条目级，无 episode 层
+  units: [[season, episode], …]  # 本次投递覆盖的单元；电影为 []（哨兵不外泄）
+  torrent: { site_id, title, spec }   # spec 为人读规格摘要
+```
+
+`subscription.fulfilled`：同上去掉 `torrent`。
+
+两个事件 `jellyfin_type=None`——没有 Jellyfin 对应物，仅自有协议 endpoint
+可订阅（设置页自动禁用勾选）。
+
 ## 2. 自有协议（`format: movieclaw`）
 
 ### 2.1 报文
@@ -217,8 +241,10 @@ data:
   `media.season_number`、`media.episode_number`；播放事件另有
   `playback.position_ms`、`playback.played`；收藏事件另有 `favorite`——覆盖
   issue 要求的全部稳定字段。
-- **便利字段**（尽力提供，内容可能随元数据刷新变化）：`media.title`、
-  `media.year`、`media.imdb_id`、`playback.duration_ms`、`playback.play_count`。
+- **便利字段**（尽力提供，内容可能随元数据刷新变化）：`media.item_id`
+  （MovieClaw 内部条目 ID，可用于回调 Jellyfin 兼容 API）、`media.title`、
+  `media.year`、`media.imdb_id`、`media.episode_title`（单集标题，非剧集单元
+  为 null）、`playback.duration_ms`、`playback.play_count`。
 - **可空对象**：`client` 整体可为 `null`（非播放器入口）。
 - 演进只加字段，消费端必须忽略未知字段；新领域事件只新增 `data` 结构承诺，
   不改信封。
@@ -432,13 +458,14 @@ emit 一行」的扩展承诺；产生点与现有 `notify_channels` 调用相�
 
 1. IM 推送（`channel_push`）与 webhook 的事件源是否统一为同一份目录——本期两者
    独立（消费形态不同），若后续 IM 推送也要逐事件开关化，可评估共享事件目录。
-2. `webhook.test` 事件对 jellyfin 格式端点如何呈现——倾向用示例变量渲染用户模板，
-   P2 实现时定稿。
-3. `progress` 节流间隔是否需要可配置——P1 不做，P2 按反馈定。
-4. 预留域（subscription/library/system）的具体事件名与 `data` 结构——各域接入时
-   在本文档追加章节定稿。
+2. ~~`webhook.test` 事件对 jellyfin 格式端点如何呈现~~——已定稿（P2）：用示例
+   变量渲染用户模板，`NotificationType` 按最常见的 `PlaybackStop` 分支。
+3. `progress` 节流间隔是否需要可配置——当前固定 30 秒，按反馈再定。
+4. ~~预留域的具体事件名与 `data` 结构~~——订阅域已在 §1.5 定稿（P3）；
+   library/system 域各自接入时继续在本文档追加。
+5. 投递日志是否落表支持失败重放——仍视用户反馈决定（届时才需要 Alembic 迁移）。
 
-## 9. P1 实现状态与落点（2026-08-05）
+## 9. 实现状态与落点（2026-08-05，P1/P2/P3 全部完成）
 
 | 设计章节 | 实现落点 |
 | --- | --- |
@@ -450,7 +477,11 @@ emit 一行」的扩展承诺；产生点与现有 `notify_channels` 调用相�
 | §4.2 管理 API | `src/movieclaw_api/api/routes/webhook.py` + `services/webhook_config.py` |
 | §4.3 设置页 | `apps/web/components/webhook-section.tsx` + `lib/api/webhook.ts`（P1 编辑卡中 jellyfin 格式禁用，注明「即将支持」） |
 | 出站服务标签 | `settings/network.py` `BUILTIN_EGRESS_SERVICES` 新增 `webhook` |
-| 测试 | `tests/events/`、`tests/playback/`、`tests/jellyfin/test_webhook_emission.py`、`tests/api/test_webhook_dispatcher.py`、`tests/api/test_webhook_api.py` |
+| §3.4 Handlebars 渲染器（P2） | `services/webhook/handlebars.py`（变量 + 5 个官方助手 + `{{else}}` + 空白控制；未知语法中文报错进投递记录） |
+| §3.2/§3.3 Jellyfin 格式器（P2） | `services/webhook/jellyfin_formatter.py`（变量字典、NotificationType 映射、completed 吸收 stopped、ticks 边界换算、ItemId 与兼容 API 同源） |
+| `playback.progress`（P2） | `routes/playstate.py`（每单元 30s 节流，completed 优先抑制 progress）；目录 `default_on=False`，新建 endpoint 默认不勾选 |
+| §1.5 订阅域（P3） | `services/subscription/events.py` + `dispatch.py` / `wanted_fulfillment.py` 各一行 emit + 目录两行登记——扩展承诺兑现，投递链路零改动 |
+| 测试 | `tests/events/`、`tests/playback/`、`tests/jellyfin/test_webhook_emission.py`、`tests/api/test_webhook_{dispatcher,api,handlebars,jellyfin_formatter}.py`、`tests/api/test_subscription_webhook_events.py` |
 
 ## 附录 A：消费端对接示例（自有协议）
 

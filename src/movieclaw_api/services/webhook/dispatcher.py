@@ -25,6 +25,11 @@ import httpx
 from movieclaw_api.services.webhook.catalog import is_known_event
 from movieclaw_api.services.webhook.deliveries import DeliveryRecord, record_delivery
 from movieclaw_api.services.webhook.formatter import format_movieclaw
+from movieclaw_api.services.webhook.handlebars import TemplateError
+from movieclaw_api.services.webhook.jellyfin_formatter import (
+    format_jellyfin,
+    merge_for_jellyfin,
+)
 from movieclaw_api.settings import WebhookEndpoint, WebhookSetting, get_setting_store
 from movieclaw_events import OutboundEvent
 from movieclaw_net import CircuitOpenError, EgressScope, egress_transport
@@ -76,6 +81,7 @@ async def deliver_test(endpoint: WebhookEndpoint) -> DeliveryRecord:
         data={
             "media": {
                 "type": "episode",
+                "item_id": 0,
                 "tmdb_id": 1399,
                 "imdb_id": None,
                 "title": "示例剧集",
@@ -98,24 +104,47 @@ async def deliver_test(endpoint: WebhookEndpoint) -> DeliveryRecord:
 
 
 async def _server_info() -> dict:
-    """信封的 server 对象：实例 ID/名称复用 Jellyfin 兼容层身份，版本取应用版本。"""
+    """服务器上下文：实例 ID/名称/地址复用 Jellyfin 兼容层身份，版本取应用版本，
+    用户名取管理员账号（Jellyfin 变量字典的 NotificationUsername）。
+
+    注意这是**内部上下文**，自有协议报文的 server 对象只取其中
+    id/name/version 三个键（见 ``_wire_server``），url/username 不进信封。
+    """
     from movieclaw_api import __version__
+    from movieclaw_api.settings import AdminAccountSetting, get_setting_store
     from movieclaw_api.settings.schemas import get_jellyfin_compat
 
     compat = await get_jellyfin_compat()
-    return {"id": compat.server_id, "name": compat.server_name, "version": __version__}
+    admin = await get_setting_store().get(AdminAccountSetting)
+    return {
+        "id": compat.server_id,
+        "name": compat.server_name,
+        "version": __version__,
+        "url": compat.published_server_url,
+        "username": admin.username,
+    }
+
+
+def _wire_server(server: dict) -> dict:
+    """自有协议信封的 server 对象（稳定契约：id/name/version）。"""
+    return {k: server.get(k, "") for k in ("id", "name", "version")}
 
 
 async def _deliver_endpoint(
     endpoint: WebhookEndpoint, events: list[OutboundEvent], server: dict
 ) -> None:
     subscribed = set(endpoint.events)
+    hits = []
     for event in events:
         if not is_known_event(event.event):
             logger.warning("忽略未在事件目录登记的 Webhook 事件：%s", event.event)
             continue
-        if event.event not in subscribed:
-            continue
+        if event.event in subscribed:
+            hits.append(event)
+    if endpoint.format == "jellyfin":
+        # 同批 stopped+completed 都映射到 PlaybackStop，completed 吸收 stopped
+        hits = merge_for_jellyfin(hits)
+    for event in hits:
         await _deliver_one(endpoint, event, server)
 
 
@@ -130,13 +159,28 @@ async def _deliver_one(
     started = time.monotonic()
     record = DeliveryRecord(event_id=event.event_id, event=event.event)
 
-    if endpoint.format != "movieclaw":
-        # P2 落地 Jellyfin 兼容格式（设计文档 §3）；先记录明确失败而非静默丢弃
-        record.error = "Jellyfin 兼容格式尚未支持（后续版本提供），本次投递已跳过"
+    try:
+        if endpoint.format == "jellyfin":
+            if not endpoint.template.strip():
+                record.error = (
+                    "jellyfin 格式的 endpoint 未配置模板，无法投递（请粘贴下游文档提供的模板）"
+                )
+                record_delivery(endpoint.id, record)
+                return record
+            body, headers = format_jellyfin(
+                event, server=server, template=endpoint.template
+            )
+        else:
+            body, headers = format_movieclaw(
+                event, server=_wire_server(server), secret=endpoint.secret
+            )
+    except (TemplateError, ValueError) as exc:
+        record.error = f"模板渲染失败：{exc}"
         record_delivery(endpoint.id, record)
+        logger.warning(
+            "Webhook 模板渲染失败：%s → %s（%s）", event.event, endpoint.name or endpoint.url, exc
+        )
         return record
-
-    body, headers = format_movieclaw(event, server=server, secret=endpoint.secret)
     if endpoint.headers:
         headers = {**headers, **endpoint.headers}
     scope = EgressScope.LAN if endpoint.egress_scope == "lan" else EgressScope.WAN

@@ -21,6 +21,7 @@ RUNTIME_MS = 47 * 60 * 1000  # 播种剧集单集时长
 @pytest.fixture
 def emitted(monkeypatch) -> list:
     """捕获协议层投递的全部事件（替换 emit_events，不走真实投递链路）。"""
+    playstate._progress_last_emit.clear()  # progress 节流状态在用例间隔离
     captured: list = []
     monkeypatch.setattr(playstate, "emit_events", captured.extend)
     return captured
@@ -49,17 +50,26 @@ def test_started_event_with_client_info(client, seeded, emitted):
     assert event.data["client"]["device_name"] == "Apple TV"
 
 
-def test_progress_flip_emits_completed_only(client, seeded, emitted):
+def test_progress_events_and_throttle(client, seeded, emitted):
     auth = _auth(client)
     ep = episode_guid(seeded["show"], 1, 1)
-    # 50%：无翻转、非停止 → 不产生事件
+    # 40%：普通进度 → 发一条 progress
+    client.post(
+        "/Sessions/Playing/Progress",
+        params=auth,
+        json={"ItemId": ep, "PositionTicks": int(RUNTIME_MS * 0.4) * TICKS_PER_MS},
+    )
+    assert [e.event for e in emitted] == ["playback.progress"]
+    assert emitted[0].data["media"]["episode_title"] == "Pilot"
+    # 30 秒内再报进度：被节流，不产生事件
+    emitted.clear()
     client.post(
         "/Sessions/Playing/Progress",
         params=auth,
         json={"ItemId": ep, "PositionTicks": RUNTIME_MS // 2 * TICKS_PER_MS},
     )
     assert emitted == []
-    # 95%：仅靠 Progress 翻转已看 → 只发 completed
+    # 95%：仅靠 Progress 翻转已看 → 只发 completed（progress 被 completed 抑制）
     client.post(
         "/Sessions/Playing/Progress",
         params=auth,
