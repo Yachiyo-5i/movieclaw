@@ -19,20 +19,6 @@ const GLASS_PAD = 32;
 const scaledSpring = (value: number, timeScale = ANIMATION_TIME_SCALE) => value / (timeScale * timeScale);
 const scaledRate = (value: number, timeScale = ANIMATION_TIME_SCALE) => Math.pow(value, 1 / timeScale);
 
-/**
- * 本项目新增：把一次性重活丢到浏览器空闲时段执行，返回可取消的句柄。
- * 带 timeout 兜底——页面一直忙（或标签页被节流）时也会在 2 秒内强制执行，
- * 不至于永远排不上；环境没有 requestIdleCallback 时退化成短延时宏任务。
- */
-function scheduleIdle(task: () => void, timeout = 2000): { cancel: () => void } {
-  if (typeof requestIdleCallback === "function") {
-    const id = requestIdleCallback(task, { timeout });
-    return { cancel: () => cancelIdleCallback(id) };
-  }
-  const id = window.setTimeout(task, 200);
-  return { cancel: () => window.clearTimeout(id) };
-}
-
 export interface LiquidGlassButtonProps {
   checked?: boolean;
   defaultChecked?: boolean;
@@ -139,6 +125,18 @@ export function LiquidGlassButton({
     } catch (error) {
       console.warn(error);
     }
+  };
+
+  /**
+   * 本项目改动：释放渲染器及其独占的 WebGL 上下文。开关只在按下/拖动的动画
+   * 期间需要玻璃层（静止态玻璃 opacity 为 0，见 transitionState），动画归位后
+   * 立刻归还上下文——浏览器每页只允许约 16 个活跃上下文，站点/搜索分类设置页
+   * 一屏十几个开关若各自常驻一个，会把常驻的侧栏面板挤掉（表现为侧栏整块变白，
+   * 见 issue #89）。下次按下时 ensureRenderer 会现场重建（约 35ms，可接受）。
+   */
+  const releaseRenderer = () => {
+    rendererRef.current?.dispose();
+    rendererRef.current = null;
   };
 
   const switchBounds = () => {
@@ -301,6 +299,8 @@ export function LiquidGlassButton({
       p.releaseRequested = false;
       p.fastMorph = false;
       syncRendererGeometry(0, false, 0);
+      // 动画完全归位（玻璃层不可见）：释放 WebGL 上下文，见 releaseRenderer 说明
+      releaseRenderer();
       return;
     }
     if (Math.abs(p.target) + Math.abs(p.stretch) + Math.abs(p.velocity) > .0015 || !shapeSettled || !positionSettled) {
@@ -318,22 +318,21 @@ export function LiquidGlassButton({
       p.position = p.positionTarget;
       p.positionVelocity = 0;
       syncRendererGeometry(0, false, p.morph);
+      // 玻璃层已完全淡出时释放 WebGL 上下文；morph 未归零说明玻璃还可见，保留
+      if (p.morph === 0) releaseRenderer();
     }
   };
 
   useEffect(() => {
     if (!canvasRef.current || !switchRef.current) return;
-    // —— 本项目改动：把 WebGL 初始化从「挂载时同步」改成「空闲时」——
-    // 每个开关都要独占一个 WebGL 上下文（建 context + 编译链接着色器 + 传纹理），
-    // 实测单个约 35ms。设置页里一屏能有十来个开关（如搜索分类列表），同步初始化
-    // 会把主线程堵住三百毫秒，切换标签页时明显卡顿。
-    // 静止态下玻璃层的不透明度本就是 0（见 transitionState：未按下时只显示 CSS 静态层），
-    // 所以延后创建没有任何视觉损失；按下 / 键盘激活的分支里也各自兜底调了 ensureRenderer，
-    // 即便空闲回调还没跑到，交互当下也一定有 renderer。
-    const idle = scheduleIdle(() => {
-      ensureRenderer();
-      syncRendererGeometry(pointerRef.current.stretch, false, pointerRef.current.morph);
-    });
+    // —— 本项目改动：挂载时完全不创建 WebGL 渲染器 ——
+    // 静止态下玻璃层的不透明度本就是 0（见 transitionState：未按下时只显示 CSS
+    // 静态层），预创建没有视觉收益，却让每个开关常驻独占一个 WebGL 上下文。
+    // 浏览器每页只允许约 16 个活跃上下文，站点/搜索分类设置页一屏十几个开关
+    // 就会把常驻的侧栏玻璃面板挤掉（表现为侧栏整块变白，见 issue #89）。
+    // 现在改为：按下时 ensureRenderer 现场创建（约 35ms，动画首帧内完成），
+    // 动画归位后在 animate 的收尾分支里 releaseRenderer 归还上下文。
+    syncRendererGeometry(pointerRef.current.stretch, false, pointerRef.current.morph);
     const root = switchRef.current;
     const observer = new ResizeObserver(([entry]) => {
       resizeRef.current = {
@@ -348,11 +347,9 @@ export function LiquidGlassButton({
     });
     observer.observe(root);
     return () => {
-      idle.cancel();
       observer.disconnect();
       cancelAnimationFrame(frameRef.current);
-      rendererRef.current?.dispose();
-      rendererRef.current = null;
+      releaseRenderer();
     };
   }, []);
 

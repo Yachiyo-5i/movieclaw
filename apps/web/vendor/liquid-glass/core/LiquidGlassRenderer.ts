@@ -6,10 +6,28 @@ type Uniforms = Record<string, WebGLUniformLocation | null>;
 const imageCache = new Map<string, HTMLImageElement>();
 const isVideoUrl = (url: string) => /\.(mp4|webm|mov)(?:$|[?#])/i.test(url);
 
+/**
+ * 各上下文的 WEBGL_lose_context 扩展缓存。必须在上下文健康时取好存下——
+ * 丢失态下 getExtension 一律返回 null，而恢复（restoreContext）恰恰只能在
+ * 丢失态下调用，只能靠这份提前缓存的引用。同一画布反复重建渲染器时（开关
+ * 「按下创建、归位释放」的用法）拿到的是同一个上下文对象，WeakMap 以它为键
+ * 跨实例共享扩展，画布被回收时条目随之释放。
+ */
+const loseContextExt = new WeakMap<WebGLRenderingContext, WEBGL_lose_context | null>();
+
+/**
+ * 已安装「上下文丢失守卫」的画布集合。守卫在 webglcontextlost 时 preventDefault，
+ * 声明"我们会自行恢复"——不阻止默认行为的话，浏览器会把上下文永久标记为不可
+ * 恢复（restoreContext 报 "context restoration not allowed"）。守卫必须常驻画布、
+ * 不能随渲染器实例移除：dispose() 主动 loseContext() 时事件是异步派发的，那一刻
+ * 实例自己的监听器已经拆掉，全靠这个守卫兜底，同一画布之后才能重建渲染器。
+ */
+const guardedCanvases = new WeakSet<HTMLCanvasElement>();
+
 export class LiquidGlassRenderer {
   private gl: WebGLRenderingContext;
   private uniforms: Uniforms = {};
-  private texture: WebGLTexture;
+  private texture!: WebGLTexture;
   private image: HTMLImageElement;
   private video: HTMLVideoElement | null = null;
   private ready = false;
@@ -55,12 +73,83 @@ private sampleBackground = 0;
     this.draw();
   };
 
+  /**
+   * 本项目改动：上下文丢失/恢复处理。浏览器每页最多允许约 16 个活跃 WebGL
+   * 上下文，超限时会强制丢弃最老的那个（受害者往往是常驻的侧栏面板，表现为
+   * 整块玻璃变白且永不恢复，见 issue #89）。配合画布上常驻的 preventDefault
+   * 守卫（guardedCanvases），丢失的上下文可以经 webglcontextrestored 复原。
+   */
+  private handleContextLost = () => {
+    // preventDefault 由画布上常驻的守卫统一处理（见 guardedCanvases），这里只标记状态
+    this.ready = false;
+    // 存活实例收到丢失事件（被浏览器挤掉，或重建前残留的丢失事件此刻才派发）：申请恢复
+    this.scheduleRestore();
+  };
+
+  /**
+   * 申请恢复丢失的上下文。恢复许可要等丢失事件的派发任务整体结束才生效——
+   * 同步调用或微任务都会抢在它前面、报 "restoration not allowed"，必须用宏任务
+   * 排到下一轮；执行时再核对状态，上下文已恢复或实例已释放就什么都不做。
+   */
+  private scheduleRestore() {
+    window.setTimeout(() => {
+      if (!this.disposed && this.gl.isContextLost()) {
+        loseContextExt.get(this.gl)?.restoreContext();
+      }
+    }, 0);
+  }
+  /** 上下文恢复后重建全部 GL 资源（着色器/缓冲/纹理）并重传背景，画面自动复原。 */
+  private handleContextRestored = () => {
+    if (this.disposed) return;
+    try {
+      this.initGL();
+    } catch (err) {
+      console.warn("液态玻璃 WebGL 上下文恢复失败：", err);
+      return;
+    }
+    if (this.video) {
+      // 视频纹理每帧 draw 时重传，这里只需恢复就绪态并标脏
+      if (this.video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA && this.video.videoWidth > 0) {
+        this.ready = true;
+        this.requestDraw();
+      }
+    } else if (this.image.complete && this.image.naturalWidth > 0) {
+      this.handleImageLoad();
+    }
+  };
+
   constructor(private canvas: HTMLCanvasElement, imageUrl: string, settings: LiquidGlassSettings) {
     const gl = canvas.getContext("webgl", { alpha: true, premultipliedAlpha: false, antialias: false });
     if (!gl) throw new Error("Liquid Glass requires WebGL.");
     this.gl = gl;
     this.settings = settings;
     this.size = { width: settings.lensWidth, height: settings.lensHeight };
+    if (!guardedCanvases.has(canvas)) {
+      guardedCanvases.add(canvas);
+      canvas.addEventListener("webglcontextlost", (event) => event.preventDefault());
+    }
+    canvas.addEventListener("webglcontextlost", this.handleContextLost);
+    canvas.addEventListener("webglcontextrestored", this.handleContextRestored);
+    if (gl.isContextLost()) {
+      // 同一画布永远返回同一个上下文对象：若它此前被 dispose() 的 loseContext()
+      // 释放过（或被浏览器挤掉），拿到手时就是丢失态，GL 调用全是无效操作。
+      // 这里申请恢复，资源创建推迟到 webglcontextrestored 回调里完成。
+      this.scheduleRestore();
+    } else {
+      this.initGL();
+    }
+    this.image = new Image();
+    this.loadSource(imageUrl);
+    this.watchPosition();
+  }
+
+  /** 创建全部 GL 资源。构造时调用一次；上下文丢失后恢复时会再次调用重建。 */
+  private initGL() {
+    const { gl } = this;
+    // 趁上下文健康缓存 WEBGL_lose_context（丢失态下 getExtension 只会返回 null）
+    if (!loseContextExt.has(gl)) {
+      loseContextExt.set(gl, gl.getExtension("WEBGL_lose_context"));
+    }
     const compile = (type: number, source: string) => {
       const shader = gl.createShader(type);
       if (!shader) throw new Error("Unable to create WebGL shader.");
@@ -106,9 +195,6 @@ private sampleBackground = 0;
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
     gl.uniform1i(this.uniforms.u_bg, 0);
-    this.image = new Image();
-    this.loadSource(imageUrl);
-    this.watchPosition();
   }
 
   private loadSource(url: string) {
@@ -238,9 +324,17 @@ private sampleBackground = 0;
     this.ready = false;
     this.image.removeEventListener("load", this.handleImageLoad);
     this.video?.removeEventListener("loadeddata", this.handleVideoReady);
+    this.canvas.removeEventListener("webglcontextlost", this.handleContextLost);
+    this.canvas.removeEventListener("webglcontextrestored", this.handleContextRestored);
     this.gl.deleteTexture(this.texture);
     this.gl.clearColor(0, 0, 0, 0);
     this.gl.clear(this.gl.COLOR_BUFFER_BIT);
+    // 本项目改动：主动归还上下文名额。浏览器对每页活跃 WebGL 上下文数量有硬上限
+    // （约 16 个），已卸载组件的上下文若等 GC 才释放，会挤占存活面板的名额、
+    // 触发"最老上下文被强制丢弃"（见 issue #89 侧栏变白）。
+    if (!this.gl.isContextLost()) {
+      loseContextExt.get(this.gl)?.loseContext();
+    }
   }
   resize(width: number, height: number) {
     const deviceScale = window.devicePixelRatio || 1;
@@ -267,7 +361,8 @@ private sampleBackground = 0;
     this.requestDraw();
   }
   draw() {
-    if (!this.ready) return;
+    // 上下文丢失期间 GL 调用全是无效操作，直接跳过，等 restored 回调重建后再画
+    if (!this.ready || this.gl.isContextLost()) return;
     const { gl, canvas, settings: s } = this;
     const source = this.video ?? this.image;
     if (this.video) {
