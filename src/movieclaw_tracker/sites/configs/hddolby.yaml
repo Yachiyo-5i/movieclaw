@@ -1,0 +1,62 @@
+# HDDolby 高清杜比
+# 选择器基于 2026-08-05 浏览器实登页面逐项验证。
+# 本站魔力值叫「鲸币」，等级 title 带前缀（如「(士兵)User」）。
+
+site_id: hddolby
+display_name: 高清杜比 HDDolby
+base_url: https://www.hddolby.com
+framework: nexusphp
+
+auth:
+  supported: [cookie, credential]
+
+min_request_interval: 5.0
+
+selectors:
+  # ---------- 种子列表 ----------
+  # 页面列数 10：1=分类 2=标题 3=评论 4=时间 5=大小 6=做种 7=下载 8=完成 9=? 10=发布者
+  torrent_row_css: "table.torrents > tr, table.torrents > tbody > tr"
+  torrent_title_css: "table.torrentname a b"                       # 100/100
+  torrent_subtitle_css: "td.embedded span[style*='float:left']"    # 100/100
+  torrent_category_css: "td:nth-child(1) a[href*='cat=']::attr(href)"  # 100/100
+  torrent_time_css: "td:nth-child(4) > span::attr(title)"          # 100/100
+  torrent_time_fallback_css: "td:nth-child(4)"
+  torrent_size_css: "td:nth-child(5)"
+  torrent_seeders_css: "td:nth-child(6)"
+  torrent_leechers_css: "td:nth-child(7)"
+  torrent_snatched_css: "td:nth-child(8)"
+  torrent_uploader_css: "td:nth-child(10)"
+  page_offset: -1
+
+  promo_download_rules:
+    "img.pro_free": 0
+    "img.pro_free2up": 0
+    "img.pro_50pctdown": 0.5
+  promo_upload_rules:
+    "img.pro_free2up": 2
+  torrent_hr_css: ""
+
+  # ---------- 详情页 ----------
+  detail_title_css: "h1#top"
+  detail_subtitle_css: "td.rowhead:contains('副标题') + td::text"
+  detail_size_css: "td.rowhead:contains('基本信息') + td.rowfollow > b::next_sibling_text"
+
+  # ---------- 用户资料 ----------
+  # 全部从顶部导航栏提取，兼容 userdetails.php 不带 id 的情况
+  profile_uid_css: "a[class*='_Name']::attr(href)"
+  profile_username_css: "a[class*='_Name'] b"
+  profile_class_css: "a[class*='_Name']::attr(class)"
+  profile_uploaded_css: "font.color_uploaded::next_sibling_text"
+  profile_downloaded_css: "font.color_downloaded::next_sibling_text"
+  profile_ratio_css: "font.color_ratio::next_sibling_text"
+  profile_bonus_css: "font.color_bonus"
+  profile_seeding_css: "img.arrowup::next_sibling_text"
+  profile_leeching_css: "img.arrowdown::next_sibling_text"
+categories:
+  movie: [401]
+  tv: [402, 403]
+  documentary: [404]
+  anime: [405]
+  music: [406, 408]
+  game: [410]
+  other: [407, 409, 411]   # 407=体育 411=学习

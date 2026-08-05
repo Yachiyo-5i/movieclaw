@@ -1,0 +1,67 @@
+# PTTime
+# 本站是 8 个站里结构改动最大的：列数 12（比标准多 3 列）、促销用 <font> 而非 <img>、
+# 上传下载/分享率/做种数只在顶栏 #info_block 里，userdetails 表格里没有。
+# 选择器基于 2026-08-05 浏览器实登页面逐项验证。
+
+site_id: pttime
+display_name: PTTime
+base_url: https://www.pttime.org
+framework: nexusphp
+
+auth:
+  supported: [cookie, credential]
+
+min_request_interval: 5.0
+
+selectors:
+  # ---------- 种子列表 ----------
+  # 页面列数 12：1=分类 … 5=时间 6=大小 7=做种 8=下载 9=完成 … 11=发布者
+  torrent_row_css: "table.torrents > tr, table.torrents > tbody > tr"
+  torrent_title_css: "table.torrentname a b"                       # 50/50
+  torrent_subtitle_css: "td.embedded font[title]::attr(title)"     # 50/50
+  torrent_category_css: "td:nth-child(1) a[href*='cat=']::attr(href)"  # 50/50
+  torrent_time_css: "td:nth-child(5) > span::attr(title)"          # 50/50
+  torrent_time_fallback_css: "td:nth-child(5)"
+  torrent_size_css: "td:nth-child(6)"
+  torrent_seeders_css: "td:nth-child(7)"
+  torrent_leechers_css: "td:nth-child(8)"
+  torrent_snatched_css: "td:nth-child(9)"
+  torrent_uploader_css: "td:nth-child(11)"
+  page_offset: -1
+
+  # 本站促销标记是 <font class="promotion free"> 这种复合类，不是标准 img.pro_*。
+  # 必须写成 font.promotion.free（两段类名同时匹配）——只写 font.promotion 会误伤
+  # font.promotion.bb（那是「字幕/附件」徽章，不是促销）。
+  promo_download_rules:
+    "font.promotion.free": 0
+    "font.promotion.twoupfree": 0
+    "font.promotion.halfdown": 0.5
+  promo_upload_rules:
+    "font.promotion.twoupfree": 2
+    "font.promotion.twoup": 2
+  torrent_hr_css: ""
+
+  # ---------- 详情页 ----------
+  detail_title_css: "h1#top"
+  detail_subtitle_css: "td.rowhead:contains('副标题') + td::text"
+  detail_size_css: "td.rowhead:contains('基本信息') + td.rowfollow > b::next_sibling_text"
+
+  # ---------- 用户资料 ----------
+  # 全部从顶部导航栏提取，兼容 userdetails.php 不带 id 的情况
+  profile_uid_css: "a[class*='_Name']::attr(href)"
+  profile_username_css: "a[class*='_Name'] b"
+  profile_class_css: "a[class*='_Name']::attr(class)"
+  profile_uploaded_css: "font.color_uploaded::next_sibling_text"
+  profile_downloaded_css: "font.color_downloaded::next_sibling_text"
+  profile_ratio_css: "font.color_ratio::next_sibling_text"
+  profile_bonus_css: "font.color_bonus"
+  profile_seeding_css: "img.arrowup::next_sibling_text"
+  profile_leeching_css: "img.arrowdown::next_sibling_text"
+categories:
+  movie: [401]
+  tv: [402, 403]
+  documentary: [404]
+  anime: [406]
+  music: [408]
+  game: [421]
+  other: [100, 405, 407, 409, 411, 412, 420, 422, 423, 430]  # 405=体育 420=编程 422=软件

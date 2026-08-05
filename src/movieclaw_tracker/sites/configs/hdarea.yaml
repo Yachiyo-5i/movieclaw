@@ -1,0 +1,66 @@
+# HDArea 高清视界
+# 所有选择器均基于 2026-08-05 浏览器实登页面（torrents.php / userdetails.php /
+# details.php）逐项验证，命中率见注释。请勿参考其它 PT 工具的站点文件直接套用。
+
+site_id: hdarea
+display_name: 高清视界 HDArea
+base_url: https://www.hdarea.club
+framework: nexusphp
+
+auth:
+  supported: [cookie, credential]
+
+min_request_interval: 60.0
+
+selectors:
+  # ---------- 种子列表 ----------
+  # 页面列数 10：1=分类 2=标题 3=评论 4=?  5=时间 6=大小 7=做种 8=下载 9=完成 10=发布者
+  # 逗号组写法同时兼容 httpx 原始 HTML（无 tbody）与浏览器渲染 DOM（有 tbody）
+  torrent_row_css: "table.torrents > tr, table.torrents > tbody > tr"
+  # 框架默认 a[href*='details.php'] 会误取到 <a> 的 title；取 <b> 内文更准（100/100）
+  torrent_title_css: "table.torrentname a b"
+  torrent_subtitle_css: "td.embedded > div[title]::attr(title)"   # 100/100
+  # 框架默认 td:nth-child(1) img::attr(class) 取到 "c_movie" 无数字，_extract_category_id 必失败
+  torrent_category_css: "td:nth-child(1) a[href*='cat=']::attr(href)"  # 100/100
+  torrent_time_css: "td:nth-child(5) > span::attr(title)"          # 100/100
+  torrent_time_fallback_css: "td:nth-child(5)"
+  torrent_size_css: "td:nth-child(6)"
+  torrent_seeders_css: "td:nth-child(7)"
+  torrent_leechers_css: "td:nth-child(8)"
+  torrent_snatched_css: "td:nth-child(9)"
+  torrent_uploader_css: "td:nth-child(10)"   # 多为「匿名」，用整列文本而非 a
+  # NexusPHP 首页是 page=0，框架默认 offset 0 会漏掉第一页
+  page_offset: -1
+
+  promo_download_rules:
+    "img.pro_free": 0
+    "img.pro_free2up": 0
+  promo_upload_rules:
+    "img.pro_free2up": 2
+  # 实抓页面未出现 H&R 标记，留空表示「未知」，避免误报成「无考核」
+  torrent_hr_css: ""
+
+  # ---------- 详情页 ----------
+  detail_title_css: "h1#top"
+  detail_subtitle_css: "td.rowhead:contains('副标题') + td::text"
+  # 「基本信息」整格含大小/类型/媒介…，取第一个 <b> 后的文本节点即纯大小
+  detail_size_css: "td.rowhead:contains('基本信息') + td.rowfollow > b::next_sibling_text"
+
+  # ---------- 用户资料 ----------
+  # 全部从顶部导航栏提取，兼容 userdetails.php 不带 id 的情况
+  profile_uid_css: "a[class*='_Name']::attr(href)"
+  profile_username_css: "a[class*='_Name'] b"
+  profile_class_css: "a[class*='_Name']::attr(class)"
+  profile_uploaded_css: "font.color_uploaded::next_sibling_text"
+  profile_downloaded_css: "font.color_downloaded::next_sibling_text"
+  profile_ratio_css: "font.color_ratio::next_sibling_text"
+  profile_bonus_css: "font.color_bonus"
+  profile_seeding_css: "img.arrowup::next_sibling_text"
+  profile_leeching_css: "img.arrowdown::next_sibling_text"
+categories:
+  movie: [300, 401, 410, 411, 412, 413, 414, 415, 416, 417]
+  tv: [402, 403]
+  documentary: [404]
+  anime: [405]
+  music: [406, 408]
+  other: [407, 409]   # 407=Sports（枚举无 sports，归 other）409=Misc
