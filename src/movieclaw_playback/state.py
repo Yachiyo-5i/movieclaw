@@ -52,25 +52,31 @@ async def _get_or_create(session: AsyncSession, unit: Unit) -> PlaybackState:
     return row
 
 
-async def record_playback_start(session: AsyncSession, unit: Unit) -> None:
+async def record_playback_start(session: AsyncSession, unit: Unit) -> PlaybackState:
     """开始播放：play_count +1、刷新最近播放时间（scrobble 语义的计数点）。"""
     row = await _get_or_create(session, unit)
     row.play_count += 1
     row.last_played_at = utcnow()
     row.updated_at = utcnow()
+    return row
 
 
 async def record_playback_progress(
     session: AsyncSession, unit: Unit, *, position_ms: int | None, runtime_ms: int | None
-) -> PlaybackState:
-    """进度上报（Progress 与 Stopped 同入口）：按阈值三分支落库。"""
+) -> tuple[PlaybackState, bool]:
+    """进度上报（Progress 与 Stopped 同入口）：按阈值三分支落库。
+
+    第二个返回值 ``newly_played`` = played 是否在本次从 False 翻转为 True，
+    供协议层判定是否发出 ``playback.completed`` webhook 事件。
+    """
     row = await _get_or_create(session, unit)
+    was_played = row.played
     outcome = resolve_progress(position_ms, runtime_ms, currently_played=row.played)
     row.position_ms = outcome.position_ms
     row.played = outcome.played
     row.last_played_at = utcnow()
     row.updated_at = utcnow()
-    return row
+    return row, (outcome.played and not was_played)
 
 
 async def mark_played(

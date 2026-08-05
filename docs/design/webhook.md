@@ -1,6 +1,7 @@
 # 通用事件 Webhook 设计
 
-> 状态：设计定稿 **v1.1**（2026-08-05），待实施。
+> 状态：**v1.1 P1 已实施**（2026-08-05）。P2（Jellyfin 兼容格式、progress 事件）
+> 与 P3（订阅域接入）待实施。
 >
 > 版本演进：v1.0 定名「播放事件 Webhook」；v1.1（2026-08-05 用户决策）① 收藏事件
 > 确认纳入 P1；② 架构泛化为**全系统通用的事件出站通道**——播放域只是首发域，
@@ -436,3 +437,56 @@ emit 一行」的扩展承诺；产生点与现有 `notify_channels` 调用相�
 3. `progress` 节流间隔是否需要可配置——P1 不做，P2 按反馈定。
 4. 预留域（subscription/library/system）的具体事件名与 `data` 结构——各域接入时
    在本文档追加章节定稿。
+
+## 9. P1 实现状态与落点（2026-08-05）
+
+| 设计章节 | 实现落点 |
+| --- | --- |
+| §1.3 统一信封 | `src/movieclaw_events/__init__.py`（OutboundEvent + 自实现 ULID） |
+| §1.4 播放/收藏 builder | `src/movieclaw_playback/events.py`；`state.py` 的 `record_playback_progress` 返回值扩展为 `(row, newly_played)`、`record_playback_start` 返回状态行 |
+| §1.2 埋点 | `src/movieclaw_jellyfin/routes/playstate.py`（8 处，handler 注入 `RequestIdentity`） |
+| §4.1 配置域 | `src/movieclaw_api/settings/webhook.py`（namespace `webhook`，endpoint secret 由模型校验/序列化钩子逐项加解密） |
+| §1.1 事件目录 / §5 投递器 | `src/movieclaw_api/services/webhook/`（catalog / formatter / dispatcher / deliveries） |
+| §4.2 管理 API | `src/movieclaw_api/api/routes/webhook.py` + `services/webhook_config.py` |
+| §4.3 设置页 | `apps/web/components/webhook-section.tsx` + `lib/api/webhook.ts`（P1 编辑卡中 jellyfin 格式禁用，注明「即将支持」） |
+| 出站服务标签 | `settings/network.py` `BUILTIN_EGRESS_SERVICES` 新增 `webhook` |
+| 测试 | `tests/events/`、`tests/playback/`、`tests/jellyfin/test_webhook_emission.py`、`tests/api/test_webhook_dispatcher.py`、`tests/api/test_webhook_api.py` |
+
+## 附录 A：消费端对接示例（自有协议）
+
+**校验签名（Python）**——对收到的原始请求体字节重算 HMAC 并与
+`X-MovieClaw-Signature` 比对：
+
+```python
+import hashlib, hmac
+
+def verify(body: bytes, signature_header: str, secret: str) -> bool:
+    expected = "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, signature_header)
+```
+
+**Home Assistant**——`configuration.yaml` 无需任何配置，直接用 webhook 触发器：
+
+```yaml
+automation:
+  - alias: "MovieClaw 看完通知"
+    trigger:
+      - platform: webhook
+        webhook_id: movieclaw            # endpoint URL 填 http://<HA>:8123/api/webhook/movieclaw
+        allowed_methods: [POST]
+        local_only: true
+    condition:
+      - condition: template
+        value_template: "{{ trigger.json.event == 'playback.completed' }}"
+    action:
+      - service: notify.mobile_app
+        data:
+          message: >
+            看完了 {{ trigger.json.data.media.title }}
+            {% if trigger.json.data.media.type == 'episode' %}
+            S{{ trigger.json.data.media.season_number }}E{{ trigger.json.data.media.episode_number }}
+            {% endif %}
+```
+
+消费端务必按 `X-MovieClaw-Delivery`（= `event_id`）幂等去重：投递重试会带来
+重复请求，且事件到达顺序不保证。

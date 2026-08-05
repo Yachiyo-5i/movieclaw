@@ -17,6 +17,7 @@ from fastapi import APIRouter, Depends, Request, Response
 from fastapi.responses import JSONResponse
 from sqlalchemy import select
 
+from movieclaw_api.services.webhook import emit_events
 from movieclaw_db.engine import get_database
 from movieclaw_db.models import LibraryFile, MediaEpisode, MediaItem, MediaMetadata
 from movieclaw_jellyfin.catalog import (
@@ -27,10 +28,27 @@ from movieclaw_jellyfin.catalog import (
 )
 from movieclaw_jellyfin.errors import bad_request_text, not_found
 from movieclaw_jellyfin.ids import EntityKind, EntityRef, decode_guid
-from movieclaw_jellyfin.security import require_device
+from movieclaw_jellyfin.security import RequestIdentity, require_device
 from movieclaw_playback import state as playback_state
+from movieclaw_playback.events import (
+    ClientInfo,
+    build_favorite_event,
+    build_marked_events,
+    build_playback_event,
+)
 
 router = APIRouter(dependencies=[Depends(require_device)])
+
+
+def _client_info(identity: RequestIdentity) -> ClientInfo:
+    """协议身份 → 协议无关的客户端信息（webhook 事件的 client 字段）。"""
+    device = identity.device
+    return ClientInfo(
+        name=device.client or "",
+        device_name=device.device_name or "",
+        device_id=device.device_id or "",
+        version=device.version or "",
+    )
 
 
 async def _read_body(request: Request) -> dict[str, Any]:
@@ -154,48 +172,89 @@ def _decode_item_ref(raw: Any) -> EntityRef | None:
 # ---------------------------------------------------------------------------
 
 
+async def _record_start(ref: EntityRef, client: ClientInfo) -> None:
+    """开始播放落库 + commit 后装配/投递 ``playback.started`` 事件。"""
+    unit = _leaf_unit(ref)
+    async with get_database().session() as session:
+        row = await playback_state.record_playback_start(session, unit)
+        await session.commit()
+        event = await build_playback_event(
+            session, "playback.started", unit, row, client=client
+        )
+    if event is not None:
+        emit_events([event])
+
+
 @router.post("/Sessions/Playing", status_code=204)
-async def playing_start(request: Request) -> Response:
+async def playing_start(
+    request: Request, identity: RequestIdentity = Depends(require_device)
+) -> Response:
     body = await _read_body(request)
     ref = _decode_item_ref(body.get("itemid"))
     if ref is not None:
-        async with get_database().session() as session:
-            await playback_state.record_playback_start(session, _leaf_unit(ref))
-            await session.commit()
+        await _record_start(ref, _client_info(identity))
     return Response(status_code=204)
 
 
-async def _apply_progress(ref: EntityRef, position_ms: int | None) -> None:
+async def _apply_progress(
+    ref: EntityRef,
+    position_ms: int | None,
+    *,
+    stopped: bool = False,
+    client: ClientInfo | None = None,
+) -> None:
+    """进度落库；commit 后按语义装配 webhook 事件：
+    Stopped 上报发 ``playback.stopped``；played 本次翻转为 True 追加
+    ``playback.completed``（Progress 与 Stopped 都可能触发翻转）。"""
     unit = _leaf_unit(ref)
     runtime_ms = await _unit_runtime_ms(unit)
     async with get_database().session() as session:
-        await playback_state.record_playback_progress(
+        row, newly_played = await playback_state.record_playback_progress(
             session, unit, position_ms=position_ms, runtime_ms=runtime_ms
         )
         await session.commit()
+        events = []
+        for name, hit in (
+            ("playback.stopped", stopped),
+            ("playback.completed", newly_played),
+        ):
+            if not hit:
+                continue
+            event = await build_playback_event(
+                session, name, unit, row, duration_ms=runtime_ms, client=client
+            )
+            if event is not None:
+                events.append(event)
+    emit_events(events)
 
 
 @router.post("/Sessions/Playing/Progress", status_code=204)
-async def playing_progress(request: Request) -> Response:
+async def playing_progress(
+    request: Request, identity: RequestIdentity = Depends(require_device)
+) -> Response:
     body = await _read_body(request)
     ref = _decode_item_ref(body.get("itemid"))
     if ref is not None:
         position = _position_ms(body)
         # Progress 不带位置的心跳（如暂停事件）不落库；报 0 = 拖回开头要落
         if position is not None:
-            await _apply_progress(ref, position)
+            await _apply_progress(ref, position, client=_client_info(identity))
     return Response(status_code=204)
 
 
 @router.post("/Sessions/Playing/Stopped", status_code=204)
-async def playing_stopped(request: Request) -> Response:
+async def playing_stopped(
+    request: Request, identity: RequestIdentity = Depends(require_device)
+) -> Response:
     body = await _read_body(request)
     if body.get("failed") is True:
         # 播放失败的上报不落库（SessionManager.cs:1164-1167）
         return Response(status_code=204)
     ref = _decode_item_ref(body.get("itemid"))
     if ref is not None:
-        await _apply_progress(ref, _position_ms(body))
+        await _apply_progress(
+            ref, _position_ms(body), stopped=True, client=_client_info(identity)
+        )
     return Response(status_code=204)
 
 
@@ -213,37 +272,48 @@ async def playing_ping(request: Request) -> Response:
 
 @router.post("/PlayingItems/{item_id}", status_code=204)
 @router.post("/Users/{user_id}/PlayingItems/{item_id}", status_code=204)
-async def playing_start_legacy(item_id: str, user_id: str | None = None) -> Response:
+async def playing_start_legacy(
+    item_id: str,
+    user_id: str | None = None,
+    identity: RequestIdentity = Depends(require_device),
+) -> Response:
     ref = _decode_item_ref(item_id)
     if ref is not None:
-        async with get_database().session() as session:
-            await playback_state.record_playback_start(session, _leaf_unit(ref))
-            await session.commit()
+        await _record_start(ref, _client_info(identity))
     return Response(status_code=204)
 
 
 @router.post("/PlayingItems/{item_id}/Progress", status_code=204)
 @router.post("/Users/{user_id}/PlayingItems/{item_id}/Progress", status_code=204)
 async def playing_progress_legacy(
-    request: Request, item_id: str, user_id: str | None = None
+    request: Request,
+    item_id: str,
+    user_id: str | None = None,
+    identity: RequestIdentity = Depends(require_device),
 ) -> Response:
     ref = _decode_item_ref(item_id)
     if ref is not None:
         position = _position_ms({}, request.query_params.get("positionTicks"))
         if position is not None:
-            await _apply_progress(ref, position)
+            await _apply_progress(ref, position, client=_client_info(identity))
     return Response(status_code=204)
 
 
 @router.delete("/PlayingItems/{item_id}", status_code=204)
 @router.delete("/Users/{user_id}/PlayingItems/{item_id}", status_code=204)
 async def playing_stopped_legacy(
-    request: Request, item_id: str, user_id: str | None = None
+    request: Request,
+    item_id: str,
+    user_id: str | None = None,
+    identity: RequestIdentity = Depends(require_device),
 ) -> Response:
     ref = _decode_item_ref(item_id)
     if ref is not None:
         await _apply_progress(
-            ref, _position_ms({}, request.query_params.get("positionTicks"))
+            ref,
+            _position_ms({}, request.query_params.get("positionTicks")),
+            stopped=True,
+            client=_client_info(identity),
         )
     return Response(status_code=204)
 
@@ -293,7 +363,10 @@ def _parse_date_played(raw: str | None) -> datetime | None:
 @router.post("/UserPlayedItems/{item_id}")
 @router.post("/Users/{user_id}/PlayedItems/{item_id}")
 async def mark_played(
-    request: Request, item_id: str, user_id: str | None = None
+    request: Request,
+    item_id: str,
+    user_id: str | None = None,
+    identity: RequestIdentity = Depends(require_device),
 ) -> JSONResponse:
     ref = _decode_item_ref(item_id)
     if ref is None:
@@ -305,12 +378,20 @@ async def mark_played(
     async with get_database().session() as session:
         await playback_state.mark_played(session, units, date_played=date_played)
         await session.commit()
+        events = await build_marked_events(
+            session, "playback.marked_played", units, client=_client_info(identity)
+        )
+    emit_events(events)
     return await _user_data_response(ref, item_id)
 
 
 @router.delete("/UserPlayedItems/{item_id}")
 @router.delete("/Users/{user_id}/PlayedItems/{item_id}")
-async def mark_unplayed(item_id: str, user_id: str | None = None) -> JSONResponse:
+async def mark_unplayed(
+    item_id: str,
+    user_id: str | None = None,
+    identity: RequestIdentity = Depends(require_device),
+) -> JSONResponse:
     ref = _decode_item_ref(item_id)
     if ref is None:
         raise not_found()
@@ -320,30 +401,51 @@ async def mark_unplayed(item_id: str, user_id: str | None = None) -> JSONRespons
     async with get_database().session() as session:
         await playback_state.mark_unplayed(session, units)
         await session.commit()
+        events = await build_marked_events(
+            session, "playback.marked_unplayed", units, client=_client_info(identity)
+        )
+    emit_events(events)
     return await _user_data_response(ref, item_id)
+
+
+async def _set_favorite(
+    ref: EntityRef, *, favorite: bool, client: ClientInfo
+) -> None:
+    """收藏落库 + commit 后装配/投递 ``item.(un)favorited`` 事件。"""
+    unit = await _favorite_unit(ref)
+    async with get_database().session() as session:
+        await playback_state.set_favorite(session, unit, favorite=favorite)
+        await session.commit()
+        event = await build_favorite_event(
+            session, unit, favorite=favorite, client=client
+        )
+    if event is not None:
+        emit_events([event])
 
 
 @router.post("/UserFavoriteItems/{item_id}")
 @router.post("/Users/{user_id}/FavoriteItems/{item_id}")
-async def mark_favorite(item_id: str, user_id: str | None = None) -> JSONResponse:
+async def mark_favorite(
+    item_id: str,
+    user_id: str | None = None,
+    identity: RequestIdentity = Depends(require_device),
+) -> JSONResponse:
     ref = _decode_item_ref(item_id)
     if ref is None:
         raise not_found()
-    unit = await _favorite_unit(ref)
-    async with get_database().session() as session:
-        await playback_state.set_favorite(session, unit, favorite=True)
-        await session.commit()
+    await _set_favorite(ref, favorite=True, client=_client_info(identity))
     return await _user_data_response(ref, item_id)
 
 
 @router.delete("/UserFavoriteItems/{item_id}")
 @router.delete("/Users/{user_id}/FavoriteItems/{item_id}")
-async def unmark_favorite(item_id: str, user_id: str | None = None) -> JSONResponse:
+async def unmark_favorite(
+    item_id: str,
+    user_id: str | None = None,
+    identity: RequestIdentity = Depends(require_device),
+) -> JSONResponse:
     ref = _decode_item_ref(item_id)
     if ref is None:
         raise not_found()
-    unit = await _favorite_unit(ref)
-    async with get_database().session() as session:
-        await playback_state.set_favorite(session, unit, favorite=False)
-        await session.commit()
+    await _set_favorite(ref, favorite=False, client=_client_info(identity))
     return await _user_data_response(ref, item_id)

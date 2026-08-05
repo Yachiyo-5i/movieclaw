@@ -40,6 +40,7 @@ from movieclaw_api.api.routes.spec import router as spec_router
 from movieclaw_api.api.routes.subscriptions import router as subscriptions_router
 from movieclaw_api.api.routes.system_notices import router as system_notices_router
 from movieclaw_api.api.routes.ui import router as ui_router
+from movieclaw_api.api.routes.webhook import router as webhook_router
 
 api_router = APIRouter()
 
@@ -77,6 +78,7 @@ _PROTECTED_ROUTERS = [
     app_update_router,
     people_router,
     spec_router,
+    webhook_router,
 ]
 for _router in _PROTECTED_ROUTERS:
     api_router.include_router(_router, dependencies=[Depends(require_login)])
