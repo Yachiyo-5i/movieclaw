@@ -56,6 +56,12 @@ from movieclaw_api.settings.store import (
     init_setting_store,
     reset_setting_store,
 )
+from movieclaw_api.settings.webhook import (
+    WebhookEndpoint,
+    WebhookSetting,
+    generate_webhook_secret,
+    mask_webhook_secret,
+)
 
 __all__ = [
     # 基类与注册表
@@ -92,4 +98,9 @@ __all__ = [
     "BUILTIN_EGRESS_SERVICES",
     # 应用服务（外部访问地址）
     "AppServerSetting",
+    # 事件 Webhook
+    "WebhookSetting",
+    "WebhookEndpoint",
+    "generate_webhook_secret",
+    "mask_webhook_secret",
 ]

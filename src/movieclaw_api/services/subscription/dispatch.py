@@ -196,6 +196,21 @@ async def dispatch(
             event="dispatch",
             image_url=tmdb_push_image_url(item.backdrop_path, item.poster_path),
         )
+        # 事件 Webhook(与 IM 推送同点位:种子已真实提交,事件即事实)
+        from movieclaw_api.services.subscription.events import build_download_started_event
+        from movieclaw_api.services.webhook import emit_events
+
+        emit_events(
+            [
+                build_download_started_event(
+                    item,
+                    [(w.season_number, w.episode_number) for w in claimed],
+                    site_id=candidate.site_id,
+                    torrent_title=candidate.title,
+                    spec=spec_text,
+                )
+            ]
+        )
     return True
 
 

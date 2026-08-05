@@ -117,6 +117,35 @@ async def test_inventory_closes_wanted_and_records_activity(db):
 
 
 @pytest.mark.asyncio
+async def test_inventory_emits_fulfilled_webhook(db, monkeypatch):
+    """对账关闭工单时产生 subscription.fulfilled webhook 事件（P3 订阅域接入）。"""
+    import movieclaw_api.services.webhook as webhook_mod
+
+    emitted = []
+    monkeypatch.setattr(webhook_mod, "emit_events", emitted.extend)
+
+    library_id, item_id, _, _ = await _seed(db)
+    async with db.session() as session:
+        session.add(
+            LibraryFile(
+                library_id=library_id,
+                media_item_id=item_id,
+                season_number=1,
+                episode_number=1,
+                file_path="/media/tv/测试剧集 (2024)/Season 01/测试剧集 (2024) - S01E01.mkv",
+                size_bytes=1,
+                source=FileSource.IMPORTED,
+            )
+        )
+        await session.commit()
+        assert await close_fulfilled_wanted(session, item_id) == 1
+
+    assert [e.event for e in emitted] == ["subscription.fulfilled"]
+    assert emitted[0].data["media"]["tmdb_id"] == 200
+    assert emitted[0].data["units"] == [[1, 1]]
+
+
+@pytest.mark.asyncio
 async def test_inventory_ignores_unrelated_units(db):
     """库里只有别的集：工单保持开放。"""
     library_id, item_id, sub_id, wanted_id = await _seed(db)

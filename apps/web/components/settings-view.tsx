@@ -17,6 +17,7 @@ import { NetworkConfigSection } from "@/components/network-config-section";
 import { SiteConfigSection } from "@/components/site-config-section";
 import { SubscriptionSettingsSection } from "@/components/subscription-settings-section";
 import { SystemLogsSection } from "@/components/system-logs-section";
+import { WebhookSection } from "@/components/webhook-section";
 import { GlassPanel } from "@/components/glass-panel";
 import { ArrowLeftIcon, CheckIcon, PlusIcon, XIcon } from "@/components/icons";
 import { fileToCompressedJpeg, useBackdrop } from "@/lib/backdrop";
@@ -168,6 +169,8 @@ export function SettingsPanel({ active }: SettingsPanelProps) {
           <ImPushSection />
         ) : section.id === "app" ? (
           <AppSection />
+        ) : section.id === "webhook" ? (
+          <WebhookSection />
         ) : section.id === "network" ? (
           <NetworkConfigSection />
         ) : section.id === "logs" ? (

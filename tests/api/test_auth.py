@@ -266,6 +266,7 @@ def test_every_route_denies_anonymous_access(client: TestClient) -> None:
             .replace("{challenge_id}", "test-challenge")
             .replace("{account_id}", "test-bot")
             .replace("{channel}", "weixin")
+            .replace("{endpoint_id}", "test-endpoint")
         )
         assert "{" not in url, f"守护测试不认识路径参数，请补充哑值：{path}"
         for method in methods:

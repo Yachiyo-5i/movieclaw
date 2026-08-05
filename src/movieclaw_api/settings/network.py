@@ -43,6 +43,12 @@ BUILTIN_EGRESS_SERVICES: list[dict[str, str]] = [
         "description": "Discord bot 收发消息(discord.com / gateway),国内网络需代理",
     },
     {
+        "id": "webhook",
+        "label": "事件 Webhook",
+        "description": "向外部服务推送播放、收藏等事件；目标多在内网，"
+        "endpoint 可单独选择直连（默认）或走代理",
+    },
+    {
         "id": "github",
         "label": "GitHub 更新",
         "description": "应用内更新的检查与产物下载（api.github.com / github.com），"
