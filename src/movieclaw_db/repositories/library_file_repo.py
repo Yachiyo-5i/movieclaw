@@ -211,6 +211,7 @@ class LibraryFileRepository:
         existing.season_number = row.season_number
         existing.episode_number = row.episode_number
         existing.size_bytes = row.size_bytes
+        existing.file_mtime_ns = row.file_mtime_ns
         existing.container = row.container
         existing.resolution = row.resolution
         existing.video_codec = row.video_codec

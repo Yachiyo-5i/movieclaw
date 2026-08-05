@@ -394,6 +394,7 @@ async def _scan(library_id: int, summary: ScanSummary, state: ScanState) -> Scan
         state.processed, state.total = 0, len(pending)
         now_ts = time.time()
         min_remaining: float | None = None
+        mtime_backfilled = 0
         for done, (root_path, file, is_disc) in enumerate(pending, start=1):
             # 每进入新的一窗，先把这一窗要用到的 TMDB 档案并发拉回来（详见
             # _PREFETCH_WINDOW 的说明）。串行链路本身一行不改，只是轮到它
@@ -459,6 +460,17 @@ async def _scan(library_id: int, summary: ScanSummary, state: ScanState) -> Scan
                         summary.errors.append(f"「{file.name}」身份复核失败：{exc}")
                 else:
                     summary.skipped_known += 1
+                # mtime 一次性回填：ETag 落库特性上线前的旧行没有 mtime，
+                # 趁扫描（用户主动发起）正在遍历目录顺手补上；补齐后的行
+                # 重扫不再 stat，秒过语义不变
+                if existing.file_mtime_ns is None:
+                    try:
+                        existing.file_mtime_ns = (
+                            await asyncio.to_thread(file.stat)
+                        ).st_mtime_ns
+                        mtime_backfilled += 1
+                    except OSError:
+                        pass
                 state.processed = done
                 continue
             # 完整性检测：mtime 太新 = 疑似写入中（下载/拷贝进行时），本轮
@@ -497,6 +509,9 @@ async def _scan(library_id: int, summary: ScanSummary, state: ScanState) -> Scan
                 logger.exception("扫描文件失败：%s", file)
                 summary.errors.append(f"「{file.name}」处理失败：{exc}")
             state.processed = done
+
+        if mtime_backfilled:
+            await session.commit()
 
         # 收尾感知删除：在位根路径下、台账有但本轮没遍历到 → 标记 missing。
         # 不存在的根整个不参与（挂载失败/掉盘时不误伤），文件回归时
@@ -843,8 +858,15 @@ async def _ingest_file(
     if is_disc:
         size_bytes = await asyncio.to_thread(_disc_total_size, file)
         container = "bluray" if (file / "BDMV").is_dir() else "dvd"
+        # 原盘条目 file_path 是目录，取目录 mtime——语义同样是"变了就变"
+        try:
+            file_mtime_ns: int | None = file.stat().st_mtime_ns
+        except OSError:
+            file_mtime_ns = None
     else:
-        size_bytes = file.stat().st_size
+        file_stat = file.stat()
+        size_bytes = file_stat.st_size
+        file_mtime_ns = file_stat.st_mtime_ns
         container = file.suffix.lstrip(".").lower() or None
 
     # 改名归并（走识别链之前）：新路径可能只是台账里某个旧文件被改了名，
@@ -912,6 +934,7 @@ async def _ingest_file(
             episode_number=episode,
             file_path=str(file),
             size_bytes=size_bytes,
+            file_mtime_ns=file_mtime_ns,
             container=container,
             resolution=spec.resolution if spec else None,
             video_codec=spec.video_codec if spec else None,

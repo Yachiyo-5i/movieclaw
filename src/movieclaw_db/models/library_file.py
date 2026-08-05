@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from enum import StrEnum
 
-from sqlalchemy import JSON, Column, ForeignKey, Index, Integer, Text
+from sqlalchemy import JSON, BigInteger, Column, ForeignKey, Index, Integer, Text
 from sqlmodel import Field
 
 from movieclaw_db.models.base import TimestampMixin
@@ -115,6 +115,15 @@ class LibraryFile(TimestampMixin, table=True):
         description="绝对路径（movieclaw 视角）",
     )
     size_bytes: int = Field(default=0, description="文件大小（字节）")
+    # 文件 mtime（纳秒）：扫描/入库时随 stat 顺手落库，播放接口的 ETag 直接
+    # 由它派生——浏览类请求不再对媒体文件本体做任何文件系统调用（云盘挂载
+    # 上一次 stat 就是一次网络往返，还会唤醒休眠盘）。NULL=旧数据未回填，
+    # 下次扫描自动补齐，期间 MediaSource 省略 ETag（纯缓存语义，无功能损失）
+    file_mtime_ns: int | None = Field(
+        default=None,
+        sa_column=Column(BigInteger, nullable=True),
+        description="文件 mtime（纳秒）；NULL=未回填（下次扫描补齐）",
+    )
     container: str | None = Field(default=None, description="容器格式（mkv/mp4/…）")
 
     # -- ffprobe 介质规格（探测失败保持 NULL）-------------------------------

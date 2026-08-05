@@ -68,7 +68,6 @@ from movieclaw_api.services import media_scrape
 from movieclaw_api.services.library import claim as library_claim
 from movieclaw_api.services.library.config import LibraryConfigService
 from movieclaw_api.services.library.items import (
-    backfill_streams_for_files,
     build_item_detail,
     build_library_index,
     build_library_wall,
@@ -1218,20 +1217,18 @@ def _file_view(row: LibraryFile, external_subs: list[str]) -> LibraryFileView:
 async def get_library_item(
     library_id: int,
     media_item_id: int,
-    background_tasks: BackgroundTasks,
     session: AsyncSession = Depends(get_session),
 ) -> ApiResponse[LibraryItemDetailView]:
     """媒体库条目详情页的数据源。规格来自 ffprobe 对文件本体的探测，
-    简介/评分/演职员本地 NFO 优先、TMDB 兜底（经持久缓存）。旧台账没探测
-    过音轨的**响应后**后台补探（ffprobe 在网络挂载上是秒级/文件，不能拖首屏），
-    前端对"尚未探测"的文件稍后静默补拉。"""
+    简介/评分/演职员本地 NFO 优先、TMDB 兜底（经持久缓存）。没探测过
+    音轨的行**不在此补探**——探测只发生在入库/扫描环节（浏览不碰媒体
+    文件本体，云盘挂载上读文件就是流量与延迟），前端对"尚未探测"的
+    文件提示用户重新扫描补齐。"""
 
     service = LibraryConfigService(session)
     library = await service.get(library_id)
     item, rows = await _item_rows(session, library_id, media_item_id)
     bundle = await build_item_detail(session, library, item, rows)
-    if bundle.pending_probe_ids:
-        background_tasks.add_task(backfill_streams_for_files, bundle.pending_probe_ids)
 
     base = get_settings().tmdb_image_base_url.rstrip("/")
     art_base = f"/libraries/{library_id}/items/{media_item_id}/artwork"

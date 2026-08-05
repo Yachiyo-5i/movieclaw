@@ -6,7 +6,8 @@
    基本信息（MediaItem）、本地刮削元数据（NFO：简介/评分/片长/演职员）、
    本地美术图（poster/fanart 优先于 TMDB 图床）、逐文件的真实介质规格
    （ffprobe：分辨率/音轨/内封字幕）与外挂字幕。旧台账没探测过音轨的，
-   详情页按需补探后回填（懒回填，不强迫用户整库重扫）。
+   **不在浏览时补探**（浏览不碰媒体文件本体，云盘挂载上读文件就是流量
+   与延迟）——前端提示用户重新扫描，由扫描的补探阶段统一回填。
 2. **本地美术图定位** ``find_local_artwork``：条目目录下按 Kodi/Emby 惯例
    命名的图片文件；找到即由 /libraries/.../artwork 接口直接回吐，
    没有时前端退回 TMDB 图床。
@@ -21,6 +22,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import shutil
@@ -80,10 +82,6 @@ _ART_EXTS = (".jpg", ".jpeg", ".png", ".webp")
 
 # 外挂字幕扩展名（同名或"同名.语言"命名，整理器的 sidecar 同一口径）
 _SUBTITLE_EXTS = {".srt", ".ass", ".ssa", ".sub", ".sup", ".vtt"}
-
-# 详情页单次请求最多补探的文件数：电影条目几个版本毫秒级完成；上百集的
-# 剧集首次打开只补一批，翻几次页自然补齐——不让一次请求卡几十秒
-_DETAIL_PROBE_LIMIT = 16
 
 # 补探过程中每探完这么多个文件提交一次：整库补探是小时级的活，不能攒成
 # 一个大事务（中途中断就全白探了），也不必一个一个提交
@@ -459,18 +457,15 @@ class ItemDetailBundle:
     local_poster_version: int
     local_fanart_version: int
     external_subtitles: dict[int, list[str]]  # file_id -> 外挂字幕文件名
-    # 待补探音轨的台账行（响应后由后台任务补探回填——ffprobe 在网络挂载上
-    # 一个文件就要秒级，放在请求路径里会把首屏拖成十几秒）
-    pending_probe_ids: list[int] = field(default_factory=list)
 
 
 async def build_item_detail(
     session: AsyncSession, library: Library, item: MediaItem, files: list[LibraryFile]
 ) -> ItemDetailBundle:
-    """装配条目详情：NFO 元数据 + 本地美术图 + 介质规格懒回填 + 外挂字幕。
+    """装配条目详情：NFO 元数据 + 本地美术图 + 外挂字幕（介质规格直接读台账）。
 
-    磁盘 IO（NFO 解析、目录列举、ffprobe 补探）全部放线程池；库根不可达时
-    各环节自然落空，页面仍能靠台账字段渲染。
+    磁盘 IO（NFO 解析、目录列举）全部放线程池；库根不可达时各环节自然
+    落空，页面仍能靠台账字段渲染。不触发 ffprobe——探测只在入库/扫描时做。
     """
     roots = [Path(p) for p in library.root_paths]
     kind = MediaKind(library.kind)
@@ -523,16 +518,6 @@ async def build_item_detail(
         local_poster_version=file_version(poster_art),
         local_fanart_version=file_version(fanart_art),
         external_subtitles=external,
-        # strm 占位文件不排后台补探——探了必失败，还会让详情页每次打开都
-        # 白排一次任务
-        pending_probe_ids=[
-            row.id
-            for row in files
-            if row.id is not None
-            and row.audio_streams is None
-            and row.missing_since is None
-            and not row.file_path.lower().endswith(STRM_EXT)
-        ][:_DETAIL_PROBE_LIMIT],
     )
 
 
@@ -857,47 +842,21 @@ async def _tmdb_fallback_meta(item: MediaItem) -> EntryMetadata | None:
     return meta if meta.has_content() else None
 
 
-async def backfill_streams_for_files(file_ids: list[int]) -> None:
-    """详情响应后的后台补探入口（自开会话；FastAPI BackgroundTasks 调用）。
-
-    探测结果落库后，前端对"尚未探测"的文件会静默补拉一次详情呈现结果
-    ——首屏不再被 ffprobe 拖住，规格晚几秒到但页面秒开。
-    """
-    if not file_ids:
-        return
-    from sqlmodel import select
-
-    from movieclaw_db.engine import get_database
-
-    db = get_database()
-    try:
-        async with db.session() as session:
-            rows = list(
-                (await session.execute(select(LibraryFile).where(LibraryFile.id.in_(file_ids))))  # type: ignore[attr-defined]
-                .scalars()
-                .all()
-            )
-            await backfill_streams(session, rows)
-    except Exception:  # noqa: BLE001 -- 后台任务兜底，失败下次打开详情页再试
-        logger.exception("后台补探介质规格失败（涉及台账行 %s）", file_ids)
-
-
 async def backfill_streams(
     session: AsyncSession,
     files: list[LibraryFile],
     *,
-    limit: int | None = _DETAIL_PROBE_LIMIT,
+    limit: int | None = None,
     on_probed: Callable[[], bool] | None = None,
 ) -> int:
     """给没探测过音轨/字幕轨的在位台账行按需补探并回填，返回实际探了几个。
 
     这是「ffprobe 后装」的唯一救赎路径——扫描对已识别且在位的行整体秒过，
-    不会回头重探。两个调用方：
-
-    - 详情页响应后的后台任务：``limit`` 取默认值限量，防止百集剧首开卡死；
-    - 扫描的补探阶段：``limit=None`` 不限量（那是有进度与停止按钮的后台
-      任务，慢没关系，半途而废才是问题），用 ``on_probed`` 汇报进度——
-      回调返回 False 即收尾（用户点了停止）。
+    不会回头重探。**只由扫描的补探阶段调用**（有进度与停止按钮的后台任务，
+    慢没关系，半途而废才是问题），用 ``on_probed`` 汇报进度——回调返回
+    False 即收尾（用户点了停止）。详情页曾经也会限量触发补探，已移除：
+    浏览不碰媒体文件本体（云盘挂载上 ffprobe 读文件就是流量与延迟），
+    未探测的行由前端提示用户重新扫描补齐。
 
     探测失败的行保持 NULL、下次再试：失败常常是暂时的（挂载还没就绪）。
     代价是永远探不出的坏文件每轮都会被重试一次，坏文件多的库要留意。
@@ -929,6 +888,10 @@ async def backfill_streams(
             row.bit_depth = row.bit_depth or spec.bit_depth
             row.duration_seconds = row.duration_seconds or spec.duration_seconds
             row.bit_rate = row.bit_rate or spec.bit_rate
+            if row.file_mtime_ns is None:
+                # 播放 ETag 用的 mtime 顺手回填（文件刚探测过，stat 是热的）
+                with contextlib.suppress(OSError):
+                    row.file_mtime_ns = Path(row.file_path).stat().st_mtime_ns
             row.updated_at = utcnow()
             since_commit += 1
         # 分批提交而不是攒到最后：整库补探可能要几个小时，中途断电/重启

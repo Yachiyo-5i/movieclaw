@@ -688,7 +688,12 @@ MediaInfoHelper.cs:305-317：仅当用户被显式赋予该权限时才禁用远
 我们两层处理（偏离②）：
 
 1. PlaybackInfo 里 strm 条目输出 `Protocol:"Http"` + `Path:<strm 内容 URL>` +
-   `IsRemote:true`，主流客户端直连云端，服务器零流量；
+   `IsRemote:true`，主流客户端直连云端，服务器零流量。**strm 只在
+   PlaybackInfo 与 /stream 这两个播放场景现读**（直链多带时效签名，须现读
+   现用）；浏览场景（列表/单条目的 `fields=MediaSources`）**不读 strm 文件**
+   ——`Path` 保留 .strm 占位路径、`Protocol/IsRemote` 照常输出。每个 strm
+   条目读一次文件在云盘挂载上就是一次网络往返，千余条目的列表请求曾因此
+   耗时 20 余秒（issue #88），而浏览场景根本用不到直链；
 2. 兜底：客户端仍请求 `/Videos/{id}/stream` 时，读 strm 内容后返回
    **302 重定向**（不做反向代理）。302 注意：HEAD 同样 302；不塞 body；
    重定向目标须自己支持 Range（CloudDrive/Alist 直链均支持）。
@@ -868,7 +873,12 @@ id），调同一套领域服务——**不**让自家前端去消费 Jellyfin �
    strm 场景 Path 也可指向我们的 stream 端点（302 每次现读 strm 文件），
    牺牲一跳换稳定；两种模式做成库级开关，默认直连。
 5. **性能**：/Items 大库分页 + fields 门控天然限量；图片缩放有缓存；台账
-   查询已有热路径索引。无新增风险面。
+   查询已有热路径索引。**浏览零媒体 IO 原则**（issue #88 后的硬约束）：
+   入库完成后，除非用户主动扫描/刷新元数据，浏览类请求不对媒体文件本体
+   做任何文件系统调用——本地文件的 `ETag` 由台账 `file_mtime_ns` 派生
+   （扫描/入库时随 stat 落库，旧行 NULL 省略、重扫回填），strm 只在播放
+   场景现读，图片 tag 由资产相对路径 + 所属行 `updated_at` 派生，演职员
+   只在 `fields=People` 时装载。
 
 ## 10. 分期实施与验收
 

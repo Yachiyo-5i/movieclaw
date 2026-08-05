@@ -16,6 +16,7 @@ from __future__ import annotations
 import hashlib
 import random
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -106,9 +107,19 @@ class ItemBundle:
 
 
 async def load_bundles(
-    session: AsyncSession, item_ids: list[int], *, library_id: int | None = None
+    session: AsyncSession,
+    item_ids: list[int],
+    *,
+    library_id: int | None = None,
+    include_people: bool = False,
 ) -> dict[int, ItemBundle]:
-    """批量装载条目素材。library_id 限定时只装该库的文件行。"""
+    """批量装载条目素材。library_id 限定时只装该库的文件行。
+
+    ``include_people`` 只在输出会用到 People 时为 True（fields=People 或
+    单条目全字段）：演职员是量最大的关联（条目数 × 十余人的 join +
+    ORM 水合），列表请求默认不带 fields=People，装了也是白装——1200 部
+    电影的库这一项就要秒级开销（issue #88）。
+    """
     if not item_ids:
         return {}
     items = (
@@ -166,21 +177,24 @@ async def load_bundles(
         if b is not None:
             b.states[(st.season_number, st.episode_number)] = st
 
-    # 演职员：media_item_person ⋈ person（人物页同款数据，头像经图片代理）
-    people_rows = (
-        await session.execute(
-            select(MediaItemPerson, Person)
-            .join(Person, Person.id == MediaItemPerson.person_id)
-            .where(MediaItemPerson.media_item_id.in_(item_ids))
-        )
-    ).all()
-    for link, person in people_rows:
-        b = bundles.get(link.media_item_id)
-        if b is not None:
-            b.people.append((link.department, link.character, link.credit_order, person))
-    for b in bundles.values():
-        # 演员在前（按剧组主次序），导演/主创随后——对齐 Jellyfin People 惯例
-        b.people.sort(key=lambda t: (0 if t[0] == "cast" else 1, t[2]))
+    if include_people:
+        # 演职员：media_item_person ⋈ person（人物页同款数据，头像经图片代理）
+        people_rows = (
+            await session.execute(
+                select(MediaItemPerson, Person)
+                .join(Person, Person.id == MediaItemPerson.person_id)
+                .where(MediaItemPerson.media_item_id.in_(item_ids))
+            )
+        ).all()
+        for link, person in people_rows:
+            b = bundles.get(link.media_item_id)
+            if b is not None:
+                b.people.append(
+                    (link.department, link.character, link.credit_order, person)
+                )
+        for b in bundles.values():
+            # 演员在前（按剧组主次序），导演/主创随后——对齐 Jellyfin People 惯例
+            b.people.sort(key=lambda t: (0 if t[0] == "cast" else 1, t[2]))
 
     # 没有任何在位文件的条目不对外呈现
     return {k: v for k, v in bundles.items() if v.files}
@@ -258,16 +272,17 @@ async def load_library_stats(session: AsyncSession) -> dict[int, LibraryStats]:
 # ---------------------------------------------------------------------------
 
 
-def _asset_tag(assets_root: Path, rel_path: str | None) -> str | None:
-    """图片 tag：md5(相对路径 + mtime)——图变则 tag 变，纯缓存语义。"""
+def _asset_tag(rel_path: str | None, version: datetime | None) -> str | None:
+    """图片 tag：md5(相对路径 + 所属行 updated_at)——纯缓存语义，零文件系统调用。
+
+    图片由刮削管线写入，重刮必然刷新所属行的 updated_at，tag 随之改变。
+    此前按图片文件 mtime 现算，列表请求要对 data/ 逐图 stat 数千次，
+    data/ 挂在网络存储上时就是慢源之一（issue #88）。
+    """
     if not rel_path:
         return None
-    target = assets_root / rel_path
-    try:
-        mtime = target.stat().st_mtime_ns
-    except OSError:
-        return None
-    return hashlib.md5(f"{rel_path}:{mtime}".encode()).hexdigest()
+    stamp = version.isoformat() if version else ""
+    return hashlib.md5(f"{rel_path}:{stamp}".encode()).hexdigest()
 
 
 # ---------------------------------------------------------------------------
@@ -428,11 +443,13 @@ def _apply_item_images(
         return
     tags: dict[str, str] = {}
     meta = bundle.metadata
-    poster = _asset_tag(ctx.assets_root, meta.poster_file if meta else None)
+    poster = _asset_tag(meta.poster_file if meta else None, meta.updated_at if meta else None)
     if poster:
         tags["Primary"] = poster
     dto["ImageTags"] = tags
-    backdrop = _asset_tag(ctx.assets_root, meta.backdrop_file if meta else None)
+    backdrop = _asset_tag(
+        meta.backdrop_file if meta else None, meta.updated_at if meta else None
+    )
     dto["BackdropImageTags"] = [backdrop] if backdrop else []
 
 
@@ -517,18 +534,21 @@ def season_dto(
         dto["ProductionYear"] = row.air_date.year
     if options.enable_images:
         tags: dict[str, str] = {}
-        poster = _asset_tag(ctx.assets_root, row.poster_file if row else None)
+        poster = _asset_tag(
+            row.poster_file if row else None, row.updated_at if row else None
+        )
         if poster:
             tags["Primary"] = poster
         dto["ImageTags"] = tags
         dto["BackdropImageTags"] = []
+        meta = bundle.metadata
         series_poster = _asset_tag(
-            ctx.assets_root, bundle.metadata.poster_file if bundle.metadata else None
+            meta.poster_file if meta else None, meta.updated_at if meta else None
         )
         if series_poster:
             dto["SeriesPrimaryImageTag"] = series_poster
         series_backdrop = _asset_tag(
-            ctx.assets_root, bundle.metadata.backdrop_file if bundle.metadata else None
+            meta.backdrop_file if meta else None, meta.updated_at if meta else None
         )
         if series_backdrop:
             dto["ParentBackdropItemId"] = item_guid(bundle.item.id)
@@ -567,7 +587,9 @@ def episode_dto(
         dto["CommunityRating"] = round(row.vote_average, 1)
     if options.enable_images:
         tags = {}
-        still = _asset_tag(ctx.assets_root, row.still_file if row else None)
+        still = _asset_tag(
+            row.still_file if row else None, row.updated_at if row else None
+        )
         if still:
             tags["Primary"] = still
         dto["ImageTags"] = tags
@@ -575,9 +597,12 @@ def episode_dto(
         # 无自有图时客户端按 Parent* 字段退级：优先季海报，再剧海报/剧背景
         meta = bundle.metadata
         season_poster = _asset_tag(
-            ctx.assets_root, season_row.poster_file if season_row else None
+            season_row.poster_file if season_row else None,
+            season_row.updated_at if season_row else None,
         )
-        series_poster = _asset_tag(ctx.assets_root, meta.poster_file if meta else None)
+        series_poster = _asset_tag(
+            meta.poster_file if meta else None, meta.updated_at if meta else None
+        )
         if season_poster:
             dto["ParentPrimaryImageItemId"] = season_guid(bundle.item.id, season)
             dto["ParentPrimaryImageTag"] = season_poster
@@ -586,7 +611,9 @@ def episode_dto(
             dto["ParentPrimaryImageTag"] = series_poster
         if series_poster:
             dto["SeriesPrimaryImageTag"] = series_poster
-        series_backdrop = _asset_tag(ctx.assets_root, meta.backdrop_file if meta else None)
+        series_backdrop = _asset_tag(
+            meta.backdrop_file if meta else None, meta.updated_at if meta else None
+        )
         if series_backdrop:
             dto["ParentBackdropItemId"] = item_guid(bundle.item.id)
             dto["ParentBackdropImageTags"] = [series_backdrop]
@@ -790,13 +817,16 @@ def version_name(f: LibraryFile) -> str:
     return " ".join(parts) or Path(f.file_path).stem
 
 
-def media_source_dto(f: LibraryFile) -> dict[str, Any] | None:
+def media_source_dto(f: LibraryFile, *, resolve_strm: bool = False) -> dict[str, Any] | None:
     """单个文件版本 → MediaSourceInfo（含 v1.1 核实的 8 个恒输出字段）。
 
-    strm 条目：Path=云端 URL、Protocol=Http、IsRemote=true——客户端 DirectPlay
-    直连云端，服务器零流量。strm 内容解析失败（非法/被安全条款拒绝）时
-    返回 None，调用方把该版本从 MediaSources 里剔除（全部失败 →
-    NoCompatibleStream），不给客户端一个必然播不了的残源。
+    strm 条目：Protocol=Http、IsRemote=true——客户端 DirectPlay 直连云端，
+    服务器零流量。``resolve_strm`` 只在播放协商（PlaybackInfo）时为 True：
+    现读 strm 拿云端 URL（直链多带时效签名，不缓存），解析失败（非法/被
+    安全条款拒绝）返回 None，调用方把该版本剔除（全部失败 →
+    NoCompatibleStream）。列表/详情等浏览场景保持 False：**不读文件**——
+    每个 strm 条目读一次文件在云盘挂载上就是一次网络往返（issue #88），
+    而浏览场景根本用不到直链，Path 保留 strm 占位路径即可。
     """
     from movieclaw_jellyfin.ids import media_source_guid
     from movieclaw_playback.streaming import resolve_strm_url
@@ -846,29 +876,33 @@ def media_source_dto(f: LibraryFile) -> dict[str, Any] | None:
         source["DefaultAudioStreamIndex"] = audio_index
 
     if is_strm(f.file_path):
-        url = resolve_strm_url(f.file_path)
-        if url is None:
-            return None
-        source["Path"] = url
         source["Protocol"] = "Http"
         source["IsRemote"] = True
-        ext = Path(url.split("?", 1)[0]).suffix.lstrip(".").lower()
-        if ext:
-            source["Container"] = ext
+        if resolve_strm:
+            url = resolve_strm_url(f.file_path)
+            if url is None:
+                return None
+            source["Path"] = url
+            ext = Path(url.split("?", 1)[0]).suffix.lstrip(".").lower()
+            if ext:
+                source["Container"] = ext
     else:
-        files = bundle_etag(f)
-        if files:
-            source["ETag"] = files
+        etag = bundle_etag(f)
+        if etag:
+            source["ETag"] = etag
     return {k: v for k, v in source.items() if v is not None}
 
 
 def bundle_etag(f: LibraryFile) -> str | None:
-    """本地文件的 ETag（对齐 Jellyfin：mtime 派生的 md5）。"""
-    try:
-        mtime = Path(f.file_path).stat().st_mtime_ns
-    except OSError:
+    """本地文件的 ETag（对齐 Jellyfin：mtime 派生的 md5）。
+
+    mtime 来自台账列（扫描/入库时落库），**不做文件系统调用**——此前每次
+    列表/详情请求都对媒体文件本体逐个 stat，云盘挂载上千余部电影要 20
+    多秒（issue #88）。旧行未回填时省略 ETag（纯缓存语义），重扫自动补齐。
+    """
+    if f.file_mtime_ns is None:
         return None
-    return hashlib.md5(str(mtime).encode()).hexdigest()
+    return hashlib.md5(str(f.file_mtime_ns).encode()).hexdigest()
 
 
 # ---------------------------------------------------------------------------

@@ -381,7 +381,7 @@ async def test_item_detail_assembles_local_scrape(db, tmp_path, monkeypatch) -> 
     summary = await scan_library(library.id)
     assert summary.identified == 1  # NFO tmdbid=300 精确锚定
 
-    # 扫描时 ffprobe 对假字节探测失败（audio_streams=NULL）→ 后台补探回填
+    # 扫描时 ffprobe 对假字节探测失败（audio_streams=NULL）→ 等扫描补探回填
     monkeypatch.setattr(items_mod, "probe_media", lambda _path: _FAKE_SPEC)
 
     async with db.session() as session:
@@ -390,8 +390,7 @@ async def test_item_detail_assembles_local_scrape(db, tmp_path, monkeypatch) -> 
             .scalars()
             .one()
         )
-        tasks = BackgroundTasks()
-        resp = await get_library_item(library.id, item.id, tasks, session)
+        resp = await get_library_item(library.id, item.id, session)
         view = resp.data
 
     assert view.title == "某电影" and view.kind == "movie" and view.tmdb_id == 300
@@ -407,24 +406,25 @@ async def test_item_detail_assembles_local_scrape(db, tmp_path, monkeypatch) -> 
     assert view.local_meta is not None
     assert view.local_meta.rating == 8.2 and view.local_meta.runtime_minutes == 121
     assert [a.name for a in view.local_meta.actors] == ["演员甲", "演员乙"]
-    # 首屏不等探测：音轨保持"尚未探测"，但已把补探排进响应后的后台任务
+    # 详情页不再触发补探：音轨保持"尚未探测"（前端据此提示重新扫描），
+    # 浏览不碰媒体文件本体（云盘挂载上读文件就是流量与延迟）
     file = view.files[0]
     assert file.file_name == "某电影.2020.1080p.WEB-DL.mkv"
     assert file.audio_streams is None
-    assert len(tasks.tasks) == 1
     embedded = [s for s in file.subtitle_streams if not s.external]
     external = [s for s in file.subtitle_streams if s.external]
-    assert embedded == []  # 内封轨要等补探
+    assert embedded == []  # 内封轨要等扫描补探
     assert external[0].file_name == "某电影.2020.1080p.WEB-DL.chs&eng.srt"
     assert external[0].title == "chs&eng"
 
-    # 执行后台补探（模拟 BackgroundTasks 在响应后运行）→ 落库 → 再取即有
-    await tasks()
+    # 扫描的补探阶段回填 → 落库 → 再取即有
     async with db.session() as session:
+        rows = list((await session.execute(select(LibraryFile))).scalars().all())
+        await items_mod.backfill_streams(session, rows)
         row = (await session.execute(select(LibraryFile))).scalars().one()
         assert row.audio_streams and row.audio_streams[0]["codec"] == "eac3"
         assert row.subtitle_streams and row.subtitle_streams[0]["codec"] == "subrip"
-        resp2 = await get_library_item(library.id, item.id, BackgroundTasks(), session)
+        resp2 = await get_library_item(library.id, item.id, session)
         file2 = resp2.data.files[0]
         assert file2.audio_streams is not None and file2.audio_streams[0].codec == "eac3"
         assert file2.audio_streams[0].channels == 6
@@ -481,9 +481,8 @@ async def test_strm_rows_never_count_as_probe_pending(db, tmp_path) -> None:
         wall = await items_mod.build_library_wall(session, library.id)
         assert [v.probe_pending_count for v in wall] == [0]
         item_id = (await session.execute(select(MediaItem))).scalars().one().id
-        tasks = BackgroundTasks()
-        await get_library_item(library.id, item_id, tasks, session)
-        assert tasks.tasks == [], "strm 不该被排进详情页的后台补探任务"
+        # 详情页可正常打开（不再有任何补探副作用）
+        await get_library_item(library.id, item_id, session)
 
 
 async def test_item_detail_selfsufficient_after_scan(db, tmp_path) -> None:
@@ -510,7 +509,7 @@ async def test_item_detail_selfsufficient_after_scan(db, tmp_path) -> None:
             .scalars()
             .one()
         )
-        resp = await get_library_item(library.id, item.id, BackgroundTasks(), session)
+        resp = await get_library_item(library.id, item.id, session)
         view = resp.data
 
     # NFO 身份高置信（identity_source=nfo）→ 最小 NFO 被升级为完整版并回读
@@ -534,7 +533,7 @@ async def test_item_detail_selfsufficient_after_scan(db, tmp_path) -> None:
             .scalars()
             .one()
         )
-        resp = await get_library_item(library.id, item.id, BackgroundTasks(), session)
+        resp = await get_library_item(library.id, item.id, session)
         view = resp.data
 
     assert view.local_meta is not None and view.local_meta.source == "db"
@@ -577,7 +576,7 @@ async def test_item_detail_fills_missing_actor_thumbs_from_archive(db, tmp_path)
             .scalars()
             .one()
         )
-        resp = await get_library_item(library.id, item.id, BackgroundTasks(), session)
+        resp = await get_library_item(library.id, item.id, session)
         view = resp.data
 
     assert view.local_meta is not None and view.local_meta.source == "nfo"
@@ -620,7 +619,7 @@ async def test_item_detail_fills_person_ids_even_when_thumbs_complete(db, tmp_pa
             .scalars()
             .one()
         )
-        resp = await get_library_item(library.id, item.id, BackgroundTasks(), session)
+        resp = await get_library_item(library.id, item.id, session)
         view = resp.data
 
     assert view.local_meta is not None and view.local_meta.source == "nfo"
@@ -776,7 +775,7 @@ async def test_item_detail_reports_scraping_state(db, tmp_path) -> None:
             .scalars()
             .one()
         ).id
-        resp = await get_library_item(library.id, item_id, BackgroundTasks(), session)
+        resp = await get_library_item(library.id, item_id, session)
         assert resp.data.scraping is False
         assert resp.data.scraping_phase is None
 
@@ -784,7 +783,7 @@ async def test_item_detail_reports_scraping_state(db, tmp_path) -> None:
         # 阶段文案与整库刷新同一套，两处状态语言因此一致
         media_scrape._scraping[item_id] = "下载图片"
         try:
-            resp = await get_library_item(library.id, item_id, BackgroundTasks(), session)
+            resp = await get_library_item(library.id, item_id, session)
             assert resp.data.scraping is True
             assert resp.data.scraping_phase == "下载图片"
         finally:
@@ -885,7 +884,7 @@ async def test_delete_item_removes_whole_entry_dir(db, tmp_path) -> None:
         assert (await session.execute(select(LibraryFile))).scalars().all() == []
         resp404 = None
         try:
-            await get_library_item(library.id, item.id, BackgroundTasks(), session)
+            await get_library_item(library.id, item.id, session)
         except NotFoundException as exc:
             resp404 = exc
         assert resp404 is not None
@@ -984,7 +983,7 @@ async def test_delete_single_file_keeps_other_version(db, tmp_path) -> None:
     assert other.exists() and entry.exists()  # 另一版本与条目目录不动
     assert (entry / "movie.nfo").exists() and (entry / "poster.jpg").exists()
     async with db.session() as session:
-        detail = (await get_library_item(library.id, item.id, BackgroundTasks(), session)).data
+        detail = (await get_library_item(library.id, item.id, session)).data
         assert detail.file_count == 1
         assert detail.files[0].file_path == str(other)
 
@@ -1165,7 +1164,7 @@ async def test_tv_episodes_merge_local_and_tmdb(db, tmp_path) -> None:
             .scalars()
             .one()
         )
-        detail = (await get_library_item(library.id, item.id, BackgroundTasks(), session)).data
+        detail = (await get_library_item(library.id, item.id, session)).data
         assert detail.seasons == [1]
 
         resp = await list_item_episodes(library.id, item.id, 1, session)
@@ -1355,7 +1354,7 @@ async def test_actor_thumb_missing_only_when_tmdb_has_no_profile(db, tmp_path) -
                 .scalars()
                 .one()
             )
-            resp = await get_library_item(library.id, item.id, BackgroundTasks(), session)
+            resp = await get_library_item(library.id, item.id, session)
         return resp.data.local_meta
 
     # 1) NFO 路径（我们自己写出的完整 NFO：有图的写 <thumb>，没图的不写）

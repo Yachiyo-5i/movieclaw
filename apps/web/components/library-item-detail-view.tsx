@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
 
@@ -115,7 +115,6 @@ export function LibraryItemDetailView({
     setDetail(null);
     setReidentifyResult(null);
     setReidentifyError(null);
-    probeRetries.current = 0; // 换条目重置静默补拉的重试预算
     reload();
   }, [reload]);
 
@@ -123,7 +122,7 @@ export function LibraryItemDetailView({
 
   // 沉浸模式：进入详情页把全站背景（body 大图 + 玻璃折射纹理）临时换成
   // 该片剧照，玻璃 UI 整体染上影片氛围；离开页面自动恢复用户配置的背景。
-  // 依赖 URL 字符串而非 detail 对象：规格补拉刷新 detail 时背景不重挂
+  // 依赖 URL 字符串而非 detail 对象：刮削轮询刷新 detail 时背景不重挂
   const { setOverrideBackdrop } = useBackdrop();
   const immersiveUrl = detail ? imageUrl(detail.backdrop_url ?? detail.poster_url) : "";
   useEffect(() => {
@@ -144,23 +143,6 @@ export function LibraryItemDetailView({
     },
     detail?.scraping ? 2000 : null,
   );
-
-  // 介质规格的静默补拉：后端把 ffprobe 补探挪到了响应之后的后台任务
-  // （网络挂载上探测是秒级/文件，不能拖首屏），"尚未探测"的文件在页面
-  // 打开后每 3 秒补拉一次详情呈现结果，最多三次（ffprobe 缺失时不空转）
-  const probeRetries = useRef(0);
-  useEffect(() => {
-    if (!detail) return;
-    const pending = detail.files.some((f) => !f.missing && f.audio_streams === null);
-    if (!pending || probeRetries.current >= 3) return;
-    const timer = setTimeout(() => {
-      probeRetries.current += 1;
-      getLibraryItemDetail(libraryId, mediaItemId)
-        .then(setDetail)
-        .catch(() => {});
-    }, 3000);
-    return () => clearTimeout(timer);
-  }, [detail, libraryId, mediaItemId]);
 
   // 兜底态（加载中/失败）的顶栏：条目标题未知，末项留空——渲染 PageNav 是为了
   // 向外壳登记「本页自带顶栏」，否则移动端全局顶栏（☰ + logo）会先显示再消失，
@@ -834,8 +816,8 @@ function SpecRows({ file }: { file: LibraryItemFile }) {
       <SpecRow label="音频">
         {file.audio_streams === null ? (
           <span className="text-sub text-[var(--text-muted)]">
-            尚未探测——后台正在读取，稍候自动刷新；持续为空请检查文件是否可达，
-            以及（源码部署时）是否装了 ffmpeg
+            尚未探测——在媒体库页对本库执行「重新扫描」即可补齐规格；
+            扫描后仍为空请检查文件是否可达，以及（源码部署时）是否装了 ffmpeg
           </span>
         ) : file.audio_streams.length === 0 ? (
           <span className="text-sub text-[var(--text-muted)]">文件内没有音轨</span>

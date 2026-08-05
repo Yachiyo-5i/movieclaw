@@ -783,6 +783,8 @@ async def _ingest_entry(
             imported += 1
             continue
         assert dest_library is not None and dest_library.id is not None
+        # stat 落位后的目标文件（跨盘复制时 mtime 与源不同），size/mtime 一次拿全
+        final_stat = final.stat()
         await repo.upsert_by_path(
             LibraryFile(
                 library_id=dest_library.id,
@@ -790,7 +792,8 @@ async def _ingest_entry(
                 season_number=season,
                 episode_number=episode,
                 file_path=str(final),
-                size_bytes=file.stat().st_size,
+                size_bytes=final_stat.st_size,
+                file_mtime_ns=final_stat.st_mtime_ns,
                 container=final.suffix.lstrip(".").lower() or None,
                 resolution=file_spec.resolution if file_spec else None,
                 video_codec=file_spec.video_codec if file_spec else None,
