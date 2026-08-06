@@ -313,6 +313,314 @@ def test_people_in_item_detail(client: TestClient, seeded: dict) -> None:
     assert len(gated["People"]) == 3
 
 
+def test_list_queries_skip_unused_json_columns(client: TestClient, seeded: dict) -> None:
+    """大库列表不应读取 DTO 用不到的演员和媒体流 JSON。"""
+    from sqlalchemy import event
+
+    from movieclaw_db.engine import get_database
+
+    token = jf_login(client)
+    statements: list[str] = []
+
+    def capture(_conn, _cursor, statement, _parameters, _context, _executemany) -> None:
+        statements.append(statement.lower())
+
+    engine = get_database().engine.sync_engine
+    event.listen(engine, "before_cursor_execute", capture)
+    try:
+        plain = client.get(
+            "/Items",
+            params={
+                "ApiKey": token,
+                "parentId": library_guid(seeded["movie_lib"]),
+                "includeItemTypes": "Movie",
+            },
+        )
+    finally:
+        event.remove(engine, "before_cursor_execute", capture)
+
+    assert plain.status_code == 200
+    sql = "\n".join(statements)
+    assert "media_metadata.cast" not in sql
+    assert "media_metadata.directors" not in sql
+    assert "library_file.audio_streams" not in sql
+    assert "library_file.subtitle_streams" not in sql
+
+    statements.clear()
+    event.listen(engine, "before_cursor_execute", capture)
+    try:
+        sources = client.get(
+            "/Items",
+            params={
+                "ApiKey": token,
+                "parentId": library_guid(seeded["movie_lib"]),
+                "includeItemTypes": "Movie",
+                "fields": "MediaSources",
+            },
+        )
+    finally:
+        event.remove(engine, "before_cursor_execute", capture)
+
+    assert sources.status_code == 200
+    assert len(sources.json()["Items"][0]["MediaSources"]) == 2
+    sql = "\n".join(statements)
+    assert "library_file.audio_streams" in sql
+    assert "library_file.subtitle_streams" in sql
+
+    statements.clear()
+    event.listen(engine, "before_cursor_execute", capture)
+    try:
+        views = client.get("/UserViews", params={"ApiKey": token})
+    finally:
+        event.remove(engine, "before_cursor_execute", capture)
+
+    assert views.status_code == 200
+    sql = "\n".join(statements)
+    assert "media_metadata.poster_file" in sql
+    assert "media_metadata.cast" not in sql
+    assert "media_metadata.overview" not in sql
+
+
+def test_large_library_list_skips_large_json_columns(
+    client: TestClient, seeded: dict, monkeypatch
+) -> None:
+    """1,200 部电影携带大 JSON 时，首页仍走最小列集并正确分页。"""
+    import json
+    import os
+    import sqlite3
+
+    from sqlalchemy import event
+
+    from movieclaw_db.engine import get_database
+
+    db_path = os.environ["DATABASE_URL"].split("///", 1)[1]
+    timestamp = "2026-08-06 00:00:00.000000"
+    large_json = json.dumps(["x" * 2_048])
+    item_ids = range(10_000, 11_200)
+    with sqlite3.connect(db_path) as conn:
+        conn.executemany(
+            """
+            INSERT INTO media_item
+                (id, kind, tmdb_id, title, original_title, aliases, created_at, updated_at)
+            VALUES (?, 'movie', ?, ?, ?, '[]', ?, ?)
+            """,
+            [
+                (
+                    item_id,
+                    item_id,
+                    f"Large library item {item_id}",
+                    f"Item {item_id}",
+                    timestamp,
+                    timestamp,
+                )
+                for item_id in item_ids
+            ],
+        )
+        conn.executemany(
+            """
+            INSERT INTO media_metadata
+                (media_item_id, genres, genre_ids, origin_countries, studios, directors, cast,
+                 poster_locked, backdrop_locked, scrape_language, created_at, updated_at)
+            VALUES (?, '[]', '[]', ?, ?, ?, ?, 0, 0, '', ?, ?)
+            """,
+            [
+                (item_id, large_json, large_json, large_json, large_json, timestamp, timestamp)
+                for item_id in item_ids
+            ],
+        )
+        conn.executemany(
+            """
+            INSERT INTO library_file
+                (library_id, media_item_id, season_number, episode_number, file_path, size_bytes,
+                 audio_streams, subtitle_streams, source, created_at, updated_at)
+            VALUES (?, ?, 0, 0, ?, 0, ?, ?, 'scanned', ?, ?)
+            """,
+            [
+                (
+                    seeded["movie_lib"],
+                    item_id,
+                    f"/large-media/item-{item_id}.mkv",
+                    large_json,
+                    large_json,
+                    timestamp,
+                    timestamp,
+                )
+                for item_id in item_ids
+            ],
+        )
+
+    token = jf_login(client)
+    statements: list[str] = []
+    loaded_bundle_sizes: list[int] = []
+
+    from movieclaw_jellyfin.routes import library as library_routes
+
+    original_load_bundles = library_routes.load_bundles
+
+    async def track_load_bundles(session, item_ids, **kwargs):
+        loaded_bundle_sizes.append(len(item_ids))
+        return await original_load_bundles(session, item_ids, **kwargs)
+
+    monkeypatch.setattr(library_routes, "load_bundles", track_load_bundles)
+
+    def capture(_conn, _cursor, statement, _parameters, _context, _executemany) -> None:
+        statements.append(statement.lower())
+
+    engine = get_database().engine.sync_engine
+    event.listen(engine, "before_cursor_execute", capture)
+    try:
+        response = client.get(
+            "/Items",
+            params={
+                "ApiKey": token,
+                "parentId": library_guid(seeded["movie_lib"]),
+                "includeItemTypes": "Movie",
+                "limit": "20",
+            },
+        )
+    finally:
+        event.remove(engine, "before_cursor_execute", capture)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["TotalRecordCount"] == 1_201
+    assert len(body["Items"]) == 20
+    # 默认电影库 Items 的 count/page 已在 SQL 完成，不能回退成 1,201 个 bundle。
+    assert loaded_bundle_sizes == [20]
+    sql = "\n".join(statements)
+    assert "media_metadata.cast" not in sql
+    assert "media_metadata.directors" not in sql
+    assert "media_metadata.origin_countries" not in sql
+    assert "library_file.audio_streams" not in sql
+    assert "library_file.subtitle_streams" not in sql
+
+    statements.clear()
+    loaded_bundle_sizes.clear()
+    event.listen(engine, "before_cursor_execute", capture)
+    try:
+        latest = client.get(
+            "/Items/Latest",
+            params={
+                "ApiKey": token,
+                "parentId": library_guid(seeded["movie_lib"]),
+                "limit": "20",
+            },
+        )
+    finally:
+        event.remove(engine, "before_cursor_execute", capture)
+
+    assert latest.status_code == 200
+    assert len(latest.json()) == 20
+    # Latest 先扫描轻量最新单元，再只装载最终的 20 个条目。
+    assert loaded_bundle_sizes == [20]
+    sql = "\n".join(statements)
+    assert "media_metadata.cast" not in sql
+    assert "media_metadata.directors" not in sql
+    assert "media_metadata.origin_countries" not in sql
+    assert "library_file.audio_streams" not in sql
+    assert "library_file.subtitle_streams" not in sql
+
+
+def test_browse_index_covers_latest_and_movie_library_page(
+    client: TestClient, seeded: dict
+) -> None:
+    """首页 SQL 只能扫描浏览索引，不能回退读取含流信息 JSON 的宽表。"""
+    import os
+    import sqlite3
+
+    db_path = os.environ["DATABASE_URL"].split("///", 1)[1]
+    latest_plan_sql = """
+        EXPLAIN QUERY PLAN
+        SELECT
+            library_file.media_item_id,
+            library_file.season_number,
+            library_file.episode_number,
+            media_item.kind,
+            max(library_file.created_at)
+        FROM library_file
+        JOIN media_item ON media_item.id = library_file.media_item_id
+        WHERE library_file.media_item_id IS NOT NULL
+          AND library_file.missing_since IS NULL
+          AND library_file.library_id = ?
+        GROUP BY
+            library_file.media_item_id,
+            library_file.season_number,
+            library_file.episode_number,
+            media_item.kind
+        ORDER BY
+            max(library_file.created_at) DESC,
+            min(library_file.id) ASC,
+            library_file.media_item_id ASC,
+            library_file.season_number ASC,
+            library_file.episode_number ASC
+    """
+    movie_page_plan_sql = """
+        EXPLAIN QUERY PLAN
+        SELECT count(*)
+        FROM media_item
+        WHERE media_item.kind = 'movie'
+          AND EXISTS (
+              SELECT library_file.id
+              FROM library_file
+              WHERE library_file.library_id = ?
+                AND library_file.media_item_id = media_item.id
+                AND library_file.season_number = 0
+                AND library_file.episode_number = 0
+                AND library_file.missing_since IS NULL
+          )
+    """
+    with sqlite3.connect(db_path) as conn:
+        latest_plan = "\n".join(
+            row[3] for row in conn.execute(latest_plan_sql, (seeded["movie_lib"],))
+        )
+        movie_page_plan = "\n".join(
+            row[3] for row in conn.execute(movie_page_plan_sql, (seeded["movie_lib"],))
+        )
+
+    assert "USING COVERING INDEX ix_library_file_browse_unit" in latest_plan
+    assert "USING COVERING INDEX ix_library_file_browse_unit" in movie_page_plan
+
+
+def test_home_playback_queries_only_load_active_series(
+    client: TestClient, seeded: dict, monkeypatch
+) -> None:
+    """Resume/NextUp 不能为无播放活动的整库条目加载 bundle。"""
+    from movieclaw_jellyfin.routes import library as library_routes
+
+    token = jf_login(client)
+    auth = {"ApiKey": token}
+    episode = episode_guid(seeded["show"], 1, 1)
+    runtime_ticks = 47 * 60 * 1000 * TICKS_PER_MS
+    assert (
+        client.post(
+            "/Sessions/Playing/Progress",
+            params=auth,
+            json={"ItemId": episode, "PositionTicks": runtime_ticks // 2},
+        ).status_code
+        == 204
+    )
+
+    calls: list[list[int]] = []
+    original_load_bundles = library_routes.load_bundles
+
+    async def track_load_bundles(session, item_ids, **kwargs):
+        calls.append(list(item_ids))
+        return await original_load_bundles(session, item_ids, **kwargs)
+
+    monkeypatch.setattr(library_routes, "load_bundles", track_load_bundles)
+
+    resume = client.get("/UserItems/Resume", params=auth).json()
+    assert resume["TotalRecordCount"] == 1
+    assert resume["Items"][0]["Id"] == episode
+    assert calls == [[seeded["show"]]]
+
+    calls.clear()
+    next_up = client.get("/Shows/NextUp", params=auth).json()
+    assert next_up["TotalRecordCount"] == 1
+    assert next_up["Items"][0]["Id"] == episode
+    assert calls == [[seeded["show"]]]
+
+
 def test_person_item_and_filter(client: TestClient, seeded: dict) -> None:
     """点开演员：人物条目可取，personIds 反查参演作品。"""
     from movieclaw_jellyfin.ids import person_guid

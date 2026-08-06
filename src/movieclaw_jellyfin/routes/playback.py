@@ -21,8 +21,15 @@ from movieclaw_db.models import LibraryFile
 from movieclaw_jellyfin.catalog import media_source_dto
 from movieclaw_jellyfin.errors import bad_request_text, not_found
 from movieclaw_jellyfin.ids import EntityKind, decode_guid, media_source_guid
-from movieclaw_jellyfin.security import require_device
-from movieclaw_playback.streaming import container_mime_type, is_strm, resolve_strm_url
+from movieclaw_jellyfin.security import RequestIdentity, require_device
+from movieclaw_playback.streaming import (
+    DisconnectAwareFileResponse,
+    container_mime_type,
+    is_strm,
+    register_device_stream,
+    resolve_strm_url,
+    unregister_device_stream,
+)
 
 router = APIRouter(dependencies=[Depends(require_device)])
 
@@ -106,7 +113,10 @@ async def playback_info(request: Request, item_id: str) -> JSONResponse:
 @router.get("/Videos/{item_id}/stream.{container}")
 @router.head("/Videos/{item_id}/stream.{container}")
 async def video_stream(
-    request: Request, item_id: str, container: str | None = None
+    request: Request,
+    item_id: str,
+    container: str | None = None,
+    identity: RequestIdentity = Depends(require_device),
 ) -> Response:
     ref = decode_guid(item_id)
     if ref is None or ref.kind not in (EntityKind.ITEM, EntityKind.EPISODE):
@@ -133,8 +143,17 @@ async def video_stream(
     if not path.is_file():
         raise not_found()
     media_type = container_mime_type(container or f.container or path.suffix)
-    # FileResponse 原生处理 Range/206/If-Range/HEAD（starlette >= 0.36）
-    return FileResponse(path, media_type=media_type)
+    # 停止播放并不保证客户端立刻关闭 Range 连接。按已认证设备登记这条流，
+    # 让 /Sessions/Playing/Stopped 能主动停止读盘；TCP 断连仍是第二道兜底。
+    device_id = identity.device.device_id
+    session_stopped = register_device_stream(device_id)
+    return DisconnectAwareFileResponse(
+        path,
+        media_type=media_type,
+        is_disconnected=request.is_disconnected,
+        session_stopped=session_stopped,
+        on_close=lambda: unregister_device_stream(device_id, session_stopped),
+    )
 
 
 @router.get("/Items/{item_id}/Download")
@@ -174,6 +193,8 @@ async def download_item(request: Request, item_id: str) -> Response:
     path = Path(f.file_path)
     if not path.is_file():
         raise not_found()
+    # 下载不是播放会话：用普通 FileResponse，不登记设备流，避免用户边下边看
+    # 时点"停止播放"误杀下载读盘（TCP 断连兜底对下载器依然生效）
     is_download = request.url.path.lower().endswith("/download")
     return FileResponse(
         path,

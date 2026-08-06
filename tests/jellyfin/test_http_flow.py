@@ -509,6 +509,26 @@ def test_stopped_failed_skips_persistence(client: TestClient, seeded: dict) -> N
     assert ud["PlaybackPositionTicks"] == 0
 
 
+def test_stopped_cancels_device_streams_even_when_failed(
+    client: TestClient, seeded: dict, monkeypatch
+) -> None:
+    """Stopped 是取流停止信号；Failed 只跳过播放状态写入，不能留下预读。"""
+    from movieclaw_jellyfin.routes import playstate
+
+    token = jf_login(client)
+    calls: list[str] = []
+    monkeypatch.setattr(playstate, "stop_device_streams", calls.append)
+
+    response = client.post(
+        "/Sessions/Playing/Stopped",
+        params={"ApiKey": token},
+        json={"ItemId": item_guid(seeded["movie"]), "Failed": True},
+    )
+
+    assert response.status_code == 204
+    assert calls == ["test-device-1"]
+
+
 def test_mark_played_cascade_and_unplayed(client: TestClient, seeded: dict) -> None:
     token = jf_login(client)
     auth = {"ApiKey": token}
