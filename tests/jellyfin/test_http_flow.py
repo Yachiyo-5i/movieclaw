@@ -381,6 +381,58 @@ def test_stream_strm_redirects_without_proxy(client: TestClient, seeded: dict) -
     assert head.status_code == 302
 
 
+def test_download_local_file_with_attachment(client: TestClient, seeded: dict) -> None:
+    token = jf_login(client)
+    guid = item_guid(seeded["movie"])
+    info = client.post(f"/Items/{guid}/PlaybackInfo", params={"ApiKey": token}).json()
+    local = next(s for s in info["MediaSources"] if s["Protocol"] == "File")
+
+    resp = client.get(
+        f"/Items/{guid}/Download",
+        params={"ApiKey": token, "mediaSourceId": local["Id"]},
+    )
+    assert resp.status_code == 200
+    assert resp.headers["content-type"] == "video/x-matroska"
+    assert "attachment" in resp.headers["content-disposition"]
+    assert len(resp.content) == 4096
+
+    # 下载器断点续传：Range 语义与取流一致
+    partial = client.get(
+        f"/Items/{guid}/Download",
+        params={"ApiKey": token, "mediaSourceId": local["Id"]},
+        headers={"Range": "bytes=0-1023"},
+    )
+    assert partial.status_code == 206
+    assert len(partial.content) == 1024
+
+    # /File 变体：裸文件，不带 attachment
+    raw = client.get(
+        f"/Items/{guid}/File",
+        params={"ApiKey": token, "mediaSourceId": local["Id"]},
+    )
+    assert raw.status_code == 200
+    assert "content-disposition" not in raw.headers
+
+    # 无 token → 401
+    anon = client.get(f"/Items/{guid}/Download")
+    assert anon.status_code == 401
+
+
+def test_download_strm_redirects_to_cloud(client: TestClient, seeded: dict) -> None:
+    token = jf_login(client)
+    guid = item_guid(seeded["movie"])
+    info = client.post(f"/Items/{guid}/PlaybackInfo", params={"ApiKey": token}).json()
+    remote = next(s for s in info["MediaSources"] if s["Protocol"] == "Http")
+
+    resp = client.get(
+        f"/Items/{guid}/Download",
+        params={"ApiKey": token, "mediaSourceId": remote["Id"]},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 302
+    assert resp.headers["Location"] == "https://pan.example.com/inception-1080p.mp4"
+
+
 def test_progress_reporting_flow(client: TestClient, seeded: dict) -> None:
     token = jf_login(client)
     auth = {"ApiKey": token}

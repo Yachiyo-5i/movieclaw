@@ -1,4 +1,4 @@
-"""播放链路（设计文档 §6）：PlaybackInfo 与取流。
+"""播放链路（设计文档 §6）：PlaybackInfo、取流与整文件下载。
 
 - PlaybackInfo：不解析 DeviceProfile，恒返回未经设备适配的 MediaSources
   （等价于"无转码权限的 Jellyfin"，协议合法）；
@@ -135,3 +135,48 @@ async def video_stream(
     media_type = container_mime_type(container or f.container or path.suffix)
     # FileResponse 原生处理 Range/206/If-Range/HEAD（starlette >= 0.36）
     return FileResponse(path, media_type=media_type)
+
+
+@router.get("/Items/{item_id}/Download")
+@router.head("/Items/{item_id}/Download")
+@router.get("/Items/{item_id}/File")
+@router.head("/Items/{item_id}/File")
+async def download_item(request: Request, item_id: str) -> Response:
+    """整文件下载（Jellyfin LibraryController 的 Download/File 两条路由）。
+
+    我们在 UserDto.Policy 里宣告了 ``EnableContentDownloading: true``，客户端
+    （VidHub 等）据此显示下载按钮，点击后打的就是 /Items/{id}/Download——
+    不实现它下载会直接 404 失败。语义对齐播放取流：
+
+    - 本地文件回 FileResponse（原生 Range/206，下载器可断点续传）；
+      Download 按真 Jellyfin 带 attachment 文件名，File 不带；
+    - strm 条目与取流同策略（偏离，真 Jellyfin 会回 .strm 文本本身）：
+      302 到云端直链，客户端下载到的是真实媒体文件，服务器零流量；
+    - ``mediaSourceId`` 为超集扩展：真 Jellyfin 此接口只认条目主文件，
+      我们允许客户端指定下载某个版本，缺省取第一个。
+    """
+    ref = decode_guid(item_id)
+    if ref is None or ref.kind not in (EntityKind.ITEM, EntityKind.EPISODE):
+        raise not_found()
+
+    files = await _files_for_ref(ref)
+    selected = _select_source(files, request.query_params.get("mediaSourceId"), item_id)
+    if not selected:
+        raise not_found()
+    f = selected[0]
+
+    if is_strm(f.file_path):
+        url = resolve_strm_url(f.file_path)
+        if url is None:
+            raise not_found()
+        return RedirectResponse(url, status_code=302)
+
+    path = Path(f.file_path)
+    if not path.is_file():
+        raise not_found()
+    is_download = request.url.path.lower().endswith("/download")
+    return FileResponse(
+        path,
+        media_type=container_mime_type(f.container or path.suffix),
+        filename=path.name if is_download else None,
+    )
