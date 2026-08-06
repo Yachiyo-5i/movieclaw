@@ -198,7 +198,9 @@ class LibraryWatcher:
                     # 但入库硬链会）——正在扫就不叠加
                 logger.info("检测到媒体库 #%s 根路径变更，触发增量扫描", library_id)
                 try:
-                    await scan_library(library_id)
+                    # 文件事件只需同步台账；历史规格补探由用户手动扫描触发，
+                    # 不让一次播放/下载相关的目录事件变成整库 ffprobe。
+                    await scan_library(library_id, backfill_existing_specs=False)
                 except Exception:  # noqa: BLE001 -- 监控消费绝不崩
                     logger.exception("实时监控触发的扫描失败：库 #%s", library_id)
 

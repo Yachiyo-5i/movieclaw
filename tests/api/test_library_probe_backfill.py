@@ -18,7 +18,7 @@ import movieclaw_api.services.library.scan as scan_mod
 import movieclaw_api.services.media_discover as discover_mod
 import movieclaw_api.services.media_probe as probe_mod
 from movieclaw_api.core.config import get_settings
-from movieclaw_api.services.library.scan import scan_library
+from movieclaw_api.services.library.scan import ScanSummary, scan_library
 from movieclaw_api.services.media_probe import MediaSpec
 from movieclaw_db.engine import dispose_db, get_database, init_db
 from movieclaw_db.migrations import run_migrations
@@ -163,6 +163,39 @@ async def test_backfill_is_idempotent(db, tmp_path, monkeypatch) -> None:
     summary = await scan_library(library_id)
     assert summary.probed == 0
     assert calls == []
+
+
+async def test_background_scan_skips_historical_spec_backfill(db, tmp_path, monkeypatch) -> None:
+    """后台对账和目录事件只盘点台账，不能对历史文件逐个启动 ffprobe。"""
+    _no_ffprobe(monkeypatch)
+    library_id = await _build(db, tmp_path)
+    await scan_library(library_id)
+
+    calls: list[str] = []
+    _with_ffprobe(monkeypatch, calls)
+    summary = await scan_library(library_id, backfill_existing_specs=False)
+
+    assert summary.probed == 0
+    assert calls == []
+    rows = await _rows(db)
+    assert all(row.audio_streams is None for row in rows)
+
+
+async def test_periodic_reconcile_skips_historical_spec_backfill(db, tmp_path, monkeypatch) -> None:
+    """定时对账传入关闭开关，避免后台周期扫到全库历史规格。"""
+    library_id = await _build(db, tmp_path, count=1)
+    calls: list[tuple[int, bool]] = []
+
+    async def fake_scan(
+        current_library_id: int, *, backfill_existing_specs: bool = True
+    ) -> ScanSummary:
+        calls.append((current_library_id, backfill_existing_specs))
+        return ScanSummary(library_id=current_library_id)
+
+    monkeypatch.setattr(scan_mod, "scan_library", fake_scan)
+    await scan_mod.reconcile_libraries()
+
+    assert calls == [(library_id, False)]
 
 
 async def test_backfill_skipped_when_ffprobe_missing(db, tmp_path, monkeypatch) -> None:

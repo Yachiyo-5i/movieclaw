@@ -276,7 +276,9 @@ def _arm_rescan(library_id: int, delay: float) -> None:
 
 async def _rescan_later(library_id: int, delay: float) -> None:
     await asyncio.sleep(delay)
-    await scan_library(library_id)
+    # 这一轮只为接住刚写完的新文件；历史规格补探必须由用户主动扫描触发，
+    # 否则下载期间一次短暂的 mtime 波动也会重新扫到整库未补探的旧文件。
+    await scan_library(library_id, backfill_existing_specs=False)
 
 
 def last_scan(library_id: int) -> tuple | None:
@@ -292,8 +294,17 @@ def scan_progress(library_id: int) -> ScanState | None:
     return _scan_tasks.state_of(library_id)
 
 
-async def scan_library(library_id: int) -> ScanSummary:
-    """扫描一个库的全部根路径（后台任务入口；自开会话，不向外抛异常）。"""
+async def scan_library(
+    library_id: int, *, backfill_existing_specs: bool = True
+) -> ScanSummary:
+    """扫描一个库的全部根路径（后台任务入口；自开会话，不向外抛异常）。
+
+    ``backfill_existing_specs`` 只应由用户主动发起的扫描保持开启。历史规格
+    补探会对每个 ``audio_streams IS NULL`` 的在位文件运行一次 ffprobe；把它
+    绑到 watchdog、写入静默补扫或 6 小时对账，会让一次很小的目录事件演变为
+    对整个机械盘媒体库的长时间读取。新入库文件仍在主流程中即时探测，不受此
+    开关影响。
+    """
     from movieclaw_api.services.library.organize import is_organizing
     from movieclaw_api.services.library.transfer import is_transferring
 
@@ -321,7 +332,12 @@ async def scan_library(library_id: int) -> ScanSummary:
     state = ScanState(phase=ScanPhase.WALKING)
     _scan_tasks.try_start(library_id, state)
     try:
-        return await _scan(library_id, summary, state)
+        return await _scan(
+            library_id,
+            summary,
+            state,
+            backfill_existing_specs=backfill_existing_specs,
+        )
     except Exception:  # noqa: BLE001 -- 后台任务兜底
         logger.exception("媒体库 #%s 扫描时发生未知错误", library_id)
         summary.errors.append("扫描中断：发生未知错误（详见后端日志）")
@@ -334,7 +350,13 @@ async def scan_library(library_id: int) -> ScanSummary:
             _arm_rescan(library_id, summary.recheck_delay_seconds)
 
 
-async def _scan(library_id: int, summary: ScanSummary, state: ScanState) -> ScanSummary:
+async def _scan(
+    library_id: int,
+    summary: ScanSummary,
+    state: ScanState,
+    *,
+    backfill_existing_specs: bool,
+) -> ScanSummary:
     db = get_database()
     async with db.session() as session:
         library = await session.get(Library, library_id)
@@ -552,7 +574,8 @@ async def _scan(library_id: int, summary: ScanSummary, state: ScanState) -> Scan
         # 已识别且在位的行在上面的循环里整体秒过，永远走不到探测那一步。
         # 没有这一步，「装好 ffmpeg 再重新扫描」这个最直觉的动作就是无效的，
         # 用户只能一个条目一个条目点开、靠详情页那点限量补探慢慢磨。
-        await _probe_backfill(session, library_id, summary, state)
+        if backfill_existing_specs:
+            await _probe_backfill(session, library_id, summary, state)
 
     if min_remaining is not None:
         summary.recheck_delay_seconds = max(5.0, min(min_remaining + 1.0, NEW_FILE_QUIET_SECONDS))
@@ -1958,7 +1981,9 @@ async def reconcile_libraries() -> None:
         libraries = list((await session.execute(select(Library))).scalars().all())
     for library in libraries:
         assert library.id is not None
-        summary = await scan_library(library.id)
+        # 对账负责让台账追上文件新增/删除；规格补探是可长达数小时的用户主动
+        # 维护任务，不能在空闲后台周期里抢占媒体盘。
+        summary = await scan_library(library.id, backfill_existing_specs=False)
         if summary.errors:
             logger.warning(
                 "媒体库「%s」对账补扫存在问题：%s", library.name, "；".join(summary.errors)

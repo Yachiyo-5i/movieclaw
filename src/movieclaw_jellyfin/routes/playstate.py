@@ -37,6 +37,7 @@ from movieclaw_playback.events import (
     build_marked_events,
     build_playback_event,
 )
+from movieclaw_playback.streaming import stop_device_streams
 
 router = APIRouter(dependencies=[Depends(require_device)])
 
@@ -269,6 +270,9 @@ async def playing_stopped(
     request: Request, identity: RequestIdentity = Depends(require_device)
 ) -> Response:
     body = await _read_body(request)
+    # VidHub 的 Stopped 不代表它已立即关闭此前发出的 Range 请求。先取消同设备
+    # 的活跃流，避免机械盘继续为已退出的播放器预读；失败停止同样必须收口。
+    stop_device_streams(identity.device.device_id)
     if body.get("failed") is True:
         # 播放失败的上报不落库（SessionManager.cs:1164-1167）
         return Response(status_code=204)
@@ -330,6 +334,7 @@ async def playing_stopped_legacy(
     identity: RequestIdentity = Depends(require_device),
 ) -> Response:
     ref = _decode_item_ref(item_id)
+    stop_device_streams(identity.device.device_id)
     if ref is not None:
         await _apply_progress(
             ref,
