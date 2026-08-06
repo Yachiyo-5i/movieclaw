@@ -61,6 +61,7 @@ DOMAIN_HELP = {
     "sub": "订阅",
     "ui": "界面偏好",
     "watch": "监听导入",
+    "webhook": "事件 Webhook 出站推送",
 }
 
 _SIMPLE_TYPES = {"string", "integer", "number", "boolean"}

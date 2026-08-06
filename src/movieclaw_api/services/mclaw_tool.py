@@ -30,6 +30,8 @@ _DOMAIN_LINES = {
     "site": "site     PT 站点接入与验证（catalog 看支持哪些站）",
     "dl": "dl       下载器接入、默认下载器与路径映射",
     "watch": "watch    监听导入规则（下载完成目录 → 自动入库）",
+    "webhook": "webhook  事件 Webhook 出站推送（show/set 配置端点、test 试发、"
+    "deliveries 查投递记录、rotate-secret 轮换签名密钥）",
     "rules": "rules    订阅过滤规则组（分辨率/制作组/体积等偏好）",
     "discover": "discover 影视元数据与榜单（media 搜索条目、拿 TMDB ID）",
     "people": "people   影人档案（本地库）",
