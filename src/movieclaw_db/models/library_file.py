@@ -84,6 +84,18 @@ class LibraryFile(TimestampMixin, table=True):
             "season_number",
             "episode_number",
         ),
+        # Jellyfin 首页浏览热路径：Latest 按库过滤在位文件，再按媒体单元聚合
+        # 最新入库时间；电影库默认分页也会按库/条目检查文件是否在位。把这些
+        # 纯标量键放进同一棵索引，SQLite 可只扫描索引而不读取音轨/字幕 JSON。
+        Index(
+            "ix_library_file_browse_unit",
+            "library_id",
+            "missing_since",
+            "media_item_id",
+            "season_number",
+            "episode_number",
+            "created_at",
+        ),
         # 改名归并的候选池查询（同库同尺寸）。缺了它，首次扫描每落一个新文件
         # 都要扫一遍本库全部台账行，整轮就是 O(文件数²)
         Index("ix_library_file_library_size", "library_id", "size_bytes"),

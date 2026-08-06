@@ -20,7 +20,7 @@ import hashlib
 import logging
 from pathlib import Path
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from movieclaw_api.core.config import get_settings
 from movieclaw_db.engine import get_database
@@ -34,6 +34,10 @@ POSTER_W_RATIO = 0.225  # 单张海报占画布宽
 POSTER_GAP_RATIO = 0.02
 POSTER_TOP_RATIO = 0.045
 MAX_POSTERS = 4
+
+# 同一库的封面选择、素材指纹计算和 Pillow 渲染必须作为一个整体去重。根级
+# Items 与库图片接口会并发调用本服务；仅锁渲染仍会让每个请求重复扫描候选素材。
+_cover_tasks: dict[int, asyncio.Task[tuple[Path, str] | None]] = {}
 
 
 def covers_dir() -> Path:
@@ -50,43 +54,29 @@ async def select_cover_posters(library_id: int) -> list[Path]:
     """选出该库最近入库、有本地海报资产的至多 4 部作品的海报绝对路径。"""
     root = _assets_root()
     async with get_database().session() as session:
+        # 只需要海报路径与入库时间：整行读取会反序列化每部作品的简介、演员等
+        # 大字段；VidHub 的根级 Items 每次启动都会走这里，大库上代价不可接受。
         rows = (
             await session.execute(
                 select(
-                    LibraryFile.media_item_id,
-                    LibraryFile.created_at,
-                ).where(
-                    LibraryFile.library_id == library_id,
-                    LibraryFile.media_item_id.is_not(None),
-                    LibraryFile.missing_since.is_(None),
+                    MediaMetadata.poster_file,
+                    func.max(LibraryFile.created_at).label("latest_created_at"),
                 )
+                .join(
+                    LibraryFile,
+                    LibraryFile.media_item_id == MediaMetadata.media_item_id,
+                )
+                .where(
+                    LibraryFile.library_id == library_id,
+                    LibraryFile.missing_since.is_(None),
+                    MediaMetadata.poster_file.is_not(None),
+                )
+                .group_by(MediaMetadata.media_item_id, MediaMetadata.poster_file)
+                .order_by(func.max(LibraryFile.created_at).desc())
             )
         ).all()
-        if not rows:
-            return []
-        # 每个条目取最近一次入库时间，按新→旧排
-        latest: dict[int, object] = {}
-        for item_id, created_at in rows:
-            if item_id not in latest or created_at > latest[item_id]:
-                latest[item_id] = created_at
-        ordered_ids = [i for i, _ in sorted(latest.items(), key=lambda kv: kv[1], reverse=True)]
-
-        posters = {
-            m.media_item_id: m.poster_file
-            for m in (
-                await session.execute(
-                    select(MediaMetadata).where(
-                        MediaMetadata.media_item_id.in_(ordered_ids),
-                        MediaMetadata.poster_file.is_not(None),
-                    )
-                )
-            ).scalars()
-        }
     result: list[Path] = []
-    for item_id in ordered_ids:
-        rel = posters.get(item_id)
-        if not rel:
-            continue
+    for rel, _created_at in rows:
         path = root / rel
         if path.is_file():
             result.append(path)
@@ -105,11 +95,31 @@ def _cover_key(paths: list[Path]) -> str:
     return hasher.hexdigest()
 
 
+def _clear_cover_task(
+    library_id: int, task: asyncio.Task[tuple[Path, str] | None]
+) -> None:
+    """仅移除当前任务，避免完成回调误删后续同库任务。"""
+    if _cover_tasks.get(library_id) is task:
+        _cover_tasks.pop(library_id, None)
+
+
 async def ensure_library_cover(library_id: int) -> tuple[Path, str] | None:
     """确保拼贴封面已渲染并返回 (文件路径, 版本 key)；无素材返回 None。
 
-    幂等：key 命中直接返回；素材变化重渲并清理该库旧产物。
+    幂等：key 命中直接返回；素材变化重渲并清理该库旧产物。同一库的并发调用
+    复用同一任务，避免重复扫描海报或重复执行 Pillow 渲染。
     """
+    task = _cover_tasks.get(library_id)
+    if task is None:
+        task = asyncio.create_task(_ensure_library_cover_once(library_id))
+        _cover_tasks[library_id] = task
+        task.add_done_callback(lambda done: _clear_cover_task(library_id, done))
+    # 单个 HTTP 请求断开时，不应取消其他请求正在等待的共享封面生成。
+    return await asyncio.shield(task)
+
+
+async def _ensure_library_cover_once(library_id: int) -> tuple[Path, str] | None:
+    """执行一次完整的封面选择、缓存检查和渲染流程。"""
     posters = await select_cover_posters(library_id)
     if not posters:
         return None
