@@ -138,6 +138,7 @@ P2 兜底兼容。**凡列出 legacy 别名的都必须与新路由一起实现*
 | `GET /Branding/Configuration`、`GET /QuickConnect/Enabled` | 匿名轻量 JSON（固定值） |
 | `GET /Branding/Css` + `/Branding/Css.css` | 匿名，**`text/css` 裸文本**（空串即可），非 JSON |
 | `GET /Sessions` → `[]`、`DELETE /Videos/ActiveEncodings` → 204、`GET /System/Endpoint` → `{"IsLocal":true,"IsInNetwork":true}` | 敷衍实现防客户端卡启动/退出（Fileball/VidHub 退出时会无条件发 ActiveEncodings 清理） |
+| `GET\|HEAD /Items/{itemId}/Download` 与 `/Items/{itemId}/File` | 整文件下载。Policy 宣告了 `EnableContentDownloading:true`，VidHub 等客户端的下载按钮打 Download，缺失则下载 404 无法开始。本地文件回 FileResponse（Download 带 attachment 文件名，File 不带，均支持 Range 断点续传）；strm 偏离真 Jellyfin（后者回 .strm 文本）：302 到云端直链 |
 
 **P2 兜底**：legacy `POST /PlayingItems/{itemId}`、`POST /PlayingItems/{itemId}/Progress`、
 **`DELETE /PlayingItems/{itemId}`**（停止是 DELETE 不是 POST）及 `/Users/{userId}/PlayingItems/*`
