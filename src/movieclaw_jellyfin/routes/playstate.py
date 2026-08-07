@@ -86,6 +86,13 @@ async def _resolve_units(ref: EntityRef) -> list[playback_state.Unit]:
             LibraryFile.missing_since.is_(None),
         )
         rows = list((await session.execute(q)).all())
+        if not rows and ref.kind in (EntityKind.ITEM, EntityKind.SEASON):
+            # 文件全部丢失的剧：真 Jellyfin 只要条目存在就允许手动标记已看
+            # （走元数据级联），不应因文件不在位而 404。退回元数据集清单
+            eq = select(
+                MediaEpisode.season_number, MediaEpisode.episode_number
+            ).where(MediaEpisode.media_item_id == ref.entity_id)
+            rows = list((await session.execute(eq)).all())
     units = sorted({(ref.entity_id, s, e) for s, e in rows})
     if ref.kind == EntityKind.EPISODE:
         return [(ref.entity_id, ref.season, ref.episode)]
@@ -273,8 +280,10 @@ async def playing_stopped(
     # VidHub 的 Stopped 不代表它已立即关闭此前发出的 Range 请求。先取消同设备
     # 的活跃流，避免机械盘继续为已退出的播放器预读；失败停止同样必须收口。
     stop_device_streams(identity.device.device_id)
-    if body.get("failed") is True:
-        # 播放失败的上报不落库（SessionManager.cs:1164-1167）
+    failed = body.get("failed")
+    if failed is True or (isinstance(failed, str) and failed.lower() == "true"):
+        # 播放失败的上报不落库（SessionManager.cs:1164-1167）；字符串 "true"
+        # 一并接住——真 Jellyfin 对它 400，我们静默落库会把失败记成正常观看
         return Response(status_code=204)
     ref = _decode_item_ref(body.get("itemid"))
     if ref is not None:
@@ -356,7 +365,7 @@ async def _user_data_response(ref: EntityRef, guid_raw: str) -> JSONResponse:
     据此原地刷新角标，不必重拉列表。"""
     guid = guid_raw.lower().replace("-", "")
     async with get_database().session() as session:
-        bundles = await load_bundles(session, [ref.entity_id])
+        bundles = await load_bundles(session, [ref.entity_id], include_fileless=True)
     bundle = bundles.get(ref.entity_id)
     if bundle is None:
         return JSONResponse(

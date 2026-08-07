@@ -716,3 +716,119 @@ def test_media_source_etag_comes_from_ledger(client: TestClient, seeded: dict) -
     body = client.get(f"/Items/{guid}", params={"ApiKey": token}).json()
     local = next(s for s in body["MediaSources"] if s["Protocol"] == "File")
     assert local["ETag"] == hashlib.md5(b"1723800000123456789").hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# 下载语义审计（对照 DtoService/BaseItem/Video 的 CanDownload 规则）
+# ---------------------------------------------------------------------------
+
+
+def test_can_download_leaf_true_folder_false(client: TestClient, seeded: dict) -> None:
+    """CanDownload：Movie/Episode 为 true，Series/Season 恒 false。
+
+    缺失该字段时 VidHub 等客户端退回 Policy.EnableContentDownloading 全局
+    放行，在剧集层级也显示下载按钮，打到 /Videos/{seriesGuid}/stream 得到
+    404 空 body 存成 0 字节"成品"（三体下载翻车的根因）。
+    """
+    token = jf_login(client)
+    auth = {"ApiKey": token, "fields": "CanDownload,CanDelete"}
+
+    movie = client.get(f"/Items/{item_guid(seeded['movie'])}", params=auth).json()
+    assert movie["CanDownload"] is True and movie["CanDelete"] is False
+
+    show = client.get(f"/Items/{item_guid(seeded['show'])}", params=auth).json()
+    assert show["CanDownload"] is False
+
+    season = client.get(f"/Items/{season_guid(seeded['show'], 1)}", params=auth).json()
+    assert season["CanDownload"] is False
+
+    ep = client.get(f"/Items/{episode_guid(seeded['show'], 1, 1)}", params=auth).json()
+    assert ep["CanDownload"] is True
+
+
+def test_leaf_constant_fields_present(client: TestClient, seeded: dict) -> None:
+    """真 Jellyfin 恒输出的字段：LocationType/VideoType/顶层 Container；
+    Season 的 ChildCount 不受 fields 门控（DtoService 短路分支）。"""
+    token = jf_login(client)
+    auth = {"ApiKey": token}
+
+    movie = client.get(f"/Items/{item_guid(seeded['movie'])}", params=auth).json()
+    assert movie["LocationType"] == "FileSystem"
+    assert movie["VideoType"] == "VideoFile"
+    assert movie["Container"] == "mkv"
+
+    season = client.get(f"/Items/{season_guid(seeded['show'], 1)}", params=auth).json()
+    assert season["ChildCount"] == 2  # S01 两集，无需 fields 请求
+
+    # 列表路径（最小列集）也必须能输出这些恒有字段，不得触发惰性加载
+    listing = client.get(
+        "/Items",
+        params={
+            "ApiKey": token,
+            "parentId": library_guid(seeded["movie_lib"]),
+            "recursive": "true",
+            "includeItemTypes": "Movie",
+        },
+    ).json()
+    assert listing["Items"][0]["Container"] == "mkv"
+
+
+def test_width_height_ishd_gated(client: TestClient, seeded: dict) -> None:
+    """Width/Height/IsHD 按 fields 门控输出，值从标称分辨率派生。"""
+    token = jf_login(client)
+    guid = item_guid(seeded["movie"])
+    body = client.get(
+        f"/Items/{guid}", params={"ApiKey": token, "fields": "Width,Height,IsHD"}
+    ).json()
+    assert (body["Width"], body["Height"]) == (3840, 2160)
+    assert body["IsHD"] is True
+
+
+def test_namespace_unknown_route_is_bare_404(client: TestClient) -> None:
+    """命名空间内未实现的路径不得漏出业务 JSON 信封（RESOURCE_NOT_FOUND）。"""
+    token = jf_login(client)
+    resp = client.get("/Videos/whatever/master.m3u8", params={"ApiKey": token})
+    assert resp.status_code == 404
+    assert resp.content == b""
+    resp = client.post("/LiveStreams/Open", params={"ApiKey": token})
+    assert resp.status_code in (404, 405)
+    assert resp.content == b""
+
+
+def test_mark_played_survives_missing_files(client: TestClient, seeded: dict) -> None:
+    """文件全部丢失的剧仍可手动标记已看（真 Jellyfin 语义：条目在即 200）。"""
+    import os
+    import sqlite3
+
+    token = jf_login(client)
+    db_path = os.environ["DATABASE_URL"].split("///", 1)[1]
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "UPDATE library_file SET missing_since = '2026-08-07 00:00:00' "
+            "WHERE media_item_id = ?",
+            (seeded["show"],),
+        )
+        conn.commit()
+
+    resp = client.post(
+        f"/Users/{'0' * 32}/PlayedItems/{item_guid(seeded['show'])}",
+        params={"ApiKey": token},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["Played"] is True
+
+
+def test_stopped_failed_string_true_skips_persistence(
+    client: TestClient, seeded: dict
+) -> None:
+    """Failed 为字符串 "true" 的 Stopped 同样不落库（不得记成正常观看）。"""
+    token = jf_login(client)
+    ep = episode_guid(seeded["show"], 2, 1)
+    resp = client.post(
+        "/Sessions/Playing/Stopped",
+        params={"ApiKey": token},
+        json={"ItemId": ep, "PositionTicks": 66 * 600_000_000, "Failed": "true"},
+    )
+    assert resp.status_code == 204
+    ud = client.get(f"/Items/{ep}", params={"ApiKey": token}).json()["UserData"]
+    assert ud["PlaybackPositionTicks"] == 0 and ud["Played"] is False
