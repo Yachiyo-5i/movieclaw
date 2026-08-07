@@ -171,3 +171,8 @@ watch entries ignore
 watch entries restore
 watch list
 watch update
+webhook deliveries
+webhook rotate-secret
+webhook set
+webhook show
+webhook test

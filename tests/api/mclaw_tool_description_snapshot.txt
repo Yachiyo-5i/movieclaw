@@ -20,6 +20,7 @@ movieclaw 的官方命令行工具。对本产品的一切操作——搜索资�
 - sub      订阅：sub create 一步完成消歧/预检/创建；list/show/update/pause/delete
 - ui       界面偏好（Web 端玻璃质感参数）
 - watch    监听导入规则（下载完成目录 → 自动入库）
+- webhook  事件 Webhook 出站推送（show/set 配置端点、test 试发、deliveries 查投递记录、rotate-secret 轮换签名密钥）
 - download 下载：download <行号> 提交上次 search 结果的某行（或 --site-id + --url）
 - status   一眼看部署状态：服务健康、登录身份、版本同步
 
