@@ -33,6 +33,7 @@ NAMESPACE_PREFIXES = {
     "videos",
     "shows",
     "sessions",
+    "livestreams",
     "playingitems",
     "branding",
     "quickconnect",
@@ -73,6 +74,7 @@ _KNOWN_QUERY_KEYS = [
     "personIds",
     "groupItems",
     "static",
+    "container",
     "mediaSourceId",
     "ApiKey",
     "api_key",
@@ -163,9 +165,21 @@ def register(app: FastAPI) -> None:
     async def jellyfin_case_normalizer(request: Request, call_next):  # type: ignore[no-untyped-def]
         path = request.scope.get("path", "")
         parts = path.split("/")
-        if len(parts) > 1 and parts[1].lower() in NAMESPACE_PREFIXES:
+        in_namespace = len(parts) > 1 and parts[1].lower() in NAMESPACE_PREFIXES
+        if in_namespace:
             request.scope["path"] = "/".join(_normalize_segment(p) for p in parts)
             raw_query = request.scope.get("query_string", b"")
             if raw_query:
                 request.scope["query_string"] = _normalize_query(raw_query)
-        return await call_next(request)
+        response = await call_next(request)
+        # 命名空间内未实现的路径/方法（/LiveStreams/Open、master.m3u8 等）会
+        # 落到业务统一处理器，返回 RESOURCE_NOT_FOUND 业务信封——这是最容易
+        # 暴露"不是真 Jellyfin"的地方。路由未匹配（scope 无 route）时改按
+        # 协议形态应答：404/405 空 body，对齐 ASP.NET 终结点兜底
+        if (
+            in_namespace
+            and response.status_code in (404, 405)
+            and "route" not in request.scope
+        ):
+            return Response(status_code=response.status_code)
+        return response

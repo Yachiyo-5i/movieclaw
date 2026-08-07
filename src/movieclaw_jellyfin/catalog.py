@@ -180,6 +180,11 @@ def _list_load_columns(
         LibraryFile.episode_number,
         LibraryFile.duration_seconds,
         LibraryFile.created_at,
+        # 叶子条目的恒输出字段（Container/VideoType 等，_apply_leaf_media_fields）
+        # 在列表路径也要读；都是短字符串列，不在"大 JSON 列"限制之列
+        LibraryFile.file_path,
+        LibraryFile.container,
+        LibraryFile.resolution,
     ]
     if options.has("ParentId"):
         file_columns.append(LibraryFile.library_id)
@@ -235,6 +240,7 @@ async def load_bundles(
     *,
     library_id: int | None = None,
     include_people: bool = False,
+    include_fileless: bool = False,
     dto_options: DtoOptions | None = None,
 ) -> dict[int, ItemBundle]:
     """批量装载条目素材。library_id 限定时只装该库的文件行。
@@ -334,7 +340,10 @@ async def load_bundles(
             # 演员在前（按剧组主次序），导演/主创随后——对齐 Jellyfin People 惯例
             b.people.sort(key=lambda t: (0 if t[0] == "cast" else 1, t[2]))
 
-    # 没有任何在位文件的条目不对外呈现
+    # 没有任何在位文件的条目不对外呈现；标记类接口除外（include_fileless）——
+    # 真 Jellyfin 里文件丢失的条目仍可手动标记已看，响应体要能算聚合 UserData
+    if include_fileless:
+        return bundles
     return {k: v for k, v in bundles.items() if v.files}
 
 
@@ -779,10 +788,57 @@ def _apply_item_images(
     dto["BackdropImageTags"] = [backdrop] if backdrop else []
 
 
+# 标称分辨率 → 常见宽高（探测层未落 width/height，与 _video_stream 同源）
+_RESOLUTION_WH = {
+    "4320p": (7680, 4320),
+    "2160p": (3840, 2160),
+    "1440p": (2560, 1440),
+    "1080p": (1920, 1080),
+    "720p": (1280, 720),
+    "480p": (720, 480),
+}
+
+
+def _apply_leaf_media_fields(
+    dto: dict[str, Any], files: list[LibraryFile], options: DtoOptions
+) -> None:
+    """可播叶子（Movie/Episode）的下载与介质字段（对齐 DtoService）。
+
+    CanDownload 是客户端渲染"下载按钮"的依据：真 Jellyfin 里只有 Video
+    子类返回 true、Series/Season 等 Folder 恒 false——缺了它，客户端退回
+    只看 Policy.EnableContentDownloading，会在剧集层级也放行下载，打到
+    /Videos/{seriesGuid}/stream 得到 404 空 body 存成 0 字节"成品"。
+    CanDelete 按现有 Policy（EnableContentDeletion=false）恒为 false。
+    LocationType/VideoType/Container 是真 Jellyfin 的恒输出字段；strm 不给
+    Container（浏览态偏离，见 media_source_dto）。
+    """
+    if options.has("CanDownload"):
+        # 有在位文件才可下载；strm 对齐真 Jellyfin（Path 是本地文件 → true）
+        dto["CanDownload"] = bool(files)
+    if options.has("CanDelete"):
+        dto["CanDelete"] = False
+    dto["LocationType"] = "FileSystem"
+    dto["VideoType"] = "VideoFile"
+    if files:
+        f = files[0]
+        if f.container and not is_strm(f.file_path):
+            dto["Container"] = f.container
+        wh = _RESOLUTION_WH.get(f.resolution or "")
+        if wh:
+            if options.has("Width"):
+                dto["Width"] = wh[0]
+            if options.has("Height"):
+                dto["Height"] = wh[1]
+            # 真 Jellyfin 只在为 true 时输出 IsHD
+            if options.has("IsHD") and wh[1] >= 720:
+                dto["IsHD"] = True
+
+
 def movie_dto(ctx: DtoContext, bundle: ItemBundle, options: DtoOptions) -> dict[str, Any]:
     guid = item_guid(bundle.item.id)
     dto = _common(ctx, guid, bundle.item.title, "Movie", "Video")
     dto["IsFolder"] = False
+    _apply_leaf_media_fields(dto, bundle.files.get((0, 0), []), options)
     if bundle.item.year:
         dto["ProductionYear"] = bundle.item.year
     runtime_ms = bundle.unit_runtime_ms(0, 0)
@@ -819,6 +875,13 @@ def series_dto(ctx: DtoContext, bundle: ItemBundle, options: DtoOptions) -> dict
     guid = item_guid(bundle.item.id)
     dto = _common(ctx, guid, bundle.item.title, "Series", "Unknown")
     dto["IsFolder"] = True
+    # Folder 不可整体下载（BaseItem.CanDownload 恒 false）；缺失时部分客户端
+    # 退回 Policy 全局开关误放行，见 _apply_leaf_media_fields 注释
+    if options.has("CanDownload"):
+        dto["CanDownload"] = False
+    if options.has("CanDelete"):
+        dto["CanDelete"] = False
+    dto["LocationType"] = "FileSystem"
     if bundle.item.year:
         dto["ProductionYear"] = bundle.item.year
     status = (bundle.item.status or "").lower()
@@ -853,9 +916,20 @@ def season_dto(
     )
     dto = _common(ctx, guid, name, "Season", "Unknown")
     dto["IsFolder"] = True
+    if options.has("CanDownload"):
+        dto["CanDownload"] = False
+    if options.has("CanDelete"):
+        dto["CanDelete"] = False
+    dto["LocationType"] = "FileSystem"
     dto["IndexNumber"] = season
     dto["SeriesId"] = item_guid(bundle.item.id)
     dto["SeriesName"] = bundle.item.title
+    # 真 Jellyfin 对 Season 的 ChildCount 不受 fields 门控（DtoService 短路分支
+    # ChildCount = RecursiveItemCount），恒输出该季集数
+    season_units = [u for u in bundle.units if u[0] == season]
+    dto["ChildCount"] = len(season_units)
+    if options.has("RecursiveItemCount"):
+        dto["RecursiveItemCount"] = len(season_units)
     _apply_parent_id(dto, item_guid(bundle.item.id), options)
     if row and row.air_date:
         dto["PremiereDate"] = row.air_date.strftime("%Y-%m-%dT00:00:00.0000000Z")
@@ -894,6 +968,7 @@ def episode_dto(
     name = (row.name if row else "") or f"Episode {episode}"
     dto = _common(ctx, guid, name, "Episode", "Video")
     dto["IsFolder"] = False
+    _apply_leaf_media_fields(dto, bundle.files.get((season, episode), []), options)
     dto["IndexNumber"] = episode
     dto["ParentIndexNumber"] = season
     dto["SeriesId"] = item_guid(bundle.item.id)

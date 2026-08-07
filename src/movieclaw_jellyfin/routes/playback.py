@@ -142,7 +142,10 @@ async def video_stream(
     path = Path(f.file_path)
     if not path.is_file():
         raise not_found()
-    media_type = container_mime_type(container or f.container or path.suffix)
+    # MIME 优先级对齐 StreamingHelpers：URL 后缀 → ?container= query → 真实容器
+    media_type = container_mime_type(
+        container or request.query_params.get("container") or f.container or path.suffix
+    )
     # 停止播放并不保证客户端立刻关闭 Range 连接。按已认证设备登记这条流，
     # 让 /Sessions/Playing/Stopped 能主动停止读盘；TCP 断连仍是第二道兜底。
     device_id = identity.device.device_id
