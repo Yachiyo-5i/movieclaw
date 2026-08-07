@@ -81,6 +81,13 @@ class ImportWatchView(BaseModel):
         default=0,
         description="已入库条目累计入库的文件数（剧集一条目是一个季包，条目数说不清入了几集）",
     )
+    imported_works: int = Field(
+        default=0,
+        description=(
+            "已入库的作品数（同一部剧的多季、多版本合并为一部）——"
+            "「已入库」展示的就是这个数，stats.imported 是记账条目数"
+        ),
+    )
     created_at: datetime
 
     @classmethod
@@ -112,6 +119,7 @@ class ImportWatchView(BaseModel):
             process_existing=row.process_existing,
             stats=stats.counts if stats else {},
             imported_files=stats.imported_files if stats else 0,
+            imported_works=stats.imported_works if stats else 0,
             created_at=created,
         )
 

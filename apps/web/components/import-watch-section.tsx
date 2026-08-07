@@ -271,13 +271,16 @@ function RuleCard({
               className="glass-row nav-item !w-auto px-2.5 py-1 text-caption font-medium"
             >
               <span className={t.tone}>
-                {t.label} {stats[t.status]}
-                {/* 剧集一条目是一个季包，「已入库 5」会被读成 5 集/5 部；
-                    文件数与条目数不同时补上，说清实际入库规模 */}
+                {t.status === "imported" && rule.imported_works > 0
+                  ? // 「已入库」报作品数：同剧多季/多版本是一个作品，用户认知里
+                    // "入库了几部剧"就是这个数；条目数与作品数不同说明有重复
+                    // 版本/多季，补注条目与文件数说清实际规模
+                    `${t.label} ${rule.imported_works} 部`
+                    : `${t.label} ${stats[t.status]}`}
                 {t.status === "imported" &&
                   rule.imported_files > 0 &&
-                  rule.imported_files !== stats.imported &&
-                  `（${rule.imported_files} 个文件）`}
+                  stats.imported > rule.imported_works &&
+                  `（${stats.imported} 个条目 · ${rule.imported_files} 个文件）`}
               </span>
             </button>
           ))}
