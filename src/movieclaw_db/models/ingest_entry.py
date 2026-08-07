@@ -68,6 +68,20 @@ class IngestEntry(TimestampMixin, table=True):
         description="处理结论（中文，含跳过/失败原因）",
     )
     imported_count: int = Field(default=0, description="本条目累计入库的文件数")
+    media_item_id: int | None = Field(
+        default=None,
+        sa_column=Column(
+            Integer,
+            ForeignKey("media_item.id", ondelete="SET NULL"),
+            nullable=True,
+            index=True,
+        ),
+        description=(
+            "本条目识别/认领到的作品；NULL=尚未定身份（待处理、非影视跳过等）。"
+            "一部剧的多个版本（不同发布组、DV/HDR 各一个种子）是多个条目但同一"
+            "作品，摘要行的「已入库」按这一列去重才是用户认知的「几部作品」"
+        ),
+    )
     attempted_at: datetime = Field(
         default_factory=utcnow, description="最近一次处理时间（failed 的退避重试依据）"
     )

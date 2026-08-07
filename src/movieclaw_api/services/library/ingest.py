@@ -617,10 +617,21 @@ async def _ingest_entry(
     # 文件是"过客"（外部流转后由库根扫描收尾），不写库台账、不生成资产
     staging = rule.target_path
     dest_library: Library | None = library
+    # 与 dest_library 同理：conclude 读的是当下的 item——定出身份前失败/跳过的
+    # 条目落账无作品归属，摘要行的作品去重自然不会把它算进任何一部
+    item: MediaItem | None = None
 
     async def conclude(status: IngestStatus, message: str, imported: int = 0) -> None:
         await _save_record(
-            session, dest_library, str(entry), snap.fingerprint, record, status, message, imported
+            session,
+            dest_library,
+            str(entry),
+            snap.fingerprint,
+            record,
+            status,
+            message,
+            imported,
+            item,
         )
 
     if snap.has_disc:
@@ -1040,11 +1051,13 @@ async def _save_record(
     status: IngestStatus,
     message: str,
     imported: int,
+    item: MediaItem | None = None,
 ) -> None:
     now = utcnow()
     if record is None:
         record = IngestEntry(
             library_id=library.id if library is not None else None,
+            media_item_id=item.id if item is not None else None,
             entry_path=entry_path,
             fingerprint=fingerprint,
             status=status,
@@ -1062,6 +1075,9 @@ async def _save_record(
         record.updated_at = now
         if library is not None:
             record.library_id = library.id  # auto 条目此前失败无归属，路由成功后补上
+        if item is not None:
+            # 同理：识别不出而挂起的条目后来认领成功，这里补上身份
+            record.media_item_id = item.id
     await session.commit()
     _stability.pop(entry_path, None)
     _deferred.pop(entry_path, None)
@@ -1099,18 +1115,27 @@ class LedgerStats(NamedTuple):
     """状态 → 条目数（imported/pending/failed/skipped/ignored）。"""
     imported_files: int
     """已入库条目累计入库的文件数。"""
+    imported_works: int
+    """已入库条目覆盖的作品数（按 media_item_id 去重，同剧多版本算一部）。"""
 
 
 async def entry_stats(session, rules: list[ImportWatch]) -> dict[int, LedgerStats]:
-    """各规则的台账汇总：状态 → 条目数，外加已入库的文件总数。
+    """各规则的台账汇总：状态 → 条目数，外加已入库的作品数与文件数。
 
-    条目 = 源目录顶层项（一次下载任务的产物），剧集的一个条目往往是整个
-    季包。只报条目数时「已入库 5」会被读成"入库了 5 集/5 部"，配上文件数
-    才说得清实际入库规模（电影通常一条目一文件，两数相同时前端不重复展示）。
+    条目 = 源目录顶层项（一次下载任务的产物），这是台账的记账单位，但不是
+    用户认知的单位：一部剧的 S01、S02，以及同一季的多个版本（不同发布组、
+    DV 与 HDR 各一个种子）都是独立条目，却同属一部作品。因此「已入库」报
+    作品数（media_item_id 去重）——用户问"入库了几部剧"要的就是这个数；
+    条目数与它不同时，前端补注文件数说清实际规模。
     """
     rows = (
         await session.execute(
-            select(IngestEntry.entry_path, IngestEntry.status, IngestEntry.imported_count)
+            select(
+                IngestEntry.entry_path,
+                IngestEntry.status,
+                IngestEntry.imported_count,
+                IngestEntry.media_item_id,
+            )
         )
     ).all()
     stats: dict[int, LedgerStats] = {}
@@ -1118,13 +1143,25 @@ async def entry_stats(session, rules: list[ImportWatch]) -> dict[int, LedgerStat
         assert rule.id is not None
         counts = {s.value: 0 for s in IngestStatus}
         imported_files = 0
-        for path, status, imported_count in rows:
+        works: set[int] = set()
+        # 老台账（本次升级前入库）没有身份，去重无从下手：这些条目按条目数
+        # 计入，宁可少合并也不能凭标题猜——回填见迁移脚本
+        legacy = 0
+        for path, status, imported_count, media_item_id in rows:
             if not _is_entry_of(path, rule.source_path) or status not in counts:
                 continue
             counts[status] += 1
             if status == IngestStatus.IMPORTED:
                 imported_files += imported_count or 0
-        stats[rule.id] = LedgerStats(counts=counts, imported_files=imported_files)
+                if media_item_id is None:
+                    legacy += 1
+                else:
+                    works.add(media_item_id)
+        stats[rule.id] = LedgerStats(
+            counts=counts,
+            imported_files=imported_files,
+            imported_works=len(works) + legacy,
+        )
     return stats
 
 

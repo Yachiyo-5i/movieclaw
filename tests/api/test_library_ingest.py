@@ -707,3 +707,46 @@ async def test_entry_stats_counts_entries_and_imported_files(db, tmp_path):
     assert ledger.imported_files == 10  # 8 + 2：嵌套行与 pending 行都不计
     assert stats[other_rule.id].counts["imported"] == 1
     assert stats[other_rule.id].imported_files == 1
+
+
+@pytest.mark.asyncio
+async def test_entry_stats_dedupes_works_across_seasons_and_versions(db, tmp_path):
+    """「已入库」报作品数：同一部剧的多季与多版本合并计一部。
+
+    真实场景（用户只入了 4 部剧却显示「已入库 11」）：一部剧的 S01/S02 各是
+    一个条目，同一季的不同发布组/DV/HDR 版本又各是一个条目——条目数远大于
+    作品数。按 media_item_id 去重后才是"入库了几部"。
+    没有 media_item_id 的老条目（迁移前入库、回填未命中）按条目各计一部，
+    宁可少合并也不凭标题猜。
+    """
+    watch = tmp_path / "watch"
+    async with db.session() as session:
+        rule = ImportWatch(source_path=str(watch), strategy="hardlink", kind="tv")
+        session.add(rule)
+        for name, item_id, files in (
+            ("剧A.S01.CHDWEB", 1, 8),  # 同一部剧：两季 + S02 三个版本
+            ("剧A.S02.MWeb.DV", 1, 6),
+            ("剧A.S02.MWeb.HDR", 1, 6),
+            ("剧A.S02.CMCTV.DV", 1, 6),
+            ("剧B.S01", 2, 10),
+            ("剧C.S01", None, 3),  # 老条目：未回填，单独计一部
+            ("认不出的", None, 0),  # pending 不计入作品数
+        ):
+            session.add(
+                IngestEntry(
+                    entry_path=str(watch / name),
+                    fingerprint=f"fp-{name}",
+                    status="imported" if files else "pending",
+                    imported_count=files,
+                    media_item_id=item_id,
+                )
+            )
+        await session.commit()
+        await session.refresh(rule)
+
+        stats = await ingest_mod.entry_stats(session, [rule])
+
+    ledger = stats[rule.id]
+    assert ledger.counts["imported"] == 6  # 条目数照旧
+    assert ledger.imported_works == 3  # 剧A + 剧B + 未回填的剧C
+    assert ledger.imported_files == 39

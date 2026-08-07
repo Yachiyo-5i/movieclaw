@@ -37,6 +37,8 @@ export interface ImportWatchRule {
   stats: Record<string, number>;
   /** 已入库条目累计入库的文件数（剧集一条目是一个季包，条目数说不清入了几集） */
   imported_files: number;
+  /** 已入库的作品数（同一部剧的多季、多版本合并为一部）——「已入库」展示这个数 */
+  imported_works: number;
   created_at: string;
 }
 
