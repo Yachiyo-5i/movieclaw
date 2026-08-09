@@ -5,7 +5,8 @@ NexusPHP 的 torrents.php 分页从 0 开始（``?page=0`` 是第一页）。应
 （搜索/同步都受影响）。
 
 本测试有两层保障：
-1. 配置层：确认 0 索引站点（chdbits / ssd）的 YAML 确实带上了 ``page_offset: -1``。
+1. 配置层：确认 0 索引站点（agsvpt / chdbits / ssd）的 YAML 确实带上了
+   ``page_offset: -1``。
 2. 行为层：用 Mock HttpClient 验证 ``search`` / ``list_torrents`` 真的把第 1 页发成 ``page=0``。
 """
 from __future__ import annotations
@@ -27,7 +28,7 @@ def _load_configs() -> None:
     load_all_sites()
 
 
-@pytest.mark.parametrize("site_id", ["chdbits", "ssd"])
+@pytest.mark.parametrize("site_id", ["agsvpt", "chdbits", "ssd"])
 def test_zero_indexed_sites_declare_offset(site_id: str) -> None:
     """0 索引站点的配置必须带 page_offset=-1（防止有人误删）。"""
     config = get_site_config(site_id)
