@@ -1249,14 +1249,19 @@ def _external_subtitle_stream(entry: dict, index: int) -> dict[str, Any]:
 
     DisplayTitle 照内封拼接规则加 " - External" 尾缀；language 解析不出时
     用 title 原文顶格（"简中&英文 - SUBRIP - External" 这类中文命名照样
-    可读）。SupportsExternalStream/IsTextSubtitleStream 恒 true——v1 只收
-    文本字幕（SUBTITLE_EXTS 已排除图形格式）。
+    可读），两者都有时 title 跟在语言后——AI 生成字幕（title="ai"，
+    subtitle-ai-translate.md §0）要靠 "Chinese - ai - …" 在播放器轨列表里
+    与人工字幕区分开。SupportsExternalStream/IsTextSubtitleStream 恒
+    true——v1 只收文本字幕（SUBTITLE_EXTS 已排除图形格式）。
     """
     lang = entry.get("language")
     fmt = str(entry.get("format") or "").lower()
     codec = _EXTERNAL_SUB_CODEC.get(fmt, fmt)
+    lang_display = _lang_display(lang)
+    title = entry.get("title")
     parts = [
-        _lang_display(lang) or entry.get("title") or "Und",
+        lang_display or title or "Und",
+        title if (lang_display and title) else None,
         "Default" if entry.get("default") else None,
         "Forced" if entry.get("forced") else None,
         codec.upper() if codec else None,

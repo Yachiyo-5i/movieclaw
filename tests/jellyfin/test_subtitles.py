@@ -48,12 +48,14 @@ def subtitle_env(seeded: dict, media_root: Path) -> dict:
                     )
                 )
             ).scalar_one()
+            # title=None：chs/default 两个 token 都被语言/旗标消费（与
+            # discover_external_subtitles 的真实产物一致）
             row.external_subtitles = [
                 {
                     "filename": SIDECAR_NAME,
                     "format": "srt",
                     "language": "chi",
-                    "title": "chs",
+                    "title": None,
                     "default": True,
                     "forced": False,
                     "sdh": False,
@@ -80,6 +82,23 @@ def _playback_info(sclient: TestClient, token: str, guid: str) -> dict:
     )
     assert resp.status_code == 200, resp.text
     return resp.json()
+
+
+def test_ai_subtitle_display_title_carries_marker() -> None:
+    """AI 生成字幕（title="ai"）在轨列表里可辨识（subtitle-ai-translate.md §0）。"""
+    from movieclaw_jellyfin.catalog import _external_subtitle_stream
+
+    stream = _external_subtitle_stream(
+        {"filename": "M.chs.ai.srt", "format": "srt", "language": "chi", "title": "ai"},
+        3,
+    )
+    assert stream["DisplayTitle"] == "Chinese - ai - SUBRIP - External"
+    # 语言解析不出时 title 顶格，不重复出现
+    stream = _external_subtitle_stream(
+        {"filename": "M.简中特效.srt", "format": "srt", "language": None, "title": "简中特效"},
+        3,
+    )
+    assert stream["DisplayTitle"] == "简中特效 - SUBRIP - External"
 
 
 def test_playback_info_external_subtitle_stream(sclient: TestClient, subtitle_env: dict) -> None:
