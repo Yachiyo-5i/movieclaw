@@ -42,8 +42,13 @@ async def claim_files(
     *,
     tmdb_id: int,
     explicit_unit: tuple[int | None, int | None] | None = None,
-) -> tuple[MediaItem, int]:
-    """把一组待识别文件认领到指定 TMDB 条目，返回 ``(条目, 认领数)``。
+) -> tuple[MediaItem, int, set[int]]:
+    """把一组文件认领到指定 TMDB 条目，返回 ``(条目, 认领数, 被腾空的旧条目 id)``。
+
+    认领不只服务"从未识别的文件"——条目详情页的「修正识别结果」把**已识别
+    但认错了**的文件改挂过来走的也是这里：两者要落的东西完全相同（人工
+    身份 + 纠正矛盾的 NFO + 库存对账），区别只在文件原来有没有锚。改挂会
+    让旧条目可能一个文件都不剩，第三个返回值就是给调用方做孤儿清理的。
 
     季集号来源（单个与整组的唯一差异）：
     - ``explicit_unit`` 给定（单个认领）：用调用方指定的季集号；电影不允许
@@ -74,6 +79,12 @@ async def claim_files(
     assert item.id is not None
     repo = LibraryFileRepository(session)
     movie = kind is MediaKind.MOVIE
+    # 改挂前挂着的其它条目：认领完可能一个文件都不剩，交调用方做孤儿清理
+    displaced = {
+        row.media_item_id
+        for row in rows
+        if row.media_item_id is not None and row.media_item_id != item.id
+    }
     for row in rows:
         assert row.id is not None
         if explicit_unit is not None:
@@ -94,7 +105,7 @@ async def claim_files(
     await asyncio.to_thread(_correct_conflicting_nfos, rows, kind, library, item)
     # 库存对账：认领让单元"在库"成立，关闭对应的订阅工单
     await close_fulfilled_wanted(session, item.id)
-    return item, len(rows)
+    return item, len(rows), displaced
 
 
 def _correct_conflicting_nfos(
@@ -136,8 +147,8 @@ def _correct_conflicting_nfos(
 
 async def resolve_review(
     session: AsyncSession, file_ids: list[int], *, accept: bool
-) -> tuple[int, str | None]:
-    """对复核清单里的文件拍板，返回 ``(处理数, 采纳条目标题)``。
+) -> tuple[int, str | None, set[int]]:
+    """对复核清单里的文件拍板，返回 ``(处理数, 采纳条目标题, 被腾空的旧条目 id)``。
 
     - ``accept=True``：改挂到建议条目；
     - ``accept=False``：维持现有身份。
@@ -149,10 +160,13 @@ async def resolve_review(
     if not pending:
         raise NotFoundException("这些文件没有待拍板的复核建议（可能已被处理）")
     accepted_items: set[int] = set()
+    displaced: set[int] = set()
     title: str | None = None
     for row in pending:
         suggestion = row.review_suggestion or {}
         if accept and suggestion.get("media_item_id"):
+            if row.media_item_id is not None and row.media_item_id != suggestion["media_item_id"]:
+                displaced.add(row.media_item_id)
             row.media_item_id = suggestion["media_item_id"]
             title = suggestion.get("title") or title
             accepted_items.add(suggestion["media_item_id"])
@@ -164,4 +178,4 @@ async def resolve_review(
     # 库存对账：改挂让新条目的单元"在库"成立，关闭对应的订阅工单
     for item_id in accepted_items:
         await close_fulfilled_wanted(session, item_id)
-    return len(pending), title
+    return len(pending), title, displaced

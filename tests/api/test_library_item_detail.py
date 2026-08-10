@@ -10,6 +10,8 @@ TMDB 为假实现。
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import httpx
 import pytest_asyncio
 from fastapi import BackgroundTasks
@@ -34,6 +36,7 @@ from movieclaw_api.services.media_probe import MediaSpec, _parse_probe
 from movieclaw_db.engine import dispose_db, get_database, init_db
 from movieclaw_db.migrations import run_migrations
 from movieclaw_db.models import LibraryFile, MediaItem
+from movieclaw_db.models.library_file import IdentitySource
 from movieclaw_db.repositories.library_repo import LibraryRepository
 
 _KEY = "0123456789abcdef0123456789abcdef"
@@ -1325,6 +1328,114 @@ async def test_reidentify_failure_moves_to_unidentified(db, tmp_path, monkeypatc
         row = (await session.execute(select(LibraryFile))).scalars().one()
         assert row.media_item_id is None
         assert row.unidentified_reason and "未能确认身份" in row.unidentified_reason
+
+
+# ---------------------------------------------------------------------------
+# 修正识别结果：预览只出结论、拍板才落库（issue #107）
+# ---------------------------------------------------------------------------
+
+
+async def _wrongly_anchored_movie(db, tmp_path) -> tuple[int, int, int]:
+    """造一个错挂现场：正确身份 tmdb=300 的电影被挂到一个无关条目上。
+
+    返回 ``(库 id, 错挂条目 id, 正确条目 id)``。
+    """
+    root, _entry, _video = _make_movie_entry(tmp_path)
+    async with db.session() as session:
+        library = await LibraryRepository(session).create(
+            name="电影库", kind="movie", root_paths=[str(root)]
+        )
+    await scan_library(library.id)
+    async with db.session() as session:
+        wrong = MediaItem(kind="movie", tmdb_id=555, title="张冠李戴", original_title="Wrong")
+        session.add(wrong)
+        await session.flush()
+        row = (await session.execute(select(LibraryFile))).scalars().one()
+        correct_id = row.media_item_id
+        row.media_item_id = wrong.id
+        await session.commit()
+        return library.id, wrong.id, correct_id
+
+
+async def test_reidentify_preview_gives_verdict_without_touching_ledger(db, tmp_path) -> None:
+    """第一阶段只出结论：预览跑完，错挂的行**仍然原样挂着错身份**。
+
+    这是这个面板成立的前提——识别错挂时机器往往是高置信地错，重跑大概率
+    复现同一个错答案，所以绝不能像旧的「重新识别」那样跑完直接改身份锚。
+    """
+    from movieclaw_api.api.routes.libraries import preview_reidentify_item
+
+    library_id, wrong_id, correct_id = await _wrongly_anchored_movie(db, tmp_path)
+
+    async with db.session() as session:
+        view = (await preview_reidentify_item(library_id, wrong_id, session)).data
+
+    assert view.current.media_item_id == wrong_id and view.current.title == "张冠李戴"
+    assert len(view.groups) == 1
+    group = view.groups[0]
+    assert group.file_count == 1 and group.sample_names
+    assert group.outcome.media_item_id == correct_id and group.outcome.tmdb_id == 300
+    assert group.outcome.same_as_current is False
+    # 身份由 NFO 钉死：面板要如实告知，否则用户改完不明白为何又被改回去
+    assert view.pinned_identity is True
+    # 台账零改动——这一条是本特性的硬约束
+    async with db.session() as session:
+        row = (await session.execute(select(LibraryFile))).scalars().one()
+        assert row.media_item_id == wrong_id
+
+
+async def test_reidentify_preview_then_claim_applies_and_clears_orphan(db, tmp_path) -> None:
+    """第二阶段：拍板走人工认领通道——身份转 manual，腾空的旧条目不留空壳。"""
+    from movieclaw_api.api.routes.libraries import claim_files_batch
+    from movieclaw_api.schemas.library import ClaimBatchPayload
+
+    library_id, wrong_id, _correct_id = await _wrongly_anchored_movie(db, tmp_path)
+
+    async with db.session() as session:
+        row = (await session.execute(select(LibraryFile))).scalars().one()
+        resp = await claim_files_batch(
+            ClaimBatchPayload(file_ids=[row.id], tmdb_id=300), BackgroundTasks(), session
+        )
+    assert resp.data["claimed"] == 1
+
+    async with db.session() as session:
+        row = (await session.execute(select(LibraryFile))).scalars().one()
+        assert row.media_item_id != wrong_id
+        item = await session.get(MediaItem, row.media_item_id)
+        assert item is not None and item.tmdb_id == 300
+        # 人工拍板过的身份，对账机制永不自动翻案
+        assert row.identity_source == IdentitySource.MANUAL
+        # 旧条目已被腾空，孤儿清理的名单里应当有它（后台任务，这里只验语义前提）
+        remaining = (
+            await session.execute(select(LibraryFile).where(LibraryFile.media_item_id == wrong_id))
+        ).scalars().all()
+        assert not remaining
+
+
+async def test_detach_marks_non_work_and_frees_the_slot(db, tmp_path) -> None:
+    """「这不是独立作品」：花絮被高置信错挂时的出口——摘掉身份锚 + 忽略。
+
+    只打忽略标记是不够的：``ignored_at`` 只让扫描不再过问，身份锚还在、
+    条目照旧出现在库存里。锚必须一起摘掉，磁盘则一个字节都不动。
+    """
+    from movieclaw_api.api.routes.libraries import detach_files, list_unidentified
+    from movieclaw_api.schemas.library import DetachPayload
+
+    library_id, wrong_id, _correct_id = await _wrongly_anchored_movie(db, tmp_path)
+
+    async with db.session() as session:
+        row = (await session.execute(select(LibraryFile))).scalars().one()
+        file_path = row.file_path
+        resp = await detach_files(DetachPayload(file_ids=[row.id]), BackgroundTasks(), session)
+    assert resp.data["detached"] == 1
+
+    async with db.session() as session:
+        row = (await session.execute(select(LibraryFile))).scalars().one()
+        assert row.media_item_id is None  # 不再占用库存
+        assert row.ignored_at is not None  # 扫描不再过问
+        # 不进待识别清单（用户已经表过态，别再来问一遍）
+        assert (await list_unidentified(library_id, session)).data == []
+    assert Path(file_path).is_file()  # 磁盘文件未受影响
 
 
 async def test_actor_thumb_missing_only_when_tmdb_has_no_profile(db, tmp_path) -> None:

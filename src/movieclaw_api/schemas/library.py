@@ -704,6 +704,64 @@ class ReviewResolvePayload(BaseModel):
     accept: bool = Field(description="true=采纳建议改挂新条目；false=维持现状")
 
 
+class ReidentifyOutcomeView(BaseModel):
+    """预览里一组文件的识别结论：命中某条目，或没命中（带原因与候选）。"""
+
+    media_item_id: int | None = None
+    tmdb_id: int | None = None
+    title: str | None = None
+    year: int | None = None
+    poster_url: str | None = None
+    source: str | None = Field(
+        default=None, description="身份来源：path_tag=目录名标记 / nfo / resolved=名称收敛"
+    )
+    same_as_current: bool = Field(default=False, description="结论与条目现有身份一致")
+    reason: str | None = Field(default=None, description="没命中时的中文原因")
+    code: str | None = Field(default=None, description="没命中时的失败分类")
+    candidates: list[UnidentifiedCandidateView] = Field(default_factory=list)
+
+
+class ReidentifyGroupView(BaseModel):
+    """预览的一组：识别结论相同的文件聚成一条，用户按组拍板。"""
+
+    key: str
+    outcome: ReidentifyOutcomeView
+    file_ids: list[int]
+    file_count: int
+    total_size_bytes: int
+    sample_names: list[str] = Field(default_factory=list, description="前几个文件名")
+
+
+class ReidentifyPreviewView(BaseModel):
+    """「修正识别结果」第一阶段：重跑识别链给出的结论，**尚未落库**。
+
+    用户在此拍板：采纳某组结论 / 自己搜一个条目 / 把这些文件标为非独立
+    作品；关掉面板则台账零改动。
+    """
+
+    current: ReviewItemView = Field(description="条目当前挂着的身份")
+    movie: bool = Field(description="本库是电影库（搜索与文案按类型走）")
+    groups: list[ReidentifyGroupView]
+    skipped_missing: int = Field(default=0, description="missing 文件数（无磁盘实体，不参与）")
+    pinned_identity: bool = Field(
+        default=False, description="身份被目录名 tmdbid 标记或 NFO 钉死——改了还会被扫描改回去"
+    )
+    unreachable: bool = Field(
+        default=False, description="有文件因 TMDB 不通而无结论，此刻不宜拍板"
+    )
+    search_seed: str = Field(default="", description="「自己搜」的预填词（解析出的片名）")
+
+
+class DetachPayload(BaseModel):
+    """「这不是独立作品」：摘掉身份锚并忽略，不动磁盘。
+
+    花絮/预告/片段被高置信错挂到别的影片时用它——用户要表达的不是"改挂
+    到条目 Y"，而是"它根本不该是个条目"。可在「已忽略」里恢复。
+    """
+
+    file_ids: list[int] = Field(min_length=1, description="要摘掉身份的台账行 id 数组")
+
+
 class MissingFileView(BaseModel):
     """缺失清单里的一个文件。"""
 

@@ -602,7 +602,9 @@ async def test_identity_review_lifecycle(db, tmp_path, monkeypatch) -> None:
 
         # ⑥ 采纳建议：改挂新条目并转人工
         await resolve_identity_review(
-            ReviewResolvePayload(file_ids=group.file_ids, accept=True), session
+            ReviewResolvePayload(file_ids=group.file_ids, accept=True),
+            BackgroundTasks(),
+            session,
         )
     async with db.session() as session:
         rows = list((await session.execute(select(LibraryFile))).scalars().all())
@@ -642,7 +644,9 @@ async def test_identity_review_reject_keeps_identity(db, tmp_path, monkeypatch) 
     async with db.session() as session:
         row = (await session.execute(select(LibraryFile))).scalars().one()
         await resolve_identity_review(
-            ReviewResolvePayload(file_ids=[row.id], accept=False), session
+            ReviewResolvePayload(file_ids=[row.id], accept=False),
+            BackgroundTasks(),
+            session,
         )
     async with db.session() as session:
         row = (await session.execute(select(LibraryFile))).scalars().one()
@@ -1724,7 +1728,7 @@ async def test_claim_rewrites_poisoned_nfo(db, tmp_path) -> None:
     await scan_library(library.id)  # 无实测时长，毒 NFO 此时仍会被采信
     async with db.session() as session:
         row = (await session.execute(select(LibraryFile))).scalars().one()
-        item, claimed = await claim_files(session, [row.id], tmdb_id=617126)
+        item, claimed, _displaced = await claim_files(session, [row.id], tmdb_id=617126)
         assert claimed == 1 and item.tmdb_id == 617126
 
     # 两份毒 NFO（同名 + 目录级）都被改写为认领身份
@@ -1767,6 +1771,65 @@ def test_guess_evidence_strips_bracket_tags_before_convention(tmp_path) -> None:
     evidence = scan_mod.guess_evidence(MediaKind.MOVIE, root, tail)
     assert evidence is not None
     assert evidence.title == "饥饿站台" and evidence.year == 2019
+
+
+# ---------------------------------------------------------------------------
+# 花絮/预告不再冒充影片（issue #107）
+# ---------------------------------------------------------------------------
+
+
+def test_movie_entry_dir_beats_file_name(tmp_path) -> None:
+    """issue #107：正片旁边的花絮按自己的文件名去搜 TMDB 会搜出别的影片。
+    「一个电影条目目录 = 一部片」，符合 Title (Year) 惯例的目录名压过文件名。"""
+    root = tmp_path / "movies"
+    bonus = root / "某电影 (2020)" / "神奇4侠 幕后制作特辑.mkv"
+    evidence = scan_mod.guess_evidence(MediaKind.MOVIE, root, bonus)
+    assert evidence is not None
+    assert evidence.title == "某电影" and evidence.year == 2020
+
+
+def test_movie_grouping_dir_does_not_hijack_file_name(tmp_path) -> None:
+    """反向保证：不符合惯例的分组目录（「电影/欧美/」这类）不参与压制，
+    照旧由文件名先说话——否则一个分类目录会把底下所有片子归成一部。"""
+    root = tmp_path / "movies"
+    file = root / "某电影" / "E.T.外星人 (1982).mkv"
+    evidence = scan_mod.guess_evidence(MediaKind.MOVIE, root, file)
+    assert evidence is not None
+    assert evidence.title == "E.T.外星人" and evidence.year == 1982
+
+
+async def test_extras_dirs_and_files_never_enter_ledger(db, tmp_path) -> None:
+    """花絮/预告不入库：Emby 惯例目录、``-trailer`` 文件名后缀、中文关键词
+    三条都要挡住。挡不住的下场是它们各自去搜 TMDB，搜出一堆莫名其妙的条目。"""
+    root = tmp_path / "media" / "movies"
+    entry = root / "某电影 (2020)"
+    (entry / "Featurettes").mkdir(parents=True)
+    (entry / "花絮").mkdir()
+    (entry / "某电影 (2020).mkv").write_bytes(b"main")  # 唯一该入库的
+    (entry / "Featurettes" / "making-of.mkv").write_bytes(b"x")
+    (entry / "花絮" / "01.mkv").write_bytes(b"x")
+    (entry / "某电影 (2020)-trailer.mkv").write_bytes(b"x")
+    (entry / "花絮片段 01.mkv").write_bytes(b"x")
+    async with db.session() as session:
+        library = await LibraryRepository(session).create(
+            name="电影库", kind="movie", root_paths=[str(root)]
+        )
+
+    summary = await scan_library(library.id)
+    assert summary.scanned == 1 and summary.identified == 1
+
+    async with db.session() as session:
+        rows = list((await session.execute(select(LibraryFile))).scalars().all())
+    assert [Path(r.file_path).name for r in rows] == ["某电影 (2020).mkv"]
+
+
+def test_extras_marker_does_not_touch_titles_containing_keywords() -> None:
+    """后缀惯例只认后缀：《Trailer Park Boys》这类片名自带关键词的正片
+    不能被当成花絮丢掉（漏挡可以补，错杀无从发现）。"""
+    assert scan_mod.extras_marker("Trailer Park Boys S01E01.mkv") is None
+    assert scan_mod.extras_marker("某电影 (2020) - 2160p.mkv") is None
+    assert scan_mod.extras_marker("某电影 (2020)-trailer.mkv") == "-trailer"
+    assert scan_mod.extras_marker("幕后花絮 01.mkv") == "花絮"
 
 
 def test_unit_for_trailing_index_episode(tmp_path) -> None:
