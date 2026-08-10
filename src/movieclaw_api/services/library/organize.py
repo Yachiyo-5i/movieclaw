@@ -11,10 +11,11 @@
 - **预览与执行分离**：``build_organize_plan`` 是纯计算（只读磁盘不写），
   预览接口直接返回完整清单；执行时**重新计算**计划——预览到确认之间
   磁盘可能已变化，执行永远以最新状态为准；
-- **防覆盖改名**：同文件系统内用 ``os.link + os.unlink`` 代替 ``os.rename``
-  ——link 遇到目标已存在会原子失败（EEXIST），不会像 rename 那样静默
-  覆盖（与入库管线并发写入同一规范名时的兜底）；不支持硬链的文件系统
-  退回"先查存在再 rename"；
+- **防覆盖改名**：``os.rename`` 会静默覆盖已存在的目标，这里用
+  ``fsops.rename_no_replace``（renameat2 RENAME_NOREPLACE）——目标已存在
+  会原子失败（EEXIST），堵死与入库管线并发写入同一规范名的覆盖窗口；
+  且 rename 会被极空间等 FUSE 存储的索引感知（旧实现的 os.link 不会，
+  改名后文件会从极影视里消失，见 fsops 模块头）；
 - **逐文件收口**：每改名成功一个立即随迁台账（repo.relocate），中途失败
   不会留下"账实不符"的批量烂摊子，单文件失败记入 errors 不断整轮；
 - **只清理自己搬空的目录**：改名后仅对被搬走文件的原目录（及其空祖先）
@@ -45,13 +46,13 @@ from __future__ import annotations
 import asyncio
 import errno
 import logging
-import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from sqlmodel import select
 
 from movieclaw_api.services.library.config import sanitize_folder_name
+from movieclaw_api.services.library.fsops import rename_no_replace
 from movieclaw_api.services.library.layout import SCAN_VIDEO_EXTS, entry_base_name
 from movieclaw_api.services.task_state import TaskState
 from movieclaw_db.engine import get_database
@@ -440,10 +441,9 @@ async def _organize(library_id: int, summary: OrganizeSummary) -> OrganizeSummar
 def _move_no_clobber(src: Path, dst: Path) -> None:
     """同文件系统内的防覆盖改名（线程池内运行）。
 
-    ``os.rename`` 会静默覆盖已存在的目标，这里用 ``os.link + os.unlink``：
-    link 遇到目标已存在会原子失败（EEXIST），杜绝"计划检查后、执行前恰有
-    同名文件落地（如入库管线并发硬链）"的覆盖窗口。不支持硬链的文件系统
-    （极少数网络挂载）退回"先查存在再 rename"。
+    ``fsops.rename_no_replace`` 一步到位：目标已存在会原子失败（EEXIST），
+    杜绝"计划检查后、执行前恰有同名文件落地（如入库管线并发落位）"的
+    覆盖窗口；rename 同时保证极空间等 FUSE 存储的索引能跟上改名。
     """
     if not src.exists():
         raise _MoveError(f"源文件已不在原位，跳过：{src}")
@@ -452,22 +452,13 @@ def _move_no_clobber(src: Path, dst: Path) -> None:
     except OSError as exc:
         raise _MoveError(f"创建目标目录失败（{exc.strerror}）：{dst.parent}") from exc
     try:
-        os.link(src, dst)
+        rename_no_replace(src, dst)
+    except FileExistsError as exc:
+        raise _MoveError(f"目标路径已被占用，跳过以免覆盖：{dst}") from exc
     except OSError as exc:
-        if exc.errno == errno.EEXIST:
-            raise _MoveError(f"目标路径已被占用，跳过以免覆盖：{dst}") from exc
         if exc.errno == errno.EXDEV:
             raise _MoveError(f"目标与源不在同一文件系统，无法改名归位：{src} → {dst}") from exc
-        if exc.errno in (errno.EPERM, errno.ENOTSUP):
-            if dst.exists():
-                raise _MoveError(f"目标路径已被占用，跳过以免覆盖：{dst}") from exc
-            try:
-                os.rename(src, dst)
-            except OSError as exc2:
-                raise _MoveError(f"改名失败（{exc2.strerror}）：{src} → {dst}") from exc2
-            return
         raise _MoveError(f"改名失败（{exc.strerror}）：{src} → {dst}") from exc
-    os.unlink(src)
 
 
 def _prune_emptied_dirs(dirty_parents: set[Path], roots: list[str]) -> int:
