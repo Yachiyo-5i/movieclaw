@@ -106,6 +106,7 @@ async def search_media(
         description="是否记录搜索历史并留存结果快照（统一搜索入口传 True；"
         "发现页工具栏等场景默认不记录）",
     ),
+    principal: Principal = Depends(require_login),
     session: AsyncSession = Depends(get_session),
 ) -> ApiResponse[list[MediaSearchItem]]:
     """搜索指定元数据来源：豆瓣移动端轻量搜索 / TMDB multi 搜索。
@@ -124,7 +125,8 @@ async def search_media(
     except (TmdbError, DoubanError) as exc:
         raise _translate(exc) from exc
     if history and source is DiscoverSource.DOUBAN:
-        await _record_media_history(session, q, results)
+        member_id = principal.member_id if principal.member_id is not None else 0
+        await _record_media_history(session, q, results, member_id=member_id)
     return ok(results)
 
 
@@ -171,7 +173,10 @@ async def get_douban_media_detail(
 
 
 async def _record_media_history(
-    session: AsyncSession, keyword: str, results: list[MediaSearchItem]
+    session: AsyncSession,
+    keyword: str,
+    results: list[MediaSearchItem],
+    member_id: int = 0,
 ) -> None:
     """媒体搜索落历史 + 回写结果快照。辅助功能：任何失败只记日志。
 
@@ -180,7 +185,7 @@ async def _record_media_history(
     """
     try:
         repo = SearchHistoryRepository(session)
-        history_id = await repo.record(keyword, vertical="media")
+        history_id = await repo.record(keyword, vertical="media", member_id=member_id)
         if history_id is None:
             return
         payload = json.dumps(

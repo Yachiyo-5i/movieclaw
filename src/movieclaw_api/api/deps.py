@@ -98,3 +98,18 @@ async def require_subscribe_capability(
     if principal.member is None or not principal.member.allow_subscribe:
         raise ForbiddenException("管理员未对你开放订阅功能，请联系管理员开启")
     return principal
+
+
+async def require_direct_download_capability(
+    principal: Principal = Depends(require_login),
+) -> Principal:
+    """一键下载能力依赖：管理员直通；成员须开启 ``allow_direct_download``。
+
+    成员版一键下载还会在服务端强制自动路由（拒绝手选 save_path），
+    见 routes/downloaders.py 的 submit 处理器。
+    """
+    if principal.is_admin:
+        return principal
+    if principal.member is None or not principal.member.allow_direct_download:
+        raise ForbiddenException("管理员未对你开放一键下载，请联系管理员开启")
+    return principal

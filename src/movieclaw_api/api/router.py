@@ -19,7 +19,12 @@
 
 from fastapi import APIRouter, Depends
 
-from movieclaw_api.api.deps import require_admin, require_login, require_search_capability
+from movieclaw_api.api.deps import (
+    require_admin,
+    require_direct_download_capability,
+    require_login,
+    require_search_capability,
+)
 from movieclaw_api.api.routes.agent import router as agent_router
 from movieclaw_api.api.routes.app_config import router as app_config_router
 from movieclaw_api.api.routes.app_update import router as app_update_router
@@ -29,6 +34,7 @@ from movieclaw_api.api.routes.channels import router as channels_router
 from movieclaw_api.api.routes.channels_im import router as channels_im_router
 from movieclaw_api.api.routes.discover import router as discover_router
 from movieclaw_api.api.routes.downloaders import router as downloaders_router
+from movieclaw_api.api.routes.downloaders import submit_router as download_submit_router
 from movieclaw_api.api.routes.extension import router as extension_router
 from movieclaw_api.api.routes.fs import router as fs_router
 from movieclaw_api.api.routes.health import router as health_router
@@ -74,8 +80,14 @@ _MEMBER_ROUTERS = [
 for _router in _MEMBER_ROUTERS:
     api_router.include_router(_router, dependencies=[Depends(require_login)])
 
-# 搜索是成员区里唯一按能力开关放行的整组：管理员直通，成员须 allow_search
+# 搜索按能力开关放行整组：管理员直通，成员须 allow_search
 api_router.include_router(search_router, dependencies=[Depends(require_search_capability)])
+
+# 一键下载：从下载器配置面单独拆出，按 allow_direct_download 放行成员；
+# 成员版在处理器内强制自动路由（拒绝手选目录/指定下载器，不回显路径）
+api_router.include_router(
+    download_submit_router, dependencies=[Depends(require_direct_download_capability)]
+)
 
 # ---- 管理区（挂载时统一注入管理员鉴权，成员访问一律 403）------------------
 # 共同特征：持有凭据（站点/下载器/LLM）、等价服务器控制权（agent 有 bash、

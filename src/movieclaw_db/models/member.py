@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import Column, ForeignKey, Integer, UniqueConstraint
+from sqlalchemy import JSON, Column, ForeignKey, Integer, UniqueConstraint
 from sqlmodel import Field
 
 from movieclaw_db.models.base import TimestampMixin
@@ -46,6 +46,15 @@ class Member(TimestampMixin, table=True):
     # ---- 资源白名单模式开关（True=全部可见含未来新建；False=查关联表）----
     all_libraries: bool = Field(default=True, description="库可见性：是否不受白名单限制")
     all_sites: bool = Field(default=True, description="站点可用性：是否不受白名单限制")
+
+    # ---- 个人界面偏好（P2）----
+    # 整体覆盖式 JSON（结构同 ui.preferences 配置域）；None = 尚未设置，
+    # 读取时回退默认值。超管继续用全局配置域，成员各存各的。
+    ui_prefs: dict | None = Field(
+        default=None,
+        sa_column=Column(JSON, nullable=True),
+        description="成员的界面偏好；None=默认",
+    )
 
 
 class MemberLibraryAccess(TimestampMixin, table=True):

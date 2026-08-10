@@ -269,6 +269,54 @@ def test_subscribe_capability_gate(client: TestClient) -> None:
     assert denied.status_code == 403
 
 
+def test_direct_download_member_restrictions(client: TestClient) -> None:
+    """一键下载（P2）：默认成员 403；开了开关后手选目录/指定下载器仍被拒
+    （服务端强制自动路由），管理员不受影响。"""
+    admin_cookie, member_cookie, member_id = _setup_admin_and_member(client)
+    payload = {"site_id": "mteam", "download_url": "https://example.com/t.torrent"}
+
+    _use(client, member_cookie)
+    denied = client.post("/api/v1/downloaders/submit", json=payload)
+    assert denied.status_code == 403
+    assert "一键下载" in denied.json()["message"]
+
+    _use(client, admin_cookie)
+    client.put(f"{_MEMBERS}/{member_id}", json={"allow_direct_download": True})
+
+    _use(client, member_cookie)
+    picked_path = client.post(
+        "/api/v1/downloaders/submit", json={**payload, "save_path": "/data/hand-picked"}
+    )
+    assert picked_path.status_code == 403
+    assert "保存目录" in picked_path.json()["message"]
+    picked_downloader = client.post(
+        "/api/v1/downloaders/submit", json={**payload, "downloader_id": 1}
+    )
+    assert picked_downloader.status_code == 403
+    assert "下载器" in picked_downloader.json()["message"]
+
+
+def test_ui_preferences_isolated_per_member(client: TestClient) -> None:
+    """界面偏好（P2）：成员保存进自己的列，不覆盖超管的全局配置。"""
+    admin_cookie, member_cookie, _ = _setup_admin_and_member(client)
+
+    _use(client, admin_cookie)
+    admin_prefs = client.get("/api/v1/ui/preferences").json()["data"]
+
+    # 成员改自己的偏好（整体覆盖：在超管当前值上翻一个字段）
+    _use(client, member_cookie)
+    member_draft = dict(admin_prefs)
+    member_draft["sidebar"] = {**admin_prefs.get("sidebar", {}), "transparency": 0.33}
+    saved = client.put("/api/v1/ui/preferences", json=member_draft)
+    assert saved.status_code == 200
+    member_prefs = client.get("/api/v1/ui/preferences").json()["data"]
+    assert member_prefs["sidebar"]["transparency"] == 0.33
+
+    # 超管的全局配置不受影响
+    _use(client, admin_cookie)
+    assert client.get("/api/v1/ui/preferences").json()["data"] == admin_prefs
+
+
 def test_library_visibility_whitelist(client: TestClient) -> None:
     """库可见性（P1）：白名单成员的列表被过滤、白名单外的库 404、
     可见库的落盘路径对成员抹除。"""

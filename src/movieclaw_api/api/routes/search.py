@@ -7,6 +7,7 @@ from fastapi import APIRouter, Depends, Query
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from movieclaw_api.api.deps import require_admin, require_login
 from movieclaw_api.exceptions import BadRequestException, NotFoundException
 from movieclaw_api.schemas.response import ApiResponse, ok
 from movieclaw_api.schemas.search import (
@@ -24,11 +25,13 @@ from movieclaw_api.schemas.search import (
     SiteStreamResult,
     TorrentHit,
 )
+from movieclaw_api.services.auth import Principal
 from movieclaw_api.services.site_catalog import SiteCatalogService
 from movieclaw_api.services.site_search import (
     search_all_sites,
     stream_search_all_sites,
 )
+from movieclaw_api.services.site_visibility import usable_site_ids
 from movieclaw_api.settings.schemas import (
     MAX_SEARCH_PRESETS,
     SearchCategoryTab,
@@ -44,6 +47,11 @@ from movieclaw_tracker.models import TorrentCategory
 logger = logging.getLogger("movieclaw_api.search")
 
 router = APIRouter(prefix="/search", tags=["search"])
+
+
+def _history_owner(principal: Principal) -> int:
+    """搜索历史的归属 id：成员用自己的 id，超管/PAT/Agent 共用哨兵 0。"""
+    return principal.member_id if principal.member_id is not None else 0
 
 
 @router.get(
@@ -69,19 +77,33 @@ async def search_torrents(
         description="发起搜索时的图览模式偏好，仅随历史留存，用于点历史重搜/看快照时还原展示模式",
     ),
     page: int = Query(1, ge=1, description="页码（各站点独立分页）"),
+    principal: Principal = Depends(require_login),
     session: AsyncSession = Depends(get_session),
 ) -> ApiResponse[SearchResponse]:
     """对「已启用且验证通过」的站点（可用 ``sites`` 圈定子集）并发发起搜索，合并结果后返回。
 
     单个站点失败（认证过期 / 网络异常等）不影响整体：其结果为空，并在
     ``data.sites[].error`` 里给出可读原因，供前端提示。
+    成员的搜索面被其可用站点白名单进一步收窄（服务端强制，勾选绕不过）。
     """
     result = await search_all_sites(
-        keyword=keyword, categories=categories, site_ids=sites, label=label, page=page
+        keyword=keyword,
+        categories=categories,
+        site_ids=sites,
+        label=label,
+        page=page,
+        allowed_site_ids=await usable_site_ids(session, principal),
     )
     if not no_history:
         history_id = await _record_history(
-            session, keyword, categories, sites, label, page, poster_mode
+            session,
+            keyword,
+            categories,
+            sites,
+            label,
+            page,
+            poster_mode,
+            member_id=_history_owner(principal),
         )
         if history_id is not None:
             await _save_snapshot(history_id, result.items, result.sites, result.total)
@@ -96,6 +118,7 @@ async def _record_history(
     label: str | None,
     page: int,
     poster_mode: bool = False,
+    member_id: int = 0,
 ) -> int | None:
     """只在第 1 页记录搜索历史：翻页是同一次搜索的延续，不该重复计数。
 
@@ -112,6 +135,7 @@ async def _record_history(
             categories=[c.value for c in categories] if categories else None,
             site_ids=sites,
             poster_mode=poster_mode,
+            member_id=member_id,
         )
     except Exception:  # noqa: BLE001 —— 历史写入失败不能拖垮搜索本身
         logger.warning("搜索历史写入失败（不影响本次搜索结果）", exc_info=True)
@@ -169,6 +193,7 @@ async def search_torrents_stream(
         description="发起搜索时的图览模式偏好，仅随历史留存，用于点历史重搜/看快照时还原展示模式",
     ),
     page: int = Query(1, ge=1, description="页码（各站点独立分页）"),
+    principal: Principal = Depends(require_login),
     session: AsyncSession = Depends(get_session),
 ) -> StreamingResponse:
     """``/search`` 的流式版本：以 Server-Sent Events 逐事件推送搜索过程与结果。
@@ -178,11 +203,20 @@ async def search_torrents_stream(
     schemas.search 的流式事件段；错误隔离口径与阻塞版一致（单站失败仅产生
     ``site_error`` 事件，不中断整个流）。
     """
-    # 历史在流开始前落库：流式响应返回后请求级 session 的生命周期不再可靠
+    # 历史在流开始前落库：流式响应返回后请求级 session 的生命周期不再可靠；
+    # 站点白名单同理（流式生成器运行时请求级 session 已不可用）
+    allowed = await usable_site_ids(session, principal)
     history_id: int | None = None
     if not no_history:
         history_id = await _record_history(
-            session, keyword, categories, sites, label, page, poster_mode
+            session,
+            keyword,
+            categories,
+            sites,
+            label,
+            page,
+            poster_mode,
+            member_id=_history_owner(principal),
         )
 
     async def event_source():
@@ -191,7 +225,12 @@ async def search_torrents_stream(
         collected: list[TorrentHit] = []
         done: SearchStreamDone | None = None
         async for event, payload in stream_search_all_sites(
-            keyword=keyword, categories=categories, site_ids=sites, label=label, page=page
+            keyword=keyword,
+            categories=categories,
+            site_ids=sites,
+            label=label,
+            page=page,
+            allowed_site_ids=allowed,
         ):
             if isinstance(payload, SiteStreamResult):
                 collected.extend(payload.items)
@@ -284,6 +323,9 @@ async def get_preferences() -> ApiResponse[SearchPreferencesView]:
     response_model=ApiResponse[SearchPreferencesView],
     summary="保存搜索偏好（标签栏：内置分类 + 自定义分类）",
     operation_id="search.prefs.update",
+    # 标签栏是全局共享配置（唯一编辑入口在管理员的「资源站点」设置页），
+    # 成员可读不可写——写开放给成员会互相覆盖
+    dependencies=[Depends(require_admin)],
 )
 async def update_preferences(
     payload: SearchPreferencesUpdate,
@@ -323,10 +365,13 @@ async def update_preferences(
 )
 async def list_search_history(
     limit: int = Query(10, ge=1, le=50, description="返回关键词组数上限"),
+    principal: Principal = Depends(require_login),
     session: AsyncSession = Depends(get_session),
 ) -> ApiResponse[list[SearchHistoryItem]]:
-    """返回最近的关键词组；组内保留媒体及各资源分类的独立记录与快照。"""
-    rows = await SearchHistoryRepository(session).list_recent_groups(limit)
+    """返回**本人**最近的关键词组；组内保留媒体及各资源分类的独立记录与快照。"""
+    rows = await SearchHistoryRepository(session).list_recent_groups(
+        limit, member_id=_history_owner(principal)
+    )
     return ok([SearchHistoryItem.from_model(r) for r in rows])
 
 
@@ -338,6 +383,7 @@ async def list_search_history(
 )
 async def get_search_snapshot(
     history_id: int,
+    principal: Principal = Depends(require_login),
     session: AsyncSession = Depends(get_session),
 ) -> ApiResponse[SearchSnapshotView]:
     """返回该历史行最近一次搜索的完整结果快照（items/sites/total + 快照时间）。
@@ -348,7 +394,7 @@ async def get_search_snapshot(
     """
     repo = SearchHistoryRepository(session)
     row = await repo.get_by_id(history_id)
-    if row is None:
+    if row is None or row.member_id != _history_owner(principal):
         raise NotFoundException("该搜索历史不存在或已被删除")
     if row.vertical != "torrent":
         raise NotFoundException("该历史是影视搜索，请改用 media-snapshot 接口读取快照")
@@ -381,6 +427,7 @@ async def get_search_snapshot(
 )
 async def get_media_search_snapshot(
     history_id: int,
+    principal: Principal = Depends(require_login),
     session: AsyncSession = Depends(get_session),
 ) -> ApiResponse[MediaSearchSnapshotView]:
     """返回该媒体搜索历史（vertical=media）最近一次的豆瓣条目快照。
@@ -390,7 +437,7 @@ async def get_media_search_snapshot(
     回退为直接发起实时搜索。
     """
     row = await SearchHistoryRepository(session).get_by_id(history_id)
-    if row is None:
+    if row is None or row.member_id != _history_owner(principal):
         raise NotFoundException("该搜索历史不存在或已被删除")
     if row.vertical != "media":
         raise NotFoundException("该历史是站点资源搜索，请改用 snapshot 接口读取快照")
@@ -418,9 +465,12 @@ async def get_media_search_snapshot(
 )
 async def delete_search_history(
     history_id: int,
+    principal: Principal = Depends(require_login),
     session: AsyncSession = Depends(get_session),
 ) -> ApiResponse[None]:
-    deleted = await SearchHistoryRepository(session).delete_by_id(history_id)
+    deleted = await SearchHistoryRepository(session).delete_by_id(
+        history_id, member_id=_history_owner(principal)
+    )
     if not deleted:
         raise NotFoundException("该搜索历史不存在或已被删除")
     return ok(None, message="已删除")
@@ -434,7 +484,10 @@ async def delete_search_history(
     openapi_extra={"x-cli-dangerous": "confirm"},
 )
 async def clear_search_history(
+    principal: Principal = Depends(require_login),
     session: AsyncSession = Depends(get_session),
 ) -> ApiResponse[None]:
-    count = await SearchHistoryRepository(session).clear()
+    count = await SearchHistoryRepository(session).clear(
+        member_id=_history_owner(principal)
+    )
     return ok(None, message=f"已清空 {count} 条搜索历史")

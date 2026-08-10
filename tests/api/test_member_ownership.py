@@ -208,6 +208,53 @@ async def test_member_deletion_transfers_subscription_to_admin(db) -> None:
 
 
 @pytest.mark.asyncio
+async def test_search_history_isolated_per_member(db) -> None:
+    """搜索历史（P2）：各人只看/只删自己的；越权删除按不存在处理。"""
+    from movieclaw_db.repositories.search_history_repo import SearchHistoryRepository
+
+    async with db.session() as session:
+        repo = SearchHistoryRepository(session)
+        admin_row = await repo.record("沙丘", member_id=0)
+        member_row = await repo.record("沙丘", member_id=7)
+        assert admin_row != member_row  # 同关键词各归各的行，互不去重
+
+        assert [r.id for r in await repo.list_recent_groups(member_id=0)] == [admin_row]
+        assert [r.id for r in await repo.list_recent_groups(member_id=7)] == [member_row]
+
+        # 成员删不到别人的行（按不存在处理），删自己的成功
+        assert await repo.delete_by_id(admin_row, member_id=7) is False
+        assert await repo.delete_by_id(member_row, member_id=7) is True
+        # 清空只清本人：超管的行还在
+        assert await repo.clear(member_id=7) == 0
+        assert [r.id for r in await repo.list_recent_groups(member_id=0)] == [admin_row]
+
+
+@pytest.mark.asyncio
+async def test_usable_site_ids_semantics(db) -> None:
+    """站点白名单判定（P2）：None=不受限；白名单成员返回集合。"""
+    from movieclaw_api.services.auth import Principal
+    from movieclaw_api.services.site_visibility import usable_site_ids
+
+    async with db.session() as session:
+        repo = MemberRepository(session)
+        member_id = await _create_member(session, "dave")
+        member = await repo.get(member_id)
+
+        admin = Principal(kind="admin", name="admin")
+        assert await usable_site_ids(session, admin) is None
+
+        principal = Principal(
+            kind="member", name="dave", member_id=member_id, is_admin=False, member=member
+        )
+        assert await usable_site_ids(session, principal) is None  # all_sites 默认
+
+        member.all_sites = False
+        await repo.save(member)
+        await repo.set_site_access(member_id, ["mteam"])
+        assert await usable_site_ids(session, principal) == {"mteam"}
+
+
+@pytest.mark.asyncio
 async def test_member_visible_ids_semantics(db) -> None:
     """None=不受限（超管 / all_libraries 成员）；白名单成员返回集合；
     成员行不存在（凭据竞态）按空集合处理。"""
