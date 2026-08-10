@@ -37,8 +37,13 @@ description: 发布 movieclaw 新版本。当用户要求发版、发布新版�
    无需在本地重跑全量测试——本地跑 pytest 还需先下载 NER 模型，且沙箱
    代理环境会造成与代码无关的误报
 3. git tag vX.Y.Z && git push origin vX.Y.Z
-   （推不了 tag 的环境——如远程会话：到 Actions → release 手动 Run workflow，
-   输入 tag，工作流会在 main HEAD 上一并创建 tag）
+   （推不了 tag 的环境——如远程会话，git 凭证只能推分支、也没有
+   workflow_dispatch 的 API 权限，两条正门都够不着。走点火通道：
+   `git push origin main:refs/heads/release-kick/vX.Y.Z`，
+   release-kick.yml 会校验 tag 与 main 的 pyproject 版本一致后，
+   以 GITHUB_TOKEN 代为触发 release.yml（在 main HEAD 上创建 tag），
+   并自动删除点火分支。人工兜底：到 Actions → release 手动
+   Run workflow 输入 tag）
 4. release.yml 自动构建并上传 Release assets：
    app-web.tar.gz / app-backend.tar.gz / manifest.json（可选 manifest.json.sig）；
    产物上传成功后自动发布多架构 Docker 镜像到 Docker Hub
