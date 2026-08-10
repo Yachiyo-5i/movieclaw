@@ -74,6 +74,7 @@ lib default set
 lib delete
 lib files claim
 lib files claim-batch
+lib files detach
 lib files ignore
 lib files restore
 lib files thumb
@@ -89,6 +90,7 @@ lib items index
 lib items list
 lib items refresh
 lib items reidentify
+lib items reidentify preview
 lib items show
 lib items transfer
 lib items transfer preview

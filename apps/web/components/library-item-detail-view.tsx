@@ -21,6 +21,7 @@ import {
 } from "@/components/icons";
 import { Modal } from "@/components/modal";
 import { PosterImage } from "@/components/poster-image";
+import { ReidentifyDialog } from "@/components/reidentify-dialog";
 import { Tooltip } from "@/components/tooltip";
 import {
   type AudioStream,
@@ -29,7 +30,6 @@ import {
   type LibraryItemDetail,
   type LibraryItemFile,
   type MediaLibrary,
-  type ReidentifyResult,
   type SeasonEpisodes,
   type SubtitleStream,
   type TransferPreview,
@@ -43,7 +43,6 @@ import {
   listLibraries,
   previewItemTransfer,
   refreshItemMetadata,
-  reidentifyLibraryItem,
   transferLibraryItem,
 } from "@/lib/api/libraries";
 import { useBackdrop } from "@/lib/backdrop";
@@ -85,10 +84,14 @@ export function LibraryItemDetailView({
   const [detail, setDetail] = useState<LibraryItemDetail | null>(null);
   const [library, setLibrary] = useState<MediaLibrary | null>(null);
   const [failed, setFailed] = useState(false);
-  // 重新识别：进行中 / 结论横幅（含"查看新条目"等后续动作）
-  const [reidentifying, setReidentifying] = useState(false);
-  const [reidentifyResult, setReidentifyResult] = useState<ReidentifyResult | null>(null);
-  const [reidentifyError, setReidentifyError] = useState<string | null>(null);
+  // 「修正识别结果」弹窗：重走识别链出结论 → 用户拍板 → 才落库。
+  // 拍板后不立刻重拉详情——文件全改挂走时本页会 404 翻成兜底态、把弹窗
+  // 连同"✓ 已改挂为《X》"的回执一起卸掉，分裂成多组时更是没法接着处理
+  // 剩下的组。改成记一个脏标记，关窗时再刷新
+  const [reidentifyOpen, setReidentifyOpen] = useState(false);
+  const [reidentifyDirty, setReidentifyDirty] = useState(false);
+  // 元数据刷新的失败提示（原先与重识别共用一条横幅）
+  const [refreshError, setRefreshError] = useState<string | null>(null);
   // 元数据刷新：**进行中的状态以服务端 detail.scraping 为准**（离开页面、
   // 刷新浏览器、换设备打开都能接着看到）；这个本地态只覆盖"点击到接口
   // 返回"这一小段，避免按钮闪一下没反应
@@ -117,8 +120,7 @@ export function LibraryItemDetailView({
 
   useEffect(() => {
     setDetail(null);
-    setReidentifyResult(null);
-    setReidentifyError(null);
+    setRefreshError(null);
     reload();
   }, [reload]);
 
@@ -213,19 +215,6 @@ export function LibraryItemDetailView({
         { label: detail.title },
       ];
 
-  const runReidentify = async () => {
-    setReidentifying(true);
-    setReidentifyError(null);
-    setReidentifyResult(null);
-    try {
-      setReidentifyResult(await reidentifyLibraryItem(libraryId, mediaItemId));
-    } catch (err) {
-      setReidentifyError(err instanceof Error ? err.message : "重新识别失败，请稍后重试");
-    } finally {
-      setReidentifying(false);
-    }
-  };
-
   const runMetadataRefresh = async () => {
     setKicking(true);
     try {
@@ -238,7 +227,7 @@ export function LibraryItemDetailView({
       // 轮询也不会启动，用户会以为没点上
       setTimeout(reload, 1500);
     } catch (err) {
-      setReidentifyError(err instanceof Error ? err.message : "元数据刷新失败，请稍后重试");
+      setRefreshError(err instanceof Error ? err.message : "元数据刷新失败，请稍后重试");
     } finally {
       setKicking(false);
     }
@@ -261,10 +250,9 @@ export function LibraryItemDetailView({
         items={trail}
         actions={
           <ItemActionsMenu
-            reidentifying={reidentifying}
             scraping={scrapingNow}
             searchHref={`/search?q=${encodeURIComponent(detail.title)}` as Route}
-            onReidentify={runReidentify}
+            onReidentify={() => setReidentifyOpen(true)}
             onRefreshMetadata={runMetadataRefresh}
             onTransfer={() => setTransferOpen(true)}
             onDelete={() => setDeleteOpen(true)}
@@ -358,39 +346,10 @@ export function LibraryItemDetailView({
             </div>
           )}
 
-          {/* 重新识别的结论横幅：结果与后续动作当场给出 */}
-          {(reidentifyResult || reidentifyError) && (
-            <div className="mt-4 max-w-2xl rounded-xl border border-white/[0.1] bg-[rgba(14,16,22,0.6)] px-4 py-3 text-sub leading-6 text-white/85 backdrop-blur-md">
-              {reidentifyError ? (
-                <span className="text-[#ff9f9f]">{reidentifyError}</span>
-              ) : (
-                <>
-                  <span>{reidentifyResult!.message}</span>
-                  <span className="ml-3 inline-flex gap-3">
-                    {reidentifyResult!.changed && reidentifyResult!.new_media_item_id != null && (
-                      <button
-                        type="button"
-                        onClick={() =>
-                          router.replace(
-                            `/library/${libraryId}/item/${reidentifyResult!.new_media_item_id}` as Route,
-                          )
-                        }
-                        className="font-medium text-[var(--accent-2)] hover:underline"
-                      >
-                        查看新条目 →
-                      </button>
-                    )}
-                    {reidentifyResult!.unidentified > 0 && (
-                      <Link
-                        href={`/library/${libraryId}` as Route}
-                        className="font-medium text-[var(--accent-2)] hover:underline"
-                      >
-                        去待识别清单 →
-                      </Link>
-                    )}
-                  </span>
-                </>
-              )}
+          {/* 元数据刷新的失败提示（识别相关的结论都在「修正识别结果」弹窗里给） */}
+          {refreshError && (
+            <div className="mt-4 max-w-2xl rounded-xl border border-white/[0.1] bg-[rgba(14,16,22,0.6)] px-4 py-3 text-sub leading-6 text-[#ff9f9f] backdrop-blur-md">
+              {refreshError}
             </div>
           )}
         </div>
@@ -491,6 +450,22 @@ export function LibraryItemDetailView({
         }
       />
 
+      <ReidentifyDialog
+        open={reidentifyOpen}
+        libraryId={libraryId}
+        mediaItemId={mediaItemId}
+        onClose={() => {
+          setReidentifyOpen(false);
+          // 条目可能已经不在了（文件全改挂走 / 全标为非独立作品）：重拉
+          // 失败会落到本页的兜底态，引导用户回库存页
+          if (reidentifyDirty) {
+            setReidentifyDirty(false);
+            reload();
+          }
+        }}
+        onApplied={() => setReidentifyDirty(true)}
+      />
+
       <ArtworkPickerDialog
         open={artworkOpen}
         libraryId={libraryId}
@@ -503,18 +478,20 @@ export function LibraryItemDetailView({
 }
 
 /**
- * 条目操作 ⋯ 菜单：重新识别 / 刷新元数据 / 转移到其他库 / 删除影片。
+ * 条目操作 ⋯ 菜单：修正识别结果 / 刷新元数据 / 转移到其他库 / 删除影片。
  *
  * 这几个都是低频且不可逆（改身份锚、重下全套图、搬目录、删文件）的操作，
  * 摆成常驻大按钮既压着正文，又把「误点」的成本摊在最显眼的位置。收进顶栏
  * 右上角的 ⋯ 后，页面主区只剩内容；跑起来之后的状态仍由正文里的进度条
  * 完整交代（与媒体库页「操作进 ⋯、状态看正文」的分工一致）。
  *
- * 「转移到其他库」与「重新识别」是**两种不同的错**的补救，菜单里紧挨着摆：
- * 前者是"片子认对了、库放错了"（韩剧进了大陆剧库），后者是"片子认错了"。
+ * 「转移到其他库」与「修正识别结果」是**两种不同的错**的补救，菜单里紧挨着
+ * 摆：前者是"片子认对了、库放错了"（韩剧进了大陆剧库），后者是"片子认错了"。
+ *
+ * 「修正识别结果」带省略号是有意的——它开的是一个拍板面板（重跑识别链、
+ * 摆出结论让人选），不是点下去就改身份的一次性动作。
  */
 function ItemActionsMenu({
-  reidentifying,
   scraping,
   searchHref,
   onReidentify,
@@ -522,7 +499,6 @@ function ItemActionsMenu({
   onTransfer,
   onDelete,
 }: {
-  reidentifying: boolean;
   scraping: boolean;
   /** 站点资源搜索直达（预填片名）：手动补版本/换版本的入口 */
   searchHref: Route;
@@ -536,7 +512,7 @@ function ItemActionsMenu({
     "glass-row nav-item cursor-pointer px-3 py-2 text-ui font-medium outline-none " +
     "data-[highlighted]:!bg-[var(--glass-fill-hover)] data-[highlighted]:!text-[var(--text)] " +
     "data-[disabled]:pointer-events-none data-[disabled]:opacity-40";
-  const running = reidentifying || scraping;
+  const running = scraping;
 
   return (
     <DropdownMenu.Root>
@@ -567,12 +543,8 @@ function ItemActionsMenu({
             搜索资源
           </DropdownMenu.Item>
           <DropdownMenu.Separator className="my-1 h-px bg-white/[0.07]" />
-          <DropdownMenu.Item
-            onSelect={onReidentify}
-            disabled={reidentifying}
-            className={itemClass}
-          >
-            {reidentifying ? "正在重新识别…" : "重新识别"}
+          <DropdownMenu.Item onSelect={onReidentify} className={itemClass}>
+            修正识别结果…
           </DropdownMenu.Item>
           <DropdownMenu.Item
             onSelect={onRefreshMetadata}

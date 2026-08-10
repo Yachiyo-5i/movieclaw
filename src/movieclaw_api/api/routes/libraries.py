@@ -18,6 +18,7 @@ from movieclaw_api.schemas.library import (
     AudioStreamView,
     ClaimBatchPayload,
     ClaimPayload,
+    DetachPayload,
     EpisodeView,
     ItemDeleteResultView,
     LastOrganizeView,
@@ -43,6 +44,9 @@ from movieclaw_api.schemas.library import (
     OrganizeStartView,
     RedownloadPayload,
     RefreshActiveView,
+    ReidentifyGroupView,
+    ReidentifyOutcomeView,
+    ReidentifyPreviewView,
     ReidentifyResultView,
     RestorePayload,
     ReviewGroupView,
@@ -92,6 +96,7 @@ from movieclaw_api.services.library.scan import (
     busy_phase,
     is_scanning,
     last_scan,
+    preview_reidentify,
     reidentify_item,
     request_stop_scan,
     scan_library,
@@ -517,13 +522,17 @@ async def list_identity_review(
 )
 async def resolve_identity_review(
     payload: ReviewResolvePayload,
+    background_tasks: BackgroundTasks,
     session: AsyncSession = Depends(get_session),
 ) -> ApiResponse[dict]:
     """对复核清单里的文件拍板（实现见 services/library/claim.resolve_review）。"""
 
-    resolved, title = await library_claim.resolve_review(
+    resolved, title, displaced = await library_claim.resolve_review(
         session, payload.file_ids, accept=payload.accept
     )
+    # 改挂后旧条目可能一个文件都不剩，连同图片资产清掉，不在库里留空壳
+    if displaced:
+        background_tasks.add_task(media_scrape.cleanup_orphan_items, sorted(displaced))
     message = (
         f"{resolved} 个文件已改挂为《{title}》"
         if payload.accept and title
@@ -1493,6 +1502,77 @@ async def delete_library_file(
 
 
 @router.post(
+    "/{library_id}/items/{media_item_id}/reidentify/preview",
+    response_model=ApiResponse[ReidentifyPreviewView],
+    summary="修正识别结果（预览）：重走识别链只出结论，不改台账",
+    operation_id="lib.items.reidentify.preview",
+)
+async def preview_reidentify_item(
+    library_id: int,
+    media_item_id: int,
+    session: AsyncSession = Depends(get_session),
+) -> ApiResponse[ReidentifyPreviewView]:
+    """界面上「修正识别结果」的第一阶段：重跑识别链，把结论摆给用户看。
+
+    识别错挂时机器往往是**高置信地错**——同一条链重跑大概率复现同一个错
+    答案，所以这里只出结论、**一行台账都不改**，由用户拍板：采纳某组结论
+    （走 ``/files/claim-batch``）、自己搜一个条目、或标为非独立作品
+    （走 ``/files/detach``）。关掉面板则台账零改动。
+
+    只读，因此不占库级锁、扫描进行中也能开——结论过时了大不了拍板时
+    按那一刻的台账走。
+    """
+    library = await LibraryConfigService(session).get(library_id)
+    item, rows = await _item_rows(session, library_id, media_item_id)
+    preview = await preview_reidentify(session, library, media_item_id, rows)
+
+    base = get_settings().tmdb_image_base_url.rstrip("/")
+
+    def poster(path: str | None) -> str | None:
+        return f"{base}/w185{path}" if path else None
+
+    view = ReidentifyPreviewView(
+        current=ReviewItemView(
+            media_item_id=media_item_id,
+            tmdb_id=item.tmdb_id,
+            title=item.title,
+            year=item.year,
+            poster_url=poster(item.poster_path),
+        ),
+        movie=preview.movie,
+        groups=[
+            ReidentifyGroupView(
+                key=group.key,
+                outcome=ReidentifyOutcomeView(
+                    media_item_id=group.outcome.media_item_id,
+                    tmdb_id=group.outcome.tmdb_id,
+                    title=group.outcome.title,
+                    year=group.outcome.year,
+                    poster_url=poster(group.outcome.poster_path),
+                    source=group.outcome.source,
+                    same_as_current=group.outcome.media_item_id == media_item_id,
+                    reason=group.outcome.reason,
+                    code=group.outcome.code,
+                    candidates=[
+                        UnidentifiedCandidateView(**c) for c in group.outcome.candidates
+                    ],
+                ),
+                file_ids=group.file_ids,
+                file_count=group.file_count,
+                total_size_bytes=group.total_size_bytes,
+                sample_names=group.sample_names,
+            )
+            for group in preview.groups
+        ],
+        skipped_missing=preview.skipped_missing,
+        pinned_identity=preview.pinned_identity,
+        unreachable=preview.unreachable,
+        search_seed=preview.search_seed,
+    )
+    return ok(view)
+
+
+@router.post(
     "/{library_id}/items/{media_item_id}/reidentify",
     response_model=ApiResponse[ReidentifyResultView],
     summary="重新识别条目：全部在位文件重走识别链（NFO → 名称解析 → TMDB 收敛）",
@@ -1842,7 +1922,7 @@ async def claim_file(
     session: AsyncSession = Depends(get_session),
 ) -> ApiResponse[dict]:
 
-    item, _ = await library_claim.claim_files(
+    item, _, displaced = await library_claim.claim_files(
         session,
         [file_id],
         tmdb_id=payload.tmdb_id,
@@ -1850,6 +1930,9 @@ async def claim_file(
     )
     # 一次入库刮削的资产补齐（图片 + 媒体目录镜像），后台执行
     background_tasks.add_task(media_scrape.ensure_assets, item.id)
+    # 改挂（修正识别结果）时旧条目可能已被腾空，连同图片资产清掉
+    if displaced:
+        background_tasks.add_task(media_scrape.cleanup_orphan_items, sorted(displaced))
     return ok({}, message=f"已认领为《{item.title}》")
 
 
@@ -1867,11 +1950,14 @@ async def claim_files_batch(
     """一次认领一整组（通常是一部剧的几十集），与单个认领共用
     services/library/claim.claim_files（季集号沿用文件名解析结果）。"""
 
-    item, claimed = await library_claim.claim_files(
+    item, claimed, displaced = await library_claim.claim_files(
         session, payload.file_ids, tmdb_id=payload.tmdb_id
     )
     # 一次入库刮削的资产补齐（图片 + 媒体目录镜像），后台执行
     background_tasks.add_task(media_scrape.ensure_assets, item.id)
+    # 改挂（修正识别结果）时旧条目可能已被腾空，连同图片资产清掉
+    if displaced:
+        background_tasks.add_task(media_scrape.cleanup_orphan_items, sorted(displaced))
     return ok(
         {"claimed": claimed},
         message=f"{claimed} 个文件已认领为《{item.title}》",
@@ -1900,6 +1986,43 @@ async def ignore_file(
         raise NotFoundException(f"台账记录不存在：id={file_id}")
     await repo.mark_ignored([file_id])
     return ok({}, message="已忽略，之后扫描不再过问（磁盘文件未受影响；可在「已忽略」里恢复）")
+
+
+@router.post(
+    "/files/detach",
+    response_model=ApiResponse[dict],
+    summary="标为「非独立作品」：摘掉身份锚并忽略（花絮/预告类，不动磁盘）",
+    operation_id="lib.files.detach",
+    openapi_extra={"x-cli-dangerous": "confirm"},
+)
+async def detach_files(
+    payload: DetachPayload,
+    background_tasks: BackgroundTasks,
+    session: AsyncSession = Depends(get_session),
+) -> ApiResponse[dict]:
+    """花絮、预告、片段被识别链**高置信错挂**到别的影片时的出口。
+
+    这类文件用户要表达的不是"改挂到条目 Y"，而是"它根本不该是个条目"。
+    单打忽略标记不够——``ignored_at`` 只让扫描不再过问，身份锚还在、条目
+    照旧出现在库存里，所以这里连锚一起摘掉。
+
+    与「删除影片」划清界限：**不动磁盘一个字节**，行也始终保留，在「已忽略」
+    清单里一键恢复即可重新参与识别。
+    """
+    repo = LibraryFileRepository(session)
+    detached, displaced = await repo.detach_and_ignore(payload.file_ids)
+    if detached == 0:
+        raise NotFoundException("这些台账记录都不存在（可能已被处理）")
+    # 摘锚后旧条目往往一个文件都不剩，连同图片资产清掉，不在库里留空壳
+    if displaced:
+        background_tasks.add_task(media_scrape.cleanup_orphan_items, sorted(displaced))
+    return ok(
+        {"detached": detached},
+        message=(
+            f"{detached} 个文件已标为非独立作品，不再占用库存"
+            "（磁盘文件未受影响；可在「已忽略」里恢复）"
+        ),
+    )
 
 
 @router.post(

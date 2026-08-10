@@ -82,10 +82,60 @@ from movieclaw_scheduler.registry import register_task
 
 logger = logging.getLogger("movieclaw_api.library_scan")
 
-# 目录级忽略（Emby/群晖/TMM 生态的辅助目录，moviebot 同款清单）
-_IGNORE_DIRS = {"@eadir", ".deletedbytmm", "bonus", "extras", "sample", "samples"}
-# 文件名含这些标记不入库
+# 目录级忽略：生态辅助目录（Emby/群晖/TMM）+ Emby/Jellyfin 的 extras 目录
+# 惯例 + 中文圈常见叫法。一个条目目录里的花絮/预告/片段不是独立作品，拿
+# 它们的文件名去 TMDB 搜必然搜出**别的影片**（issue #107）。
+#
+# 两个刻意不收的名字：
+# - ``specials``：Emby 对电影把它当 extras，但对剧集它是 Season 0——特别篇
+#   是正片内容，忽略掉等于把用户的剧集内容吞了；
+# - ``shorts`` / ``other``：Emby 官方列表里有，但它们太像用户自建的内容
+#   分组目录（短片收藏、杂项），误伤的是真片子。宁可漏挡不可错杀。
+_IGNORE_DIRS = {
+    "@eadir",
+    ".deletedbytmm",
+    "sample",
+    "samples",
+    # Emby/Jellyfin extras 目录惯例
+    "behind the scenes",
+    "bonus",
+    "bonus disc",
+    "clips",
+    "deleted scenes",
+    "extra",
+    "extras",
+    "featurettes",
+    "interviews",
+    "scenes",
+    "trailers",
+    # 中文圈常见叫法
+    "花絮",
+    "幕后花絮",
+    "预告片",
+    "制作特辑",
+    "删减片段",
+    "特典",
+}
+# 文件名含这些标记不入库（子串匹配，历来只挡样片）
 _IGNORE_MARKERS = ("sample",)
+
+# Emby/Jellyfin 的 extras **文件名后缀**惯例：``片名-trailer.mkv``。花絮常常
+# 不在子目录里、就躺在正片旁边，只靠目录名挡不住。**只认后缀不认子串**：
+# 《Trailer Park Boys》这类片名自带关键词的正片绝不能被误伤
+_EXTRAS_SUFFIXES = (
+    "-behindthescenes",
+    "-clip",
+    "-deleted",
+    "-deletedscene",
+    "-featurette",
+    "-interview",
+    "-scene",
+    "-short",
+    "-trailer",
+)
+# 中文圈没有后缀惯例，花絮通常直接写进名字（「花絮01.mkv」「【花絮】…」），
+# 只能子串匹配。因此只取歧义最小的两个词——正片片名里几乎不会出现它们
+_EXTRAS_KEYWORDS = ("花絮", "预告片")
 
 # 路径里的显式 tmdb id 标记（Emby/Jellyfin/TMM 通行惯例，用户手写的身份声明）：
 # 「风筝 (2017) [tmdbid=75956]」「Kite [tmdb-75956]」「{tmdb-75956}」
@@ -106,7 +156,38 @@ _BRACKET_GROUP = re.compile(r"[\[{][^\]}]*[\]}]")
 #         4 = 原盘目录名不再被 .stem 截断（E.T.外星人）；钉死身份矛盾校验
 #             增加时长轴并收紧超短标题的包含判定（3 分钟短片《4》冒认
 #             神奇4侠）；目录名 Title (Year) 惯例作备选查询词
-RESOLVER_VERSION = 4
+#         5 = 电影的「Title (Year)」条目目录名压过文件名（issue #107：正片
+#             旁边的花絮/片段按自己的文件名搜出别的影片）
+RESOLVER_VERSION = 5
+
+
+def conventional_title(text: str) -> tuple[str, int] | None:
+    """「Title (Year)」惯例名（Emby/TMM 整理产物）→ ``(片名, 年份)``；不匹配返回 None。
+
+    先剥掉 ``[tmdbid=N]``/``[1080p]`` 这类方括号标记组再匹配，允许年份后
+    还挂着画质等尾巴。惯例名是识别链里的**高置信来源**（理由见
+    ``guess_evidence``），够格压过 NER 从脏名字里抽出来的片名。
+    """
+    cleaned = _BRACKET_GROUP.sub(" ", text).strip()
+    matched = re.match(r"^(.+?)\s*\((\d{4})\)", cleaned)
+    return (matched.group(1).strip(), int(matched.group(2))) if matched else None
+
+
+def extras_marker(name: str) -> str | None:
+    """文件名是否命中 extras（花絮/预告/片段）惯例；命中返回命中的那个标记。
+
+    两套判据（见 ``_EXTRAS_SUFFIXES`` / ``_EXTRAS_KEYWORDS`` 的取舍说明）：
+    Jellyfin/Emby 的 ``-trailer`` 后缀惯例按后缀匹配，中文关键词按子串匹配。
+    """
+    stem = Path(name).stem.lower()
+    for suffix in _EXTRAS_SUFFIXES:
+        if stem.endswith(suffix):
+            return suffix
+    for keyword in _EXTRAS_KEYWORDS:
+        if keyword in stem:
+            return keyword
+    return None
+
 
 # 身份来源的中文名（日志与提示用）
 _ID_SOURCE_NAMES = {
@@ -845,6 +926,12 @@ def _walk_videos(root: Path, unreadable: list[str] | None = None):
             if suffix not in SCAN_VIDEO_EXTS and suffix != ".iso":
                 continue
             if any(marker in lower for marker in _IGNORE_MARKERS):
+                continue
+            # 花絮/预告常常不在子目录里、就躺在正片旁边（BD 压制的通行做法），
+            # 目录级忽略挡不住，靠文件名惯例挡住——不入库就不会错挂
+            marker = extras_marker(name)
+            if marker is not None:
+                logger.debug("跳过花絮/预告类文件（命中「%s」）：%s", marker, entry)
                 continue
             yield entry, False
 
@@ -1675,17 +1762,34 @@ def guess_evidence(
 ) -> LocalEvidence | None:
     """收集本地识别证据：条目名/年份 + 剧集的季集号（供收敛验证器佐证）。
 
-    条目名：剧集优先用"剧集目录名"（比文件名干净），电影优先用文件名；
-    库根与文件之间的**每一层**目录都是候选（由近及远），第一个能解析出
-    片名的胜出——分类分组层（``剧集/大陆/风筝 (2017)/…``）很常见，只认
-    "库根的直接子目录"会把「大陆」当条目目录，白白丢掉真条目目录名里的
-    年份证据。散落在库根下的裸文件退回用文件名解析。
+    条目名：剧集优先用"剧集目录名"（比文件名干净）；电影优先用**符合
+    「Title (Year)」惯例的条目目录名**，没有这样的目录才退回文件名（取舍
+    见下方分支注释）。库根与文件之间的**每一层**目录都是候选（由近及远），
+    第一个能解析出片名的胜出——分类分组层（``剧集/大陆/风筝 (2017)/…``）
+    很常见，只认"库根的直接子目录"会把「大陆」当条目目录，白白丢掉真
+    条目目录名里的年份证据。散落在库根下的裸文件退回用文件名解析。
     季集号：目录名与文件名两个来源合并取最大（季包目录带 SNN、文件名带
     SxxExx，各有一半信息）；S00 特别篇不计入季数证据。
     """
     dir_names = [d.name for d in entry_dirs(root, file)]
     own = unit_name(file, is_disc)
-    sources = [*dir_names, own] if kind is MediaKind.TV else [own, *dir_names]
+    if kind is MediaKind.TV:
+        sources = [*dir_names, own]
+    else:
+        # 电影：**符合「Title (Year)」惯例的条目目录名压过文件名**。
+        # 「一个电影条目目录 = 一部片」是 Emby/Plex/Jellyfin 的共同语义，而
+        # 目录里除正片外常躺着花絮、片段、没被忽略名单挡住的杂项——拿它们
+        # 的文件名去搜 TMDB 会高置信地搜出**另一部影片**（issue #107：
+        # 「同一个文件夹下正片可以识别，bonus 等会识别成其他影片」）。惯例名
+        # 带年份、是整理工具的产物，可信度高于目录内任意一个文件名。
+        # 明知而为的代价：规范目录里塞了另一部片时会归到目录身份——那是
+        # 用户的组织错误（Emby 同样会认成一部），且条目详情页的「修正识别
+        # 结果」能当场改挂；而花絮混在正片目录里是压制片源的普遍现象。
+        # 不符合惯例的分组目录（「电影/2021/」「电影/大陆/」）解析不出
+        # 「Title (Year)」，照旧由文件名先说话，不受影响。
+        titled_dirs = [name for name in dir_names if conventional_title(name)]
+        # 去重保序：命中惯例的目录名在后半段会再出现一次，重复 enrich 是白跑
+        sources = list(dict.fromkeys([*titled_dirs, own, *dir_names]))
     parsed = [enrich(text) for text in sources]
 
     evidence: LocalEvidence | None = None
@@ -1700,22 +1804,18 @@ def guess_evidence(
         # 「E.T.外星人」只剩「外星人」），截断词同年撞上别的条目就是静默
         # 错挂。因此两者并存且不同形时，惯例名当主查询词、NER 结果降为
         # 备选（收敛失败后换词重跑，混排名拆分的价值仍在）
-        cleaned = _BRACKET_GROUP.sub(" ", text).strip()
-        plain = re.match(r"^(.+?)\s*\((\d{4})\)", cleaned)
-        plain_title = plain.group(1).strip() if plain else None
+        plain_title, plain_year = conventional_title(text) or (None, None)
         if plain_title and title and normalize_title(plain_title) != normalize_title(title):
-            evidence = LocalEvidence(
-                title=plain_title, year=int(plain.group(2)), alt_title=title
-            )
+            evidence = LocalEvidence(title=plain_title, year=plain_year, alt_title=title)
             break
         if title:
             evidence = LocalEvidence(title=title, year=attrs.year)
-            if plain and evidence.year is None:
-                evidence.year = int(plain.group(2))
+            if plain_year is not None and evidence.year is None:
+                evidence.year = plain_year
             break
         # NER 抽不出时退回惯例名
         if plain_title:
-            evidence = LocalEvidence(title=plain_title, year=int(plain.group(2)))
+            evidence = LocalEvidence(title=plain_title, year=plain_year)
             break
     if evidence is None:
         return None
@@ -1779,6 +1879,154 @@ def _unit_for(kind: MediaKind, file: Path) -> tuple[int, int]:
         return dir_season, episode
     season = attrs.seasons[0] if attrs.seasons else dir_season
     return season if season is not None else 0, episode
+
+
+# ---------------------------------------------------------------------------
+# 修正识别结果（条目详情页）第一阶段：重走识别链但只出结论、不写台账
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ReidentifyOutcome:
+    """预览里一组文件的识别结论：命中某条目，或没命中（带原因与候选）。"""
+
+    media_item_id: int | None = None
+    tmdb_id: int | None = None
+    title: str | None = None
+    year: int | None = None
+    poster_path: str | None = None
+    source: str | None = None  # path_tag / nfo / resolved（命中时有值）
+    reason: str | None = None  # 没命中时的中文原因
+    code: str | None = None  # 没命中时的失败分类
+    candidates: list[dict] = field(default_factory=list)
+
+
+@dataclass
+class ReidentifyGroup:
+    """预览的一组：识别结论相同的文件聚在一起，用户按组拍板。
+
+    按结论而非按文件分组，是这个面板能用的前提——一部剧几十集重跑出同一个
+    结论，逐个确认既刷屏又折磨人；真出现"38 个文件归 A、2 个归 B"的分裂，
+    分组恰好把它如实摆出来。
+    """
+
+    key: str
+    outcome: ReidentifyOutcome
+    file_ids: list[int] = field(default_factory=list)
+    file_count: int = 0
+    total_size_bytes: int = 0
+    sample_names: list[str] = field(default_factory=list)  # 前几个文件名，认得出是哪些
+
+
+@dataclass
+class ReidentifyPreview:
+    """一次「修正识别结果」的预览结论（不含任何写操作）。"""
+
+    library_id: int
+    media_item_id: int
+    movie: bool
+    groups: list[ReidentifyGroup] = field(default_factory=list)
+    skipped_missing: int = 0  # missing 文件没有磁盘实体，不参与
+    pinned_identity: bool = False  # 身份被目录名 tmdbid 标记/NFO 钉死
+    unreachable: bool = False  # 有文件因 TMDB 不通而无结论：此刻别让用户拍板
+    search_seed: str = ""  # 「都不对，我自己搜」的预填词（识别链解析出的片名）
+
+
+async def preview_reidentify(
+    session, library: Library, media_item_id: int, rows: list[LibraryFile]
+) -> ReidentifyPreview:
+    """重走识别链、按结论分组返回，**一行台账都不改**。
+
+    与 ``reidentify_item`` 的分工：那个是"重跑并直接落库"（CLI/自动化的
+    一键翻案入口）；这个是界面上「修正识别结果」的第一阶段。识别错挂时
+    机器往往是**高置信地错**——同一条链、同样的输入，重跑大概率复现同一个
+    错答案，所以结论必须先给人看、由人拍板，落库走人工认领通道
+    （``claim_files``，身份记为 manual、顺带纠正矛盾的 NFO）。
+
+    只读的边界说清楚：**不改任何 library_file**，用户取消 = 台账零改动。
+    唯一的副作用是结论条目会在 ``media_item`` 建档（识别链要靠它拿标题与
+    海报来展示），没被采纳的那些是孤儿条目，由既有的孤儿清理兜底。
+
+    不占库级锁：纯读不会和扫描打架；结论过时了也无妨，拍板落库时以那一刻
+    的台账为准。
+    """
+    kind = MediaKind(library.kind)
+    assert library.id is not None
+    preview = ReidentifyPreview(
+        library_id=library.id, media_item_id=media_item_id, movie=kind is MediaKind.MOVIE
+    )
+    media_service = MediaLibraryService(session, get_tmdb_client())
+    resolve_cache: dict[tuple, tuple] = {}
+    episodes_cache: dict[Path, int | None] = {}
+    hints = await _load_hints(session)
+    roots = [Path(p) for p in library.root_paths]
+    grouped: dict[tuple[str, object], ReidentifyGroup] = {}
+
+    for row in rows:
+        if row.missing_since is not None:
+            preview.skipped_missing += 1
+            continue
+        file = Path(row.file_path)
+        # 文件所在的库根：识别链用它界定条目目录与 NFO 向上查找的边界
+        root = next((r for r in roots if r in file.parents), file.parent)
+        is_disc = row.container in ("bluray", "dvd")
+        if pinned_tmdb_id(kind, root, file, is_disc=is_disc)[0] is not None:
+            preview.pinned_identity = True
+        if not preview.search_seed:
+            evidence = guess_evidence(kind, root, file, is_disc=is_disc)
+            preview.search_seed = evidence.title if evidence is not None else ""
+        identified = await _identify(
+            media_service,
+            kind,
+            root,
+            file,
+            resolve_cache,
+            episodes_cache,
+            duration_seconds=row.duration_seconds,
+            hint=_hint_for(file, hints),
+            is_disc=is_disc,
+        )
+        item = identified.item
+        if item is None and identified.code == UnidentifiedCode.TMDB_UNREACHABLE:
+            preview.unreachable = True
+        key: tuple[str, object] = (
+            ("item", item.id) if item is not None else ("none", identified.code or "")
+        )
+        group = grouped.get(key)
+        if group is None:
+            group = ReidentifyGroup(
+                key=f"{key[0]}:{key[1]}",
+                outcome=ReidentifyOutcome(
+                    media_item_id=item.id if item is not None else None,
+                    tmdb_id=item.tmdb_id if item is not None else None,
+                    title=item.title if item is not None else None,
+                    year=item.year if item is not None else None,
+                    poster_path=item.poster_path if item is not None else None,
+                    source=identified.source.value if identified.source is not None else None,
+                    reason=identified.reason,
+                    code=identified.code,
+                    candidates=identified.candidates or [],
+                ),
+            )
+            grouped[key] = group
+        assert row.id is not None
+        group.file_ids.append(row.id)
+        group.file_count += 1
+        group.total_size_bytes += row.size_bytes
+        if len(group.sample_names) < 3:
+            group.sample_names.append(file.name)
+
+    # 文件多的组排前面：分裂时主结论先出现，零星文件不抢视线
+    preview.groups = sorted(grouped.values(), key=lambda g: -g.file_count)
+    logger.info(
+        "媒体库 #%s 条目 #%s 修正识别结果预览：%d 个文件收敛为 %d 组结论%s",
+        library.id,
+        media_item_id,
+        sum(g.file_count for g in preview.groups),
+        len(preview.groups),
+        "（身份由 tmdbid 标记/NFO 指定）" if preview.pinned_identity else "",
+    )
+    return preview
 
 
 # ---------------------------------------------------------------------------

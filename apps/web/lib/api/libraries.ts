@@ -642,6 +642,19 @@ export function claimFilesBatch(
   );
 }
 
+/**
+ * 标为「非独立作品」：摘掉身份锚并忽略（花絮/预告被高置信错挂时的出口）。
+ * 不动磁盘，可在「已忽略」清单恢复。
+ */
+export function detachFiles(fileIds: number[]): Promise<{ detached: number }> {
+  return unwrap(
+    request<ApiEnvelope<{ detached: number }>>(`/libraries/files/detach`, {
+      method: "POST",
+      body: JSON.stringify({ file_ids: fileIds }),
+    }),
+  );
+}
+
 /** 身份复核里的一方（现身份 / 建议身份）。 */
 export interface ReviewItemInfo {
   media_item_id: number;
@@ -958,6 +971,65 @@ export function deleteLibraryFile(
     request<ApiEnvelope<ItemDeleteResult>>(
       `/libraries/${libraryId}/items/${mediaItemId}/files/${fileId}`,
       { method: "DELETE" },
+    ),
+  );
+}
+
+/** 「修正识别结果」预览里一组文件的识别结论。 */
+export interface ReidentifyOutcome {
+  media_item_id: number | null;
+  tmdb_id: number | null;
+  title: string | null;
+  year: number | null;
+  poster_url: string | null;
+  /** 身份来源：path_tag=目录名标记 / nfo / resolved=名称收敛 */
+  source: string | null;
+  /** 结论与条目现有身份一致 */
+  same_as_current: boolean;
+  /** 没命中时的中文原因 */
+  reason: string | null;
+  /** 没命中时的失败分类 */
+  code: string | null;
+  candidates: UnidentifiedCandidate[];
+}
+
+/** 预览的一组：识别结论相同的文件聚成一条，用户按组拍板。 */
+export interface ReidentifyGroup {
+  key: string;
+  outcome: ReidentifyOutcome;
+  file_ids: number[];
+  file_count: number;
+  total_size_bytes: number;
+  sample_names: string[];
+}
+
+/** 「修正识别结果」第一阶段的结论——尚未落库，关掉面板则台账零改动。 */
+export interface ReidentifyPreview {
+  /** 条目当前挂着的身份 */
+  current: ReviewItemInfo;
+  movie: boolean;
+  groups: ReidentifyGroup[];
+  skipped_missing: number;
+  /** 身份被目录名 tmdbid 标记或 NFO 钉死——改了还会被扫描改回去 */
+  pinned_identity: boolean;
+  /** 有文件因 TMDB 不通而无结论，此刻不宜拍板 */
+  unreachable: boolean;
+  /** 「自己搜」的预填词（识别链解析出的片名） */
+  search_seed: string;
+}
+
+/**
+ * 修正识别结果（预览）：重走识别链只出结论，**不改任何台账**。
+ * 拍板由 claimFilesBatch（改挂）/ detachFiles（非独立作品）落库。
+ */
+export function previewReidentify(
+  libraryId: number,
+  mediaItemId: number,
+): Promise<ReidentifyPreview> {
+  return unwrap(
+    request<ApiEnvelope<ReidentifyPreview>>(
+      `/libraries/${libraryId}/items/${mediaItemId}/reidentify/preview`,
+      { method: "POST" },
     ),
   );
 }

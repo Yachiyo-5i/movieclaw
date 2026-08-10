@@ -306,6 +306,40 @@ class LibraryFileRepository:
         await self._session.refresh(row)
         return row
 
+    async def detach_and_ignore(self, file_ids: list[int]) -> tuple[int, set[int]]:
+        """「这不是独立作品」：摘掉身份锚 + 打忽略标记，返回 ``(处理数, 被腾空前挂着的条目 id)``。
+
+        花絮、预告、片段这类文件被识别链高置信错挂到别的影片时，用户要
+        表达的不是"改挂到条目 Y"，而是"它根本不该是个条目"。单打忽略
+        标记不够——``ignored_at`` 只让扫描不再过问，身份锚还在，条目照旧
+        出现在库存里；必须连锚一起摘掉，这一行才真正从库存中消失。
+
+        与「忽略待识别文件」同样是**可反悔**的：行始终保留，在「已忽略」
+        里恢复即可重新参与识别（磁盘文件自始至终未被触碰）。
+        """
+        now = utcnow()
+        detached = 0
+        previous: set[int] = set()
+        for file_id in file_ids:
+            row = await self._session.get(LibraryFile, file_id)
+            if row is None:
+                continue
+            if row.media_item_id is not None:
+                previous.add(row.media_item_id)
+            row.media_item_id = None
+            # 身份没了，围绕身份的三件套（失败原因/分类/候选）与复核建议随之失义
+            row.unidentified_reason = None
+            row.unidentified_code = None
+            row.unidentified_candidates = None
+            row.identity_source = None
+            row.resolved_version = None
+            row.review_suggestion = None
+            row.ignored_at = row.ignored_at or now
+            row.updated_at = now
+            detached += 1
+        await self._session.commit()
+        return detached, previous
+
     async def mark_missing(self, file_id: int, *, since: datetime | None = None) -> None:
         """对账：标记文件消失（不删记录）。"""
         row = await self._session.get(LibraryFile, file_id)
