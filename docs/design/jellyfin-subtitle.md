@@ -11,6 +11,10 @@
 > MediaStreamSelector 复核：非 forced 完整字幕优先、forced 沉底），补
 > 原盘条目边界、中文语言别名、strm"仅字幕流"形态、query 键归一化
 > 实施要点四处。
+> v4.1 同步主干成员体系（[member-management.md](member-management.md)
+> P0-P2 已合入 main）：轨记忆随 playback_state 天然按成员隔离（保真度
+> 反而更高）、Subtitles 路由强制库可见性、"单用户模型"表述全部改为
+> "成员体系无每成员字幕偏好"。
 > 源起：jellyfin-compat.md §6.5 与 §11 开放问题 1。
 > 关联：[library.md](library.md)、[strm-workflow.md](strm-workflow.md)。
 
@@ -26,7 +30,9 @@
 Attachments/FallbackFont（转码与网页 libass 场景）、字幕管理五接口与在线
 下载 provider 生态（Policy 已宣告关闭；播放器自带在线字幕）、外挂图形字幕
 `.sub/.idx/.sup`（歧义与支持参差）、外挂音轨/歌词（不搭车）、SubtitleMode
-五态全量（单用户模型，只实现宣告的 Default 模式）。
+五态全量（成员体系无每成员字幕偏好配置——`user_configuration()` 对所有
+成员恒输出 Default 模式与空语言偏好，实现 Default 一种即语义自洽；将来
+成员页若加字幕偏好，B 层选择函数加成员维度参数即可）。
 
 ## 1. 分层切分总表（本设计的骨架）
 
@@ -206,6 +212,13 @@ v2 曾设计直接存 Jellyfin Index——那是方言渗入领域层，且有�
 免疫（`external:Movie.chs.srt` 不随编号变）——**解耦不只是洁癖，
 直接消灭了一个缺陷**。
 
+**成员维度（主干成员体系合入后的同步）**：`playback_state` 行已按
+`member_id` 分行（唯一键含成员，0=超管哨兵），新增两列**天然按成员
+隔离**——每人各记各的字幕选择，语义与真 Jellyfin 的 per-user userData
+完全对齐，保真度比单用户时代的设计反而更高。读写服务照 state.py 新约定
+**显式传 `member_id`**（协议层从设备/会话凭据解析身份后传入，本层不做
+身份判定）。
+
 读写服务落 `movieclaw_playback/state.py`（进度回报已在此层）：值变化才
 写（Progress 高频）；读出时校验引用仍有效（台账/内封轨还在），失效回落
 §3.4 选择策略。
@@ -292,6 +305,10 @@ GET /Videos/{itemId}/{mediaSourceId}/Subtitles/{index}/Stream.{format}
   行为）；
 - 鉴权 `require_device`（偏离③照旧：真 Jellyfin 匿名，我们要 token，
   DeliveryUrl 自带 `?ApiKey=`）；
+- **库可见性强制**（成员体系同步）：文件装载复用
+  `_files_for_ref(ref, identity.device.member_id)`——成员白名单外的库
+  对其 404，与三个播放处理器同一约束（member-management.md §3.6：GUID
+  可枚举，不能只在浏览路径挡、放字幕路径直进）；
 - `mediaSourceId` 复用 `_select_source`（小写归一 + 等于 itemId 回落
   第一个版本——DeliveryUrl 的 msGuid 必须能反解）；
 - `index` 经 §4.1 反解成中性引用，指到内封轨/越界 → 404；内容与
@@ -309,8 +326,11 @@ GET /Videos/{itemId}/{mediaSourceId}/Subtitles/{index}/Stream.{format}
 
 `/Sessions/Playing` 与 `/Sessions/Playing/Progress` 开始消费
 `AudioStreamIndex/SubtitleStreamIndex`（此前接受并忽略）：经 §4.1 换算成
-中性引用后调 B 层记忆服务；`SubtitleStreamIndex: -1` → `"off"`；换算
-失败（悬空索引）丢弃不落库；`Failed=true` 的 Stopped 照既有规则整体跳过。
+中性引用后带 `identity.device.member_id` 调 B 层记忆服务（playstate 路由
+的进度落库已按成员隔离，轨记忆走同一身份）；`SubtitleStreamIndex: -1` →
+`"off"`；换算失败（悬空索引）丢弃不落库；`Failed=true` 的 Stopped 照既有
+规则整体跳过。§4.3 的 DefaultSubtitleStreamIndex 读取同理按当前设备的
+member_id 查记忆。
 
 ## 5. 技术选型（Python 社区比对结论）
 
@@ -329,8 +349,8 @@ GET /Videos/{itemId}/{mediaSourceId}/Subtitles/{index}/Stream.{format}
 | 期 | 层 | 内容 | 验收 |
 |---|---|---|---|
 | S1 | A | 台账列 + 迁移 + 扫描/watchdog 发现 + 命名解析 + 内封重探挂钩（§2.4） | 单测:前缀匹配边界（stem 相等/带分隔/撞名不误收/多版本前缀重叠）、token 矩阵（语言含中文别名/旗标/大小写/从右往左序）、mtime 变→重探/不变→零探测;扫描后台账正确,strm 旁挂同样入账,原盘条目恒 [] |
-| S2 | B+C | 内容服务（编码归一+srt↔vtt）+ 编号双向换算 + 外挂流 DTO + 投递字段 + Subtitles 路由 + query 键归一登记 | 单测:编号换算互逆、GBK→UTF-8、srt→vtt 金样、坏文件 404+中文日志;手测:Infuse/VidHub 外挂字幕可选可显、GBK 不乱码、**strm"仅字幕流"源可播可显字幕（第一优先）** |
-| S3 | B+C | 中性轨引用 + playback_state 增列 + 记忆读写 + 默认轨策略 + DefaultSubtitleStreamIndex/上报消费 | 单测:策略排序矩阵（**含 forced 沉底、仅 forced 可选才选 forced**）、记忆往返（含 off/-1）、引用失效回落、悬空索引丢弃;手测:切轨重进沿用、关字幕重进仍关 |
+| S2 | B+C | 内容服务（编码归一+srt↔vtt）+ 编号双向换算 + 外挂流 DTO + 投递字段 + Subtitles 路由（含库可见性）+ query 键归一登记 | 单测:编号换算互逆、GBK→UTF-8、srt→vtt 金样、坏文件 404+中文日志、**白名单外成员拉字幕 404**;手测:Infuse/VidHub 外挂字幕可选可显、GBK 不乱码、**strm"仅字幕流"源可播可显字幕（第一优先）** |
+| S3 | B+C | 中性轨引用 + playback_state 增列 + 记忆读写（按成员） + 默认轨策略 + DefaultSubtitleStreamIndex/上报消费 | 单测:策略排序矩阵（**含 forced 沉底、仅 forced 可选才选 forced**）、记忆往返（含 off/-1）、**成员隔离（甲记忆不串到乙）**、引用失效回落、悬空索引丢弃;手测:切轨重进沿用、关字幕重进仍关 |
 
 S1/S2 一起交付才有用户可见价值；S3 可独立后行。B 层全部函数不 import
 `movieclaw_jellyfin`（架构守护测试加一条断言）。合并前照例全绿：
