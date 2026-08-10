@@ -40,17 +40,20 @@ def _is_relevant_event(event) -> bool:  # noqa: ANN001
        「扫描 → 读文件事件 → 再扫描」的循环——探测失败的行每轮保持
        NULL 重试，循环永不收敛（实测线上每 ~10 秒一轮无限扫描，
        扫描进行中的状态在前端时隐时现）；
-    2. 非视频文件的变动忽略：刮削/整库刷新写进库目录的 NFO 和图片、
-       下载器的 .!qB 半成品、字幕等附属文件，都不是扫描的盘点对象，
-       触发扫描只会让「正在扫描」在刷新/下载期间反复闪现。下载完成时
-       改名缀上视频扩展名，那一刻自然收到 moved/created 事件。
+    2. 视频/strm/**字幕**之外的文件变动忽略：刮削/整库刷新写进库目录的
+       NFO 和图片、下载器的 .!qB 半成品，都不是扫描的盘点对象，触发扫描
+       只会让「正在扫描」在刷新/下载期间反复闪现。下载完成时改名缀上
+       视频扩展名，那一刻自然收到 moved/created 事件。字幕文件自
+       外挂字幕台账（jellyfin-subtitle.md §2.1）起是盘点对象——用户把
+       .srt 丢进目录要即时可见；秒过时的重发现只做内存匹配 + 对少数字幕
+       文件 stat，且服务端只 stat 不 open，不构成读事件自激。
 
     目录事件只留移动/删除——整个条目目录被挪走/删掉时收不到目录内
     逐文件的事件；目录的新建/修改则必有后续的文件事件跟进，不必抢跑。
     """
     from watchdog.events import EVENT_TYPE_CLOSED_NO_WRITE, EVENT_TYPE_OPENED
 
-    from movieclaw_api.services.library.layout import SCAN_VIDEO_EXTS
+    from movieclaw_api.services.library.layout import SCAN_VIDEO_EXTS, SUBTITLE_EXTS
 
     if event.event_type in (EVENT_TYPE_OPENED, EVENT_TYPE_CLOSED_NO_WRITE):
         return False
@@ -59,8 +62,26 @@ def _is_relevant_event(event) -> bool:  # noqa: ANN001
     # moved 事件的语义看终点：改名成视频（下载完成）要触发，视频被改走
     # （旧路径消失）同样要触发——起点终点任一是视频扩展名即算数。
     # strm 与视频同权：网盘工具重新生成 strm 树时台账要跟着对齐
+    watched = SCAN_VIDEO_EXTS | SUBTITLE_EXTS
     paths = (getattr(event, "dest_path", "") or "", event.src_path or "")
-    return any(Path(os.fsdecode(p)).suffix.lower() in SCAN_VIDEO_EXTS for p in paths if p)
+    return any(Path(os.fsdecode(p)).suffix.lower() in watched for p in paths if p)
+
+
+def _modified_video_path(event) -> str | None:  # noqa: ANN001
+    """视频文件的 modified 事件返回其路径（内容变化重探的点名依据，
+    jellyfin-subtitle.md §2.4）；其余事件返回 None。
+
+    只认 modified：created/moved 走正常入账（本就会探测），deleted 走
+    丢失标记。strm 不点名——它无媒体流，重探无意义。
+    """
+    from movieclaw_api.services.library.layout import VIDEO_EXTS
+
+    if event.is_directory or event.event_type != "modified":
+        return None
+    path = os.fsdecode(event.src_path or "")
+    if path and Path(path).suffix.lower() in VIDEO_EXTS:
+        return path
+    return None
 
 
 class LibraryWatcher:
@@ -68,7 +89,9 @@ class LibraryWatcher:
 
     def __init__(self) -> None:
         self._observer = None
-        self._queue: asyncio.Queue[int] = asyncio.Queue()
+        # 队列元素 (library_id, modified_video_path|None)：后者是"该视频
+        # 内容被修改过"的点名（去抖后汇总传给扫描做变化重探）
+        self._queue: asyncio.Queue[tuple[int, str | None]] = asyncio.Queue()
         self._loop: asyncio.AbstractEventLoop | None = None
         self._consumer: asyncio.Task | None = None
         self._available = True
@@ -145,7 +168,9 @@ class LibraryWatcher:
 
             def on_any_event(self, event) -> None:  # noqa: ANN001
                 if _is_relevant_event(event):
-                    watcher._enqueue_threadsafe(self._library_id)
+                    watcher._enqueue_threadsafe(
+                        self._library_id, _modified_video_path(event)
+                    )
 
         self._stop_observer()
         observer = Observer()
@@ -169,27 +194,35 @@ class LibraryWatcher:
 
     # -- 事件通道 ----------------------------------------------------------
 
-    def _enqueue_threadsafe(self, library_id: int) -> None:
+    def _enqueue_threadsafe(self, library_id: int, modified_path: str | None) -> None:
         loop = self._loop
         if loop is None or loop.is_closed():
             return
-        loop.call_soon_threadsafe(self._queue.put_nowait, library_id)
+        loop.call_soon_threadsafe(self._queue.put_nowait, (library_id, modified_path))
 
     async def _consume(self) -> None:
         """去抖消费：首事件后等安静窗口，汇总本批涉及的库做增量扫描。"""
         from movieclaw_api.services.library.scan import is_scanning, scan_library
 
         while True:
-            first = await self._queue.get()
-            pending = {first}
+            library_id, modified_path = await self._queue.get()
+            # 库 id → 点名重探的视频路径集（modified 事件携带）
+            pending: dict[int, set[str]] = {library_id: set()}
+            if modified_path is not None:
+                pending[library_id].add(modified_path)
             deadline = asyncio.get_running_loop().time() + _MAX_WAIT_SECONDS
             while True:
                 remaining = deadline - asyncio.get_running_loop().time()
                 timeout = min(_QUIET_SECONDS, max(remaining, 0))
                 try:
-                    pending.add(await asyncio.wait_for(self._queue.get(), timeout))
+                    library_id, modified_path = await asyncio.wait_for(
+                        self._queue.get(), timeout
+                    )
                 except TimeoutError:
                     break  # 安静窗口达成
+                paths = pending.setdefault(library_id, set())
+                if modified_path is not None:
+                    paths.add(modified_path)
                 if asyncio.get_running_loop().time() >= deadline:
                     break  # 兜底：持续有事件也要触发
             for library_id in sorted(pending):
@@ -200,7 +233,13 @@ class LibraryWatcher:
                 try:
                     # 文件事件只需同步台账；历史规格补探由用户手动扫描触发，
                     # 不让一次播放/下载相关的目录事件变成整库 ffprobe。
-                    await scan_library(library_id, backfill_existing_specs=False)
+                    # 本批 modified 点名的视频例外：事件本身就是变更信号，
+                    # 扫描会对它们 stat 确认后重探（jellyfin-subtitle.md §2.4）
+                    await scan_library(
+                        library_id,
+                        backfill_existing_specs=False,
+                        reprobe_paths=pending[library_id] or None,
+                    )
                 except Exception:  # noqa: BLE001 -- 监控消费绝不崩
                     logger.exception("实时监控触发的扫描失败：库 #%s", library_id)
 

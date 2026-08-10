@@ -67,6 +67,7 @@ from movieclaw_api.services.library.resolve import (
     parse_total_episodes,
     resolve_with_candidates,
 )
+from movieclaw_api.services.library.subtitles import discover_external_subtitles_async
 from movieclaw_api.services.media_discover import get_tmdb_client
 from movieclaw_api.services.media_library import MediaLibraryService
 from movieclaw_api.services.media_probe import probe_media
@@ -376,7 +377,10 @@ def scan_progress(library_id: int) -> ScanState | None:
 
 
 async def scan_library(
-    library_id: int, *, backfill_existing_specs: bool = True
+    library_id: int,
+    *,
+    backfill_existing_specs: bool = True,
+    reprobe_paths: set[str] | None = None,
 ) -> ScanSummary:
     """扫描一个库的全部根路径（后台任务入口；自开会话，不向外抛异常）。
 
@@ -385,6 +389,12 @@ async def scan_library(
     绑到 watchdog、写入静默补扫或 6 小时对账，会让一次很小的目录事件演变为
     对整个机械盘媒体库的长时间读取。新入库文件仍在主流程中即时探测，不受此
     开关影响。
+
+    ``reprobe_paths``：watchdog 点名的"内容被修改过"的视频路径集合
+    （jellyfin-subtitle.md §2.4）。秒过时对名单内的行 stat 比对
+    (size, mtime)，确认变化才重探——视频原地替换（洗版/重灌同路径）后
+    介质规格与内封字幕轨不再永久陈旧。手动扫描（backfill_existing_specs
+    开启）则对全部在位行做该比对，无需点名。
     """
     from movieclaw_api.services.library.organize import is_organizing
     from movieclaw_api.services.library.transfer import is_transferring
@@ -418,6 +428,7 @@ async def scan_library(
             summary,
             state,
             backfill_existing_specs=backfill_existing_specs,
+            reprobe_paths=reprobe_paths or set(),
         )
     except Exception:  # noqa: BLE001 -- 后台任务兜底
         logger.exception("媒体库 #%s 扫描时发生未知错误", library_id)
@@ -437,6 +448,7 @@ async def _scan(
     state: ScanState,
     *,
     backfill_existing_specs: bool,
+    reprobe_paths: set[str],
 ) -> ScanSummary:
     db = get_database()
     async with db.session() as session:
@@ -476,13 +488,15 @@ async def _scan(
         # 不可信，自动清理必须整轮让路（见 _auto_clear_missing）
         unreadable_dirs: list[str] = []
         pending: list[tuple[Path, Path, bool]] = []  # (根, 文件, 是否原盘)
+        # 目录 → 文件名列表：遍历时顺手截获，外挂字幕发现零额外目录 IO
+        dir_files: dict[str, list[str]] = {}
         for root in library.root_paths:
             root_path = Path(root)
             if not root_path.exists():
                 summary.errors.append(f"根路径不存在，已跳过：{root}")
                 continue
             scanned_roots.append(str(root_path))
-            for file, is_disc in _walk_videos(root_path, unreadable_dirs):
+            for file, is_disc in _walk_videos(root_path, unreadable_dirs, dir_files):
                 # 根路径互相嵌套时同一个文件会被遍历两次，去重后才是"每个文件
                 # 处理一次"：重复处理不只是白跑一趟识别链，第二趟还会拿着过期的
                 # 台账快照去插入已存在的路径
@@ -498,6 +512,7 @@ async def _scan(
         now_ts = time.time()
         min_remaining: float | None = None
         mtime_backfilled = 0
+        rows_refreshed = 0  # 秒过行的外挂字幕/规格刷新计数（批量一次 commit）
         for done, (root_path, file, is_disc) in enumerate(pending, start=1):
             # 每进入新的一窗，先把这一窗要用到的 TMDB 档案并发拉回来（详见
             # _PREFETCH_WINDOW 的说明）。串行链路本身一行不改，只是轮到它
@@ -574,6 +589,20 @@ async def _scan(
                         mtime_backfilled += 1
                     except OSError:
                         pass
+                # 外挂字幕重发现 + 视频变化重探（jellyfin-subtitle.md §2.4）。
+                # 前者纯内存匹配 + 对命中的少数字幕文件 stat，每轮都做；
+                # 后者要对视频本体 stat，只在手动扫描（backfill 开启）或
+                # watchdog 点名该路径时做——6 小时对账保持零视频 stat
+                if await _refresh_known_row(
+                    existing,
+                    file,
+                    dir_files.get(str(file.parent)),
+                    is_disc=is_disc,
+                    check_media_change=(
+                        backfill_existing_specs or path_str in reprobe_paths
+                    ),
+                ):
+                    rows_refreshed += 1
                 state.processed = done
                 continue
             # 完整性检测：mtime 太新 = 疑似写入中（下载/拷贝进行时），本轮
@@ -606,6 +635,7 @@ async def _scan(
                     is_disc=is_disc,
                     hint=_hint_for(file, hints),
                     existing=existing,
+                    dir_names=dir_files.get(str(file.parent)),
                 )
             except Exception as exc:  # noqa: BLE001 -- 单文件失败不断整轮
                 await recover_failed_session()
@@ -613,8 +643,14 @@ async def _scan(
                 summary.errors.append(f"「{file.name}」处理失败：{exc}")
             state.processed = done
 
-        if mtime_backfilled:
+        if mtime_backfilled or rows_refreshed:
             await session.commit()
+        if rows_refreshed:
+            logger.info(
+                "媒体库 #%s：%d 个在位文件的外挂字幕/介质规格已刷新",
+                library_id,
+                rows_refreshed,
+            )
 
         # 收尾感知删除：在位根路径下、台账有但本轮没遍历到 → 标记 missing。
         # 不存在的根整个不参与（挂载失败/掉盘时不误伤），文件回归时
@@ -891,7 +927,11 @@ def _disc_total_size(disc_dir: Path) -> int:
     return total
 
 
-def _walk_videos(root: Path, unreadable: list[str] | None = None):
+def _walk_videos(
+    root: Path,
+    unreadable: list[str] | None = None,
+    dir_files: dict[str, list[str]] | None = None,
+):
     """深度遍历，产出 (路径, 是否原盘目录)。
 
     原盘目录（BDMV/VIDEO_TS 结构）整体作为**一个条目**产出、不再下钻——
@@ -901,6 +941,10 @@ def _walk_videos(root: Path, unreadable: list[str] | None = None):
     会把路径记进来。读不动的目录只能跳过——但**跳过不等于目录是空的**，
     它底下的文件会因为"本轮没遍历到"被判丢失。标记 missing 时这无伤大雅
     （回归自动恢复），自动清理必须知情：这一轮的"没遍历到"不可信。
+
+    ``dir_files``：调用方传入的目录清单收集器（目录路径 → 文件名列表）。
+    外挂字幕发现（jellyfin-subtitle.md §2.1）靠它做零额外 IO 的前缀匹配
+    ——目录本轮已经列过，不再为字幕单独列第二遍。
     """
     stack = [root]
     while stack:
@@ -911,6 +955,8 @@ def _walk_videos(root: Path, unreadable: list[str] | None = None):
             if unreadable is not None:
                 unreadable.append(str(current))
             continue
+        if dir_files is not None:
+            dir_files[str(current)] = [e.name for e in entries if not e.is_dir()]
         for entry in entries:
             name = entry.name
             if entry.is_dir():
@@ -936,6 +982,60 @@ def _walk_videos(root: Path, unreadable: list[str] | None = None):
             yield entry, False
 
 
+async def _refresh_known_row(
+    row: LibraryFile,
+    file: Path,
+    dir_names: list[str] | None,
+    *,
+    is_disc: bool,
+    check_media_change: bool,
+) -> bool:
+    """秒过行的增量刷新：外挂字幕重发现 +（点名时）视频变化重探。
+
+    返回是否改动了行（调用方批量 commit，与 mtime 回填同一提交点）。
+
+    - 外挂字幕：每轮都做——纯内存前缀匹配 + 对命中的少数字幕文件 stat，
+      不触碰视频本体；旧行（NULL）顺带回填。原盘条目恒 []（§2.1）；
+    - 视频变化重探（§2.4）：只在 ``check_media_change`` 时 stat 视频本体，
+      (size, mtime) 确认变化才 ffprobe；**探测成功才回写**规格与新鲜度键
+      ——半截写入的替换文件探测会失败，保留旧值让下一轮重试。strm 无
+      媒体流，不参与重探。
+    """
+    changed = False
+    if is_disc:
+        discovered: list[dict] = []
+    else:
+        discovered = await discover_external_subtitles_async(file, dir_names)
+    if row.external_subtitles != discovered:
+        row.external_subtitles = discovered
+        row.updated_at = utcnow()
+        changed = True
+
+    is_strm = not is_disc and file.suffix.lower() == STRM_EXT
+    if check_media_change and not is_disc and not is_strm:
+        try:
+            st = await asyncio.to_thread(file.stat)
+        except OSError:
+            return changed
+        if (st.st_size, st.st_mtime_ns) != (row.size_bytes, row.file_mtime_ns):
+            spec = await asyncio.to_thread(probe_media, file)
+            if spec is not None:
+                row.size_bytes = st.st_size
+                row.file_mtime_ns = st.st_mtime_ns
+                row.resolution = spec.resolution
+                row.video_codec = spec.video_codec
+                row.hdr = spec.hdr
+                row.bit_depth = spec.bit_depth
+                row.duration_seconds = spec.duration_seconds
+                row.bit_rate = spec.bit_rate
+                row.audio_streams = list(spec.audio_streams)
+                row.subtitle_streams = list(spec.subtitle_streams)
+                row.updated_at = utcnow()
+                changed = True
+                logger.info("视频文件内容已变化，介质规格与内封字幕轨已重探：%s", file)
+    return changed
+
+
 async def _ingest_file(
     session,
     repo: LibraryFileRepository,
@@ -951,6 +1051,7 @@ async def _ingest_file(
     is_disc: bool = False,
     hint: _SubtitleHint | None = None,
     existing: LibraryFile | None = None,
+    dir_names: list[str] | None = None,
 ) -> None:
     """把一个文件识别并写入台账。``existing`` 是该路径已有的台账行：
     在位但待识别 → 本次是识别重试；标记过 missing → 文件回归。"""
@@ -1035,6 +1136,11 @@ async def _ingest_file(
             if unidentified_code == UnidentifiedCode.KIND_MISMATCH:
                 summary.kind_mismatched += 1
     attrs = enrich(unit_name(file, is_disc))
+    # 外挂字幕发现（jellyfin-subtitle.md §2.1）：原盘恒 []，其余（含 strm）
+    # 用遍历时截获的目录清单做前缀匹配
+    external_subtitles: list[dict] = (
+        [] if is_disc else await discover_external_subtitles_async(file, dir_names)
+    )
     assert library.id is not None
     await repo.upsert_by_path(
         LibraryFile(
@@ -1054,6 +1160,7 @@ async def _ingest_file(
             bit_rate=spec.bit_rate if spec else None,
             audio_streams=list(spec.audio_streams) if spec else None,
             subtitle_streams=list(spec.subtitle_streams) if spec else None,
+            external_subtitles=external_subtitles,
             media_source=attrs.media_source,
             release_group=attrs.release_group,
             source=FileSource.SCANNED,

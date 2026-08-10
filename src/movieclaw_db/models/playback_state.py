@@ -53,6 +53,14 @@ class PlaybackState(TimestampMixin, table=True):
     episode_number: int = Field(default=0, description="集号；电影=0（哨兵）")
 
     position_ms: int = Field(default=0, description="续播位置（毫秒）；0=无续播点")
+    # 轨选择记忆（docs/design/jellyfin-subtitle.md §3.3）：存协议无关的
+    # 中性轨引用（"embedded:<k>" / "external:<文件名>" / 字幕特有 "off"），
+    # 不存 Jellyfin 的合成流序号——序号随补探回填漂移，中性引用天然免疫。
+    # NULL=从未上报过轨选择。
+    audio_track: str | None = Field(default=None, description="记忆的音轨（中性引用）")
+    subtitle_track: str | None = Field(
+        default=None, description="记忆的字幕轨（中性引用；off=明确关闭）"
+    )
     played: bool = Field(default=False, index=True, description="是否已看完")
     play_count: int = Field(default=0, description="播放次数（开始播放时 +1）")
     is_favorite: bool = Field(default=False, description="是否收藏")

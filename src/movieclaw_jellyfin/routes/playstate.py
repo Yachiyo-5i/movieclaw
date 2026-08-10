@@ -25,7 +25,9 @@ from movieclaw_jellyfin.catalog import (
     TICKS_PER_MS,
     _folder_user_data,
     _leaf_user_data,
+    audio_track_for_index,
     load_bundles,
+    subtitle_track_for_index,
 )
 from movieclaw_jellyfin.errors import bad_request_text, not_found
 from movieclaw_jellyfin.ids import EntityKind, EntityRef, decode_guid
@@ -38,6 +40,7 @@ from movieclaw_playback.events import (
     build_playback_event,
 )
 from movieclaw_playback.streaming import stop_device_streams
+from movieclaw_playback.subtitles import SUBTITLE_OFF
 
 router = APIRouter(dependencies=[Depends(require_device)])
 
@@ -181,11 +184,67 @@ def _decode_item_ref(raw: Any) -> EntityRef | None:
 # ---------------------------------------------------------------------------
 
 
-async def _record_start(ref: EntityRef, client: ClientInfo, *, member_id: int) -> None:
+async def _tracks_from_body(
+    ref: EntityRef, body: dict[str, Any], member_id: int
+) -> tuple[str | None, str | None]:
+    """上报里的轨序号 → 中性轨引用（jellyfin-subtitle.md §4.5）。
+
+    序号是相对某个 MediaSource 的合成编号，换算要落到具体文件行：按
+    body 的 mediaSourceId 定位版本，缺省第一个。字幕 -1 → "off"（用户
+    明确关闭也要记住）；换算失败（悬空索引/版本不见了）返回 None 丢弃。
+    None = 本次没报该轨，领域层保持原值。
+    """
+    audio_raw = body.get("audiostreamindex")
+    subtitle_raw = body.get("subtitlestreamindex")
+    if audio_raw is None and subtitle_raw is None:
+        return None, None
+    if ref.kind not in (EntityKind.ITEM, EntityKind.EPISODE):
+        return None, None
+    # 复用播放路由的装载点：库可见性同一套约束
+    from movieclaw_jellyfin.routes.playback import _files_for_ref, _select_source
+
+    files = await _files_for_ref(ref, member_id)
+    raw_ms = body.get("mediasourceid")
+    selected = _select_source(files, str(raw_ms) if raw_ms else None, "")
+    f = selected[0] if selected else (files[0] if files else None)
+    if f is None:
+        return None, None
+
+    def _to_int(raw: Any) -> int | None:
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return None
+
+    audio_track = None
+    audio_index = _to_int(audio_raw)
+    if audio_index is not None:
+        audio_track = audio_track_for_index(f, audio_index)
+
+    subtitle_track = None
+    subtitle_index = _to_int(subtitle_raw)
+    if subtitle_index is not None:
+        subtitle_track = (
+            SUBTITLE_OFF if subtitle_index == -1 else subtitle_track_for_index(f, subtitle_index)
+        )
+    return audio_track, subtitle_track
+
+
+async def _record_start(
+    ref: EntityRef,
+    client: ClientInfo,
+    *,
+    member_id: int,
+    audio_track: str | None = None,
+    subtitle_track: str | None = None,
+) -> None:
     """开始播放落库 + commit 后装配/投递 ``playback.started`` 事件。"""
     unit = _leaf_unit(ref)
     async with get_database().session() as session:
         row = await playback_state.record_playback_start(session, unit, member_id=member_id)
+        playback_state.apply_track_selection(
+            row, audio_track=audio_track, subtitle_track=subtitle_track
+        )
         await session.commit()
         event = await build_playback_event(
             session, "playback.started", unit, row, client=client
@@ -201,8 +260,14 @@ async def playing_start(
     body = await _read_body(request)
     ref = _decode_item_ref(body.get("itemid"))
     if ref is not None:
+        member_id = identity.device.member_id
+        audio_track, subtitle_track = await _tracks_from_body(ref, body, member_id)
         await _record_start(
-            ref, _client_info(identity), member_id=identity.device.member_id
+            ref,
+            _client_info(identity),
+            member_id=member_id,
+            audio_track=audio_track,
+            subtitle_track=subtitle_track,
         )
     return Response(status_code=204)
 
@@ -230,6 +295,8 @@ async def _apply_progress(
     member_id: int,
     stopped: bool = False,
     client: ClientInfo | None = None,
+    audio_track: str | None = None,
+    subtitle_track: str | None = None,
 ) -> None:
     """进度落库；commit 后按语义装配 webhook 事件：
     Stopped 上报发 ``playback.stopped``；played 本次翻转为 True 追加
@@ -244,6 +311,9 @@ async def _apply_progress(
             member_id=member_id,
             position_ms=position_ms,
             runtime_ms=runtime_ms,
+        )
+        playback_state.apply_track_selection(
+            row, audio_track=audio_track, subtitle_track=subtitle_track
         )
         await session.commit()
         emit_progress = (
@@ -275,11 +345,15 @@ async def playing_progress(
         position = _position_ms(body)
         # Progress 不带位置的心跳（如暂停事件）不落库；报 0 = 拖回开头要落
         if position is not None:
+            member_id = identity.device.member_id
+            audio_track, subtitle_track = await _tracks_from_body(ref, body, member_id)
             await _apply_progress(
                 ref,
                 position,
-                member_id=identity.device.member_id,
+                member_id=member_id,
                 client=_client_info(identity),
+                audio_track=audio_track,
+                subtitle_track=subtitle_track,
             )
     return Response(status_code=204)
 
@@ -299,12 +373,16 @@ async def playing_stopped(
         return Response(status_code=204)
     ref = _decode_item_ref(body.get("itemid"))
     if ref is not None:
+        member_id = identity.device.member_id
+        audio_track, subtitle_track = await _tracks_from_body(ref, body, member_id)
         await _apply_progress(
             ref,
             _position_ms(body),
-            member_id=identity.device.member_id,
+            member_id=member_id,
             stopped=True,
             client=_client_info(identity),
+            audio_track=audio_track,
+            subtitle_track=subtitle_track,
         )
     return Response(status_code=204)
 

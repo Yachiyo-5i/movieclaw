@@ -202,6 +202,7 @@ def _list_load_columns(
                 LibraryFile.bit_rate,
                 LibraryFile.audio_streams,
                 LibraryFile.subtitle_streams,
+                LibraryFile.external_subtitles,
             ]
         )
     elif options.has("Path"):
@@ -1238,7 +1239,57 @@ def _subtitle_stream(raw: dict, index: int) -> dict[str, Any]:
     return stream
 
 
+# 外挂字幕格式 → Jellyfin 惯用 codec 名（真 Jellyfin 由 ffprobe 得出，
+# 我们由台账扩展名映射）
+_EXTERNAL_SUB_CODEC = {"srt": "subrip", "vtt": "webvtt", "ass": "ass", "ssa": "ssa"}
+
+
+def _external_subtitle_stream(entry: dict, index: int) -> dict[str, Any]:
+    """台账外挂字幕元素 → MediaStream（jellyfin-subtitle.md §4.2）。
+
+    DisplayTitle 照内封拼接规则加 " - External" 尾缀；language 解析不出时
+    用 title 原文顶格（"简中&英文 - SUBRIP - External" 这类中文命名照样
+    可读）。SupportsExternalStream/IsTextSubtitleStream 恒 true——v1 只收
+    文本字幕（SUBTITLE_EXTS 已排除图形格式）。
+    """
+    lang = entry.get("language")
+    fmt = str(entry.get("format") or "").lower()
+    codec = _EXTERNAL_SUB_CODEC.get(fmt, fmt)
+    parts = [
+        _lang_display(lang) or entry.get("title") or "Und",
+        "Default" if entry.get("default") else None,
+        "Forced" if entry.get("forced") else None,
+        codec.upper() if codec else None,
+        "External",
+    ]
+    stream: dict[str, Any] = {
+        "Type": "Subtitle",
+        "Index": index,
+        "IsDefault": bool(entry.get("default")),
+        "IsForced": bool(entry.get("forced")),
+        "IsHearingImpaired": bool(entry.get("sdh")),
+        "IsExternal": True,
+        "SupportsExternalStream": True,
+        "IsTextSubtitleStream": True,
+        "Path": entry.get("filename"),
+        "DisplayTitle": " - ".join(p for p in parts if p),
+    }
+    if codec:
+        stream["Codec"] = codec
+    if lang:
+        stream["Language"] = lang
+    if entry.get("title"):
+        stream["Title"] = entry["title"]
+    return stream
+
+
 def media_streams_dto(f: LibraryFile) -> list[dict[str, Any]]:
+    """合成流编号是 Jellyfin 方言、唯一产地在本层（jellyfin-subtitle.md §4.1）：
+    video=0、audio 1..n、内封字幕接续、**外挂字幕接在最后**（台账数组序）。
+    有意偏离 Jellyfin master 的"外挂在前"排法：外挂在后时增删 sidecar 不
+    漂移内封编号；客户端只认下发的 Index 值，两种排法协议等价。
+    编号↔中性轨引用的换算（subtitle_track_for_index 等）必须与本函数同源。
+    """
     streams: list[dict[str, Any]] = [_video_stream(f)]
     index = 1
     for raw in f.audio_streams or []:
@@ -1247,7 +1298,55 @@ def media_streams_dto(f: LibraryFile) -> list[dict[str, Any]]:
     for raw in f.subtitle_streams or []:
         streams.append(_subtitle_stream(raw, index))
         index += 1
+    for entry in f.external_subtitles or []:
+        streams.append(_external_subtitle_stream(entry, index))
+        index += 1
     return streams
+
+
+# -- 合成编号 ↔ 中性轨引用（协议层 ↔ 领域层的翻译，§4.1） --------------------
+
+
+def subtitle_track_for_index(f: LibraryFile, index: int) -> str | None:
+    """合成 Index → 字幕的中性轨引用；不在字幕区间返回 None。"""
+    from movieclaw_playback.subtitles import embedded_track, external_track
+
+    base = 1 + len(f.audio_streams or [])
+    n_embedded = len(f.subtitle_streams or [])
+    if base <= index < base + n_embedded:
+        return embedded_track(index - base)
+    externals = f.external_subtitles or []
+    j = index - base - n_embedded
+    if 0 <= j < len(externals):
+        filename = externals[j].get("filename")
+        return external_track(filename) if filename else None
+    return None
+
+
+def index_for_subtitle_track(f: LibraryFile, track: str) -> int | None:
+    """中性轨引用 → 合成 Index；引用悬空（轨已不在）返回 None。"""
+    from movieclaw_playback.subtitles import parse_embedded_track, parse_external_track
+
+    base = 1 + len(f.audio_streams or [])
+    n_embedded = len(f.subtitle_streams or [])
+    k = parse_embedded_track(track)
+    if k is not None:
+        return base + k if k < n_embedded else None
+    filename = parse_external_track(track)
+    if filename is not None:
+        for j, entry in enumerate(f.external_subtitles or []):
+            if entry.get("filename") == filename:
+                return base + n_embedded + j
+    return None
+
+
+def audio_track_for_index(f: LibraryFile, index: int) -> str | None:
+    """合成 Index → 音轨的中性轨引用；不在音轨区间返回 None。"""
+    from movieclaw_playback.subtitles import embedded_track
+
+    if 1 <= index <= len(f.audio_streams or []):
+        return embedded_track(index - 1)
+    return None
 
 
 def version_name(f: LibraryFile) -> str:
