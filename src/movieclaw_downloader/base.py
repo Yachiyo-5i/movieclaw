@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import abc
 
+from movieclaw_downloader.exceptions import DownloaderNotSupportedError
 from movieclaw_downloader.models import (
     DownloaderConfig,
     DownloaderInfo,
@@ -51,6 +52,22 @@ class BaseDownloader(abc.ABC):
         下载监听导入据此按**名称**判定条目是否下载完成——名称匹配免疫
         容器路径映射，比 save_path 比对可靠（见 TorrentBrief 注释）。
         """
+
+    async def delete_torrent(
+        self,
+        info_hash: str,
+        *,
+        delete_files: bool = False,
+        required_category: str | None = None,
+    ) -> bool:
+        """删除一个下载任务，返回任务是否存在且满足归属约束。
+
+        ``delete_files=False`` 是强制保守的默认值：仅从下载器移除任务，
+        已下载的数据仍保留在磁盘。``required_category`` 用于把管理接口
+        收窄到本产品创建的任务；不支持分类的适配器不会实现删除能力。具体
+        下载器若尚未实现此可选能力，统一抛 ``DownloaderNotSupportedError``。
+        """
+        raise DownloaderNotSupportedError(self.config.type.value)
 
     @abc.abstractmethod
     async def test_connection(self) -> DownloaderInfo:

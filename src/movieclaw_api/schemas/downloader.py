@@ -178,7 +178,6 @@ class DownloadSubmitPayload(BaseModel):
             raise ValueError("保存目录必须是以 / 开头的绝对路径")
         return value
 
-
 class DownloadSubmitView(BaseModel):
     """手动提交下载的结果视图。"""
 
@@ -190,3 +189,10 @@ class DownloadSubmitView(BaseModel):
     save_path: str | None = Field(
         description="实际使用的保存目录（下载器视角，已过路径映射；空 = 下载器自身默认目录）"
     )
+
+
+class DownloadTaskDeleteView(BaseModel):
+    """删除下载任务的回执：默认只删除任务，数据是否删除必须明确回显。"""
+
+    info_hash: str = Field(description="已删除任务的 infohash（统一转为小写）")
+    delete_files: bool = Field(description="是否同时删除 qBittorrent 已下载的数据")

@@ -23,15 +23,27 @@ import logging
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
-from movieclaw_api.exceptions import BadRequestException, UpstreamServiceException
+from movieclaw_api.exceptions import (
+    BadRequestException,
+    ConflictException,
+    NotFoundException,
+    UpstreamServiceException,
+)
 from movieclaw_api.services.site_access import SiteUnavailableError, get_site_access
-from movieclaw_db.models import DownloaderClient, DownloadHint, utcnow
+from movieclaw_db.models import DownloaderClient, DownloadHint, WantedItem, WantedStatus, utcnow
+from movieclaw_db.models.downloader_client import ClientType
 from movieclaw_db.models.site_credential import ConfigStatus
 from movieclaw_db.repositories.downloader_repo import DownloaderRepository
+from movieclaw_downloader import DownloaderException
 from movieclaw_downloader.factory import create_downloader
 from movieclaw_downloader.models import DownloaderConfig, DownloadRequest, SubmitResult
 
 logger = logging.getLogger("movieclaw_api.torrent_submit")
+
+# 所有经 MovieClaw 投递的 qB 任务都会写入此分类。删除接口只管理这部分，
+# 不应因 Agent/接口知道一个 hash 就触碰用户在同一 qB 中自行管理的任务。
+_MOVIECLAW_CATEGORY = "movieclaw"
+_IN_FLIGHT_WANTED = (WantedStatus.GRABBED, WantedStatus.DOWNLOADED)
 
 
 def _best_match(
@@ -221,6 +233,89 @@ async def submit_torrent(
                 "下载线索写入失败（目录 %s），副标题识别信号将缺失", save_path, exc_info=True
             )
     return submit_result, row
+
+
+async def delete_torrent(
+    session: AsyncSession,
+    *,
+    downloader_id: int,
+    info_hash: str,
+    delete_files: bool = False,
+) -> DownloaderClient:
+    """从已配置的 qBittorrent 删除一项 MovieClaw 手动任务。
+
+    此处不要求 ``enabled``：停用仅表示不再接收新下载，用户仍应能清理该
+    下载器中的遗留任务。连接状态必须为 ACTIVE，避免在凭证/地址已失效时
+    发起一个必然失败且难以判断结果的删除请求。订阅在途任务不能在这里删：
+    它们的工单仍会被救援巡检重排，必须先由订阅语义显式暂停或删除。
+    """
+    row = await session.get(DownloaderClient, downloader_id)
+    if row is None:
+        raise NotFoundException(f"下载器不存在：#{downloader_id}")
+    if row.client_type != ClientType.QBITTORRENT:
+        raise BadRequestException(
+            f"下载器「{row.name}」当前不支持删除下载任务（目前仅支持 qBittorrent）"
+        )
+    if row.status != ConfigStatus.ACTIVE:
+        raise BadRequestException(
+            f"下载器「{row.name}」当前连接未通过验证，请在「设置 → 下载器」中检查后重试"
+        )
+
+    linked = list(
+        (
+            await session.execute(
+                select(WantedItem.subscription_id)
+                .where(
+                    WantedItem.info_hash == info_hash,
+                    WantedItem.status.in_(_IN_FLIGHT_WANTED),  # type: ignore[attr-defined]
+                )
+                .distinct()
+            )
+        ).scalars()
+    )
+    if linked:
+        ids = "、".join(f"#{subscription_id}" for subscription_id in sorted(linked))
+        raise ConflictException(
+            f"该下载任务仍由订阅 {ids} 追踪；请先暂停或删除关联订阅，再删除下载任务，"
+            "否则系统会自动重新寻找并投递资源"
+        )
+
+    repo = DownloaderRepository(session)
+    config = DownloaderConfig(
+        type=row.client_type.value,
+        url=row.url,
+        username=row.username,
+        password=repo.decrypted_password(row),
+    )
+    downloader = create_downloader(config)
+    try:
+        deleted = await downloader.delete_torrent(
+            info_hash,
+            delete_files=delete_files,
+            required_category=_MOVIECLAW_CATEGORY,
+        )
+    except DownloaderException as exc:
+        logger.warning("删除下载器「%s」任务失败：%s", row.name, exc.message)
+        raise UpstreamServiceException(
+            f"从下载器「{row.name}」删除任务失败：{exc.message}"
+        ) from exc
+    except Exception as exc:  # noqa: BLE001 -- 对外下载器异常必须转为可读的 502
+        logger.exception("删除下载器「%s」任务时发生未知错误", row.name)
+        raise UpstreamServiceException(
+            f"从下载器「{row.name}」删除任务时发生未知错误：{type(exc).__name__}"
+        ) from exc
+    finally:
+        await downloader.close()
+
+    if not deleted:
+        raise NotFoundException(
+            f"下载器「{row.name}」中不存在下载任务，或该任务并非 MovieClaw 创建：{info_hash}"
+        )
+
+    logger.info(
+        "已删除下载器「%s」任务: hash=%s 删除数据=%s", row.name, info_hash, delete_files
+    )
+    return row
 
 
 async def _upsert_hint(

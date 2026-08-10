@@ -6,7 +6,7 @@ movieclaw 的官方命令行工具。对本产品的一切操作——搜索资�
 - auth     账号、API 令牌管理
 - channels 通知渠道（微信扫码绑定与账号管理）
 - discover 影视元数据与榜单（media 搜索条目、拿 TMDB ID）
-- dl       下载器接入、默认下载器与路径映射
+- dl       下载器接入、默认下载器与路径映射；torrent delete 可删除 qB 下载任务
 - extension 浏览器插件 Cookie 同步令牌
 - health   服务健康检查（一般用 status 即可）
 - lib      媒体库：库管理、scan 扫描、organize 整理、items 条目、unidentified 待识别认领、missing 缺失重下、review 身份复核
@@ -29,4 +29,5 @@ movieclaw 的官方命令行工具。对本产品的一切操作——搜索资�
 - 参数拿不准就先 --help（域级与命令级都有，含示例），不要凭记忆猜参数或取值。
 - 列表默认有条数上限、长字段有截断；下结论前确认数据没有被截断（--limit 可调）。
 - 带 ⚠ 的命令需要 --yes 确认。其中 lib items delete 会删除磁盘上的媒体文件：必须先用只读命令查清将删除的具体条目、向用户复述并取得本轮明确同意后才能执行；用户泛泛说「清理/整理」不构成删除文件的同意。其余 ⚠ 命令（删配置、清记录）在用户任务明确要求时可直接 --yes。
+- dl torrent delete 默认只删 qBittorrent 任务、保留数据。产品内 Agent 不可删除 已下载文件；如需清除磁盘数据，用户须在 Web 界面或本机 CLI 中明确执行。
 - 扫描/整理/元数据刷新默认阻塞等待完成；预计超过 4 分钟的任务用 --no-wait 启动后轮询进度，或调大本工具的 timeout 参数。

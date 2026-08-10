@@ -15,6 +15,7 @@ import httpx
 import pytest
 
 from movieclaw_cli.core import http as http_mod
+from movieclaw_cli.core.errors import CliError, ExitCode
 
 
 def _envelope(data, message=None):
@@ -67,6 +68,18 @@ def _transport(routes: dict[tuple[str, str], httpx.Response], calls: list[dict])
         return routes[key]
 
     return httpx.MockTransport(handler)
+
+
+def test_agent_token_is_locked_to_its_bound_server(monkeypatch) -> None:
+    """即使绕过 mclaw 工具层，HTTP 客户端也不能把 Agent 令牌发给其他地址。"""
+    monkeypatch.setenv("MOVIECLAW_AGENT_LOCKED_SERVER", "http://127.0.0.1:3000")
+    monkeypatch.setenv("MOVIECLAW_TOKEN", "agent-token")
+
+    with pytest.raises(CliError) as exc:
+        http_mod.Api("https://example.invalid")
+
+    assert exc.value.exit_code == ExitCode.AUTH
+    assert "不允许" in exc.value.message
 
 
 # ---------------------------------------------------------------------------
@@ -267,6 +280,71 @@ def test_search_resolution_filter(run_cli) -> None:
     assert code == 0
     rows = json.loads(out)
     assert len(rows) == 1 and rows[0]["resolution"] == "2160p"
+
+
+def test_generated_qb_task_delete_keeps_files_and_requires_confirmation(run_cli) -> None:
+    """Agent 可调用的删除命令只能删任务，且仍须显式确认。"""
+    calls: list[dict] = []
+    info_hash = "a" * 40
+    transport = _transport(
+        {
+            ("DELETE", f"/api/v1/downloaders/7/torrents/{info_hash}"): httpx.Response(
+                200,
+                json=_envelope(
+                    {"info_hash": info_hash, "delete_files": False},
+                    message="已确认下载器「qb」中任务已删除，已保留已下载数据",
+                ),
+            )
+        },
+        calls,
+    )
+
+    code, out, err = run_cli(
+        [
+            "dl",
+            "torrent",
+            "delete",
+            "7",
+            info_hash,
+            "--yes",
+            "-o",
+            "json",
+        ],
+        transport,
+    )
+
+    assert code == 0, err
+    assert json.loads(out) == {"info_hash": info_hash, "delete_files": False}
+    assert calls[-1]["params"] == {}
+    assert "保留已下载数据" in err
+
+
+def test_generated_qb_task_data_delete_is_destructive(run_cli) -> None:
+    """本机 CLI 的数据删除走独立端点，并由 destructive 元数据显示磁盘影响。"""
+    calls: list[dict] = []
+    info_hash = "b" * 40
+    transport = _transport(
+        {
+            ("DELETE", f"/api/v1/downloaders/7/torrents/{info_hash}/files"): httpx.Response(
+                200,
+                json=_envelope(
+                    {"info_hash": info_hash, "delete_files": True},
+                    message="已确认下载器「qb」中任务及已下载数据均已删除",
+                ),
+            )
+        },
+        calls,
+    )
+
+    code, out, err = run_cli(
+        ["dl", "torrent", "files", "delete", "7", info_hash, "--yes", "-o", "json"],
+        transport,
+    )
+
+    assert code == 0, err
+    assert json.loads(out) == {"info_hash": info_hash, "delete_files": True}
+    assert calls[-1]["params"] == {}
+    assert "破坏性操作" in err and "已下载数据" in err
 
 
 def test_download_row_out_of_range_exits_2(run_cli) -> None:

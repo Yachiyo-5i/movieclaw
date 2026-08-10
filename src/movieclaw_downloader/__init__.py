@@ -18,6 +18,7 @@ from movieclaw_downloader.exceptions import (
     DownloaderException,
     DownloaderNotSupportedError,
     DownloaderSubmitError,
+    DownloaderTaskDeleteError,
     TorrentParseError,
 )
 from movieclaw_downloader.factory import create_downloader
@@ -42,6 +43,7 @@ __all__ = [
     "DownloaderInfo",
     "DownloaderNotSupportedError",
     "DownloaderSubmitError",
+    "DownloaderTaskDeleteError",
     "DownloaderType",
     "SubmitResult",
     "TorrentBrief",

@@ -39,6 +39,29 @@ class _FakeDownloader:
         pass
 
 
+class _FakeTaskDeleteDownloader:
+    """删除接口的假适配器：记录调用参数，并可精确模拟外部下载器结果。"""
+
+    deleted: bool = True
+    error: Exception | None = None
+    calls: list[tuple[str, bool, str | None]] = []
+
+    async def delete_torrent(
+        self,
+        info_hash: str,
+        *,
+        delete_files: bool = False,
+        required_category: str | None = None,
+    ) -> bool:
+        self.calls.append((info_hash, delete_files, required_category))
+        if self.error is not None:
+            raise self.error
+        return self.deleted
+
+    async def close(self) -> None:
+        pass
+
+
 @pytest.fixture
 def client(tmp_path, monkeypatch):
     # 每个测试用独立临时 SQLite 库与密钥文件，保证隔离
@@ -263,3 +286,111 @@ def test_delete_then_404(client) -> None:
     assert c.delete(f"/api/v1/downloaders/{did}").status_code == 200
     assert c.get(f"/api/v1/downloaders/{did}").status_code == 404
     assert c.delete(f"/api/v1/downloaders/{did}").status_code == 404
+
+
+def _install_task_delete_downloader(
+    monkeypatch, *, deleted: bool = True, error: Exception | None = None
+):
+    """把删除编排使用的适配器替换成可断言调用参数的假对象。"""
+    import movieclaw_api.services.torrent_submit as torrent_submit
+
+    _FakeTaskDeleteDownloader.deleted = deleted
+    _FakeTaskDeleteDownloader.error = error
+    _FakeTaskDeleteDownloader.calls = []
+    monkeypatch.setattr(
+        torrent_submit,
+        "create_downloader",
+        lambda config: _FakeTaskDeleteDownloader(),
+    )
+    return _FakeTaskDeleteDownloader
+
+
+def test_delete_qb_task_keeps_files_by_default(client, monkeypatch) -> None:
+    c, _ = client
+    did = c.post("/api/v1/downloaders", json=_PAYLOAD).json()["data"]["id"]
+    fake = _install_task_delete_downloader(monkeypatch)
+
+    r = c.delete(f"/api/v1/downloaders/{did}/torrents/{'A' * 40}")
+
+    assert r.status_code == 200
+    assert r.json()["data"] == {"info_hash": "a" * 40, "delete_files": False}
+    assert "保留已下载数据" in r.json()["message"]
+    assert fake.calls == [("a" * 40, False, "movieclaw")]
+
+
+def test_delete_qb_task_can_delete_files_explicitly(client, monkeypatch) -> None:
+    c, _ = client
+    did = c.post("/api/v1/downloaders", json=_PAYLOAD).json()["data"]["id"]
+    fake = _install_task_delete_downloader(monkeypatch)
+
+    r = c.delete(f"/api/v1/downloaders/{did}/torrents/{'a' * 40}/files")
+
+    assert r.status_code == 200
+    assert r.json()["data"] == {"info_hash": "a" * 40, "delete_files": True}
+    assert "及已下载数据" in r.json()["message"]
+    assert fake.calls == [("a" * 40, True, "movieclaw")]
+
+
+def test_delete_qb_task_not_found_returns_404(client, monkeypatch) -> None:
+    c, _ = client
+    did = c.post("/api/v1/downloaders", json=_PAYLOAD).json()["data"]["id"]
+    _install_task_delete_downloader(monkeypatch, deleted=False)
+
+    r = c.delete(f"/api/v1/downloaders/{did}/torrents/{'a' * 40}")
+
+    assert r.status_code == 404
+    assert r.json()["code"] == "RESOURCE_NOT_FOUND"
+    assert "不存在下载任务" in r.json()["message"]
+
+
+def test_delete_task_rejects_non_qb_downloader(client, monkeypatch) -> None:
+    c, _ = client
+    payload = {**_PAYLOAD, "name": "Transmission", "client_type": "transmission"}
+    did = c.post("/api/v1/downloaders", json=payload).json()["data"]["id"]
+    fake = _install_task_delete_downloader(monkeypatch)
+
+    r = c.delete(f"/api/v1/downloaders/{did}/torrents/{'a' * 40}")
+
+    assert r.status_code == 400
+    assert "仅支持 qBittorrent" in r.json()["message"]
+    assert fake.calls == []
+
+
+def test_delete_qb_task_adapter_error_returns_readable_502(client, monkeypatch) -> None:
+    c, _ = client
+    did = c.post("/api/v1/downloaders", json=_PAYLOAD).json()["data"]["id"]
+    _install_task_delete_downloader(
+        monkeypatch,
+        error=DownloaderConnectError("无法连接到 qBittorrent，请检查 WebUI 地址和端口"),
+    )
+
+    r = c.delete(f"/api/v1/downloaders/{did}/torrents/{'a' * 40}")
+
+    assert r.status_code == 502
+    assert r.json()["code"] == "UPSTREAM_ERROR"
+    assert "无法连接到 qBittorrent" in r.json()["message"]
+
+
+def test_delete_qb_task_rejects_legacy_delete_files_flag(client, monkeypatch) -> None:
+    c, _ = client
+    did = c.post("/api/v1/downloaders", json=_PAYLOAD).json()["data"]["id"]
+    fake = _install_task_delete_downloader(monkeypatch)
+
+    r = c.delete(
+        f"/api/v1/downloaders/{did}/torrents/{'a' * 40}", params={"delete_files": "true"}
+    )
+
+    assert r.status_code == 400
+    assert "删除任务及数据" in r.json()["message"]
+    assert fake.calls == []
+
+
+def test_delete_qb_task_requires_exact_v1_or_v2_hash(client, monkeypatch) -> None:
+    c, _ = client
+    did = c.post("/api/v1/downloaders", json=_PAYLOAD).json()["data"]["id"]
+    fake = _install_task_delete_downloader(monkeypatch)
+
+    r = c.delete(f"/api/v1/downloaders/{did}/torrents/{'a' * 41}")
+
+    assert r.status_code == 422
+    assert fake.calls == []

@@ -23,6 +23,9 @@ from movieclaw_cli.core.errors import CliError, ExitCode
 
 ENV_SERVER = "MOVIECLAW_SERVER"
 ENV_TOKEN = "MOVIECLAW_TOKEN"
+# 产品内 Agent 注入的服务端锁。普通 CLI 不设置它，仍可通过 --server 管理多台实例；
+# Agent 带着短时效高权限令牌，绝不能把该令牌随 --server 转发给任意地址。
+ENV_AGENT_LOCKED_SERVER = "MOVIECLAW_AGENT_LOCKED_SERVER"
 ENV_CONTEXT = "MOVIECLAW_CONTEXT"
 ENV_CONFIG_DIR = "MOVIECLAW_CONFIG_DIR"
 

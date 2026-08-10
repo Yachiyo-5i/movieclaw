@@ -15,6 +15,7 @@ from movieclaw_downloader.exceptions import (
     DownloaderAuthError,
     DownloaderConnectError,
     DownloaderSubmitError,
+    DownloaderTaskDeleteError,
 )
 from movieclaw_downloader.models import DownloaderConfig, DownloaderType, DownloadRequest
 from movieclaw_downloader.torrent import compute_info_hash
@@ -41,12 +42,18 @@ class FakeQbtClient:
         self.store: dict[str, SimpleNamespace] = {}
         self.add_response = add_response
         self.add_calls: list[dict] = []
+        self.delete_calls: list[dict] = []
         # 添加成功后自动登记到 store 的 (hash, name)，模拟下载器注册行为
         self.register_on_add: tuple[str, str] | None = (TORRENT_HASH, "test.mkv")
 
-    def torrents_info(self, torrent_hashes=None):
+    def torrents_info(self, torrent_hashes=None, category=None):
         found = self.store.get(torrent_hashes)
-        return [found] if found else []
+        result = [found] if found else []
+        if category is not None:
+            result = [
+                torrent for torrent in result if getattr(torrent, "category", None) == category
+            ]
+        return result
 
     def torrents_add(self, **kwargs):
         self.add_calls.append(kwargs)
@@ -54,6 +61,11 @@ class FakeQbtClient:
             info_hash, name = self.register_on_add
             self.store[info_hash] = SimpleNamespace(hash=info_hash, name=name)
         return self.add_response
+
+    def torrents_delete(self, **kwargs):
+        self.delete_calls.append(kwargs)
+        for info_hash in str(kwargs["torrent_hashes"]).split("|"):
+            self.store.pop(info_hash, None)
 
     def auth_log_in(self):
         pass
@@ -156,3 +168,105 @@ class TestConnection:
 
         with pytest.raises(DownloaderAuthError):
             await downloader.test_connection()
+
+
+class TestDeleteTorrent:
+    async def test_delete_task_keeps_files_by_default(self):
+        fake = FakeQbtClient()
+        fake.store[TORRENT_HASH] = SimpleNamespace(
+            hash=TORRENT_HASH, name="existing.mkv", category="movieclaw"
+        )
+        downloader = make_downloader(fake)
+
+        deleted = await downloader.delete_torrent(TORRENT_HASH, required_category="movieclaw")
+
+        assert deleted is True
+        assert fake.delete_calls == [{"torrent_hashes": TORRENT_HASH, "delete_files": False}]
+        assert TORRENT_HASH not in fake.store
+
+    async def test_delete_task_can_explicitly_delete_files(self):
+        fake = FakeQbtClient()
+        fake.store[TORRENT_HASH] = SimpleNamespace(
+            hash=TORRENT_HASH, name="existing.mkv", category="movieclaw"
+        )
+        downloader = make_downloader(fake)
+
+        deleted = await downloader.delete_torrent(TORRENT_HASH, delete_files=True)
+
+        assert deleted is True
+        assert fake.delete_calls == [{"torrent_hashes": TORRENT_HASH, "delete_files": True}]
+
+    async def test_delete_unknown_task_returns_false_without_calling_delete(self):
+        fake = FakeQbtClient()
+        downloader = make_downloader(fake)
+
+        deleted = await downloader.delete_torrent(TORRENT_HASH)
+
+        assert deleted is False
+        assert fake.delete_calls == []
+
+    async def test_delete_non_movieclaw_task_returns_false_without_calling_delete(self):
+        fake = FakeQbtClient()
+        fake.store[TORRENT_HASH] = SimpleNamespace(
+            hash=TORRENT_HASH, name="personal.mkv", category="personal"
+        )
+        downloader = make_downloader(fake)
+
+        deleted = await downloader.delete_torrent(TORRENT_HASH, required_category="movieclaw")
+
+        assert deleted is False
+        assert fake.delete_calls == []
+
+    async def test_delete_api_error_is_translated(self):
+        fake = FakeQbtClient()
+        fake.store[TORRENT_HASH] = SimpleNamespace(
+            hash=TORRENT_HASH, name="existing.mkv", category="movieclaw"
+        )
+
+        def raise_api_error(**kwargs):
+            raise qbittorrentapi.APIError("boom")
+
+        fake.torrents_delete = raise_api_error
+        downloader = make_downloader(fake)
+
+        with pytest.raises(DownloaderTaskDeleteError, match="删除下载任务失败"):
+            await downloader.delete_torrent(TORRENT_HASH)
+
+    async def test_delete_connection_error_is_translated(self):
+        fake = FakeQbtClient()
+
+        def raise_connection_error(torrent_hashes=None, category=None):
+            raise qbittorrentapi.APIConnectionError("boom")
+
+        fake.torrents_info = raise_connection_error
+        downloader = make_downloader(fake)
+
+        with pytest.raises(DownloaderConnectError, match="无法连接"):
+            await downloader.delete_torrent(TORRENT_HASH)
+
+    async def test_delete_auth_error_is_translated(self):
+        fake = FakeQbtClient()
+
+        def raise_login_failed(torrent_hashes=None, category=None):
+            raise qbittorrentapi.LoginFailed("bad credentials")
+
+        fake.torrents_info = raise_login_failed
+        downloader = make_downloader(fake)
+
+        with pytest.raises(DownloaderAuthError, match="登录失败"):
+            await downloader.delete_torrent(TORRENT_HASH)
+
+    async def test_delete_requires_qb_to_confirm_task_is_gone(self):
+        fake = FakeQbtClient()
+        fake.store[TORRENT_HASH] = SimpleNamespace(
+            hash=TORRENT_HASH, name="existing.mkv", category="movieclaw"
+        )
+        downloader = make_downloader(fake)
+
+        def keep_task(**kwargs):
+            fake.delete_calls.append(kwargs)
+
+        fake.torrents_delete = keep_task
+
+        with pytest.raises(DownloaderTaskDeleteError, match="未确认"):
+            await downloader.delete_torrent(TORRENT_HASH)

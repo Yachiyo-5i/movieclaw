@@ -83,5 +83,7 @@ def test_dangerous_and_long_task_flow_into_commands() -> None:
     ops = {op["operation_id"]: op for op in iter_operations(load_baseline())}
     assert ops["lib.items.delete"]["dangerous"] == "destructive"
     assert ops["sub.delete"]["dangerous"] == "confirm"
+    assert ops["dl.torrent.delete"]["dangerous"] == "confirm"
+    assert ops["dl.torrent.files.delete"]["dangerous"] == "destructive"
     assert ops["lib.scan.start"]["long_task"]["progress_op"] == "lib.show"
     assert ops["lib.refresh.start"]["long_task"]["done_field"] == "refreshing"

@@ -20,6 +20,7 @@ from movieclaw_downloader.exceptions import (
     DownloaderAuthError,
     DownloaderConnectError,
     DownloaderSubmitError,
+    DownloaderTaskDeleteError,
 )
 from movieclaw_downloader.models import (
     DownloaderInfo,
@@ -76,6 +77,41 @@ def _translate_errors(url: str) -> Iterator[None]:
     except qbittorrentapi.APIConnectionError as exc:
         raise DownloaderConnectError(
             "无法连接到 qBittorrent，请检查 WebUI 地址和端口",
+            details={"url": url, "error": str(exc)},
+        ) from exc
+
+
+@contextmanager
+def _translate_delete_errors(url: str) -> Iterator[None]:
+    """把删除任务时的 qBittorrent 异常翻译成明确、可展示的中文错误。
+
+    删除接口可能返回任意 HTTP API 错误，不能复用提交任务的「种子文件
+    无效」文案；认证与网络问题仍沿用统一语义，方便上层区分配置问题。
+    """
+    try:
+        yield
+    except qbittorrentapi.LoginFailed as exc:
+        raise DownloaderAuthError(
+            "qBittorrent 登录失败：用户名或密码错误", details={"url": url}
+        ) from exc
+    except (qbittorrentapi.Unauthorized401Error, qbittorrentapi.Forbidden403Error) as exc:
+        raise DownloaderAuthError(
+            "qBittorrent 拒绝访问：请检查凭证，多次失败可能触发了 IP 封禁",
+            details={"url": url},
+        ) from exc
+    except qbittorrentapi.HTTPError as exc:
+        raise DownloaderTaskDeleteError(
+            "qBittorrent 删除下载任务失败：下载器返回了 API 错误",
+            details={"url": url, "error": str(exc)},
+        ) from exc
+    except qbittorrentapi.APIConnectionError as exc:
+        raise DownloaderConnectError(
+            "无法连接到 qBittorrent，请检查 WebUI 地址和端口",
+            details={"url": url, "error": str(exc)},
+        ) from exc
+    except qbittorrentapi.APIError as exc:
+        raise DownloaderTaskDeleteError(
+            "qBittorrent 删除下载任务失败：下载器返回异常",
             details={"url": url, "error": str(exc)},
         ) from exc
 
@@ -185,6 +221,50 @@ class QBittorrentDownloader(BaseDownloader):
             eta_seconds=eta if 0 < eta < 8640000 else None,
             state=_normalize_state(str(getattr(torrent, "state", "")), completed=completed),
         )
+
+    async def delete_torrent(
+        self,
+        info_hash: str,
+        *,
+        delete_files: bool = False,
+        required_category: str | None = None,
+    ) -> bool:
+        """删除 qBittorrent 任务；任务不存在或不属指定分类时返回 False。
+
+        qB 的 ``torrents_delete`` 对不存在的 hash 仍返回成功，单靠它无法让
+        调用方区分「确实删掉」和「早已不存在」。因此先按 hash/分类查找，
+        再删除并回查确认任务已消失；对外回执只承诺最终状态，不虚构原子删除。
+        """
+        return await asyncio.to_thread(
+            self._delete_torrent_sync, info_hash, delete_files, required_category
+        )
+
+    def _delete_torrent_sync(
+        self,
+        info_hash: str,
+        delete_files: bool = False,
+        required_category: str | None = None,
+    ) -> bool:
+        client = self._client()
+        with _translate_delete_errors(self.config.url):
+            if not client.torrents_info(
+                torrent_hashes=info_hash,
+                category=required_category,
+            ):
+                return False
+            client.torrents_delete(
+                torrent_hashes=info_hash,
+                delete_files=delete_files,
+            )
+            if client.torrents_info(torrent_hashes=info_hash):
+                raise DownloaderTaskDeleteError(
+                    "qBittorrent 未确认任务已删除，请稍后刷新任务列表后重试",
+                    details={"url": self.config.url},
+                )
+        logger.info(
+            "已从 qBittorrent 删除下载任务: hash=%s 删除数据=%s", info_hash, delete_files
+        )
+        return True
 
     async def list_torrents(self) -> list[TorrentBrief]:
         return await asyncio.to_thread(self._list_torrents_sync)

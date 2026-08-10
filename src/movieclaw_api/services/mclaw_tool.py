@@ -28,7 +28,7 @@ _DOMAIN_LINES = {
     "lib": "lib      媒体库：库管理、scan 扫描、organize 整理、items 条目、"
     "unidentified 待识别认领、missing 缺失重下、review 身份复核",
     "site": "site     PT 站点接入与验证（catalog 看支持哪些站）",
-    "dl": "dl       下载器接入、默认下载器与路径映射",
+    "dl": "dl       下载器接入、默认下载器与路径映射；torrent delete 可删除 qB 下载任务",
     "watch": "watch    监听导入规则（下载完成目录 → 自动入库）",
     "webhook": "webhook  事件 Webhook 出站推送（show/set 配置端点、test 试发、"
     "deliveries 查投递记录、rotate-secret 轮换签名密钥）",

@@ -15,10 +15,15 @@ from sqlmodel import select
 
 import movieclaw_api.services.download_progress as progress_mod
 from movieclaw_api.core.config import get_settings
+from movieclaw_api.exceptions import ConflictException
 from movieclaw_api.services.subscription.wanted_fulfillment import close_fulfilled_wanted
+from movieclaw_api.services.torrent_submit import delete_torrent
 from movieclaw_db.engine import dispose_db, get_database, init_db
 from movieclaw_db.migrations import run_migrations
 from movieclaw_db.models import (
+    ClientType,
+    ConfigStatus,
+    DownloaderClient,
     FileSource,
     LibraryFile,
     MediaItem,
@@ -165,6 +170,29 @@ async def test_inventory_ignores_unrelated_units(db):
         assert await close_fulfilled_wanted(session, item_id) == 0
         wanted = await session.get(WantedItem, wanted_id)
         assert wanted.status == WantedStatus.GRABBED
+
+
+@pytest.mark.asyncio
+async def test_task_delete_rejects_subscription_task_before_touching_qb(db):
+    """订阅仍追踪的 hash 不可走通用 qB 删除，避免巡检稍后把它重新投递。"""
+    _library_id, _item_id, _sub_id, _wanted_id = await _seed(db)
+    async with db.session() as session:
+        downloader = DownloaderClient(
+            name="测试 qB",
+            client_type=ClientType.QBITTORRENT,
+            url="http://qb.example",
+            status=ConfigStatus.ACTIVE,
+        )
+        session.add(downloader)
+        await session.commit()
+        assert downloader.id is not None
+
+        with pytest.raises(ConflictException, match="自动重新寻找"):
+            await delete_torrent(
+                session,
+                downloader_id=downloader.id,
+                info_hash="abc123",
+            )
 
 
 @pytest.mark.asyncio

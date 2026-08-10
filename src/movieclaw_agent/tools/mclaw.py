@@ -45,6 +45,28 @@ _BLOCKED = {
     "logout": "授权已自动配置，不需要也不允许执行 login/logout（会破坏凭证状态）。",
 }
 
+# Agent 的工作区令牌只应访问创建该运行的本机服务。--server/--context 是人类
+# CLI 的多实例便利功能；在 Agent 里保留它们会把 MOVIECLAW_TOKEN 一并发往
+# 任意 URL，形成令牌外泄与 SSRF 通道。删除下载数据同样不能由模型自己把
+# --yes 拼出来，先只开放可逆的「删除任务、保留文件」能力。
+_BLOCKED_OPTIONS = ("--server", "--context")
+_DISK_DELETE_COMMAND = ("dl", "torrent", "files", "delete")
+
+
+def _validate_agent_argv(argv: list[str]) -> None:
+    """在启动子进程前拒绝会扩大 Agent 权限边界的参数组合。"""
+    for arg in argv:
+        if arg in _BLOCKED_OPTIONS or arg.startswith(("--server=", "--context=")):
+            raise ValueError(
+                "产品内 Agent 不允许覆盖服务器或上下文，"
+                "以免将工作区授权令牌发送到其他地址"
+            )
+    if tuple(argv[: len(_DISK_DELETE_COMMAND)]) == _DISK_DELETE_COMMAND:
+        raise ValueError(
+            "产品内 Agent 不能删除已下载文件；"
+            "如需清除磁盘数据，请由用户在 Web 界面或本机 CLI 中明确执行"
+        )
+
 _PROTOCOL = """\
 movieclaw 的官方命令行工具。对本产品的一切操作——搜索资源、订阅、媒体库、下载、\
 站点/下载器/规则等全部设置——都用本工具完成（不要通过 bash 调用，bash 环境没有授权）。\
@@ -60,13 +82,15 @@ movieclaw 的官方命令行工具。对本产品的一切操作——搜索资�
 必须先用只读命令查清将删除的具体条目、向用户复述并取得本轮明确同意后才能执行；\
 用户泛泛说「清理/整理」不构成删除文件的同意。其余 ⚠ 命令（删配置、清记录）在用户\
 任务明确要求时可直接 --yes。
+- dl torrent delete 默认只删 qBittorrent 任务、保留数据。产品内 Agent 不可删除\
+ 已下载文件；如需清除磁盘数据，用户须在 Web 界面或本机 CLI 中明确执行。
 - 扫描/整理/元数据刷新默认阻塞等待完成；预计超过 4 分钟的任务用 --no-wait 启动后\
 轮询进度，或调大本工具的 timeout 参数。"""
 
 
 def build_description(service_map: str) -> str:
     """组装完整工具描述：静态使用协议 + 动态一级服务目录。"""
-    return _PROTOCOL.format(service_map=service_map.strip())
+    return _PROTOCOL.format(service_map=service_map.strip()) + "\n"
 
 
 def make_mclaw_tool(
@@ -92,6 +116,12 @@ def make_mclaw_tool(
             raise ValueError('args 不能为空；例如 args="sub list" 或 args="--help"')
         if note := _BLOCKED.get(argv[0]):
             raise ValueError(note)
+        _validate_agent_argv(argv)
+
+        child_env = {**os.environ, **extra_env}
+        if server := extra_env.get("MOVIECLAW_SERVER"):
+            # CLI HTTP 层的第二道出口闸门（见 core.config.ENV_AGENT_LOCKED_SERVER）。
+            child_env["MOVIECLAW_AGENT_LOCKED_SERVER"] = server.rstrip("/")
 
         # 与当前解释器同环境的 CLI 入口（同 venv/镜像内必然可用，无需依赖 PATH）
         proc = await asyncio.create_subprocess_exec(
@@ -100,7 +130,7 @@ def make_mclaw_tool(
             "movieclaw_cli",
             *argv,
             cwd=workdir,
-            env={**os.environ, **extra_env},
+            env=child_env,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )

@@ -45,6 +45,17 @@ class Api:
         self.server = server
         self.debug = debug
         self.last_message: str | None = None
+        # 内置 Agent 的令牌只能用于创建它的本机服务。除了工具层拒绝
+        # --server 外，这里再做一次网络出口闸门：即使将来新增了能改写
+        # Settings 的命令，也不会把 Bearer 令牌发给用户输入或提示注入指定的地址。
+        if (locked_server := os.environ.get(cfg.ENV_AGENT_LOCKED_SERVER)) and (
+            server.rstrip("/") != locked_server.rstrip("/")
+        ):
+            raise CliError(
+                "产品内 Agent 不允许把授权令牌发送到其他服务器",
+                exit_code=ExitCode.AUTH,
+                hint="请移除 --server/--context，使用 Agent 已绑定的本机服务",
+            )
         cookies = {}
         headers = {"Accept": "application/json"}
         # Bearer 令牌通道：PAT 或产品内 Agent 工作区注入的短时效令牌。

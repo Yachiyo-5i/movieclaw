@@ -32,6 +32,22 @@ def test_login_logout_blocked(tmp_path: Path) -> None:
             asyncio.run(tool.handler({"args": cmd}))
 
 
+@pytest.mark.parametrize(
+    "args",
+    (
+        "sub list --server http://example.invalid",
+        "sub list --server=http://example.invalid",
+        "sub list --context other",
+        "dl torrent files delete 1 " + "a" * 40 + " --yes",
+    ),
+)
+def test_agent_blocks_token_exfiltration_and_disk_deletion(tmp_path: Path, args: str) -> None:
+    """高权限工作区令牌不能改投其他服务，也不能由模型删除磁盘数据。"""
+    tool = _tool(tmp_path)
+    with pytest.raises(ValueError, match="不允许覆盖服务器|不能删除已下载文件"):
+        asyncio.run(tool.handler({"args": args}))
+
+
 def test_unparseable_args_gives_chinese_error(tmp_path: Path) -> None:
     tool = _tool(tmp_path)
     with pytest.raises(ValueError, match="引号不配对"):
@@ -81,4 +97,5 @@ def test_description_contains_service_map_and_protocol() -> None:
     desc = build_description("可用服务：\n- sub 订阅")
     assert "可用服务" in desc and "sub 订阅" in desc
     assert "--help" in desc and "--yes" in desc
+    assert "Agent 不可删除" in desc
     assert "bash" in desc  # 排他性引导：不要经 bash 调用

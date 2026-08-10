@@ -60,6 +60,8 @@ dl list
 dl show
 dl status set
 dl submit
+dl torrent delete
+dl torrent files delete
 dl update
 dl verify
 extension cookies push

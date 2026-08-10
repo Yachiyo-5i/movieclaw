@@ -1,14 +1,16 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, BackgroundTasks, Depends
+from fastapi import APIRouter, BackgroundTasks, Depends, Path, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from movieclaw_api.exceptions import BadRequestException
 from movieclaw_api.schemas.downloader import (
     DownloaderPayload,
     DownloaderStatusUpdate,
     DownloaderView,
     DownloadSubmitPayload,
     DownloadSubmitView,
+    DownloadTaskDeleteView,
 )
 from movieclaw_api.schemas.response import ApiResponse, ok
 from movieclaw_api.services.downloader_config import (
@@ -16,7 +18,11 @@ from movieclaw_api.services.downloader_config import (
     verify_downloader,
 )
 from movieclaw_api.services.library.config import LibraryConfigService
-from movieclaw_api.services.torrent_submit import submit_torrent, translate_save_path
+from movieclaw_api.services.torrent_submit import (
+    delete_torrent,
+    submit_torrent,
+    translate_save_path,
+)
 from movieclaw_db.engine import get_session
 
 router = APIRouter(prefix="/downloaders", tags=["downloaders"])
@@ -93,6 +99,73 @@ async def submit_download(
     else:
         message = f"已提交到「{row.name}」"
     return ok(view, message=message)
+
+
+@router.delete(
+    "/{downloader_id}/torrents/{info_hash}",
+    response_model=ApiResponse[DownloadTaskDeleteView],
+    summary="删除 MovieClaw 创建的 qBittorrent 下载任务（保留已下载数据）",
+    operation_id="dl.torrent.delete",
+    openapi_extra={"x-cli-dangerous": "confirm"},
+)
+async def delete_download_task(
+    downloader_id: int,
+    info_hash: str = Path(
+        pattern="^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$",
+        description="要删除的 qBittorrent 下载任务 infohash（v1 为 40 位，v2 为 64 位）",
+    ),
+    delete_files: str | None = Query(default=None, include_in_schema=False),
+    session: AsyncSession = Depends(get_session),
+) -> ApiResponse[DownloadTaskDeleteView]:
+    """删除单个 MovieClaw 创建的 qBittorrent 任务，磁盘数据保持不动。"""
+    if delete_files is not None:
+        raise BadRequestException(
+            "删除磁盘数据必须调用「删除任务及数据」接口，不能通过 delete_files 参数请求"
+        )
+    normalized_hash = info_hash.lower()
+    row = await delete_torrent(
+        session,
+        downloader_id=downloader_id,
+        info_hash=normalized_hash,
+        delete_files=False,
+    )
+    return ok(
+        DownloadTaskDeleteView(info_hash=normalized_hash, delete_files=False),
+        message=f"已确认下载器「{row.name}」中任务已删除，已保留已下载数据",
+    )
+
+
+@router.delete(
+    "/{downloader_id}/torrents/{info_hash}/files",
+    response_model=ApiResponse[DownloadTaskDeleteView],
+    summary="删除 MovieClaw 创建的 qBittorrent 下载任务及已下载数据",
+    operation_id="dl.torrent.files.delete",
+    openapi_extra={"x-cli-dangerous": "destructive"},
+)
+async def delete_download_task_and_files(
+    downloader_id: int,
+    info_hash: str = Path(
+        pattern="^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$",
+        description="要删除的 qBittorrent 下载任务 infohash（v1 为 40 位，v2 为 64 位）",
+    ),
+    session: AsyncSession = Depends(get_session),
+) -> ApiResponse[DownloadTaskDeleteView]:
+    """删除单个 MovieClaw 创建的 qBittorrent 任务及其落盘数据。
+
+    此接口仅供明确了解影响面的 Web 或本机 CLI 使用；产品内 Agent 被工具层
+    硬性禁止调用，避免模型自行生成确认参数而误删磁盘文件。
+    """
+    normalized_hash = info_hash.lower()
+    row = await delete_torrent(
+        session,
+        downloader_id=downloader_id,
+        info_hash=normalized_hash,
+        delete_files=True,
+    )
+    return ok(
+        DownloadTaskDeleteView(info_hash=normalized_hash, delete_files=True),
+        message=f"已确认下载器「{row.name}」中任务及已下载数据均已删除",
+    )
 
 
 @router.get(
