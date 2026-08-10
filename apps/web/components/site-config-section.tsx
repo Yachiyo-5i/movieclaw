@@ -451,12 +451,37 @@ function SiteCard({
     <div className="css-glass !rounded-xl">
       {/* 顶部行：首字母徽标 + 站点信息 + 状态 + 操作 */}
       <div className="flex items-center gap-3.5 p-4">
-        <span className="icon-chip size-10 !rounded-xl text-body font-semibold">
-          {item.display_name.charAt(0).toUpperCase()}
-        </span>
+        {item.base_url ? (
+          <a
+            href={item.base_url}
+            target="_blank"
+            rel="noreferrer"
+            aria-label={`在新窗口打开 ${item.display_name}`}
+            title="在新窗口打开站点"
+            className="icon-chip size-10 cursor-pointer !rounded-xl text-body font-semibold outline-none hover:bg-white/[0.1] hover:text-[var(--text)] focus-visible:ring-2 focus-visible:ring-[var(--accent-ring)]"
+          >
+            {item.display_name.charAt(0).toUpperCase()}
+          </a>
+        ) : (
+          <span className="icon-chip size-10 !rounded-xl text-body font-semibold">
+            {item.display_name.charAt(0).toUpperCase()}
+          </span>
+        )}
         <div className="min-w-0 flex-1">
           <div className="flex items-center gap-2">
-            <p className="truncate text-body font-semibold text-[var(--text)]">{item.display_name}</p>
+            {item.base_url ? (
+              <a
+                href={item.base_url}
+                target="_blank"
+                rel="noreferrer"
+                title="在新窗口打开站点"
+                className="truncate text-body font-semibold text-[var(--text)] underline decoration-transparent underline-offset-4 transition-colors hover:cursor-pointer hover:text-white/80 hover:decoration-white/50 focus-visible:outline-none focus-visible:decoration-white/50"
+              >
+                {item.display_name}
+              </a>
+            ) : (
+              <p className="truncate text-body font-semibold text-[var(--text)]">{item.display_name}</p>
+            )}
             <span
               className="flex shrink-0 items-center gap-1.5 rounded-full px-2 py-0.5 text-caption font-medium"
               style={{ background: `${meta.color}1f`, color: meta.color }}
