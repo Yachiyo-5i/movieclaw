@@ -116,7 +116,10 @@ export interface RuleSetSpec {
   video_codecs?: string[];
   release_groups_allow?: string[];
   release_groups_block?: string[];
+  /** 判断整个 HDR 家族（含 DV），与 dv 轴正交 */
   hdr?: "any" | "require" | "forbid";
+  /** 单独判断杜比视界；"必须 HDR 但排除 DV" = hdr:require + dv:forbid */
+  dv?: "any" | "require" | "forbid";
   free_only?: boolean;
   min_seeders?: number | null;
   /** 体积区间按「每集均摊」评估：整季包用总体积 ÷ 集数比较 */

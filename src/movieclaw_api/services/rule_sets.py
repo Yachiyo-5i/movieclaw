@@ -117,7 +117,11 @@ class RuleSetService:
 
     @staticmethod
     def _validate(name: str, spec: dict) -> dict:
-        """经 RuleSetSpec 校验并规整（未知字段拒绝、类型收敛），存精简形态。"""
+        """经 RuleSetSpec 校验并规整（未知字段忽略、类型收敛），存精简形态。
+
+        未知字段被静默忽略是 pydantic 默认行为，也是刻意保留的兼容策略：
+        新版本加字段（如 dv）后回退旧版本，旧代码读到新字段不会报错。
+        """
         if not name.strip():
             raise BadRequestException("规则组名称不能为空")
         try:

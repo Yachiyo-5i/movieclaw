@@ -253,6 +253,8 @@ export function specSummary(spec: RuleSetSpec): string[] {
   }
   if (spec.hdr === "require") chips.push("必须 HDR");
   if (spec.hdr === "forbid") chips.push("排除 HDR");
+  if (spec.dv === "require") chips.push("必须 DV");
+  if (spec.dv === "forbid") chips.push("排除 DV");
   if (spec.free_only) chips.push("仅免费");
   if (spec.min_seeders != null) chips.push(`做种 ≥ ${spec.min_seeders}`);
   if (spec.size_min_mb != null || spec.size_max_mb != null) {
@@ -306,6 +308,7 @@ export function RuleSetEditorDialog({
       ),
   );
   const [hdr, setHdr] = useState<"any" | "require" | "forbid">(spec.hdr ?? "any");
+  const [dv, setDv] = useState<"any" | "require" | "forbid">(spec.dv ?? "any");
   const [freeOnly, setFreeOnly] = useState(spec.free_only ?? false);
   const [excludeHr, setExcludeHr] = useState(spec.exclude_hr ?? false);
   const [hrStrict, setHrStrict] = useState(spec.hr_unknown_policy === "strict");
@@ -358,6 +361,7 @@ export function RuleSetEditorDialog({
     ];
     if (codecs.length) next.video_codecs = codecs;
     if (hdr !== "any") next.hdr = hdr;
+    if (dv !== "any") next.dv = dv;
     if (freeOnly) next.free_only = true;
     if (excludeHr) {
       next.exclude_hr = true;
@@ -470,7 +474,7 @@ export function RuleSetEditorDialog({
             </div>
           </Field>
 
-          <Field label="HDR">
+          <Field label="HDR" hint="判断整个 HDR 家族（HDR10/HLG/DV 等）；DV 可在下方单独控制">
             <div className="flex flex-wrap gap-1.5">
               {(
                 [
@@ -479,7 +483,42 @@ export function RuleSetEditorDialog({
                   ["forbid", "排除 HDR"],
                 ] as const
               ).map(([value, label]) => (
-                <ToggleChip key={value} active={hdr === value} onClick={() => setHdr(value)}>
+                <ToggleChip
+                  key={value}
+                  active={hdr === value}
+                  onClick={() => {
+                    setHdr(value);
+                    // 排除整个 HDR 家族时，「必须 DV」成为矛盾条件，自动复位
+                    if (value === "forbid" && dv === "require") setDv("any");
+                  }}
+                >
+                  {label}
+                </ToggleChip>
+              ))}
+            </div>
+          </Field>
+
+          <Field
+            label="杜比视界（DV）"
+            hint="与上面的 HDR 条件叠加生效，如「必须 HDR」+「排除 DV」= 只要不带 DV 的 HDR 资源"
+          >
+            <div className="flex flex-wrap gap-1.5">
+              {(
+                [
+                  ["any", "不限"],
+                  ["require", "必须 DV"],
+                  ["forbid", "排除 DV"],
+                ] as const
+              ).map(([value, label]) => (
+                <ToggleChip
+                  key={value}
+                  active={dv === value}
+                  onClick={() => {
+                    setDv(value);
+                    // 「必须 DV」与「排除 HDR」矛盾（DV 属于 HDR 家族），自动复位后者
+                    if (value === "require" && hdr === "forbid") setHdr("any");
+                  }}
+                >
                   {label}
                 </ToggleChip>
               ))}

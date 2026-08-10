@@ -18,6 +18,7 @@ movieclaw_api 的 services 层编排（docs/design/subscription.md 第 3 节）�
 from movieclaw_matcher.decision import pick_best
 from movieclaw_matcher.identity import match_identity, normalize_title
 from movieclaw_matcher.models import (
+    DvPolicy,
     HdrPolicy,
     HrUnknownPolicy,
     IdentityMatch,
@@ -29,6 +30,7 @@ from movieclaw_matcher.models import (
 from movieclaw_matcher.rules import evaluate_rules
 
 __all__ = [
+    "DvPolicy",
     "HdrPolicy",
     "HrUnknownPolicy",
     "IdentityMatch",
