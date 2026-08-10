@@ -5,6 +5,8 @@ import { useCallback, useEffect, useState } from "react";
 import type { Route } from "next";
 import Link from "next/link";
 
+import { ContentEmptyState } from "@/components/content-empty-state";
+import { CompassIcon } from "@/components/icons";
 import { PosterCardVisual, type PosterVisualItem } from "@/components/poster-card";
 import { useSubscribeEntry } from "@/components/subscribe-entry";
 import { getPipelineHealth, type Subscription } from "@/lib/api/subscriptions";
@@ -114,18 +116,33 @@ export function SubscriptionsView() {
       )}
 
       {subscriptions !== null && !failed && visible.length === 0 && (
-        <p className="mt-16 text-center text-ui leading-7 text-[var(--text-muted)]">
-          还没有订阅任何{mediaType === "movie" ? "电影" : "剧集"}。
-          <br />
-          在发现页或搜索结果里打开影片详情，点「订阅追踪」即可加入。
-        </p>
+        <ContentEmptyState
+          variant="subscription"
+          title={
+            subscriptions.length === 0
+              ? "从一部想看的作品开始"
+              : `还没有${mediaType === "movie" ? "电影" : "剧集"}订阅`
+          }
+          description={`去发现页挑选一部${mediaType === "movie" ? "电影" : "剧集"}，打开详情并点击「订阅追踪」，有合适资源时会自动下载入库。`}
+          action={
+            <Link
+              href={`/discover/${mediaType}` as Route}
+              className="btn-accent flex items-center gap-1.5 rounded-full px-4 py-2 text-ui font-semibold"
+            >
+              <CompassIcon className="size-4" />
+              去发现{mediaType === "movie" ? "电影" : "剧集"}
+            </Link>
+          }
+        />
       )}
 
-      <div className="mt-6 grid gap-x-4 gap-y-7 px-6 [grid-template-columns:repeat(auto-fill,minmax(148px,1fr))] max-md:mt-4 max-md:gap-x-3 max-md:gap-y-5 max-md:px-4 max-md:[grid-template-columns:repeat(auto-fill,minmax(140px,1fr))]">
-        {visible.map((sub) => (
-          <SubscriptionCell key={sub.id} sub={sub} />
-        ))}
-      </div>
+      {visible.length > 0 && (
+        <div className="mt-6 grid gap-x-4 gap-y-7 px-6 [grid-template-columns:repeat(auto-fill,minmax(148px,1fr))] max-md:mt-4 max-md:gap-x-3 max-md:gap-y-5 max-md:px-4 max-md:[grid-template-columns:repeat(auto-fill,minmax(140px,1fr))]">
+          {visible.map((sub) => (
+            <SubscriptionCell key={sub.id} sub={sub} />
+          ))}
+        </div>
+      )}
     </div>
   );
 }

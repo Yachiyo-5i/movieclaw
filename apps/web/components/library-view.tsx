@@ -6,6 +6,7 @@ import type { Route } from "next";
 import Link from "next/link";
 import { createPortal } from "react-dom";
 
+import { ContentEmptyState } from "@/components/content-empty-state";
 import { DirectoryPicker } from "@/components/directory-picker";
 import { useConfirm } from "@/components/feedback";
 import { HScroller } from "@/components/h-scroller";
@@ -414,22 +415,21 @@ export function LibraryView() {
       )}
 
       {libraries !== null && libraries.length === 0 && (
-        <div className="mt-20 flex flex-col items-center gap-4 px-6 text-center">
-          <p className="text-body-lg font-semibold text-[var(--text)]">还没有媒体库</p>
-          <p className="max-w-[440px] text-ui leading-relaxed text-[var(--text-muted)]">
-            媒体库定义「内容放在哪」：订阅和下载完成的影片会整理进对应库的根目录，
-            Plex / Emby 指向同一目录即可识别。建议按类型分别创建，比如电影库、剧集库，
-            根路径选到你的媒体盘（Docker 部署时是挂进容器的那个路径）。
-          </p>
-          <button
-            type="button"
-            onClick={() => setEditing("new")}
-            className="btn-accent flex items-center gap-1 rounded-full py-2 pl-3 pr-4 text-ui font-semibold"
-          >
-            <PlusIcon className="size-4" />
-            创建第一个媒体库
-          </button>
-        </div>
+        <ContentEmptyState
+          variant="library"
+          title="为收藏准备一个家"
+          description="创建电影库或剧集库，选好根目录后，订阅完成的内容会自动整理到这里。"
+          action={
+            <button
+              type="button"
+              onClick={() => setEditing("new")}
+              className="btn-accent flex items-center gap-1 rounded-full py-2 pl-3 pr-4 text-ui font-semibold"
+            >
+              <PlusIcon className="size-4" />
+              创建第一个媒体库
+            </button>
+          }
+        />
       )}
 
       {/* 库卡片横排：库多了不换行堆高，改为一行横滚（与下方「最近添加」
