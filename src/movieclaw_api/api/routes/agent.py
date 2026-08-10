@@ -34,6 +34,7 @@ from movieclaw_api.services.agent_sessions import (
     SessionEntry,
     get_agent_session_store,
 )
+from movieclaw_api.services.auth import Principal
 from movieclaw_api.services.llm_config import acquire_llm_router
 from movieclaw_api.services.mclaw_tool import render_service_map
 from movieclaw_api.settings import AppServerSetting, get_setting_store
@@ -136,7 +137,7 @@ async def _cli_env(session_id: str) -> dict[str, str]:
 )
 async def start_agent(
     payload: AgentStartPayload,
-    identity: str = Depends(require_login),
+    identity: Principal = Depends(require_login),
     session: AsyncSession = Depends(get_session),
 ) -> ApiResponse[AgentStartView]:
     """创建后台运行并立即返回编号，执行生命周期不再绑定当前 HTTP 连接。
@@ -153,7 +154,7 @@ async def start_agent(
     # 递归硬闸（docs/design/agent-cli-integration.md §4）：Agent 工作区令牌
     # 不允许再发起新的 Agent 运行——工具层已有软闸，这里是绕过工具（curl 等）
     # 也拦得住的最后防线。放在一切校验/落盘之前。
-    if identity.startswith("agent:"):
+    if identity.kind == "agent":
         raise BadRequestException("Agent 工作区内不能再发起新的 Agent 运行（禁止递归）")
 
     store = get_agent_session_store()
@@ -286,7 +287,7 @@ async def rename_agent_session(
 )
 async def compact_agent_session(
     session_id: str,
-    identity: str = Depends(require_login),
+    identity: Principal = Depends(require_login),
     session: AsyncSession = Depends(get_session),
 ) -> ApiResponse[AgentCompactView]:
     """把会话历史压缩成「保留的用户原话 + 交接摘要」，压缩行写入转录。

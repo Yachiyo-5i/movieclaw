@@ -38,9 +38,10 @@ async def client(db):
     """
     from movieclaw_api.api.deps import require_login
     from movieclaw_api.app import create_app
+    from movieclaw_api.services.auth import Principal
 
     app = create_app()
-    app.dependency_overrides[require_login] = lambda: "tester"
+    app.dependency_overrides[require_login] = lambda: Principal(kind="admin", name="tester")
     async with AsyncClient(
         transport=ASGITransport(app=app), base_url="http://testserver"
     ) as async_client:

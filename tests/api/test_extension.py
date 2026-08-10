@@ -43,11 +43,12 @@ def client(tmp_path, monkeypatch):
 
     from movieclaw_api.api.deps import require_login
     from movieclaw_api.app import create_app
+    from movieclaw_api.services.auth import Principal
 
     app = create_app()
     # 令牌管理接口（Web 后台侧）需要管理员登录，这里用依赖覆盖绕过；
     # 插件侧接口的 sync token 鉴权不受影响，仍按真实逻辑测试。
-    app.dependency_overrides[require_login] = lambda: "tester"
+    app.dependency_overrides[require_login] = lambda: Principal(kind="admin", name="tester")
     with TestClient(app) as c:  # with 块内触发 lifespan：建库、迁移、初始化配置内核
         yield c
 

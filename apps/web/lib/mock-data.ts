@@ -15,6 +15,7 @@ import {
   PaletteIcon,
   SendIcon,
   ServerIcon,
+  ShieldIcon,
   SparkIcon,
   TerminalIcon,
   TvIcon,
@@ -120,6 +121,14 @@ export const settingsSectionGroups: SettingsSectionGroup[] = [
     ],
   },
   {
+    // 成员管理单独成组（docs/design/member-management.md §3.9.1）：
+    // 权限（能力开关 + 库/站点白名单）的写入口唯一在这里，库页面零改动
+    label: "成员",
+    items: [
+      { id: "members", label: "成员", description: "家庭成员账号、能力开关与可见范围", icon: ShieldIcon },
+    ],
+  },
+  {
     // 组内按资源接入链路排序：订阅（消费整条链路，含链路体检）→
     // 站点（含插件 Cookie 同步）→ 下载器 → 监听入库
     label: "资源与下载",
@@ -152,3 +161,22 @@ export const settingsSectionGroups: SettingsSectionGroup[] = [
 export const settingsSections: SettingsSection[] = settingsSectionGroups.flatMap(
   (group) => group.items,
 );
+
+/** 成员可见的设置分区（其余分区后端一律 403，前端不给入口）。 */
+const MEMBER_SECTION_IDS = new Set(["profile", "appearance"]);
+
+/**
+ * 按角色过滤设置分区分组：管理员全量；成员只剩「通用」组的个人分区。
+ * 这只是界面裁剪——安全边界在后端的 require_admin / 守护测试。
+ */
+export function settingsSectionGroupsFor(
+  role: "admin" | "member",
+): SettingsSectionGroup[] {
+  if (role === "admin") return settingsSectionGroups;
+  return settingsSectionGroups
+    .map((group) => ({
+      ...group,
+      items: group.items.filter((s) => MEMBER_SECTION_IDS.has(s.id)),
+    }))
+    .filter((group) => group.items.length > 0);
+}

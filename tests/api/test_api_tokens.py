@@ -110,7 +110,10 @@ def test_agent_token_lifecycle(tmp_path, monkeypatch) -> None:
         init_secret_box(settings.master_key, Path(settings.secret_key_file))
         init_setting_store()
         token = await auth_service.issue_agent_token("sess-1")
-        assert await auth_service.verify_bearer_token(token) == "agent:sess-1"
+        principal = await auth_service.verify_bearer_token(token)
+        # Principal 化后字符串形态保持旧格式（日志归因兼容），Agent 令牌等价管理员
+        assert str(principal) == "agent:sess-1"
+        assert principal.kind == "agent" and principal.is_admin
 
         await auth_service.rotate_session_secret()
         with pytest.raises(UnauthorizedException):

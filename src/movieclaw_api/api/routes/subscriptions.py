@@ -3,6 +3,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from movieclaw_api.api.deps import require_admin, require_subscribe_capability
 from movieclaw_api.exceptions import BadRequestException, NotFoundException
 from movieclaw_api.schemas.response import ApiResponse, ok
 from movieclaw_api.schemas.subscription import (
@@ -34,6 +35,12 @@ from movieclaw_media.models import MediaKind
 
 router = APIRouter(prefix="/subscriptions", tags=["subscriptions"])
 
+# 权限分层（docs/design/member-management.md §2.2/§3.2）：
+# - 读（列表/详情/时间线）：登录即可（路由器挂载时已注入 require_login）；
+# - 写（发起/修改/暂停/删除/立即搜索）：路由级挂成员订阅能力开关；
+# - 运维（投递预检/链路体检/下载明细/手动选种）：暴露落盘路径、种子与
+#   下载器细节，路由级挂 require_admin。
+
 
 def _service(session: AsyncSession) -> SubscriptionService:
     library = MediaLibraryService(session, get_tmdb_client())
@@ -45,6 +52,7 @@ def _service(session: AsyncSession) -> SubscriptionService:
     response_model=ApiResponse[PrepareView],
     summary="订阅预检：建档条目、返回季集结构与库存；歧义时返回候选清单",
     operation_id="sub.prepare",
+    dependencies=[Depends(require_subscribe_capability)],
 )
 async def prepare_subscription(
     payload: PreparePayload,
@@ -118,6 +126,7 @@ async def prepare_subscription(
     response_model=ApiResponse[SubscriptionDetailView],
     summary="创建订阅（生成初始工单；同条目重复订阅幂等返回已有）",
     operation_id="sub.create",
+    dependencies=[Depends(require_subscribe_capability)],
 )
 async def create_subscription(
     payload: SubscriptionCreatePayload,
@@ -147,6 +156,7 @@ async def create_subscription(
     response_model=ApiResponse[DispatchPreviewView],
     summary="投递路由预检：按类型与目标库预演下载会落到哪、能否自动入库",
     operation_id="sub.dispatch-preview",
+    dependencies=[Depends(require_admin)],
 )
 async def dispatch_preview(
     kind: str = Query(description="movie / tv"),
@@ -172,6 +182,7 @@ async def dispatch_preview(
     response_model=ApiResponse[PipelineHealthView],
     summary="订阅链路体检：逐库预演「投递 → 转移 → 入库」，联合约束一次亮清",
     operation_id="sub.health",
+    dependencies=[Depends(require_admin)],
 )
 async def pipeline_health_check(
     session: AsyncSession = Depends(get_session),
@@ -218,6 +229,7 @@ async def get_subscription(
     response_model=ApiResponse[list[SubscriptionDownloadView]],
     summary="订阅在途种子的实时下载进度（速度/ETA，详情页轮询用）",
     operation_id="sub.downloads",
+    dependencies=[Depends(require_admin)],
 )
 async def list_subscription_downloads(
     subscription_id: int,
@@ -258,6 +270,7 @@ async def list_subscription_activities(
     response_model=ApiResponse[SubscriptionDetailView],
     summary="修改订阅（季选择/追新/规则组，diff 重算工单）",
     operation_id="sub.update",
+    dependencies=[Depends(require_subscribe_capability)],
 )
 async def update_subscription(
     subscription_id: int,
@@ -283,6 +296,7 @@ async def update_subscription(
     response_model=ApiResponse[SearchNowView],
     summary="立即搜索：缺口工单跳过冷却重新排队，随即触发一轮缺口搜索",
     operation_id="sub.search-now",
+    dependencies=[Depends(require_subscribe_capability)],
 )
 async def search_subscription_now(
     subscription_id: int,
@@ -300,6 +314,7 @@ async def search_subscription_now(
     response_model=ApiResponse[GrabResultView],
     summary="手动选种：把一条搜索结果直接投给本订阅（跳过规则组过滤）",
     operation_id="sub.grab",
+    dependencies=[Depends(require_admin)],
 )
 async def grab_subscription_torrent(
     subscription_id: int,
@@ -340,6 +355,7 @@ async def grab_subscription_torrent(
     response_model=ApiResponse[SubscriptionDetailView],
     summary="暂停 / 恢复订阅",
     operation_id="sub.pause",
+    dependencies=[Depends(require_subscribe_capability)],
 )
 async def pause_subscription(
     subscription_id: int,
@@ -359,6 +375,7 @@ async def pause_subscription(
     summary="删除订阅（不影响已下载内容）",
     operation_id="sub.delete",
     openapi_extra={"x-cli-dangerous": "confirm"},
+    dependencies=[Depends(require_subscribe_capability)],
 )
 async def delete_subscription(
     subscription_id: int,

@@ -13,6 +13,7 @@ from movieclaw_api.settings.schemas import get_jellyfin_compat
 from movieclaw_db.engine import get_database
 from movieclaw_db.models import JellyfinDevice
 from movieclaw_db.models.base import utcnow
+from movieclaw_db.models.member import Member
 from movieclaw_jellyfin.errors import (
     JellyfinError,
     bad_request_text,
@@ -46,10 +47,14 @@ async def authenticate_by_name(request: Request) -> JSONResponse:
         raise bad_request_text()
 
     try:
-        await auth_service.authenticate(username, str(password))
+        identity = await auth_service.authenticate(username, str(password))
     except Exception:
         # 密码错/账号不存在 → 401 text/plain "Error processing request."
         raise JellyfinError(401, text="Error processing request.") from None
+    if isinstance(identity, Member):
+        # 成员经 Jellyfin 登录属于 P1（设备须绑定 member_id、Policy 按成员
+        # 投影）；在那之前放行会让成员拿到超管的 Jellyfin 身份，必须拒绝。
+        raise JellyfinError(401, text="Error processing request.")
 
     setting = await get_jellyfin_compat()
     token = secrets.token_hex(16)

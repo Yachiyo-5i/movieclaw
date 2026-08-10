@@ -1,9 +1,20 @@
-"""超级管理员登录鉴权服务。
+"""登录鉴权服务：超级管理员 + 成员（docs/design/member-management.md）。
 
 职责边界（"原语用库、编排手写"）：
 - 密码哈希 / 校验     → pwdlib（argon2，常量时间比较由库保证）
 - 会话令牌签名 / 验签 → itsdangerous（Flask session 同款签名机制）
-- 本模块只写编排：一次性初始化锁、登录限速、会话生命周期。
+- 本模块只写编排：一次性初始化锁、登录限速、会话生命周期、Principal 装配。
+
+★ 双身份体系
+------------
+超管仍是 ``auth.admin`` 配置域的一条配置（明确的产品决策：与成员体系互不
+混用）；成员是 ``member`` 表的行。登录先匹配超管再查成员表；会话令牌通过
+负载里的 ``k`` 字段区分——**没有 ``k`` 字段的旧令牌一律按超管解释**，升级
+后已登录的管理员不掉线。
+
+会话失效语义的差异（谁改密踢谁）：
+- 超管改密 → 轮换全局签名密钥，所有端全部下线（密钥可能泄露时这是正确行为）；
+- 成员改密/停用/重置 → 该成员 ``token_version+1``，只踢这一个人。
 
 ★ 一次性初始化锁（本模块最核心的安全保证）
 ------------------------------------------
@@ -27,6 +38,8 @@ import hmac
 import logging
 import secrets
 import time
+from collections import OrderedDict
+from dataclasses import dataclass
 from datetime import UTC, datetime
 
 from itsdangerous import BadSignature, URLSafeSerializer
@@ -46,8 +59,40 @@ from movieclaw_api.settings import (
     get_descriptor_by_model,
     get_setting_store,
 )
+from movieclaw_db.engine import get_database
+from movieclaw_db.models.member import Member
+from movieclaw_db.repositories.member_repo import MemberRepository
 
 logger = logging.getLogger("movieclaw_api.auth")
+
+
+# ---------------------------------------------------------------------------
+# Principal：鉴权层产出、授权层消费的统一请求主体
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Principal:
+    """请求主体。``require_login`` 的返回值，全站授权判定的唯一依据。
+
+    - ``kind``：``admin``（超管会话）/ ``member``（成员会话）/
+      ``pat``（CLI 长期令牌）/ ``agent``（Agent 工作区令牌）；
+    - ``is_admin``：admin / pat / agent 均为 True——PAT 与 Agent 令牌只能由
+      超管创建，等价管理员（PAT 创建接口已收口为管理员专属，防止成员提权）；
+    - ``member``：kind == "member" 时携带已加载的成员行（验签时顺路查库拿到），
+      供能力开关判定（allow_subscribe 等）免二次查库。
+
+    ``__str__`` 返回与旧字符串身份一致的格式，日志归因处零改造。
+    """
+
+    kind: str
+    name: str
+    member_id: int | None = None
+    is_admin: bool = True
+    member: Member | None = None
+
+    def __str__(self) -> str:  # pragma: no cover - 纯格式化
+        return self.name
 
 # 会话 Cookie 名与有效期。签名令牌里带过期时间戳，轮换签名密钥即全端下线。
 SESSION_COOKIE_NAME = "movieclaw_session"
@@ -59,13 +104,24 @@ _SESSION_SALT = "movieclaw.session.v1"
 # argon2（pwdlib 推荐配置）。verify 内部是常量时间比较。
 _password_hash = PasswordHash.recommended()
 
+
+def hash_password(password: str) -> str:
+    """生成密码哈希（成员服务建号/重置密码复用同一套 argon2 配置）。"""
+    return _password_hash.hash(password)
+
+
+def verify_password(password: str, password_hash: str) -> bool:
+    """校验密码与哈希是否匹配（常量时间比较）。"""
+    return _password_hash.verify(password, password_hash)
+
 # 建号一次性锁（进程内串行化，详见模块 docstring）
 _bootstrap_lock = asyncio.Lock()
 
 
 # ---------------------------------------------------------------------------
-# 登录限速：全局连续失败计数（单管理员场景按账号维度限速最有效，
-# 按 IP 反而会被反代地址稀释）。成功登录清零。
+# 登录限速：按用户名分桶的连续失败计数（按 IP 会被反代地址稀释）。
+# 分桶的意义：多成员后一个人输错密码只锁他自己的用户名，不连坐全家；
+# Jellyfin 侧登录复用同一入口，电视上输错也只锁对应用户名。成功登录清零。
 # ---------------------------------------------------------------------------
 
 
@@ -104,7 +160,25 @@ class LoginThrottle:
         self._locked_until = 0.0
 
 
-_throttle = LoginThrottle()
+# 桶上限：防止攻击者用海量随机用户名注水内存。超限时按 LRU 淘汰最旧的桶——
+# 被淘汰的桶等于计数清零，但攻击者为此必须持续换用户名，对单一账号的爆破
+# 仍被各自的桶挡住。
+_MAX_THROTTLE_BUCKETS = 128
+_throttles: OrderedDict[str, LoginThrottle] = OrderedDict()
+
+
+def _throttle_for(username: str) -> LoginThrottle:
+    """取（或建）该用户名的限速桶。键做去空格 + 小写归一化。"""
+    key = username.strip().lower()
+    bucket = _throttles.get(key)
+    if bucket is None:
+        bucket = LoginThrottle()
+        _throttles[key] = bucket
+        while len(_throttles) > _MAX_THROTTLE_BUCKETS:
+            _throttles.popitem(last=False)
+    else:
+        _throttles.move_to_end(key)
+    return bucket
 
 
 # ---------------------------------------------------------------------------
@@ -160,25 +234,48 @@ async def create_admin(username: str, password: str) -> AdminAccountSetting:
 # ---------------------------------------------------------------------------
 
 
-async def authenticate(username: str, password: str) -> AdminAccountSetting:
-    """校验用户名密码；失败计入限速，成功清零。"""
-    _throttle.ensure_allowed()
+async def authenticate(username: str, password: str) -> AdminAccountSetting | Member:
+    """校验用户名密码，返回命中的身份（超管配置或成员行）。
+
+    匹配顺序：先超管、后成员表（用户名建号时已保证互斥，顺序只是实现细节）。
+    失败计入该用户名的限速桶，成功清零。无论用户名是否存在都执行一次密码
+    哈希校验，避免通过响应时间差探测用户名；错误信息也不区分"用户名不存在
+    /密码错误"。
+    """
+    throttle = _throttle_for(username)
+    throttle.ensure_allowed()
 
     admin = await get_setting_store().get(AdminAccountSetting)
     if not admin.password_hash:
         raise BadRequestException("系统尚未初始化，请先完成首次引导创建管理员账号")
 
-    # 无论用户名是否匹配都执行一次密码哈希校验，避免通过响应时间差探测用户名
-    password_ok = _password_hash.verify(password, admin.password_hash)
-    username_ok = secrets.compare_digest(username.encode(), admin.username.encode())
-    if not (password_ok and username_ok):
-        _throttle.record_failure()
+    if secrets.compare_digest(username.encode(), admin.username.encode()):
+        if _password_hash.verify(password, admin.password_hash):
+            throttle.reset()
+            logger.info("管理员 %s 登录成功", admin.username)
+            return admin
+        throttle.record_failure()
         logger.warning("登录失败：用户名或密码错误（用户名输入：%s）", username)
         raise UnauthorizedException("用户名或密码错误")
 
-    _throttle.reset()
-    logger.info("管理员 %s 登录成功", admin.username)
-    return admin
+    async with get_database().session() as session:
+        repo = MemberRepository(session)
+        member = await repo.get_by_username(username)
+        # 成员不存在时也对超管哈希跑一次校验，抹平响应时间差
+        target_hash = member.password_hash if member else admin.password_hash
+        password_ok = _password_hash.verify(password, target_hash)
+        if member is None or not password_ok:
+            throttle.record_failure()
+            logger.warning("登录失败：用户名或密码错误（用户名输入：%s）", username)
+            raise UnauthorizedException("用户名或密码错误")
+        if member.status != "active":
+            # 密码对但账号被停用：不计失败（不是爆破），明确告知找管理员
+            logger.warning("登录被拒：成员 %s 已被停用", member.username)
+            raise UnauthorizedException("账号已被停用，请联系管理员")
+        throttle.reset()
+        await repo.touch_last_login(member)
+        logger.info("成员 %s 登录成功", member.username)
+        return member
 
 
 async def get_admin_account() -> AdminAccountSetting:
@@ -233,15 +330,39 @@ async def rotate_session_secret() -> None:
 
 
 async def issue_session_token(username: str, *, remember: bool = False) -> tuple[str, int]:
-    """签发会话令牌，返回 (令牌, 有效秒数)。过期时间写进签名负载，无法篡改。"""
+    """签发**超管**会话令牌，返回 (令牌, 有效秒数)。负载不带 ``k`` 字段——
+    与升级前的旧令牌同构，旧会话在新版本下继续有效。"""
     max_age = SESSION_TTL_REMEMBER_SECONDS if remember else SESSION_TTL_SECONDS
     serializer = URLSafeSerializer(await _get_session_secret(), salt=_SESSION_SALT)
     token = serializer.dumps({"u": username, "exp": int(time.time()) + max_age})
     return token, max_age
 
 
-async def verify_session_token(token: str | None) -> str:
-    """校验会话令牌，返回登录用户名；无效/过期统一抛 401 提示重新登录。"""
+async def issue_member_session_token(member: Member, *, remember: bool = False) -> tuple[str, int]:
+    """签发成员会话令牌。负载携带成员 id 与签发时的 ``token_version``——
+    改密/停用把版本 +1，旧令牌验签通过但版本不匹配，即刻失效（只踢这个人）。"""
+    max_age = SESSION_TTL_REMEMBER_SECONDS if remember else SESSION_TTL_SECONDS
+    serializer = URLSafeSerializer(await _get_session_secret(), salt=_SESSION_SALT)
+    token = serializer.dumps(
+        {
+            "u": member.username,
+            "k": "member",
+            "mid": member.id,
+            "ver": member.token_version,
+            "exp": int(time.time()) + max_age,
+        }
+    )
+    return token, max_age
+
+
+async def verify_session_token(token: str | None) -> Principal:
+    """校验会话令牌并装配 Principal；无效/过期统一抛 401 提示重新登录。
+
+    负载无 ``k`` 字段 → 超管（含升级前签发的旧令牌，向前兼容）；
+    ``k == "member"`` → 查库校验成员仍存在、未停用、token_version 匹配——
+    成员会话因此不是纯无状态，代价是一次按主键的行读取（SQLite 下可忽略），
+    换来"停用/改密即刻生效"的正确语义。
+    """
     if not token:
         raise UnauthorizedException("未登录，请先登录")
 
@@ -253,7 +374,23 @@ async def verify_session_token(token: str | None) -> str:
 
     if not isinstance(payload, dict) or int(payload.get("exp", 0)) < time.time():
         raise UnauthorizedException("登录已过期，请重新登录")
-    return str(payload.get("u", ""))
+
+    if payload.get("k") != "member":
+        return Principal(kind="admin", name=str(payload.get("u", "")), is_admin=True)
+
+    async with get_database().session() as session:
+        member = await MemberRepository(session).get(int(payload.get("mid", 0)))
+    if member is None or member.status != "active":
+        raise UnauthorizedException("登录状态已失效，请重新登录")
+    if int(payload.get("ver", -1)) != member.token_version:
+        raise UnauthorizedException("登录状态已失效，请重新登录")
+    return Principal(
+        kind="member",
+        name=member.username,
+        member_id=member.id,
+        is_admin=False,
+        member=member,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -317,8 +454,11 @@ async def issue_agent_token(session_id: str) -> str:
     )
 
 
-async def verify_bearer_token(token: str) -> str:
-    """校验 Bearer 令牌（Agent 签名令牌或 PAT），返回身份标识（用于日志归因）。"""
+async def verify_bearer_token(token: str) -> Principal:
+    """校验 Bearer 令牌（Agent 签名令牌或 PAT），装配 Principal。
+
+    两类令牌都只能由超管创建（PAT 创建接口为管理员专属），因此 is_admin=True。
+    """
     # 先试无状态的 Agent 签名令牌（无 IO），再查落库的 PAT
     serializer = URLSafeSerializer(await _get_session_secret(), salt=_AGENT_TOKEN_SALT)
     try:
@@ -328,15 +468,15 @@ async def verify_bearer_token(token: str) -> str:
     if isinstance(payload, dict) and payload.get("aud") == "agent":
         if int(payload.get("exp", 0)) < time.time():
             raise UnauthorizedException("Agent 令牌已过期，请重新发起 Agent 运行")
-        return f"agent:{payload.get('sid', '')}"
+        return Principal(kind="agent", name=f"agent:{payload.get('sid', '')}", is_admin=True)
 
     provided_hash = _hash_token(token)
     for record in await list_api_tokens():
         if hmac.compare_digest(provided_hash, record.token_hash):
-            return f"token:{record.name}"
+            return Principal(kind="pat", name=f"token:{record.name}", is_admin=True)
     raise UnauthorizedException("令牌无效或已吊销，请重新创建（mclaw auth tokens create）")
 
 
 def reset_auth_state() -> None:
-    """清空模块级可变状态（登录限速计数）。仅供测试在用例间隔离。"""
-    _throttle.reset()
+    """清空模块级可变状态（登录限速分桶）。仅供测试在用例间隔离。"""
+    _throttles.clear()

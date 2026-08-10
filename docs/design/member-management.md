@@ -1,6 +1,7 @@
 # 成员管理：把系统分享给家人朋友——设计
 
-> 状态：设计草案（调研 2026-08-10，未实施）。
+> 状态：已定稿（2026-08-10 评审通过，评审记录见 §2.1/§2.2/§3.6/§3.9.1
+> 各"评审"注记；P0 实施中）。
 > 关联文档：[jellyfin-compat.md](jellyfin-compat.md)（播放侧多用户的协议基础）、
 > [library.md](library.md)（库模型）、[subscription.md](subscription.md)（订阅模型）、
 > [cli.md](cli.md)（§10 开放问题①的令牌 scope 讨论，本文一并收口）。

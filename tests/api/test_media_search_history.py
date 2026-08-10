@@ -23,10 +23,11 @@ def client(tmp_path, monkeypatch):
     from movieclaw_api.api.deps import require_login
     from movieclaw_api.api.routes import discover as discover_route
     from movieclaw_api.app import create_app
+    from movieclaw_api.services.auth import Principal
 
     app = create_app()
     # 本文件只测历史业务：登录鉴权用依赖覆盖绕过（鉴权本身在 test_auth 覆盖）
-    app.dependency_overrides[require_login] = lambda: "tester"
+    app.dependency_overrides[require_login] = lambda: Principal(kind="admin", name="tester")
     # 豆瓣搜索换成假实现：固定返回两条候选
     monkeypatch.setattr(discover_route, "get_douban_media_service", lambda: _StubDouban())
     with TestClient(app) as c:  # with 块内触发 lifespan：建库、迁移
