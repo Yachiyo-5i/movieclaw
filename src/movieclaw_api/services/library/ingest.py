@@ -71,8 +71,11 @@
 
 幂等与安全：
 - 源文件**永不改动**：硬链保种零占用（需与主根同盘），复制适合跨盘；
-- 搬运用 ``os.link`` 原子防覆盖落位（同 library_organize），目标已存在
-  且内容不同时按多版本约定加 " - 版本标签" 后缀，仍冲突则跳过不覆盖；
+- 搬运落位统一「备好内容 → rename 发布」（fsops.rename_no_replace，原子
+  防覆盖，同 library_organize；直接 link 到最终名在极空间的 FUSE 文件
+  系统上不产生索引事件，极影视会永远看不到该文件，见 fsops 模块头）；
+  目标已存在且内容不同时按多版本约定加 " - 版本标签" 后缀，仍冲突则
+  跳过不覆盖；
 - 台账逐条目收口：源文件留在监听目录，没有台账每轮都会重复处理。
 
 与扫描/整理的并发：本模块只**新建**规范命名文件（与订阅入库管线同性质），
@@ -91,12 +94,14 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import NamedTuple
+from uuid import uuid4
 
 from sqlalchemy import update
 from sqlmodel import select
 
 from movieclaw_api.services.import_watch_config import rule_target_label
 from movieclaw_api.services.library.config import derive_entry_dir, derive_save_path
+from movieclaw_api.services.library.fsops import rename_no_replace
 from movieclaw_api.services.library.layout import (
     IN_PROGRESS_MARKERS,
     VIDEO_EXTS,
@@ -993,8 +998,10 @@ def _transfer(src: Path, dst: Path, strategy: str, version_label: str) -> Path |
     """把源文件按策略搬到目标；返回最终落位路径，None = 同内容已在库。
 
     目标已存在且内容不同时按多版本约定退让到 ``… - 版本标签.ext``；
-    落位一律走 ``os.link`` 原子防覆盖（复制策略先写 .part 临时文件——
-    库根的 watchdog/扫描不认 .part 后缀，不会看到半成品）。
+    落位一律「先在目标目录写 .part 临时名（复制=copyfile、硬链=os.link），
+    再 rename_no_replace 发布到最终名」——rename 保证极空间等 FUSE 存储的
+    索引能看到新文件（见 fsops 模块头），NOREPLACE 保证不静默覆盖；
+    库根的 watchdog/扫描不认 .part 后缀，不会看到半成品。
     """
     final = dst
     if final.exists():
@@ -1014,7 +1021,7 @@ def _transfer(src: Path, dst: Path, strategy: str, version_label: str) -> Path |
         part = final.with_name(final.name + ".part")
         try:
             shutil.copyfile(src, part)
-            os.link(part, final)
+            rename_no_replace(part, final)
         except FileExistsError as exc:
             raise IngestError(f"目标已存在同名文件，跳过以免覆盖：{final.name}") from exc
         except OSError as exc:
@@ -1023,8 +1030,12 @@ def _transfer(src: Path, dst: Path, strategy: str, version_label: str) -> Path |
             part.unlink(missing_ok=True)
         return final
 
+    # 硬链临时名带随机段：同名条目的失败重试/并发不会互踩残留；崩溃残留的
+    # .part 对扫描不可见且不占空间（硬链接），下次同条目重试不受其影响
+    tmp = final.with_name(f"{final.name}.{uuid4().hex[:8]}.part")
     try:
-        os.link(src, final)
+        os.link(src, tmp)
+        rename_no_replace(tmp, final)
     except FileExistsError as exc:
         raise IngestError(f"目标已存在同名文件，跳过以免覆盖：{final.name}") from exc
     except OSError as exc:
@@ -1034,6 +1045,8 @@ def _transfer(src: Path, dst: Path, strategy: str, version_label: str) -> Path |
                 "请把该监听目录的策略改为「复制」，或把两者放到同一存储卷"
             ) from exc
         raise IngestError(f"硬链接失败（{exc.strerror}）：{src.name} → {final}") from exc
+    finally:
+        tmp.unlink(missing_ok=True)
     return final
 
 
