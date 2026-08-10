@@ -96,7 +96,7 @@ bash）、文件系统浏览这些等价于服务器控制权的功能。
 |---|---|---|
 | `allow_subscribe` | 开 | 发起订阅 / 关注已有订阅；可查看并暂停/删除自己发起的订阅 |
 | `allow_search` | 关 | 站点聚合搜索。消耗站点配额、暴露站点存在，默认不给 |
-| `library_access` | 全部 | 可见库白名单，`null` = 全部库（含以后新建的） |
+| 可见库 | 全部 | 默认全部库可见（含以后新建的）；管理员可切换为白名单模式并逐库勾选（§3.6） |
 
 **管理员专属**（除上述外的一切）：库 CRUD/扫描/刮削/整理/删除、订阅链路
 运维（grab/体检/预览）、全部系统设置、成员管理本身。
@@ -137,7 +137,20 @@ class Member(TimestampMixin, table=True):
     token_version: int = 0                            # 改密/停用时 +1，旧会话即失效
     allow_subscribe: bool = True
     allow_search: bool = False
-    library_access: list[int] | None = None           # JSON；None = 全部库可见
+    all_libraries: bool = True                        # True=全部库可见（含未来新建）；False=查关联表
+```
+
+库可见性白名单是独立关联表（选型理由与演进路径见 §3.6）：
+
+```python
+class MemberLibraryAccess(TimestampMixin, table=True):
+    """成员 × 库 的访问关系。仅 member.all_libraries=False 时生效。"""
+    __tablename__ = "member_library_access"
+
+    id: int | None = Field(default=None, primary_key=True)
+    member_id: int = Field(foreign_key="member.id", ondelete="CASCADE")
+    library_id: int = Field(foreign_key="library.id", ondelete="CASCADE")
+    # UNIQUE(member_id, library_id)
 ```
 
 要点：
@@ -147,10 +160,6 @@ class Member(TimestampMixin, table=True):
   最硬的安全约束；
 - **用户名互斥**：建成员时校验与超管用户名不同（大小写不敏感），登录时先查
   超管再查 `member` 表，语义无歧义；
-- `library_access` 用 JSON 列而非关联表——与 `library.root_paths`、
-  `match_rules` 的既有先例一致，家庭场景成员数与库数都是个位数，关联表是
-  过度设计。库被删除时白名单里的悬空 id 直接忽略（等价于不可见），无需
-  级联清理；
 - 新模型必须在 `movieclaw_db/models/__init__.py` 注册，否则 Alembic
   autogenerate 看不到（该文件 docstring 的硬规则）。
 
@@ -276,20 +285,77 @@ subscription_follower(subscription_id, member_id, UNIQUE(两列))
 
 成员可见的订阅列表 = 自己发起的 + 自己关注的；超管看全部并展示发起人。
 
-### 3.6 库可见性
+### 3.6 库访问模型：单点收口，为"库 × 成员"的生长留位
 
-过滤实现在服务层单点收口（`library` 列表查询处），消费面：
+库在本设计中始终是**全局资源**（一块盘、一批文件，不按成员分片），
+"成员对库"是一层访问关系。这层关系今天只有"可见/不可见"一个维度，但
+它是最可能生长的地方（权限等级、私人库、家长控制都会落在这里），所以
+架构上做两件事保证可扩展：**判定收口成服务层单一入口**，**存储用关联表**。
 
-- `GET /libraries` 及全部 `/libraries/{id}/...` 读接口：白名单外的库 404
-  （不是 403——不泄露"存在但你不能看"）;
+#### 判定收口（真正的可扩展性保证）
+
+新建 `LibraryAccessService`，全系统只有这一个地方回答"这个主体能不能
+访问这个库"：
+
+```python
+class LibraryAccessService:
+    async def visible_library_ids(self, principal) -> set[int] | None:
+        """None = 不受限（超管、all_libraries 成员）；否则返回可见库 id 集合。"""
+
+    async def assert_visible(self, principal, library_id: int) -> None:
+        """不可见抛 NotFoundException（404 而非 403——不泄露"存在但你不能看"）。"""
+```
+
+全部消费面只调用这个入口，**不自行拼查询条件**：
+
+- `GET /libraries` 及全部 `/libraries/{id}/...` 读接口；
 - 全局搜索 `GET /libraries/search`：结果按可见库过滤；
-- Jellyfin `/UserViews`、`/Items` 层级导航：按成员可见库投影（§3.7）；
+- Jellyfin `/UserViews`、`/Items` 层级导航：按可见库投影（§3.7）；
 - 发现页/详情页的"已入库"徽标：按可见库计算，避免"显示已入库但点进去 404"。
+
+收口的意义：未来无论访问规则怎么变（加等级、加 owner、加分级过滤），
+存储形态和判定逻辑只改这一个服务，几十个消费点一行不动。这与库路由
+"routing.py 单点决策"的既有架构手法同构。
+
+#### 存储：`member.all_libraries` 开关 + `member_library_access` 关联表
+
+`all_libraries = True`（默认）表示全部库可见**且自动包含未来新建的库**——
+家庭场景多数成员不需要限制，新建库不用挨个补授权。切为 False 后查关联表。
+
+选关联表而非 member 上的 JSON id 列表，是为第三问（未来控制到成员）
+买的三张票：
+
+1. **反向查询可索引**：“这个库对哪些成员可见”——成员管理 UI 要用，未来
+   库设置页的"可见成员"列表也要用。JSON 列表只能全表扫成员逐个解析；
+2. **引用完整性**：库删除靠外键级联清理，不产生悬空 id；
+3. **属性有落点**：未来"库 × 成员"关系上的任何新属性（权限等级、授权时间、
+   授权来源）都是这张表加一列，零数据搬运。JSON 标量列表要升级成对象数组
+   才装得下属性，等于换存储格式。
+
+#### 预留的演进路径（本期不实现，架构为其留位）
+
+按可能性从高到低，每条都验证过"落在现有骨架上不需要推倒重来"：
+
+1. **权限等级（库管理员）**：让懂技术的家人管理某个库（扫描/整理/改元数据）。
+   落法：关联表加 `level` 列（`viewer` / `manager`），`LibraryAccessService`
+   增加 `can_manage(principal, library_id)`；`libraries` 管理路由从
+   `require_admin` 降为逐库判定。判定入口已收口，改动不外溢；
+2. **私人库**：某成员的个人内容，仅本人 + 超管可见。落法：`library` 加
+   `owner_member_id` 可空列，`visible_library_ids` 的查询多一个 OR 分支，
+   owner 对自己的库自动拥有 manager 级；库路由（match_rules 自动选库）
+   排除私人库即可，不影响公共链路；
+3. **家长控制（内容分级）**：这是**条目级**过滤，与"库 × 成员"正交，刻意
+   不塞进本表。落法：`member` 加 policy 字段（如 `max_parental_rating`），
+   过滤发生在条目查询层；分级数据刮削时已落库（metadata.md），Jellyfin
+   协议侧有现成的 `MaxParentalRating` / `BlockedUnratedItems` 字段可投影。
+   库层管"能不能进这个门"，分级管"进门后能看到哪些片"，两层各自独立生长；
+4. **条目级手工隐藏**：不预留。真实诉求（孩子别看到恐怖片）由分级覆盖，
+   逐条目勾选对家庭管理员是负担不是能力。
 
 **可见性不影响下载链路**：成员发起的订阅照常走库路由（可能落到一个他看不到
 的库）——资源是公共的，可见性只是浏览隔离。订阅详情对成员只展示库名不展示
 路径。若这个语义在实际使用中反直觉（"我订的东西我看不到"），再考虑"订阅
-路由限制在可见库内"，属于可逆的服务层小改。
+路由限制在可见库内"，属于 `LibraryAccessService` 内的可逆小改。
 
 ### 3.7 Jellyfin 兼容层多用户
 
@@ -338,7 +404,7 @@ subscription_follower(subscription_id, member_id, UNIQUE(两列))
 
 ### 3.10 迁移与发布
 
-- 新增：`member`、`subscription_follower` 两张表；加列：
+- 新增：`member`、`member_library_access`、`subscription_follower` 三张表；加列：
   `playback_state.member_id`、`subscription.created_by_member_id`、
   `jellyfin_device.member_id`。全部是"新表 + 带默认值的加列"，符合
   "迁移只能向前兼容"的发布铁律；唯一约束重建走 batch 模式；
