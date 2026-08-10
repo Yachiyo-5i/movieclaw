@@ -17,13 +17,19 @@ class PlaybackState(TimestampMixin, table=True):
 
     键沿用全局约定的 (media_item_id, season_number, episode_number) 数字对
     （电影 (0,0) 哨兵，与 wanted_item / library_file 同源），不锚 media_episode
-    行 id（集行随元数据刷新可增删重建）。单管理员形态不带 user 维度，
-    将来真要多用户时加列即可向前兼容。
+    行 id（集行随元数据刷新可增删重建）。
+
+    成员维度（docs/design/member-management.md §3.4）：``member_id`` 进唯一
+    约束，每人各一行——进度、已看、收藏全部按人隔离。**哨兵值 0 = 超管**，
+    刻意不用 NULL：SQLite 的 UNIQUE 视 NULL 互不相等，可空列进唯一约束会
+    让同一单元插出无限行。也因此本列不是外键——删除成员时由服务层显式
+    清理其状态行。存量数据迁移后 member_id=0（历史进度归超管，语义正确）。
     """
 
     __tablename__ = "playback_state"
     __table_args__ = (
         UniqueConstraint(
+            "member_id",
             "media_item_id",
             "season_number",
             "episode_number",
@@ -32,6 +38,7 @@ class PlaybackState(TimestampMixin, table=True):
     )
 
     id: int | None = Field(default=None, primary_key=True)
+    member_id: int = Field(default=0, index=True, description="归属成员；0=超管（哨兵）")
 
     media_item_id: int = Field(
         sa_column=Column(

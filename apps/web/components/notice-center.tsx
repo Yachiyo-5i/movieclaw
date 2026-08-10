@@ -14,6 +14,8 @@
  */
 
 import { useCallback, useEffect, useState } from "react";
+
+import { useSession } from "@/lib/session";
 import type { Route } from "next";
 import { useRouter } from "next/navigation";
 
@@ -36,6 +38,13 @@ const DOT_COLOR: Record<string, string> = {
 };
 
 export function NoticeCenter({ collapsed }: { collapsed: boolean }) {
+  // 系统通知是运维告警（管理员专属接口）：成员不渲染入口、也不发起轮询
+  const { session } = useSession();
+  if (session.role === "member") return null;
+  return <NoticeCenterInner collapsed={collapsed} />;
+}
+
+function NoticeCenterInner({ collapsed }: { collapsed: boolean }) {
   const [notices, setNotices] = useState<SystemNotice[]>([]);
   const [open, setOpen] = useState(false);
   const router = useRouter();

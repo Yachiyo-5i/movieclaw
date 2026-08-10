@@ -20,7 +20,11 @@ from types import EllipsisType
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from movieclaw_api.exceptions import BadRequestException, NotFoundException
+from movieclaw_api.exceptions import (
+    BadRequestException,
+    ForbiddenException,
+    NotFoundException,
+)
 from movieclaw_api.services.media_library import MediaLibraryService
 from movieclaw_api.services.rule_sets import RuleSetService
 from movieclaw_db.models import (
@@ -207,10 +211,26 @@ class SubscriptionService:
         rule_set_id: int | None = None,
         library_id: int | None = None,
         douban_id: str | None = None,
+        member_id: int | None = None,
     ) -> Subscription:
-        """创建订阅并生成初始工单。同一条目已有订阅时幂等返回已有（不改参数）。"""
+        """创建订阅并生成初始工单。同一条目已有订阅时幂等返回已有（不改参数）。
+
+        ``member_id``：发起成员（None=超管）。已有订阅时成员的"再订"转为
+        **关注**（docs/design/member-management.md §3.5）——订阅出现在他的
+        列表里，期望集合 E 不变，一份下载全家共享。
+        """
         item, seasons, existing = await self.prepare(kind, tmdb_id, douban_id=douban_id)
         if existing is not None:
+            assert existing.id is not None
+            is_new_follower = (
+                member_id is not None
+                and existing.created_by_member_id != member_id
+                and await self._repo.add_follower(existing.id, member_id)
+            )
+            if is_new_follower:
+                await self._log(
+                    existing, ActivityType.CREATED, "有成员关注了本订阅（共享同一份下载）"
+                )
             logger.info("条目《%s》已有订阅 #%s，幂等返回", item.title, existing.id)
             return existing
         assert item.id is not None
@@ -247,6 +267,7 @@ class SubscriptionService:
                 rule_set_id=rule_set_id,
                 library_id=library_id,
                 status=SubscriptionStatus.ACTIVE,
+                created_by_member_id=member_id,
             )
         )
         assert subscription.id is not None
@@ -533,17 +554,72 @@ class SubscriptionService:
         self._kick_search()  # 暂停期间积压的到期工单立即处理
         return subscription
 
-    async def delete(self, subscription_id: int) -> None:
-        """删除订阅（工单级联删除；不动已下载内容与下载器任务）。"""
+    async def assert_can_manage(self, subscription_id: int, member_id: int | None) -> None:
+        """归属校验：修改/暂停订阅只有发起人与超管可以（§3.5）。
+
+        ``member_id`` 为 None（超管/PAT/Agent）直通；成员不是发起人时给
+        可读中文错误——他能做的是取消关注，而不是改别人的订阅参数。
+        """
+        if member_id is None:
+            return
         subscription = await self._get_or_404(subscription_id)
+        if subscription.created_by_member_id != member_id:
+            raise ForbiddenException(
+                "只有订阅的发起人（或管理员）可以调整它；如不想再追，可在列表里取消关注"
+            )
+
+    async def delete(self, subscription_id: int, *, member_id: int | None = None) -> str:
+        """删除/取消订阅，返回结果的中文描述（路由直接用作 message）。
+
+        超管（member_id=None）：真删（工单级联删除；不动已下载内容与下载器
+        任务）。成员：
+        - 非发起人 → 只删自己的关注行，订阅不受影响；
+        - 发起人且仍有关注者 → 发起人转移给最早的关注者，订阅继续活着——
+          成员的取消永远不影响别人正在追的内容；
+        - 发起人且无关注者 → 真删。
+        """
+        subscription = await self._get_or_404(subscription_id)
+        if member_id is not None and subscription.created_by_member_id != member_id:
+            if await self._repo.remove_follower(subscription_id, member_id):
+                logger.info("成员 #%d 已取消关注订阅 #%d", member_id, subscription_id)
+                return "已取消关注；订阅本身不受影响"
+            raise ForbiddenException(
+                "只有订阅的发起人（或管理员）可以删除它；你当前也没有关注本订阅"
+            )
+        if member_id is not None:
+            followers = await self._repo.follower_member_ids(subscription_id)
+            if followers:
+                heir = followers[0]
+                subscription.created_by_member_id = heir
+                await self._repo.save(subscription)
+                await self._repo.remove_follower(subscription_id, heir)
+                await self._log(
+                    subscription, ActivityType.CREATED, "发起人退出，订阅转由最早的关注者接管"
+                )
+                logger.info(
+                    "订阅 #%d 发起人 #%d 退出，转移给成员 #%d", subscription_id, member_id, heir
+                )
+                return "你已退出；订阅转由其他关注的家人继续追更"
         await self._repo.delete(subscription)
         logger.info("订阅 #%s 已删除", subscription_id)
+        return "已取消订阅"
 
     async def list_with_progress(
-        self, *, kind: str | None = None
+        self, *, kind: str | None = None, member_id: int | None = None
     ) -> list[tuple[Subscription, MediaItem, dict[str, int]]]:
-        """列表页数据：订阅 + 条目 + 工单状态分布（一次分组统计，不逐条查）。"""
+        """列表页数据：订阅 + 条目 + 工单状态分布（一次分组统计，不逐条查）。
+
+        ``member_id``：成员视角只看"自己发起的 + 自己关注的"；None=全部
+        （超管视角）。
+        """
         subscriptions = await self._repo.list_all(kind=kind)
+        if member_id is not None:
+            followed = await self._repo.followed_subscription_ids(member_id)
+            subscriptions = [
+                s
+                for s in subscriptions
+                if s.created_by_member_id == member_id or s.id in followed
+            ]
         counts = await self._repo.count_wanted_by_status(
             [s.id for s in subscriptions if s.id is not None]
         )

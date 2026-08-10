@@ -3,6 +3,11 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from movieclaw_api.api.deps import (
+    require_admin,
+    require_login,
+    require_subscribe_capability,
+)
 from movieclaw_api.exceptions import BadRequestException, NotFoundException
 from movieclaw_api.schemas.response import ApiResponse, ok
 from movieclaw_api.schemas.subscription import (
@@ -25,6 +30,7 @@ from movieclaw_api.schemas.subscription import (
     SubscriptionUpdatePayload,
     SubscriptionView,
 )
+from movieclaw_api.services.auth import Principal
 from movieclaw_api.services.media_discover import get_tmdb_client
 from movieclaw_api.services.media_library import MediaLibraryService
 from movieclaw_api.services.subscription import SubscriptionService
@@ -33,6 +39,12 @@ from movieclaw_media.library import ResolveStatus
 from movieclaw_media.models import MediaKind
 
 router = APIRouter(prefix="/subscriptions", tags=["subscriptions"])
+
+# 权限分层（docs/design/member-management.md §2.2/§3.2）：
+# - 读（列表/详情/时间线）：登录即可（路由器挂载时已注入 require_login）；
+# - 写（发起/修改/暂停/删除/立即搜索）：路由级挂成员订阅能力开关；
+# - 运维（投递预检/链路体检/下载明细/手动选种）：暴露落盘路径、种子与
+#   下载器细节，路由级挂 require_admin。
 
 
 def _service(session: AsyncSession) -> SubscriptionService:
@@ -45,6 +57,7 @@ def _service(session: AsyncSession) -> SubscriptionService:
     response_model=ApiResponse[PrepareView],
     summary="订阅预检：建档条目、返回季集结构与库存；歧义时返回候选清单",
     operation_id="sub.prepare",
+    dependencies=[Depends(require_subscribe_capability)],
 )
 async def prepare_subscription(
     payload: PreparePayload,
@@ -121,18 +134,25 @@ async def prepare_subscription(
 )
 async def create_subscription(
     payload: SubscriptionCreatePayload,
+    principal: Principal = Depends(require_subscribe_capability),
     session: AsyncSession = Depends(get_session),
 ) -> ApiResponse[SubscriptionDetailView]:
-    """创建订阅。"立即踢一次缺口搜索"由 service 层统一触发，路由不用管。"""
+    """创建订阅。"立即踢一次缺口搜索"由 service 层统一触发，路由不用管。
+
+    成员发起时记录归属；同条目已有订阅时成员的"再订"幂等转为关注（§3.5）。
+    成员没有"选库/选规则组"的入口，这两个参数只对管理员生效。
+    """
     service = _service(session)
+    is_member = not principal.is_admin
     subscription = await service.create(
         payload.kind,
         payload.tmdb_id,
         selected_seasons=payload.selected_seasons,
         follow_future=payload.follow_future,
-        rule_set_id=payload.rule_set_id,
-        library_id=payload.library_id,
+        rule_set_id=None if is_member else payload.rule_set_id,
+        library_id=None if is_member else payload.library_id,
         douban_id=payload.douban_id,
+        member_id=principal.member_id if is_member else None,
     )
     assert subscription.id is not None
     sub, item, wanted = await service.detail(subscription.id)
@@ -147,6 +167,7 @@ async def create_subscription(
     response_model=ApiResponse[DispatchPreviewView],
     summary="投递路由预检：按类型与目标库预演下载会落到哪、能否自动入库",
     operation_id="sub.dispatch-preview",
+    dependencies=[Depends(require_admin)],
 )
 async def dispatch_preview(
     kind: str = Query(description="movie / tv"),
@@ -172,6 +193,7 @@ async def dispatch_preview(
     response_model=ApiResponse[PipelineHealthView],
     summary="订阅链路体检：逐库预演「投递 → 转移 → 入库」，联合约束一次亮清",
     operation_id="sub.health",
+    dependencies=[Depends(require_admin)],
 )
 async def pipeline_health_check(
     session: AsyncSession = Depends(get_session),
@@ -191,10 +213,15 @@ async def pipeline_health_check(
 )
 async def list_subscriptions(
     kind: str | None = Query(default=None, description="movie / tv，缺省全部"),
+    principal: Principal = Depends(require_login),
     session: AsyncSession = Depends(get_session),
 ) -> ApiResponse[list[SubscriptionView]]:
+    """超管看全部；成员只看"自己发起的 + 自己关注的"（§3.5）。"""
     service = _service(session)
-    rows = await service.list_with_progress(kind=kind)
+    rows = await service.list_with_progress(
+        kind=kind,
+        member_id=None if principal.is_admin else principal.member_id,
+    )
     return ok([SubscriptionView.from_model(s, m, c) for s, m, c in rows])
 
 
@@ -218,6 +245,7 @@ async def get_subscription(
     response_model=ApiResponse[list[SubscriptionDownloadView]],
     summary="订阅在途种子的实时下载进度（速度/ETA，详情页轮询用）",
     operation_id="sub.downloads",
+    dependencies=[Depends(require_admin)],
 )
 async def list_subscription_downloads(
     subscription_id: int,
@@ -262,9 +290,13 @@ async def list_subscription_activities(
 async def update_subscription(
     subscription_id: int,
     payload: SubscriptionUpdatePayload,
+    principal: Principal = Depends(require_subscribe_capability),
     session: AsyncSession = Depends(get_session),
 ) -> ApiResponse[SubscriptionDetailView]:
     service = _service(session)
+    await service.assert_can_manage(
+        subscription_id, None if principal.is_admin else principal.member_id
+    )
     await service.update(
         subscription_id,
         selected_seasons=payload.selected_seasons,
@@ -286,11 +318,15 @@ async def update_subscription(
 )
 async def search_subscription_now(
     subscription_id: int,
+    principal: Principal = Depends(require_subscribe_capability),
     session: AsyncSession = Depends(get_session),
 ) -> ApiResponse[SearchNowView]:
     """只重置"本来就能搜"的缺口（未定档/待播出/在途的不碰）；订阅暂停中、
     或没有可搜缺口时给可读中文错误。"""
     service = _service(session)
+    await service.assert_can_manage(
+        subscription_id, None if principal.is_admin else principal.member_id
+    )
     reset = await service.search_now(subscription_id)
     return ok(SearchNowView(reset_count=reset), message=f"{reset} 个缺口已重新排队，正在搜索")
 
@@ -300,6 +336,7 @@ async def search_subscription_now(
     response_model=ApiResponse[GrabResultView],
     summary="手动选种：把一条搜索结果直接投给本订阅（跳过规则组过滤）",
     operation_id="sub.grab",
+    dependencies=[Depends(require_admin)],
 )
 async def grab_subscription_torrent(
     subscription_id: int,
@@ -344,9 +381,13 @@ async def grab_subscription_torrent(
 async def pause_subscription(
     subscription_id: int,
     payload: SubscriptionPausePayload,
+    principal: Principal = Depends(require_subscribe_capability),
     session: AsyncSession = Depends(get_session),
 ) -> ApiResponse[SubscriptionDetailView]:
     service = _service(session)
+    await service.assert_can_manage(
+        subscription_id, None if principal.is_admin else principal.member_id
+    )
     await service.set_paused(subscription_id, payload.paused)
     sub, item, wanted = await service.detail(subscription_id)
     message = "已暂停，匹配与搜索将跳过该订阅" if payload.paused else "已恢复追踪"
@@ -362,8 +403,14 @@ async def pause_subscription(
 )
 async def delete_subscription(
     subscription_id: int,
+    principal: Principal = Depends(require_subscribe_capability),
     session: AsyncSession = Depends(get_session),
 ) -> ApiResponse[dict]:
+    """超管真删；成员按 §3.5 语义：非发起人取关、发起人退出时转移给最早的
+    关注者、无人关注才真删——绝不影响别人正在追的内容。"""
     service = _service(session)
-    await service.delete(subscription_id)
-    return ok({}, message="已取消订阅")
+    message = await service.delete(
+        subscription_id,
+        member_id=None if principal.is_admin else principal.member_id,
+    )
+    return ok({}, message=message)

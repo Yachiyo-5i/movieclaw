@@ -17,6 +17,9 @@ class SearchHistoryRepository:
     职责：记录每次搜索（按「关键词 + 分类/站点组合快照」去重计数）、按最近
     搜索时间列出、逐条删除与清空。容量上限也在本层维护——``record`` 落库后
     顺手裁掉最旧的超额行，调用方无感。
+
+    成员维度（P2）：所有读写按 ``member_id`` 归属（0=超管哨兵）——历史是
+    各人自己的，去重、列表、裁剪、清空都在本人范围内进行。
     """
 
     # 历史记录保留上限。超出后按「最近一次搜索时间」淘汰最旧的行。
@@ -50,6 +53,7 @@ class SearchHistoryRepository:
         site_ids: list[str] | None = None,
         poster_mode: bool = False,
         vertical: str = "torrent",
+        member_id: int = 0,
     ) -> int | None:
         """记录一次搜索：同 (keyword, 垂直, 组合快照) 已存在则累加次数，否则新建一行。
 
@@ -68,6 +72,7 @@ class SearchHistoryRepository:
         site_ids_json = self.snapshot(site_ids)
         result = await self._session.execute(
             select(SearchHistory).where(
+                SearchHistory.member_id == member_id,
                 SearchHistory.keyword == keyword,
                 SearchHistory.vertical == vertical,
                 # 快照为 None 时，SQLAlchemy 会把 == None 翻译成 IS NULL
@@ -83,6 +88,7 @@ class SearchHistoryRepository:
             row.updated_at = utcnow()
         else:
             row = SearchHistory(
+                member_id=member_id,
                 keyword=keyword,
                 label=label,
                 categories_json=categories_json,
@@ -92,7 +98,7 @@ class SearchHistoryRepository:
             )
             self._session.add(row)
         await self._session.commit()
-        await self._trim()
+        await self._trim(member_id)
         return row.id
 
     async def get_by_id(self, history_id: int) -> SearchHistory | None:
@@ -112,10 +118,11 @@ class SearchHistoryRepository:
         row.snapshot_at = utcnow()
         await self._session.commit()
 
-    async def _trim(self) -> None:
-        """把超出 MAX_ENTRIES 的最旧记录删掉，防止表无限膨胀。"""
+    async def _trim(self, member_id: int = 0) -> None:
+        """把该搜索者超出 MAX_ENTRIES 的最旧记录删掉，防止表无限膨胀。"""
         result = await self._session.execute(
             select(SearchHistory.id)
+            .where(SearchHistory.member_id == member_id)
             .order_by(SearchHistory.updated_at.desc(), SearchHistory.id.desc())
             .offset(self.MAX_ENTRIES)
         )
@@ -125,7 +132,9 @@ class SearchHistoryRepository:
         await self._session.execute(sa_delete(SearchHistory).where(SearchHistory.id.in_(stale_ids)))
         await self._session.commit()
 
-    async def list_recent_groups(self, limit: int = 10) -> list[SearchHistory]:
+    async def list_recent_groups(
+        self, limit: int = 10, *, member_id: int = 0
+    ) -> list[SearchHistory]:
         """返回最近 ``limit`` 个关键词组及各组的全部范围记录。
 
         搜索结果页切换分类会产生同关键词、不同范围的独立历史和快照，这些记录
@@ -139,6 +148,7 @@ class SearchHistoryRepository:
                 keyword_key.label("keyword_key"),
                 func.max(SearchHistory.updated_at).label("group_updated_at"),
             )
+            .where(SearchHistory.member_id == member_id)
             .group_by(keyword_key)
             .order_by(func.max(SearchHistory.updated_at).desc())
             .limit(limit)
@@ -147,6 +157,7 @@ class SearchHistoryRepository:
         result = await self._session.execute(
             select(SearchHistory)
             .join(recent_groups, keyword_key == recent_groups.c.keyword_key)
+            .where(SearchHistory.member_id == member_id)
             .order_by(
                 recent_groups.c.group_updated_at.desc(),
                 SearchHistory.updated_at.desc(),
@@ -155,17 +166,19 @@ class SearchHistoryRepository:
         )
         return list(result.scalars().all())
 
-    async def delete_by_id(self, history_id: int) -> bool:
-        """删除单条历史记录，返回是否真的删了（不存在返回 False）。"""
+    async def delete_by_id(self, history_id: int, *, member_id: int = 0) -> bool:
+        """删除单条历史记录（仅限本人的行），返回是否真的删了。"""
         row = await self._session.get(SearchHistory, history_id)
-        if row is None:
+        if row is None or row.member_id != member_id:
             return False
         await self._session.delete(row)
         await self._session.commit()
         return True
 
-    async def clear(self) -> int:
-        """清空全部历史记录，返回删除条数。"""
-        result = await self._session.execute(sa_delete(SearchHistory))
+    async def clear(self, *, member_id: int = 0) -> int:
+        """清空该搜索者的全部历史记录，返回删除条数。"""
+        result = await self._session.execute(
+            sa_delete(SearchHistory).where(SearchHistory.member_id == member_id)
+        )
         await self._session.commit()
         return result.rowcount or 0

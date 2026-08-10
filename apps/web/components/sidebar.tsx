@@ -24,6 +24,7 @@ import { sidebarGlass } from "@/lib/glass";
 import { formatRelativeTime } from "@/lib/time";
 import { useUiPrefs } from "@/lib/ui-prefs";
 import { useIsMobile } from "@/lib/use-media-query";
+import { useSession } from "@/lib/session";
 import { exploreItems } from "@/lib/mock-data";
 import { GlassPanel } from "@/components/glass-panel";
 import { SearchCommand, type SearchSubmitOptions } from "@/components/search-command";
@@ -52,13 +53,16 @@ export interface SidebarProps {
   flat?: boolean;
 }
 
-/** 主导航：新任务 / 媒体库 / 订阅 + 探索项，合并成一列扁平列表 */
+/** 主导航：新任务 / 媒体库 / 订阅 + 探索项，合并成一列扁平列表。
+ *  「新任务」是 Agent 入口（管理员专属，成员侧隐藏——后端也会 403）。 */
 const mainNavItems = [
   { id: "new", label: "新任务", icon: PlusIcon },
   { id: "library", label: "媒体库", icon: LayersIcon },
   { id: "subscriptions", label: "我的订阅", icon: BookmarkIcon },
   ...exploreItems,
 ];
+
+const memberNavItems = mainNavItems.filter((item) => item.id !== "new");
 
 export function Sidebar({
   activeNav,
@@ -78,6 +82,11 @@ export function Sidebar({
   // 基底为 LiquidGlassCard 同款材质；设置页拖动滑杆时经预览草稿实时生效。
   const { prefs } = useUiPrefs();
   const glass = sidebarGlass(prefs.sidebar);
+  // 成员形态做减法：隐藏 Agent 入口（新任务）与「最近会话」组；
+  // 这是界面裁剪，安全边界在后端 require_admin
+  const { session } = useSession();
+  const isMember = session.role === "member";
+  const navItems = isMember ? memberNavItems : mainNavItems;
   const body = (
     <>
       {/* 品牌头部。展开：完整字标 + 开合/搜索图标横排；折叠：独立徽标、开合、搜索竖排居中。
@@ -85,7 +94,7 @@ export function Sidebar({
           两种形态的 logo 都是「回首页」入口，等同于点击导航里的「新任务」。 */}
       {collapsed ? (
         <div className="flex flex-col items-center gap-2 px-3 pb-3 pt-5">
-          <BrandHome onSelect={onSelect}>
+          <BrandHome onSelect={onSelect} homeId={isMember ? "library" : "new"}>
             <Image
               src="/movieclaw-logo-mark-rotor.png"
               alt="MovieClaw"
@@ -100,7 +109,7 @@ export function Sidebar({
         </div>
       ) : (
         <div className="flex items-center justify-between px-4 pb-3 pt-4">
-          <BrandHome onSelect={onSelect}>
+          <BrandHome onSelect={onSelect} homeId={isMember ? "library" : "new"}>
             <Image
               src="/movieclaw-logo-rotor.png"
               alt="MovieClaw"
@@ -126,7 +135,7 @@ export function Sidebar({
             自带 overflow 是矮窗口下的安全阀：空间不够时它自己滚，
             而不是把「最近会话」挤没。 */}
         <div className="scroll-thin space-y-0.5 overflow-y-auto">
-          {mainNavItems.map((item) => {
+          {navItems.map((item) => {
             const Icon = item.icon;
             return (
               <button
@@ -155,8 +164,8 @@ export function Sidebar({
           <AppUpdateEntry collapsed={collapsed} onOpen={() => onOpenSettings("app")} />
         </div>
 
-        {/* 分组：最近会话（真实 Agent 会话，按最近更新排序；折叠时整组隐藏） */}
-        {!collapsed && <RecentSessions activeNav={activeNav} onSelect={onSelect} />}
+        {/* 分组：最近会话（真实 Agent 会话，按最近更新排序；折叠或成员形态时整组隐藏） */}
+        {!collapsed && !isMember && <RecentSessions activeNav={activeNav} onSelect={onSelect} />}
       </nav>
 
       {/* 左下角：用户信息（无分割线，靠间距区隔）；折叠时只留头像 */}
@@ -193,15 +202,18 @@ export function Sidebar({
  */
 function BrandHome({
   onSelect,
+  homeId,
   children,
 }: {
   onSelect: (id: string) => void;
+  /** 「回首页」的落点：管理员是新任务页，成员是媒体库（成员没有 Agent 入口） */
+  homeId: string;
   children: ReactNode;
 }) {
   return (
     <button
       type="button"
-      onClick={() => onSelect("new")}
+      onClick={() => onSelect(homeId)}
       aria-label="回到首页"
       title="回到首页"
       className="shrink-0 cursor-pointer transition-opacity hover:opacity-75"

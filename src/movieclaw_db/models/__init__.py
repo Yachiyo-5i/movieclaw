@@ -23,6 +23,7 @@ from movieclaw_db.models.library_file import FileSource, LibraryFile
 from movieclaw_db.models.llm_provider import LlmProvider
 from movieclaw_db.models.media_item import MediaItem, MediaSeason
 from movieclaw_db.models.media_metadata import MediaEpisode, MediaMetadata
+from movieclaw_db.models.member import Member, MemberLibraryAccess, MemberSiteAccess
 from movieclaw_db.models.person import MediaItemPerson, Person
 from movieclaw_db.models.playback_state import PlaybackState
 from movieclaw_db.models.rule_set import RuleSet
@@ -43,6 +44,7 @@ from movieclaw_db.models.site_torrent import (
 from movieclaw_db.models.site_user_profile import SiteUserProfile
 from movieclaw_db.models.subscription import (
     Subscription,
+    SubscriptionFollower,
     SubscriptionStatus,
     WantedItem,
     WantedStatus,
@@ -81,11 +83,15 @@ __all__ = [
     "MediaItemPerson",
     "MediaItem",
     "MediaMetadata",
+    "Member",
+    "MemberLibraryAccess",
+    "MemberSiteAccess",
     "Person",
     "PlaybackState",
     "MediaSeason",
     "RuleSet",
     "Subscription",
+    "SubscriptionFollower",
     "SubscriptionStatus",
     "WantedItem",
     "WantedStatus",

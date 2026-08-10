@@ -181,11 +181,11 @@ def _decode_item_ref(raw: Any) -> EntityRef | None:
 # ---------------------------------------------------------------------------
 
 
-async def _record_start(ref: EntityRef, client: ClientInfo) -> None:
+async def _record_start(ref: EntityRef, client: ClientInfo, *, member_id: int) -> None:
     """开始播放落库 + commit 后装配/投递 ``playback.started`` 事件。"""
     unit = _leaf_unit(ref)
     async with get_database().session() as session:
-        row = await playback_state.record_playback_start(session, unit)
+        row = await playback_state.record_playback_start(session, unit, member_id=member_id)
         await session.commit()
         event = await build_playback_event(
             session, "playback.started", unit, row, client=client
@@ -201,7 +201,9 @@ async def playing_start(
     body = await _read_body(request)
     ref = _decode_item_ref(body.get("itemid"))
     if ref is not None:
-        await _record_start(ref, _client_info(identity))
+        await _record_start(
+            ref, _client_info(identity), member_id=identity.device.member_id
+        )
     return Response(status_code=204)
 
 
@@ -225,6 +227,7 @@ async def _apply_progress(
     ref: EntityRef,
     position_ms: int | None,
     *,
+    member_id: int,
     stopped: bool = False,
     client: ClientInfo | None = None,
 ) -> None:
@@ -236,7 +239,11 @@ async def _apply_progress(
     runtime_ms = await _unit_runtime_ms(unit)
     async with get_database().session() as session:
         row, newly_played = await playback_state.record_playback_progress(
-            session, unit, position_ms=position_ms, runtime_ms=runtime_ms
+            session,
+            unit,
+            member_id=member_id,
+            position_ms=position_ms,
+            runtime_ms=runtime_ms,
         )
         await session.commit()
         emit_progress = (
@@ -268,7 +275,12 @@ async def playing_progress(
         position = _position_ms(body)
         # Progress 不带位置的心跳（如暂停事件）不落库；报 0 = 拖回开头要落
         if position is not None:
-            await _apply_progress(ref, position, client=_client_info(identity))
+            await _apply_progress(
+                ref,
+                position,
+                member_id=identity.device.member_id,
+                client=_client_info(identity),
+            )
     return Response(status_code=204)
 
 
@@ -288,7 +300,11 @@ async def playing_stopped(
     ref = _decode_item_ref(body.get("itemid"))
     if ref is not None:
         await _apply_progress(
-            ref, _position_ms(body), stopped=True, client=_client_info(identity)
+            ref,
+            _position_ms(body),
+            member_id=identity.device.member_id,
+            stopped=True,
+            client=_client_info(identity),
         )
     return Response(status_code=204)
 
@@ -314,7 +330,9 @@ async def playing_start_legacy(
 ) -> Response:
     ref = _decode_item_ref(item_id)
     if ref is not None:
-        await _record_start(ref, _client_info(identity))
+        await _record_start(
+            ref, _client_info(identity), member_id=identity.device.member_id
+        )
     return Response(status_code=204)
 
 
@@ -330,7 +348,12 @@ async def playing_progress_legacy(
     if ref is not None:
         position = _position_ms({}, request.query_params.get("positionTicks"))
         if position is not None:
-            await _apply_progress(ref, position, client=_client_info(identity))
+            await _apply_progress(
+                ref,
+                position,
+                member_id=identity.device.member_id,
+                client=_client_info(identity),
+            )
     return Response(status_code=204)
 
 
@@ -348,6 +371,7 @@ async def playing_stopped_legacy(
         await _apply_progress(
             ref,
             _position_ms({}, request.query_params.get("positionTicks")),
+            member_id=identity.device.member_id,
             stopped=True,
             client=_client_info(identity),
         )
@@ -359,13 +383,17 @@ async def playing_stopped_legacy(
 # ---------------------------------------------------------------------------
 
 
-async def _user_data_response(ref: EntityRef, guid_raw: str) -> JSONResponse:
+async def _user_data_response(
+    ref: EntityRef, guid_raw: str, *, member_id: int
+) -> JSONResponse:
     """标记类接口的 200 响应体：与浏览接口同一套 UserData 公式，
     文件夹（Series/Season）给聚合形态（含 UnplayedItemCount），客户端
     据此原地刷新角标，不必重拉列表。"""
     guid = guid_raw.lower().replace("-", "")
     async with get_database().session() as session:
-        bundles = await load_bundles(session, [ref.entity_id], include_fileless=True)
+        bundles = await load_bundles(
+            session, [ref.entity_id], member_id=member_id, include_fileless=True
+        )
     bundle = bundles.get(ref.entity_id)
     if bundle is None:
         return JSONResponse(
@@ -412,13 +440,19 @@ async def mark_played(
         raise not_found()
     date_played = _parse_date_played(request.query_params.get("datePlayed"))
     async with get_database().session() as session:
-        await playback_state.mark_played(session, units, date_played=date_played)
+        await playback_state.mark_played(
+            session, units, member_id=identity.device.member_id, date_played=date_played
+        )
         await session.commit()
         events = await build_marked_events(
-            session, "playback.marked_played", units, client=_client_info(identity)
+            session,
+            "playback.marked_played",
+            units,
+            member_id=identity.device.member_id,
+            client=_client_info(identity),
         )
     emit_events(events)
-    return await _user_data_response(ref, item_id)
+    return await _user_data_response(ref, item_id, member_id=identity.device.member_id)
 
 
 @router.delete("/UserPlayedItems/{item_id}")
@@ -435,22 +469,30 @@ async def mark_unplayed(
     if not units:
         raise not_found()
     async with get_database().session() as session:
-        await playback_state.mark_unplayed(session, units)
+        await playback_state.mark_unplayed(
+            session, units, member_id=identity.device.member_id
+        )
         await session.commit()
         events = await build_marked_events(
-            session, "playback.marked_unplayed", units, client=_client_info(identity)
+            session,
+            "playback.marked_unplayed",
+            units,
+            member_id=identity.device.member_id,
+            client=_client_info(identity),
         )
     emit_events(events)
-    return await _user_data_response(ref, item_id)
+    return await _user_data_response(ref, item_id, member_id=identity.device.member_id)
 
 
 async def _set_favorite(
-    ref: EntityRef, *, favorite: bool, client: ClientInfo
+    ref: EntityRef, *, member_id: int, favorite: bool, client: ClientInfo
 ) -> None:
     """收藏落库 + commit 后装配/投递 ``item.(un)favorited`` 事件。"""
     unit = await _favorite_unit(ref)
     async with get_database().session() as session:
-        await playback_state.set_favorite(session, unit, favorite=favorite)
+        await playback_state.set_favorite(
+            session, unit, member_id=member_id, favorite=favorite
+        )
         await session.commit()
         event = await build_favorite_event(
             session, unit, favorite=favorite, client=client
@@ -469,8 +511,13 @@ async def mark_favorite(
     ref = _decode_item_ref(item_id)
     if ref is None:
         raise not_found()
-    await _set_favorite(ref, favorite=True, client=_client_info(identity))
-    return await _user_data_response(ref, item_id)
+    await _set_favorite(
+        ref,
+        member_id=identity.device.member_id,
+        favorite=True,
+        client=_client_info(identity),
+    )
+    return await _user_data_response(ref, item_id, member_id=identity.device.member_id)
 
 
 @router.delete("/UserFavoriteItems/{item_id}")
@@ -483,5 +530,10 @@ async def unmark_favorite(
     ref = _decode_item_ref(item_id)
     if ref is None:
         raise not_found()
-    await _set_favorite(ref, favorite=False, client=_client_info(identity))
-    return await _user_data_response(ref, item_id)
+    await _set_favorite(
+        ref,
+        member_id=identity.device.member_id,
+        favorite=False,
+        client=_client_info(identity),
+    )
+    return await _user_data_response(ref, item_id, member_id=identity.device.member_id)
