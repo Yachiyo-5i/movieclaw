@@ -39,9 +39,24 @@ async def require_sync_token(authorization: str | None = Header(default=None)) -
         raise UnauthorizedException("令牌无效或已重置，请重新填写")
 
 
-async def require_login(
+async def optional_login(
     session_token: str | None = Cookie(default=None, alias=auth_service.SESSION_COOKIE_NAME),
     authorization: str | None = Header(default=None),
+) -> Principal | None:
+    """解析可选登录主体；未携带凭据返回 None，携带无效凭据仍返回 401。
+
+    仅用于少量“匿名可读、登录后按账号分流”的接口，例如背景图库。不能用它
+    替代业务接口的 ``require_login``，否则会把默认拒绝边界改成匿名放行。
+    """
+    if session_token:
+        return await auth_service.verify_session_token(session_token)
+    if bearer := _extract_bearer(authorization):
+        return await auth_service.verify_bearer_token(bearer)
+    return None
+
+
+async def require_login(
+    principal: Principal | None = Depends(optional_login),
 ) -> Principal:
     """业务接口的登录鉴权依赖：会话 Cookie **或** Bearer 令牌，返回请求主体。
 
@@ -55,11 +70,9 @@ async def require_login(
     未登录 / 会话过期 / 令牌无效统一 401。授权（管理员/能力开关）不在
     这里判——挂 ``require_admin`` 或在服务层消费 Principal。
     """
-    if session_token:
-        return await auth_service.verify_session_token(session_token)
-    if bearer := _extract_bearer(authorization):
-        return await auth_service.verify_bearer_token(bearer)
-    raise UnauthorizedException("未登录，请先登录")
+    if principal is None:
+        raise UnauthorizedException("未登录，请先登录")
+    return principal
 
 
 async def require_admin(principal: Principal = Depends(require_login)) -> Principal:

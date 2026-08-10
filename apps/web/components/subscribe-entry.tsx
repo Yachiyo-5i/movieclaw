@@ -15,6 +15,7 @@ import { SubscribeDialog, type SubscribeTarget } from "@/components/subscribe-di
 import { fetchDoubanMediaDetail } from "@/lib/api/discover";
 import { listSubscriptions, type Subscription } from "@/lib/api/subscriptions";
 import type { MediaType } from "@/lib/media-types";
+import { usePermissions } from "@/lib/permissions";
 
 /**
  * 海报卡片「订阅影片」入口 + 全站订阅状态的唯一数据源。
@@ -34,6 +35,8 @@ import type { MediaType } from "@/lib/media-types";
  * 条目，弹层内会展示明确的错误信息，不会静默错订。
  */
 interface SubscribeEntryValue {
+  /** 当前身份能否创建、调整或取消订阅；页面据此直接隐藏操作入口。 */
+  canSubscribe: boolean;
   /** 打开订阅弹层；豆瓣来源缺 type 时先补拉详情识别类型，故为异步 */
   open: (item: PosterVisualItem) => Promise<void>;
   /** 查找该影片已存在的订阅；未订阅（或列表尚未加载完成）返回 undefined */
@@ -62,6 +65,7 @@ export function useSubscribeEntry(): SubscribeEntryValue {
 }
 
 export function SubscribeEntryProvider({ children }: { children: ReactNode }) {
+  const { canSubscribe } = usePermissions();
   const [target, setTarget] = useState<SubscribeTarget | null>(null);
   // 全站订阅列表：启动拉取一次；失败不覆盖已有数据——状态判断降级为「都未订阅」，
   // 不影响订阅入口本身（弹层预检有自己的错误提示）
@@ -81,6 +85,7 @@ export function SubscribeEntryProvider({ children }: { children: ReactNode }) {
   }, [refresh]);
 
   const open = useCallback(async (item: PosterVisualItem) => {
+    if (!canSubscribe) return;
     const source = item.source ?? "tmdb";
     let kind = item.type;
     if (!kind && source === "douban") {
@@ -96,7 +101,7 @@ export function SubscribeEntryProvider({ children }: { children: ReactNode }) {
       title: item.title,
       year: item.year,
     });
-  }, []);
+  }, [canSubscribe]);
 
   // 查表索引：subscriptionOf 在海报墙的每张卡片渲染时都会被调用，线性查找
   // 是 O(卡片数 × 订阅数)；列表变化时建一次索引，单次查询 O(1)，同键保留首条。
@@ -132,8 +137,8 @@ export function SubscribeEntryProvider({ children }: { children: ReactNode }) {
   );
 
   const value = useMemo(
-    () => ({ open, subscriptionOf, subscriptions: subs, refresh }),
-    [open, subscriptionOf, subs, refresh],
+    () => ({ canSubscribe, open, subscriptionOf, subscriptions: subs, refresh }),
+    [canSubscribe, open, subscriptionOf, subs, refresh],
   );
 
   return (

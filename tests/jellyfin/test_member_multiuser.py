@@ -11,8 +11,12 @@
 
 from __future__ import annotations
 
+import sqlite3
+from pathlib import Path
+
 from fastapi.testclient import TestClient
 
+from movieclaw_api.core.config import get_settings
 from movieclaw_jellyfin.ids import episode_guid, item_guid, library_guid
 
 from .helpers import ADMIN, jf_login
@@ -24,7 +28,7 @@ MEMBER_AUTH_HEADER = (
 )
 
 
-def _create_member(client: TestClient, *, tv_lib_id: int) -> None:
+def _create_member(client: TestClient, *, tv_lib_id: int) -> int:
     """经 Web API 建成员并把可见库限定为剧集库（client 已带超管 Cookie）。"""
     created = client.post("/api/v1/members", json=MEMBER)
     assert created.status_code == 200, created.text
@@ -34,6 +38,7 @@ def _create_member(client: TestClient, *, tv_lib_id: int) -> None:
         json={"all_libraries": False, "library_ids": [tv_lib_id]},
     )
     assert updated.status_code == 200, updated.text
+    return member_id
 
 
 def _member_login(client: TestClient) -> str:
@@ -44,6 +49,49 @@ def _member_login(client: TestClient) -> str:
     )
     assert resp.status_code == 200, resp.text
     return resp.json()["AccessToken"]
+
+
+def _duplicate_episode_into_member_library(
+    client: TestClient, seeded: dict, media_root: Path
+) -> tuple[int, Path]:
+    """制造现场同款数据：同一集同时存在于隐藏库和成员可见库。"""
+    member_root = media_root.parent / "member-visible"
+    member_root.mkdir()
+    created = client.post(
+        "/api/v1/libraries",
+        json={"name": "成员剧集", "kind": "tv", "root_paths": [str(member_root)]},
+    )
+    assert created.status_code == 200, created.text
+    library_id = created.json()["data"]["id"]
+
+    target = member_root / "S01E01.mkv"
+    target.write_bytes(b"M" * 2048)
+    database_url = get_settings().database_url
+    prefix = "sqlite+aiosqlite:///"
+    assert database_url.startswith(prefix)
+    with sqlite3.connect(database_url.removeprefix(prefix)) as connection:
+        connection.row_factory = sqlite3.Row
+        source = connection.execute(
+            """
+            SELECT * FROM library_file
+            WHERE library_id = ? AND media_item_id = ?
+              AND season_number = 1 AND episode_number = 1
+            """,
+            (seeded["tv_lib"], seeded["show"]),
+        ).fetchone()
+        assert source is not None
+        row = dict(source)
+        row.pop("id")
+        row["library_id"] = library_id
+        row["file_path"] = str(target)
+        columns = list(row)
+        connection.execute(
+            f"INSERT INTO library_file ({', '.join(columns)}) "
+            f"VALUES ({', '.join('?' for _ in columns)})",
+            [row[column] for column in columns],
+        )
+        connection.commit()
+    return library_id, target
 
 
 def test_member_identity_projection(client: TestClient, seeded: dict) -> None:
@@ -65,17 +113,51 @@ def test_member_identity_projection(client: TestClient, seeded: dict) -> None:
     assert me["Id"] != public[0]["Id"]
 
 
-def test_member_library_visibility_enforced_on_all_paths(
+def test_member_password_reset_revokes_jellyfin_token(
     client: TestClient, seeded: dict
 ) -> None:
-    """白名单外的电影库：枚举不出现，直达（详情/协商/取流/下载）全 404。"""
+    """管理员重置成员密码后，播放器保存的旧 AccessToken 必须失效。"""
+    member_id = _create_member(client, tv_lib_id=seeded["tv_lib"])
+    token = _member_login(client)
+    assert client.get("/Users/Me", headers={"X-Emby-Token": token}).status_code == 200
+
+    reset = client.post(f"/api/v1/members/{member_id}/reset-password")
+    assert reset.status_code == 200, reset.text
+    assert client.get("/Users/Me", headers={"X-Emby-Token": token}).status_code == 401
+
+
+def test_member_password_change_revokes_jellyfin_token(
+    client: TestClient, seeded: dict
+) -> None:
+    """成员自己改密码后，播放器保存的旧 AccessToken 也必须失效。"""
     _create_member(client, tv_lib_id=seeded["tv_lib"])
+    token = _member_login(client)
+    assert client.get("/Users/Me", headers={"X-Emby-Token": token}).status_code == 200
+
+    login = client.post("/api/v1/auth/login", json=MEMBER)
+    assert login.status_code == 200, login.text
+    changed = client.put(
+        "/api/v1/auth/password",
+        json={"old_password": MEMBER["password"], "new_password": "family-new-pass-9"},
+    )
+    assert changed.status_code == 200, changed.text
+    assert client.get("/Users/Me", headers={"X-Emby-Token": token}).status_code == 401
+
+
+def test_member_library_visibility_enforced_on_all_paths(
+    client: TestClient, seeded: dict, media_root: Path
+) -> None:
+    """白名单外的电影库：枚举不出现，直达（详情/协商/取流/下载）全 404。"""
+    member_library_id, member_file = _duplicate_episode_into_member_library(
+        client, seeded, media_root
+    )
+    _create_member(client, tv_lib_id=member_library_id)
     token = _member_login(client)
     headers = {"X-Emby-Token": token}
     movie_guid = item_guid(seeded["movie"])
 
     views = client.get("/UserViews", headers=headers).json()
-    assert [v["Name"] for v in views["Items"]] == ["剧集"]
+    assert [v["Name"] for v in views["Items"]] == ["成员剧集"]
 
     assert client.get(f"/Items/{movie_guid}", headers=headers).status_code == 404
     info = client.get(f"/Items/{movie_guid}/PlaybackInfo", headers=headers).json()
@@ -91,6 +173,24 @@ def test_member_library_visibility_enforced_on_all_paths(
     # 可见库内的剧集一切正常（对照组，防止把门修成了全关）
     show_guid = item_guid(seeded["show"])
     assert client.get(f"/Items/{show_guid}", headers=headers).status_code == 200
+    episode = episode_guid(seeded["show"], 1, 1)
+    detail = client.get(f"/Items/{episode}", headers=headers).json()
+    assert [source["Path"] for source in detail["MediaSources"]] == [str(member_file)]
+    playback = client.post(f"/Items/{episode}/PlaybackInfo", headers=headers).json()
+    assert [source["Id"] for source in playback["MediaSources"]] == [
+        detail["MediaSources"][0]["Id"]
+    ]
+    stream = client.get(
+        f"/Videos/{episode}/stream.mp4",
+        params={
+            "static": "true",
+            "mediaSourceId": detail["MediaSources"][0]["Id"],
+        },
+        headers=headers,
+    )
+    assert stream.status_code == 200
+    assert stream.content == b"M" * 2048
+
     admin_token = jf_login(client)
     assert (
         client.get(f"/Items/{movie_guid}", headers={"X-Emby-Token": admin_token}).status_code

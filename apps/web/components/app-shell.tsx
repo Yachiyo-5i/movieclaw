@@ -26,6 +26,7 @@ import { buildSearchPath } from "@/lib/search-url";
 import { UiPrefsProvider } from "@/lib/ui-prefs";
 import { useIsMobile } from "@/lib/use-media-query";
 import { settingsSections } from "@/lib/mock-data";
+import { usePermissions } from "@/lib/permissions";
 
 /**
  * 应用外壳：全站骨架布局（左栏 + 右区），所有导航态由 URL 驱动。
@@ -388,6 +389,7 @@ function MobileTopBar({
   title?: string;
 }) {
   const router = useRouter();
+  const { canSearch } = usePermissions();
   return (
     <header className="mobile-topbar pointer-events-none absolute inset-x-0 top-0 z-40">
       <div className="pointer-events-auto flex h-[52px] items-center gap-2 px-3">
@@ -434,9 +436,11 @@ function MobileTopBar({
             min-w-0 让它在窄屏上自己收缩，而不是把搜索挤出屏幕 */}
         <div className="ml-auto flex min-w-0 shrink items-center gap-2">
           {actions}
-          <div className="shrink-0">
-            <SearchCommand onSearch={onSearch} triggerClassName={PAGE_NAV_BUTTON_CLASS} />
-          </div>
+          {canSearch && (
+            <div className="shrink-0">
+              <SearchCommand onSearch={onSearch} triggerClassName={PAGE_NAV_BUTTON_CLASS} />
+            </div>
+          )}
         </div>
       </div>
     </header>

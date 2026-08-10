@@ -521,19 +521,11 @@ function AppSection() {
  * 草稿自动撤销（组件卸载即触发既有的清理逻辑）。
  */
 function AppearanceSection() {
-  // 背景图库是全局共享资源（换图/删图波及全家，接口也已收口管理员）；
-  // 成员的外观分区只剩界面质感——那份偏好按成员各存各的（ui_prefs）
-  const { session } = useSession();
-  const isMember = session.role === "member";
-  const [tab, setTab] = useState<"backdrop" | "texture">(
-    isMember ? "texture" : "backdrop",
-  );
-  const tabs = isMember
-    ? ([{ id: "texture" as const, label: "界面质感" }] as const)
-    : ([
-        { id: "backdrop" as const, label: "背景图" },
-        { id: "texture" as const, label: "界面质感" },
-      ] as const);
+  const [tab, setTab] = useState<"backdrop" | "texture">("backdrop");
+  const tabs = [
+    { id: "backdrop" as const, label: "背景图" },
+    { id: "texture" as const, label: "界面质感" },
+  ] as const;
 
   return (
     <div className="space-y-5">
@@ -554,7 +546,7 @@ function AppearanceSection() {
           </button>
         ))}
       </div>
-      {tab === "backdrop" && !isMember ? <BackdropGroup /> : <InterfaceTextureGroup />}
+      {tab === "backdrop" ? <BackdropGroup /> : <InterfaceTextureGroup />}
     </div>
   );
 }
@@ -568,8 +560,8 @@ function AppearanceSection() {
  *      当前项带高亮环 + 对勾；hover 自定义瓷砖浮出 × 可单独删除；上传是「+」瓷砖；
  *   3) 大预览即投放区：hover 浮出更换按钮，拖图片进来直接换，点击任意处打开文件选择。
  *
- * 上传的图**全部保留**在服务端图库（data/uploads/backdrops），想传几张传几张
- * （上限 20 张），随时点选切换；切回默认不删图，只有点瓷砖上的 × 才真正删除。
+ * 上传的图**全部保留**在当前账号的服务端图库，成员之间互不可见；每个账号
+ * 最多 20 张，可随时点选切换。切回默认不删图，只有点瓷砖上的 × 才真正删除。
  * 生效图同时驱动 body::before 铺底与所有液态玻璃面板的折射纹理（见 lib/backdrop.tsx）。
  */
 function BackdropGroup() {

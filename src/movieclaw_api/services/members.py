@@ -22,6 +22,7 @@ from movieclaw_api.exceptions import (
     NotFoundException,
     UnauthorizedException,
 )
+from movieclaw_api.services import appearance as appearance_media
 from movieclaw_api.services import auth as auth_service
 from movieclaw_api.services import avatar as avatar_media
 from movieclaw_db.models.member import Member
@@ -119,7 +120,7 @@ async def _drop_jellyfin_devices(session: AsyncSession, member_id: int) -> None:
     """删除该成员的全部 Jellyfin 设备凭据。
 
     协议侧的设备 token 长期有效且无版本机制（jellyfin_device 模型注释），
-    停用/删除成员时直接删行是让电视端即刻失效的唯一手段。
+    停用/删除/改密时直接删行是让电视端即刻失效的唯一手段。
     """
     from sqlalchemy import delete as sa_delete
 
@@ -149,14 +150,15 @@ async def reset_member_password(session: AsyncSession, member_id: int) -> tuple[
     plaintext = generate_password()
     member.password_hash = auth_service.hash_password(plaintext)
     member = await repo.bump_token_version(member)
-    logger.info("已重置成员 %s 的密码（旧会话已全部下线）", member.username)
+    await _drop_jellyfin_devices(session, member_id)
+    logger.info("已重置成员 %s 的密码（旧会话与播放器凭据已全部下线）", member.username)
     return member, plaintext
 
 
 async def delete_member(session: AsyncSession, member_id: int) -> None:
     """删除成员：清理个人数据，保留公共资源（§3.9.1 生命周期语义）。
 
-    - 头像文件、Jellyfin 设备、播放进度/收藏：显式清理（播放状态的
+    - 头像文件、个人背景图库、Jellyfin 设备、播放进度/收藏：显式清理（播放状态的
       member_id 是哨兵值非外键，不能依赖级联）；
     - 库/站点白名单、订阅关注行：外键级联自动清理；
     - 其发起的订阅：外键 SET NULL 自动转为超管发起——绝不静默删除
@@ -168,6 +170,7 @@ async def delete_member(session: AsyncSession, member_id: int) -> None:
 
     member = await get_member(session, member_id)
     avatar_media.delete_avatar(avatar_media.member_stem(member_id))
+    appearance_media.remove_member_gallery(member_id)
     await _drop_jellyfin_devices(session, member_id)
     await session.execute(sa_delete(PlaybackState).where(PlaybackState.member_id == member_id))
     # 搜索历史必须跟人清：member_id 是哨兵值非外键，SQLite 复用行 id 时
@@ -209,5 +212,6 @@ async def change_own_password(
         raise UnauthorizedException("原密码错误")
     member.password_hash = auth_service.hash_password(new_password)
     member = await repo.bump_token_version(member)
-    logger.info("成员 %s 已修改密码，其他设备已下线", member.username)
+    await _drop_jellyfin_devices(session, member_id)
+    logger.info("成员 %s 已修改密码，其他会话与播放器凭据已下线", member.username)
     return member

@@ -6,6 +6,8 @@ import { createPortal } from "react-dom";
 import { AvatarBadge } from "@/components/avatar-badge";
 import { GearIcon, LogoutIcon } from "@/components/icons";
 import { logout } from "@/lib/api/auth";
+import { clearBackdropCache } from "@/lib/backdrop-cache";
+import { roleLabel } from "@/lib/permissions";
 import { useSession } from "@/lib/session";
 
 /**
@@ -61,6 +63,7 @@ export function UserMenu({ onOpenSettings, collapsed = false }: UserMenuProps) {
     } catch {
       // 即使请求失败（如网络断开），也照常跳登录页；会话在后端仍会自然过期
     }
+    clearBackdropCache();
     window.location.href = "/login";
   };
 
@@ -137,7 +140,9 @@ export function UserMenu({ onOpenSettings, collapsed = false }: UserMenuProps) {
               <span className="block truncate text-ui font-semibold text-[var(--text)]">
                 {session.nickname}
               </span>
-              <span className="block truncate text-caption text-[var(--text-muted)]">超级管理员</span>
+              <span className="block truncate text-caption text-[var(--text-muted)]">
+                {roleLabel(session)}
+              </span>
             </span>
             <svg
               viewBox="0 0 20 20"

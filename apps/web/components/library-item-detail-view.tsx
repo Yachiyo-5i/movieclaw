@@ -50,6 +50,7 @@ import { getDiscoveryReturnPath } from "@/lib/discovery-return-path";
 import { formatBytes } from "@/lib/format";
 import { resolveRequestUrl } from "@/lib/http";
 import { cachedImageUrl } from "@/lib/image-proxy";
+import { usePermissions } from "@/lib/permissions";
 import { formatRelativeTime } from "@/lib/time";
 import { usePageTitle } from "@/lib/use-page-title";
 import { useVisiblePolling } from "@/lib/use-visible-polling";
@@ -79,6 +80,7 @@ export function LibraryItemDetailView({
   mediaItemId: number;
   returnTo?: string;
 }) {
+  const { canManageLibraries } = usePermissions();
   const router = useRouter();
   const discoveryReturnPath = getDiscoveryReturnPath(returnTo);
   const [detail, setDetail] = useState<LibraryItemDetail | null>(null);
@@ -249,14 +251,16 @@ export function LibraryItemDetailView({
       <PageNav
         items={trail}
         actions={
-          <ItemActionsMenu
-            scraping={scrapingNow}
-            searchHref={`/search?q=${encodeURIComponent(detail.title)}` as Route}
-            onReidentify={() => setReidentifyOpen(true)}
-            onRefreshMetadata={runMetadataRefresh}
-            onTransfer={() => setTransferOpen(true)}
-            onDelete={() => setDeleteOpen(true)}
-          />
+          canManageLibraries ? (
+            <ItemActionsMenu
+              scraping={scrapingNow}
+              searchHref={`/search?q=${encodeURIComponent(detail.title)}` as Route}
+              onReidentify={() => setReidentifyOpen(true)}
+              onRefreshMetadata={runMetadataRefresh}
+              onTransfer={() => setTransferOpen(true)}
+              onDelete={() => setDeleteOpen(true)}
+            />
+          ) : null
         }
       />
 
@@ -275,13 +279,15 @@ export function LibraryItemDetailView({
             alt={`${detail.title} 海报`}
             className="aspect-[2/3] w-full object-cover"
           />
-          <button
-            type="button"
-            onClick={() => setArtworkOpen(true)}
-            className="touch-reveal absolute inset-x-0 bottom-0 flex h-11 items-center justify-center bg-black/70 text-sub font-medium text-white opacity-0 backdrop-blur-sm transition group-hover/poster:opacity-100 max-md:h-8 max-md:text-caption"
-          >
-            更换图片
-          </button>
+          {canManageLibraries && (
+            <button
+              type="button"
+              onClick={() => setArtworkOpen(true)}
+              className="touch-reveal absolute inset-x-0 bottom-0 flex h-11 items-center justify-center bg-black/70 text-sub font-medium text-white opacity-0 backdrop-blur-sm transition group-hover/poster:opacity-100 max-md:h-8 max-md:text-caption"
+            >
+              更换图片
+            </button>
+          )}
         </div>
 
         <div className="min-w-0 flex-1 pb-1">
@@ -383,7 +389,7 @@ export function LibraryItemDetailView({
           <SeasonEpisodesSection
             libraryId={libraryId}
             detail={detail}
-            onDeleteFile={setDeleteFileTarget}
+            onDeleteFile={canManageLibraries ? setDeleteFileTarget : undefined}
           />
         )}
 
@@ -412,22 +418,22 @@ export function LibraryItemDetailView({
               files={files}
               isMovie={isMovie}
               title={isMovie ? "文件" : "其他文件"}
-              onDeleteFile={setDeleteFileTarget}
+              onDeleteFile={canManageLibraries ? setDeleteFileTarget : undefined}
             />
           );
         })()}
       </div>
       </div>
 
-      <DeleteDialog
+      {canManageLibraries && <DeleteDialog
         open={deleteOpen}
         detail={detail}
         onClose={() => setDeleteOpen(false)}
         onDeleted={() => router.replace(`/library/${libraryId}` as Route)}
         libraryId={libraryId}
-      />
+      />}
 
-      <DeleteFileDialog
+      {canManageLibraries && <DeleteFileDialog
         file={deleteFileTarget}
         detail={detail}
         libraryId={libraryId}
@@ -437,9 +443,9 @@ export function LibraryItemDetailView({
           if (deletedItem) router.replace(`/library/${libraryId}` as Route);
           else reload();
         }}
-      />
+      />}
 
-      <TransferDialog
+      {canManageLibraries && <TransferDialog
         open={transferOpen}
         detail={detail}
         libraryId={libraryId}
@@ -448,9 +454,9 @@ export function LibraryItemDetailView({
         onTransferred={(targetLibraryId) =>
           router.replace(`/library/${targetLibraryId}/item/${mediaItemId}` as Route)
         }
-      />
+      />}
 
-      <ReidentifyDialog
+      {canManageLibraries && <ReidentifyDialog
         open={reidentifyOpen}
         libraryId={libraryId}
         mediaItemId={mediaItemId}
@@ -464,15 +470,15 @@ export function LibraryItemDetailView({
           }
         }}
         onApplied={() => setReidentifyDirty(true)}
-      />
+      />}
 
-      <ArtworkPickerDialog
+      {canManageLibraries && <ArtworkPickerDialog
         open={artworkOpen}
         libraryId={libraryId}
         mediaItemId={mediaItemId}
         onClose={() => setArtworkOpen(false)}
         onChanged={reload}
-      />
+      />}
     </div>
   );
 }
@@ -896,7 +902,7 @@ function SeasonEpisodesSection({
 }: {
   libraryId: number;
   detail: LibraryItemDetail;
-  onDeleteFile: (file: LibraryItemFile) => void;
+  onDeleteFile?: (file: LibraryItemFile) => void;
 }) {
   const seasons = detail.seasons;
   // 季选择器列的是「元数据的季 ∪ 库里实有的季」，本地没有的季也在里面（看得到
@@ -1060,7 +1066,7 @@ function SeasonEpisodesSection({
                         <span className="tnum shrink-0 text-caption text-[var(--text-faint)]">
                           {formatRelativeTime(file.added_at)}
                         </span>
-                        <button
+                        {onDeleteFile && <button
                           type="button"
                           aria-label="删除此文件"
                           title="删除此文件"
@@ -1068,7 +1074,7 @@ function SeasonEpisodesSection({
                           className="touch-reveal shrink-0 rounded-md p-1.5 text-[var(--text-faint)] opacity-0 transition group-hover/epfile:opacity-100 hover:bg-white/[0.06] hover:text-[#ff9f9f]"
                         >
                           <TrashIcon className="size-4" />
-                        </button>
+                        </button>}
                       </div>
                       <div className="mt-3.5">
                         <SpecRows file={file} />
@@ -1156,7 +1162,7 @@ function FileSection({
   files: LibraryItemFile[];
   isMovie: boolean;
   title: string;
-  onDeleteFile: (file: LibraryItemFile) => void;
+  onDeleteFile?: (file: LibraryItemFile) => void;
 }) {
   // 剧集按季分组；电影全部落在 0 组
   const groups = useMemo(() => {
@@ -1188,7 +1194,7 @@ function FileSection({
                 key={file.id}
                 file={file}
                 isMovie={isMovie}
-                onDelete={() => onDeleteFile(file)}
+                onDelete={onDeleteFile ? () => onDeleteFile(file) : undefined}
               />
             ))}
           </div>
@@ -1208,7 +1214,7 @@ function FileRow({
 }: {
   file: LibraryItemFile;
   isMovie: boolean;
-  onDelete: () => void;
+  onDelete?: () => void;
 }) {
   // 剧集行可展开看逐集完整规格（电影已有片源规格区，这里保持单行紧凑）
   const [expanded, setExpanded] = useState(false);
@@ -1266,7 +1272,7 @@ function FileRow({
         <span className="tnum w-20 shrink-0 text-right text-caption text-[var(--text-faint)]">
           {formatRelativeTime(file.added_at)}
         </span>
-        <button
+        {onDelete && <button
           type="button"
           aria-label="删除此文件"
           title="删除此文件"
@@ -1277,7 +1283,7 @@ function FileRow({
           className="touch-reveal shrink-0 rounded-md p-1.5 text-[var(--text-faint)] opacity-0 transition group-hover/filerow:opacity-100 hover:bg-white/[0.06] hover:text-[#ff9f9f]"
         >
           <TrashIcon className="size-4" />
-        </button>
+        </button>}
       </div>
       {expanded && !isMovie && (
         <div className="border-t border-white/[0.04] bg-white/[0.02] px-5 py-4">

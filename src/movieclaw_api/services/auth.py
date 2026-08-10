@@ -322,7 +322,19 @@ async def change_password(old_password: str, new_password: str) -> None:
     admin.password_hash = _password_hash.hash(new_password)
     await get_setting_store().set(admin)
     await rotate_session_secret()
-    logger.info("管理员密码已修改，所有登录会话已强制下线")
+    await _drop_admin_jellyfin_devices()
+    logger.info("管理员密码已修改，所有登录会话与播放器凭据已强制下线")
+
+
+async def _drop_admin_jellyfin_devices() -> None:
+    """管理员改密时吊销超管身份的 Jellyfin AccessToken。"""
+    from sqlalchemy import delete as sa_delete
+
+    from movieclaw_db.models import JellyfinDevice
+
+    async with get_database().session() as session:
+        await session.execute(sa_delete(JellyfinDevice).where(JellyfinDevice.member_id == 0))
+        await session.commit()
 
 
 # ---------------------------------------------------------------------------

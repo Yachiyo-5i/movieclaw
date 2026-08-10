@@ -403,6 +403,7 @@ async def _query_items(request: Request, scope: ViewerScope) -> JSONResponse:
                 page_ids,
                 member_id=scope.member_id,
                 library_id=parent_ref.entity_id,
+                visible_library_ids=scope.visible,
                 dto_options=options,
             )
             page_entries = [
@@ -495,7 +496,11 @@ async def _entries_for_ids(
     # 直达 id 也过可见性筛（与浏览口径一致，不给可枚举 GUID 留后门）
     scoped = {i for i in scoped if await _item_visible(session, i, scope)}
     bundles = await load_bundles(
-        session, list(scoped), member_id=scope.member_id, dto_options=options
+        session,
+        list(scoped),
+        member_id=scope.member_id,
+        visible_library_ids=scope.visible,
+        dto_options=options,
     )
     entries: list[Entry] = []
     for ref in refs:
@@ -530,7 +535,11 @@ async def _entries_for_parent(
             types = include_types or {"Movie", "Series"}
             ids = await item_ids_with_files(session, visible_library_ids=scope.visible)
             bundles = await load_bundles(
-                session, ids, member_id=scope.member_id, dto_options=options
+                session,
+                ids,
+                member_id=scope.member_id,
+                visible_library_ids=scope.visible,
+                dto_options=options,
             )
             return _build_entries(bundles, types)
         return None
@@ -566,6 +575,7 @@ async def _entries_for_parent(
             ids,
             member_id=scope.member_id,
             library_id=ref.entity_id,
+            visible_library_ids=scope.visible,
             dto_options=options,
         )
         return _build_entries(bundles, types)
@@ -574,7 +584,11 @@ async def _entries_for_parent(
         if not await _item_visible(session, ref.entity_id, scope):
             raise not_found()
         bundles = await load_bundles(
-            session, [ref.entity_id], member_id=scope.member_id, dto_options=options
+            session,
+            [ref.entity_id],
+            member_id=scope.member_id,
+            visible_library_ids=scope.visible,
+            dto_options=options,
         )
         types = include_types or {"Season"}
         return _build_entries(bundles, types)
@@ -583,7 +597,11 @@ async def _entries_for_parent(
         if not await _item_visible(session, ref.entity_id, scope):
             raise not_found()
         bundles = await load_bundles(
-            session, [ref.entity_id], member_id=scope.member_id, dto_options=options
+            session,
+            [ref.entity_id],
+            member_id=scope.member_id,
+            visible_library_ids=scope.visible,
+            dto_options=options,
         )
         return _build_entries(bundles, {"Episode"}, season_scope=ref.season)
 
@@ -667,6 +685,7 @@ async def items_latest(
             selected_ids,
             member_id=scope.member_id,
             library_id=library_id,
+            visible_library_ids=scope.visible,
             dto_options=options,
         )
     dtos: list[dict[str, Any]] = []
@@ -729,7 +748,11 @@ async def items_resume(
             )
             selected_ids = list(dict.fromkeys(c.media_item_id for c in page_candidates))
             bundles = await load_bundles(
-                session, selected_ids, member_id=scope.member_id, dto_options=options
+                session,
+                selected_ids,
+                member_id=scope.member_id,
+                visible_library_ids=scope.visible,
+                dto_options=options,
             )
     else:
         page_candidates = []
@@ -902,7 +925,11 @@ async def get_item(
         if not await _item_visible(session, ref.entity_id, scope):
             raise not_found()
         bundles = await load_bundles(
-            session, [ref.entity_id], member_id=scope.member_id, dto_options=options
+            session,
+            [ref.entity_id],
+            member_id=scope.member_id,
+            visible_library_ids=scope.visible,
+            dto_options=options,
         )
 
     bundle = bundles.get(ref.entity_id)
@@ -955,7 +982,11 @@ async def shows_next_up(
             series_id=series_filter.entity_id if series_filter else None,
         )
         bundles = await load_bundles(
-            session, ids, member_id=scope.member_id, dto_options=options
+            session,
+            ids,
+            member_id=scope.member_id,
+            visible_library_ids=scope.visible,
+            dto_options=options,
         )
 
     candidates: list[tuple[Any, dict[str, Any]]] = []
@@ -1020,7 +1051,11 @@ async def shows_seasons(
         if not await _item_visible(session, ref.entity_id, scope):
             raise not_found()
         bundles = await load_bundles(
-            session, [ref.entity_id], member_id=scope.member_id, dto_options=options
+            session,
+            [ref.entity_id],
+            member_id=scope.member_id,
+            visible_library_ids=scope.visible,
+            dto_options=options,
         )
     bundle = bundles.get(ref.entity_id)
     if bundle is None or bundle.item.kind != "tv":
@@ -1066,7 +1101,11 @@ async def shows_episodes(
         if not await _item_visible(session, target_item_id, scope):
             raise not_found_message("Series not found")
         bundles = await load_bundles(
-            session, [target_item_id], member_id=scope.member_id, dto_options=options
+            session,
+            [target_item_id],
+            member_id=scope.member_id,
+            visible_library_ids=scope.visible,
+            dto_options=options,
         )
     bundle = bundles.get(target_item_id)
     if bundle is None or bundle.item.kind != "tv":

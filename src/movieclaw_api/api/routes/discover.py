@@ -13,7 +13,7 @@ from enum import StrEnum
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from movieclaw_api.api.deps import require_login
+from movieclaw_api.api.deps import require_login, require_subscribe_capability
 from movieclaw_api.exceptions import (
     AppException,
     NotFoundException,
@@ -106,7 +106,7 @@ async def search_media(
         description="是否记录搜索历史并留存结果快照（统一搜索入口传 True；"
         "发现页工具栏等场景默认不记录）",
     ),
-    principal: Principal = Depends(require_login),
+    principal: Principal = Depends(require_subscribe_capability),
     session: AsyncSession = Depends(get_session),
 ) -> ApiResponse[list[MediaSearchItem]]:
     """搜索指定元数据来源：豆瓣移动端轻量搜索 / TMDB multi 搜索。

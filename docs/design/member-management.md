@@ -249,7 +249,7 @@ class Principal:
 **路由挂载**：`api/router.py` 的 `_PROTECTED_ROUTERS` 拆为两组：
 
 ```
-_MEMBER_ROUTERS   require_login   discover / people / images / ui / appearance /
+_MEMBER_ROUTERS   require_login   discover / people / images / ui /
                                   system-notices / libraries(读) / subscriptions(部分) /
                                   search(受 allow_search) / playback
 _ADMIN_ROUTERS    require_admin   sites / downloaders / llm / network / app /
@@ -264,6 +264,9 @@ _ADMIN_ROUTERS    require_admin   sites / downloaders / llm / network / app /
 整组配置面降级为逐路由防守。`libraries` 当前
 是 2000+ 行 47 条路由的单文件，正好借本次改造按"浏览 / 管理"拆为两个
 router 文件分别挂载（属于本改动的直接产物，不是顺手重构）。
+
+`appearance` 读取保持公开：匿名请求用于登录页的管理员背景，登录成员读取
+自己的背景图库；上传、切换和删除要求登录，并按 `Principal` 隔离存储作用域。
 
 **守护测试升级为双层**：
 
@@ -500,6 +503,8 @@ class MemberSiteAccess(TimestampMixin, table=True):
 - 成员的 `/settings/profile` 复用现有头像/昵称/改密组件，后端对应接口
   （`/auth/profile`、`/auth/avatar`、`/auth/password`）按 Principal 分流到
   member 表；
+- `/settings/appearance` 的界面质感和背景图库都按成员隔离；成员图片存入
+  `data/uploads/backdrops/members/<member_id>/`，删除成员时一并清理；
 - 成员管理页的完整设计见 §3.9.1（含"权限写入口唯一在成员页"的决策）。
 
 #### 3.9.1 成员管理页

@@ -30,6 +30,20 @@ def test_system_info_public_shape(client: TestClient) -> None:
     assert body["LocalAddress"].startswith("http")
 
 
+def test_system_info_public_uses_forwarded_external_address(client: TestClient) -> None:
+    """前端/反代入口不能把内部上游地址作为播放器后续访问地址下发。"""
+    resp = client.get(
+        "/System/Info/Public",
+        headers={
+            "Host": "127.0.0.1:8000",
+            "X-Forwarded-Host": "192.168.1.50:3000, proxy.internal",
+            "X-Forwarded-Proto": "https, http",
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.json()["LocalAddress"] == "https://192.168.1.50:3000"
+
+
 def test_system_ping_returns_product_name_json_string(client: TestClient) -> None:
     for method in (client.get, client.post):
         resp = method("/System/Ping")
@@ -86,6 +100,19 @@ def test_relogin_same_device_revokes_old_token(client: TestClient) -> None:
     assert token1 != token2
     assert client.get("/Users/Me", params={"ApiKey": token1}).status_code == 401
     assert client.get("/Users/Me", params={"ApiKey": token2}).status_code == 200
+
+
+def test_admin_password_change_revokes_jellyfin_token(client: TestClient) -> None:
+    """超管改密必须吊销播放器里的长期 AccessToken。"""
+    token = jf_login(client)
+    assert client.get("/Users/Me", params={"ApiKey": token}).status_code == 200
+
+    changed = client.put(
+        "/api/v1/auth/password",
+        json={"old_password": ADMIN["password"], "new_password": "admin-new-pass-456"},
+    )
+    assert changed.status_code == 200, changed.text
+    assert client.get("/Users/Me", params={"ApiKey": token}).status_code == 401
 
 
 def test_token_positions(client: TestClient) -> None:

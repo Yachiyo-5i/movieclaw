@@ -12,6 +12,9 @@
 
 from __future__ import annotations
 
+import base64
+from pathlib import Path
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -24,6 +27,9 @@ _AUTH = "/api/v1/auth"
 _MEMBERS = "/api/v1/members"
 _ADMIN = {"username": "admin", "password": "s3cret-pass"}
 _MEMBER = {"username": "family", "password": "family-pass-1"}
+_PNG_1X1 = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+)
 
 
 @pytest.fixture
@@ -250,7 +256,7 @@ def test_search_capability_gate(client: TestClient) -> None:
     admin_cookie, member_cookie, member_id = _setup_admin_and_member(client)
 
     _use(client, member_cookie)
-    denied = client.get("/api/v1/search/preferences")
+    denied = client.get("/api/v1/search", params={"keyword": "沙丘"})
     assert denied.status_code == 403
     assert "搜索" in denied.json()["message"]
 
@@ -258,11 +264,11 @@ def test_search_capability_gate(client: TestClient) -> None:
     client.put(f"{_MEMBERS}/{member_id}", json={"allow_search": True})
 
     _use(client, member_cookie)
-    assert client.get("/api/v1/search/preferences").status_code == 200
+    assert client.get("/api/v1/search", params={"keyword": "沙丘"}).status_code == 200
 
 
 def test_subscribe_capability_gate(client: TestClient) -> None:
-    """关闭 allow_subscribe 后，订阅写接口 403；读接口不受影响。"""
+    """关闭 allow_subscribe 后，订阅写接口与影视搜索 403；读接口不受影响。"""
     admin_cookie, member_cookie, member_id = _setup_admin_and_member(client)
 
     _use(client, admin_cookie)
@@ -272,6 +278,8 @@ def test_subscribe_capability_gate(client: TestClient) -> None:
     assert client.get("/api/v1/subscriptions").status_code == 200
     denied = client.post("/api/v1/subscriptions/prepare", json={})
     assert denied.status_code == 403
+    media_search = client.get("/api/v1/discover/search", params={"q": "沙丘"})
+    assert media_search.status_code == 403
 
 
 def test_direct_download_member_restrictions(client: TestClient) -> None:
@@ -320,6 +328,63 @@ def test_ui_preferences_isolated_per_member(client: TestClient) -> None:
     # 超管的全局配置不受影响
     _use(client, admin_cookie)
     assert client.get("/api/v1/ui/preferences").json()["data"] == admin_prefs
+
+
+def test_backdrop_gallery_isolated_per_member(client: TestClient) -> None:
+    """背景图库与生效项按账号隔离，匿名登录页只读取管理员图库。"""
+    admin_cookie, first_cookie, first_member_id = _setup_admin_and_member(client)
+
+    _use(client, admin_cookie)
+    admin_item = client.post(
+        "/api/v1/appearance/backdrops",
+        files={"file": ("admin.png", _PNG_1X1, "image/png")},
+    ).json()["data"]["backdrops"][0]
+
+    second_password = "second-pass-1"
+    created = client.post(
+        _MEMBERS,
+        json={"username": "second", "password": second_password},
+    )
+    assert created.status_code == 200, created.text
+    second_cookie = _login(client, "second", second_password)
+
+    _use(client, first_cookie)
+    assert client.get("/api/v1/appearance").json()["data"]["backdrops"] == []
+    first_view = client.post(
+        "/api/v1/appearance/backdrops",
+        files={"file": ("first.png", _PNG_1X1, "image/png")},
+    ).json()["data"]
+    first_item = first_view["backdrops"][0]
+    assert first_view["active_id"] == first_item["id"]
+    assert client.get(f"/api/v1/appearance/backdrops/{admin_item['id']}").status_code == 404
+
+    _use(client, second_cookie)
+    assert client.get("/api/v1/appearance").json()["data"]["backdrops"] == []
+    assert client.get(f"/api/v1/appearance/backdrops/{first_item['id']}").status_code == 404
+    second_view = client.post(
+        "/api/v1/appearance/backdrops",
+        files={"file": ("second.png", _PNG_1X1, "image/png")},
+    ).json()["data"]
+    second_item = second_view["backdrops"][0]
+
+    _use(client, first_cookie)
+    assert client.get("/api/v1/appearance").json()["data"]["backdrops"] == [first_item]
+    assert client.get(f"/api/v1/appearance/backdrops/{second_item['id']}").status_code == 404
+
+    _use(client, admin_cookie)
+    assert client.get("/api/v1/appearance").json()["data"]["backdrops"] == [admin_item]
+    assert client.get(f"/api/v1/appearance/backdrops/{first_item['id']}").status_code == 404
+
+    client.cookies.clear()
+    assert client.get("/api/v1/appearance").json()["data"]["backdrops"] == [admin_item]
+    assert client.get(f"/api/v1/appearance/backdrops/{admin_item['id']}").status_code == 200
+
+    # 删除成员时一并清除其个人图库，不留下运行期文件。
+    _use(client, admin_cookie)
+    gallery = Path(get_settings().media_dir) / "backdrops" / "members" / str(first_member_id)
+    assert gallery.is_dir()
+    assert client.delete(f"{_MEMBERS}/{first_member_id}").status_code == 200
+    assert not gallery.exists()
 
 
 def test_library_visibility_whitelist(client: TestClient) -> None:
@@ -381,9 +446,11 @@ _MEMBER_ALLOWLIST = {
     ("PUT", "/api/v1/auth/password"),
     ("POST", "/api/v1/auth/avatar"),
     ("GET", "/api/v1/auth/avatar"),
-    # 外观（读公开；背景图库是全局共享资源，写已收口管理员——成员的
-    # 界面个性化走 per-member 的 ui.preferences）
+    # 外观：匿名读取管理员背景；登录成员的图库、当前背景与写操作均按账号隔离
     ("GET", "/api/v1/appearance"),
+    ("POST", "/api/v1/appearance/backdrops"),
+    ("PUT", "/api/v1/appearance/active"),
+    ("DELETE", "/api/v1/appearance/backdrops/{backdrop_id}"),
     ("GET", "/api/v1/appearance/backdrops/{backdrop_id}"),
     # 界面偏好（同上，P2 per-member 化）
     ("GET", "/api/v1/ui/preferences"),
@@ -411,6 +478,12 @@ _MEMBER_ALLOWLIST = {
     ("GET", "/api/v1/libraries/{library_id}/items/{media_item_id}"),
     ("GET", "/api/v1/libraries/{library_id}/items/{media_item_id}/artwork"),
     ("GET", "/api/v1/libraries/{library_id}/items/{media_item_id}/episodes"),
+    # 搜索历史：个人数据；站点资源搜索/快照另由 allow_search 单独控制，
+    # 媒体快照随 allow_subscribe（默认开启）开放。
+    ("GET", "/api/v1/search/history"),
+    ("GET", "/api/v1/search/history/{history_id}/media-snapshot"),
+    ("DELETE", "/api/v1/search/history/{history_id}"),
+    ("DELETE", "/api/v1/search/history"),
     # 订阅：读 + 写（写受 allow_subscribe，默认开）；运维接口是管理员专属
     ("GET", "/api/v1/subscriptions"),
     ("POST", "/api/v1/subscriptions"),

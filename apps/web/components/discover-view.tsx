@@ -503,7 +503,7 @@ function HeroSlide({
   preload: boolean;
 }) {
   const { open } = useMediaDetail();
-  const { open: openSubscribe, subscriptionOf } = useSubscribeEntry();
+  const { canSubscribe, open: openSubscribe, subscriptionOf } = useSubscribeEntry();
   // 该影片是否已有订阅（数据来自 SubscribeEntryProvider 的全站订阅列表，Hero 自身不发请求）
   const existingSub = subscriptionOf(item);
   // 「粘性」装载：轮到过一次就永久保留 src（浏览器已缓存，重复挂载无成本）
@@ -600,7 +600,7 @@ function HeroSlide({
             它嵌在「整块进详情」的点击区里，所以点击必须 stopPropagation，
             否则订阅弹层弹出的同时详情页也会被打开。 */}
         <div className="mt-5 flex flex-wrap items-center gap-3 max-md:mt-3.5 max-md:gap-2">
-          <button
+          {canSubscribe && <button
             type="button"
             aria-label={existingSub ? `管理《${item.title}》的订阅` : `订阅影片《${item.title}》`}
             onPointerDown={subscribeTapGuard.onPointerDown}
@@ -627,7 +627,7 @@ function HeroSlide({
                 订阅影片
               </>
             )}
-          </button>
+          </button>}
         </div>
       </div>
     </div>

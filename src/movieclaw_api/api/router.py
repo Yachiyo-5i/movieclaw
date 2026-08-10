@@ -23,7 +23,6 @@ from movieclaw_api.api.deps import (
     require_admin,
     require_direct_download_capability,
     require_login,
-    require_search_capability,
 )
 from movieclaw_api.api.routes.agent import router as agent_router
 from movieclaw_api.api.routes.app_config import router as app_config_router
@@ -72,15 +71,13 @@ _MEMBER_ROUTERS = [
     ui_router,
     discover_router,
     images_router,
+    search_router,
     subscriptions_router,
     libraries_router,
     people_router,
 ]
 for _router in _MEMBER_ROUTERS:
     api_router.include_router(_router, dependencies=[Depends(require_login)])
-
-# 搜索按能力开关放行整组：管理员直通，成员须 allow_search
-api_router.include_router(search_router, dependencies=[Depends(require_search_capability)])
 
 # 一键下载：从下载器配置面单独拆出，按 allow_direct_download 放行成员；
 # 成员版在处理器内强制自动路由（拒绝手选目录/指定下载器，不回显路径）

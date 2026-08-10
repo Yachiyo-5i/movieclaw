@@ -30,12 +30,12 @@ export interface AppearanceView {
   backdrops: BackdropItem[];
 }
 
-/** 读取当前外观设置（背景图库与生效图）。 */
+/** 读取当前账号的外观设置；未登录时读取管理员用于登录页的全局背景。 */
 export function getAppearance(init?: RequestInit): Promise<AppearanceView> {
   return unwrap(request<ApiEnvelope<AppearanceView>>("/appearance", init));
 }
 
-/** 上传一张新背景图：加入图库并立即设为生效。file 为已压缩的图片 Blob（通常是 JPEG）。 */
+/** 上传一张新背景图：加入当前账号图库并立即设为生效。file 通常为已压缩的 JPEG。 */
 export function uploadBackdrop(file: Blob): Promise<AppearanceView> {
   const form = new FormData();
   form.append("file", file, "backdrop.jpg");

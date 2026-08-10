@@ -240,14 +240,19 @@ async def load_bundles(
     *,
     member_id: int = 0,
     library_id: int | None = None,
+    visible_library_ids: set[int] | None = None,
     include_people: bool = False,
     include_fileless: bool = False,
     dto_options: DtoOptions | None = None,
 ) -> dict[int, ItemBundle]:
-    """批量装载条目素材。library_id 限定时只装该库的文件行。
+    """批量装载条目素材。库参数限定时只装对应范围内的文件行。
 
     ``member_id``：观看者（0=超管哨兵）——bundle 里的播放状态只装该
     成员自己的行，UserData（进度/已看/收藏）随之按人投影。
+
+    ``visible_library_ids``：成员可见库范围。条目可能同时存在于多个库，
+    不能只在进入详情前判断“至少有一份可见”，否则 DTO 会夹带隐藏库的
+    MediaSourceId，播放器选择后又在取流层被 404，形成“能看见但播不了”。
 
     ``include_people`` 只在输出会用到 People 时为 True（fields=People 或
     单条目全字段）：演职员是量最大的关联（条目数 × 十余人的 join +
@@ -296,6 +301,8 @@ async def load_bundles(
     )
     if library_id is not None:
         file_q = file_q.where(LibraryFile.library_id == library_id)
+    if visible_library_ids is not None:
+        file_q = file_q.where(LibraryFile.library_id.in_(visible_library_ids))
     if summary_columns is not None:
         file_q = file_q.options(load_only(*summary_columns[2]))
     for f in (await session.execute(file_q)).scalars():

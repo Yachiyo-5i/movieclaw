@@ -7,7 +7,12 @@ from fastapi import APIRouter, Depends, Query
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from movieclaw_api.api.deps import require_admin, require_login
+from movieclaw_api.api.deps import (
+    require_admin,
+    require_login,
+    require_search_capability,
+    require_subscribe_capability,
+)
 from movieclaw_api.exceptions import BadRequestException, NotFoundException
 from movieclaw_api.schemas.response import ApiResponse, ok
 from movieclaw_api.schemas.search import (
@@ -77,7 +82,7 @@ async def search_torrents(
         description="发起搜索时的图览模式偏好，仅随历史留存，用于点历史重搜/看快照时还原展示模式",
     ),
     page: int = Query(1, ge=1, description="页码（各站点独立分页）"),
-    principal: Principal = Depends(require_login),
+    principal: Principal = Depends(require_search_capability),
     session: AsyncSession = Depends(get_session),
 ) -> ApiResponse[SearchResponse]:
     """对「已启用且验证通过」的站点（可用 ``sites`` 圈定子集）并发发起搜索，合并结果后返回。
@@ -193,7 +198,7 @@ async def search_torrents_stream(
         description="发起搜索时的图览模式偏好，仅随历史留存，用于点历史重搜/看快照时还原展示模式",
     ),
     page: int = Query(1, ge=1, description="页码（各站点独立分页）"),
-    principal: Principal = Depends(require_login),
+    principal: Principal = Depends(require_search_capability),
     session: AsyncSession = Depends(get_session),
 ) -> StreamingResponse:
     """``/search`` 的流式版本：以 Server-Sent Events 逐事件推送搜索过程与结果。
@@ -308,6 +313,7 @@ def _validate_tabs(payload: SearchPreferencesUpdate) -> None:
     response_model=ApiResponse[SearchPreferencesView],
     summary="读取搜索偏好（标签栏：内置分类 + 自定义分类）",
     operation_id="search.prefs.show",
+    dependencies=[Depends(require_search_capability)],
 )
 async def get_preferences() -> ApiResponse[SearchPreferencesView]:
     """返回全量标签的有序列表（含隐藏项）。
@@ -383,7 +389,7 @@ async def list_search_history(
 )
 async def get_search_snapshot(
     history_id: int,
-    principal: Principal = Depends(require_login),
+    principal: Principal = Depends(require_search_capability),
     session: AsyncSession = Depends(get_session),
 ) -> ApiResponse[SearchSnapshotView]:
     """返回该历史行最近一次搜索的完整结果快照（items/sites/total + 快照时间）。
@@ -427,7 +433,7 @@ async def get_search_snapshot(
 )
 async def get_media_search_snapshot(
     history_id: int,
-    principal: Principal = Depends(require_login),
+    principal: Principal = Depends(require_subscribe_capability),
     session: AsyncSession = Depends(get_session),
 ) -> ApiResponse[MediaSearchSnapshotView]:
     """返回该媒体搜索历史（vertical=media）最近一次的豆瓣条目快照。

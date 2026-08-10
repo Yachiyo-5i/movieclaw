@@ -11,6 +11,7 @@ import {
 
 import { fetchSearchPreferences, updateSearchPreferences } from "@/lib/api/search";
 import { DEFAULT_SEARCH_TABS, type SearchTab } from "@/lib/categories";
+import { usePermissions } from "@/lib/permissions";
 
 /**
  * 搜索偏好（标签栏：内置分类 + 自定义分类，统一混排）的全局状态。
@@ -38,10 +39,15 @@ interface SearchPrefsContextValue {
 const SearchPrefsContext = createContext<SearchPrefsContextValue | null>(null);
 
 export function SearchPrefsProvider({ children }: { children: React.ReactNode }) {
+  const { isAdmin } = usePermissions();
   const [tabs, setTabs] = useState<SearchTab[]>(DEFAULT_SEARCH_TABS);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
+    if (!isAdmin) {
+      setLoading(false);
+      return;
+    }
     let cancelled = false;
     fetchSearchPreferences()
       .then((list) => !cancelled && setTabs(list))
@@ -53,7 +59,7 @@ export function SearchPrefsProvider({ children }: { children: React.ReactNode })
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [isAdmin]);
 
   const saveTabs = useCallback(
     async (next: SearchTab[]) => {
