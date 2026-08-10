@@ -7,13 +7,19 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 from fastapi.testclient import TestClient
+from sqlmodel import select
 
+import movieclaw_api.api.routes.downloaders as downloaders_route
 import movieclaw_api.services.downloader_config as downloader_config_service
 import movieclaw_api.services.torrent_submit as torrent_submit_service
 from movieclaw_api.core.config import get_settings
 from movieclaw_api.services.site_access import SiteUnavailableError
+from movieclaw_db.engine import get_database
+from movieclaw_db.models import Library, ManualDownloadIntent, MediaItem
 from movieclaw_downloader import DownloaderInfo
 from movieclaw_downloader.models import DownloadRequest, SubmitResult
 
@@ -396,6 +402,166 @@ def test_submit_without_any_downloader(client) -> None:
     r = client.post("/api/v1/downloaders/submit", json=_SUBMIT)
     assert r.status_code == 400
     assert "默认下载器" in r.json()["message"]
+
+
+def test_resolve_target_returns_existing_route_preview(client, monkeypatch) -> None:
+    """手动下载预检：唯一身份后复用订阅的收藏范围/监听目录预检结论。"""
+    import movieclaw_api.services.subscription as subscription_service
+    from movieclaw_api.services.torrent_submit import ManualTargetResolution
+
+    async def resolve_target(**kwargs):
+        assert kwargs["kind"] == "movie" and kwargs["title"] == "测试电影"
+        return ManualTargetResolution(tmdb_id=42, candidates=[])
+
+    async def preview(session, *, kind, library_id, tmdb_id, downloader_id=None):
+        assert (kind, library_id, tmdb_id, downloader_id) == ("movie", None, 42, 8)
+        return {
+            "mode": "watch",
+            "path": "/downloads/manual/movies",
+            "staging_path": None,
+            "library_id": 7,
+            "library_name": "国内电影",
+            "downloader_name": "家里的 qBittorrent",
+            "route_matched": True,
+            "route_reason": "命中「国内电影」：区域=中国",
+            "ok": True,
+            "warning": None,
+        }
+
+    monkeypatch.setattr(downloaders_route, "resolve_manual_target", resolve_target)
+    monkeypatch.setattr(subscription_service, "preview_dispatch_route", preview)
+    r = client.post(
+        "/api/v1/downloaders/resolve-target",
+        json={"kind": "movie", "title": "测试电影", "year": 2024, "downloader_id": 8},
+    )
+    assert r.status_code == 200
+    data = r.json()["data"]
+    assert data["status"] == "ready"
+    assert data["tmdb_id"] == 42
+    assert data["library_name"] == "国内电影"
+    assert data["path"] == "/downloads/manual/movies"
+
+
+def test_resolve_target_accepts_a_confirmed_candidate(client, monkeypatch) -> None:
+    """歧义候选由用户确认后，可继续复用同一套自动路由预检。"""
+    import movieclaw_api.services.subscription as subscription_service
+    from movieclaw_api.services.library.resolve import ResolveCandidate
+    from movieclaw_api.services.torrent_submit import ManualTargetResolution
+
+    async def resolve_target(**kwargs):
+        return ManualTargetResolution(
+            tmdb_id=None,
+            candidates=[ResolveCandidate(tmdb_id=9527, title="确认影片", year=2024)],
+        )
+
+    async def preview(session, *, kind, library_id, tmdb_id, downloader_id=None):
+        assert (kind, library_id, tmdb_id, downloader_id) == ("movie", None, 9527, None)
+        return {
+            "mode": "watch",
+            "path": "/downloads/manual/movies",
+            "staging_path": None,
+            "library_id": 7,
+            "library_name": "国内电影",
+            "downloader_name": "家里的 qBittorrent",
+            "route_matched": True,
+            "route_reason": "命中「国内电影」：区域=中国",
+            "ok": True,
+            "warning": None,
+        }
+
+    monkeypatch.setattr(downloaders_route, "resolve_manual_target", resolve_target)
+    monkeypatch.setattr(subscription_service, "preview_dispatch_route", preview)
+    r = client.post(
+        "/api/v1/downloaders/resolve-target",
+        json={
+            "kind": "movie",
+            "title": "确认影片",
+            "year": 2024,
+            "selected_tmdb_id": 9527,
+        },
+    )
+    assert r.status_code == 200, r.json()
+    assert r.json()["data"]["status"] == "ready"
+    assert r.json()["data"]["tmdb_id"] == 9527
+
+
+def test_auto_route_submits_to_watch_and_anchors_info_hash(client, monkeypatch) -> None:
+    """真实提交时服务端重新路由，并用 infohash 保存监听导入可认领的身份。"""
+    import movieclaw_api.services.library.routing as routing_service
+    import movieclaw_api.services.media_discover as media_discover_service
+    from movieclaw_api.services.library.routing import RouteDecision
+    from movieclaw_api.services.media_library import MediaLibraryService
+
+    _add_default_downloader(client)
+    selected_downloader_id = _add_default_downloader(
+        client,
+        name="NAS 上的 qBittorrent",
+        url="http://192.168.1.20:8080",
+        path_mappings=[{"local": "/downloads/manual", "remote": "/mnt/manual"}],
+    )
+    library = client.post(
+        "/api/v1/libraries",
+        json={"name": "自动路由电影库", "kind": "movie", "root_paths": ["/media/movies"]},
+    ).json()["data"]
+    watch = client.post(
+        "/api/v1/import-watch",
+        json={
+            "source_path": "/downloads/manual/movies",
+            "strategy": "copy",
+            "library_id": library["id"],
+        },
+    )
+    assert watch.status_code == 200, watch.json()
+
+    async def ensure(self, kind, tmdb_id, **kwargs):
+        row = MediaItem(
+            kind=kind.value,
+            tmdb_id=tmdb_id,
+            title="确认影片",
+            original_title="Confirmed Movie",
+            year=2024,
+            aliases=[],
+        )
+        self._session.add(row)
+        await self._session.commit()
+        await self._session.refresh(row)
+        return row
+
+    async def route_for_item(session, kind, item):
+        target = await session.get(Library, library["id"])
+        assert target is not None
+        return RouteDecision(
+            library=target,
+            matched=True,
+            reason="命中「自动路由电影库」：区域=中国",
+        )
+
+    monkeypatch.setattr(MediaLibraryService, "ensure_media_item", ensure)
+    monkeypatch.setattr(routing_service, "route_for_item", route_for_item)
+    monkeypatch.setattr(media_discover_service, "get_tmdb_client", object)
+    r = client.post(
+        "/api/v1/downloaders/submit",
+        json={
+            **_SUBMIT,
+            "auto_route": True,
+            "media_kind": "movie",
+            "tmdb_id": 9527,
+            "title": "确认影片",
+            "year": 2024,
+            "downloader_id": selected_downloader_id,
+        },
+    )
+    assert r.status_code == 200, r.json()
+    assert _captured_requests[-1].save_path == "/mnt/manual/movies"
+    assert r.json()["data"]["downloader_id"] == selected_downloader_id
+
+    async def load_intent():
+        async with get_database().session() as session:
+            return (await session.execute(select(ManualDownloadIntent))).scalar_one()
+
+    intent = asyncio.run(load_intent())
+    assert intent.info_hash == "a" * 40
+    assert intent.library_id == library["id"]
 
 
 def test_submit_with_disabled_default_downloader(client) -> None:

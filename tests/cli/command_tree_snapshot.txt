@@ -57,6 +57,7 @@ dl add
 dl default set
 dl delete
 dl list
+dl resolve-target
 dl show
 dl status set
 dl submit

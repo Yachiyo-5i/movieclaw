@@ -3,12 +3,16 @@ from __future__ import annotations
 from fastapi import APIRouter, BackgroundTasks, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from movieclaw_api.exceptions import BadRequestException
 from movieclaw_api.schemas.downloader import (
     DownloaderPayload,
     DownloaderStatusUpdate,
     DownloaderView,
     DownloadSubmitPayload,
     DownloadSubmitView,
+    ManualDownloadCandidateView,
+    ManualDownloadTargetPayload,
+    ManualDownloadTargetView,
 )
 from movieclaw_api.schemas.response import ApiResponse, ok
 from movieclaw_api.services.downloader_config import (
@@ -16,7 +20,12 @@ from movieclaw_api.services.downloader_config import (
     verify_downloader,
 )
 from movieclaw_api.services.library.config import LibraryConfigService
-from movieclaw_api.services.torrent_submit import submit_torrent, translate_save_path
+from movieclaw_api.services.torrent_submit import (
+    anchor_manual_download,
+    resolve_manual_target,
+    submit_torrent,
+    translate_save_path,
+)
 from movieclaw_db.engine import get_session
 
 router = APIRouter(prefix="/downloaders", tags=["downloaders"])
@@ -27,6 +36,76 @@ def _mappings_to_rows(payload: DownloaderPayload) -> list[dict[str, str]] | None
     if payload.path_mappings is None:
         return None
     return [m.model_dump() for m in payload.path_mappings]
+
+
+@router.post(
+    "/resolve-target",
+    response_model=ApiResponse[ManualDownloadTargetView],
+    summary="识别手动搜索结果并预演媒体库与监听导入投递目录",
+    operation_id="dl.resolve-target",
+)
+async def resolve_download_target(
+    payload: ManualDownloadTargetPayload,
+    session: AsyncSession = Depends(get_session),
+) -> ApiResponse[ManualDownloadTargetView]:
+    """手动下载弹窗的只读预检。
+
+    先用标题、年份与副标题收敛出唯一 TMDB 身份，再复用订阅链路的
+    ``preview_dispatch_route``：媒体库收藏范围负责选择库，监听导入规则负责
+    给出实际投递源目录。未收敛时明确返回候选或未找到，不把不确定的种子
+    静默放进默认库。
+    """
+    resolution = await resolve_manual_target(
+        kind=payload.kind, title=payload.title, year=payload.year, subtitle=payload.subtitle
+    )
+    candidates = [
+        ManualDownloadCandidateView(
+            tmdb_id=candidate.tmdb_id,
+            title=candidate.title,
+            year=candidate.year,
+            episode_count=candidate.episode_count,
+        )
+        for candidate in resolution.candidates
+    ]
+    candidate_ids = {candidate.tmdb_id for candidate in resolution.candidates}
+    if resolution.tmdb_id is not None:
+        candidate_ids.add(resolution.tmdb_id)
+    tmdb_id = (
+        payload.selected_tmdb_id
+        if payload.selected_tmdb_id is not None
+        else resolution.tmdb_id
+    )
+    if payload.selected_tmdb_id is not None and payload.selected_tmdb_id not in candidate_ids:
+        raise BadRequestException("确认的 TMDB 条目不在本次识别候选中，请重新识别后再选择")
+    if tmdb_id is None:
+        status = "ambiguous" if candidates else "not_found"
+        message = (
+            "找到多个可能的影视条目，请确认后再选择自动入库目录"
+            if candidates
+            else "未能可靠识别该资源；请手选保存目录或补充准确的标题和年份"
+        )
+        return ok(ManualDownloadTargetView(status=status, candidates=candidates), message=message)
+
+    # 与订阅预检/真实投递共享同一套「路由 → 监听规则 → 路径映射」判断，
+    # 不能在此重算目录，否则多个入口会出现不同归宿。
+    from movieclaw_api.services.subscription import preview_dispatch_route
+
+    preview = await preview_dispatch_route(
+        session,
+        kind=payload.kind,
+        library_id=None,
+        tmdb_id=tmdb_id,
+        downloader_id=payload.downloader_id,
+    )
+    return ok(
+        ManualDownloadTargetView(
+            status="ready",
+            tmdb_id=tmdb_id,
+            candidates=candidates,
+            **preview,
+        ),
+        message="已识别资源并预演自动入库目录",
+    )
 
 
 @router.post(
@@ -52,7 +131,35 @@ async def submit_download(
     library = None
     derived_path = None
     entry_level = False  # 条目级目录才允许锚下载线索
-    if payload.save_path is not None:
+    manual_item = None
+    route_reason: str | None = None
+    if payload.auto_route:
+        # 预检结果只作展示；真正提交时必须服务端按 TMDB 锚重新建档和路由，
+        # 避免前端参数被篡改/配置变化后仍投到过期目录。
+        from movieclaw_api.services.library.routing import route_for_item
+        from movieclaw_api.services.media_discover import get_tmdb_client
+        from movieclaw_api.services.media_library import MediaLibraryService
+        from movieclaw_media.models import MediaKind
+
+        assert payload.media_kind is not None and payload.tmdb_id is not None and payload.title
+        manual_item = await MediaLibraryService(session, get_tmdb_client()).ensure_media_item(
+            MediaKind(payload.media_kind), payload.tmdb_id, extra_aliases=[payload.title]
+        )
+        route = await route_for_item(session, payload.media_kind, manual_item)
+        library = route.library
+        route_reason = route.reason
+        if library is None:
+            raise BadRequestException("没有可用的目标媒体库，无法启用自动入库；请先创建媒体库")
+        decision = await resolve_save_path(
+            session,
+            library,
+            kind=payload.media_kind,
+            title=manual_item.title,
+            year=manual_item.year,
+        )
+        derived_path = decision.path
+        entry_level = decision.entry_level
+    elif payload.save_path is not None:
         # 用户在下载弹窗里手选了目录：完全尊重（映射守门仍在 submit_torrent）；
         # 手选目录不是条目级，不锚下载线索
         derived_path = payload.save_path
@@ -76,6 +183,15 @@ async def submit_download(
         downloader_id=payload.downloader_id,
     )
     assert row.id is not None  # 落库记录必有主键
+    if manual_item is not None:
+        assert manual_item.id is not None and library is not None and library.id is not None
+        await anchor_manual_download(
+            session,
+            info_hash=result.info_hash,
+            media_item_id=manual_item.id,
+            library_id=library.id,
+            site_id=payload.site_id,
+        )
     view = DownloadSubmitView(
         info_hash=result.info_hash,
         name=result.name,
@@ -90,6 +206,8 @@ async def submit_download(
         message = "该种子已在下载器中，未重复添加"
     elif library is not None:
         message = f"已提交到「{row.name}」，入库到「{library.name}」"
+        if route_reason:
+            message += f"（{route_reason}）"
     else:
         message = f"已提交到「{row.name}」"
     return ok(view, message=message)

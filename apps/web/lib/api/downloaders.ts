@@ -149,6 +149,55 @@ export interface DownloadSubmitPayload {
   save_path?: string | null;
   /** 指定投递到哪台下载器（配了多台按需分流）；缺省用默认下载器 */
   downloader_id?: number | null;
+  /** 服务端按已确认的 TMDB 身份重新匹配媒体库并选择监听导入目录 */
+  auto_route?: boolean;
+  /** 智能入库的媒体类型，与 tmdb_id 一起构成后端路由输入 */
+  media_kind?: "movie" | "tv";
+  /** 智能入库已确认的 TMDB 条目 ID */
+  tmdb_id?: number;
+}
+
+/** 手动下载识别未收敛时返回的 TMDB 候选（供界面解释为何不自动投递）。 */
+export interface ManualDownloadTargetCandidate {
+  tmdb_id: number;
+  title: string;
+  year: number | null;
+  episode_count: number | null;
+}
+
+/** 手动搜索种子的「识别 → 库路由 → 监听投递目录」预检结果。 */
+export interface ManualDownloadTarget {
+  status: "ready" | "ambiguous" | "not_found";
+  tmdb_id: number | null;
+  candidates: ManualDownloadTargetCandidate[];
+  library_id: number | null;
+  library_name: string | null;
+  mode: "watch" | "inplace" | "downloader_default" | null;
+  path: string | null;
+  staging_path: string | null;
+  route_matched: boolean | null;
+  route_reason: string | null;
+  ok: boolean;
+  warning: string | null;
+}
+
+/** 预演一条搜索结果能否被可靠识别并投递到匹配库的监听目录。 */
+export function resolveManualDownloadTarget(payload: {
+  kind: "movie" | "tv";
+  title: string;
+  year: number;
+  subtitle?: string | null;
+  /** 用这台下载器的路径映射预检；缺省沿用后端默认下载器语义 */
+  downloader_id?: number | null;
+  /** 歧义时由用户确认的、且必须属于本次候选的 TMDB ID */
+  selected_tmdb_id?: number | null;
+}): Promise<ManualDownloadTarget> {
+  return unwrap(
+    request<ApiEnvelope<ManualDownloadTarget>>("/downloaders/resolve-target", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+  );
 }
 
 /** 手动提交下载的结果（见 schemas.downloader.DownloadSubmitView）。 */

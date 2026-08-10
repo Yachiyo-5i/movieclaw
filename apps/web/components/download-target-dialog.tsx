@@ -24,10 +24,10 @@ import {
   submitTorrentDownload,
   type ConfiguredDownloader,
   type DownloadSubmitResult,
+  type ManualDownloadTarget,
   type PathMapping,
+  resolveManualDownloadTarget,
 } from "@/lib/api/downloaders";
-import { defaultLibraryFor, type MediaLibrary } from "@/lib/api/libraries";
-import { getDispatchPreview, type DispatchPreview } from "@/lib/api/subscriptions";
 
 /** 弹窗需要的种子身份切片（由搜索结果的 TorrentHit 提炼）。 */
 export interface DownloadTargetRequest {
@@ -44,7 +44,7 @@ export interface DownloadTargetRequest {
 type RememberKind = "movie" | "tv" | "other";
 
 export interface RememberedTarget {
-  /** smart = 自动入库（需要身份 + 默认库）；dir = 固定目录；default = 下载器默认目录 */
+  /** smart = 自动入库（需要唯一身份）；dir = 固定目录；default = 下载器默认目录 */
   kind: "smart" | "dir" | "default";
   savePath: string | null;
   /** 指定的下载器；null = 默认下载器 */
@@ -83,7 +83,8 @@ function writeRememberedTarget(kind: RememberKind, target: RememberedTarget | nu
 
 /**
  * 按记住的目标直接提交（下载按钮的快速通道），不经弹窗。
- * smart 目标需要现查默认库；查不到（库被删）返回 null 让调用方回落弹窗。
+ * smart 目标需要重新确认 TMDB 身份和投递预检；未收敛/配置有警示时返回 null
+ * 让调用方回落弹窗，不把不确定资源静默放进默认库。
  */
 export async function submitRememberedTarget(
   request: DownloadTargetRequest,
@@ -93,10 +94,18 @@ export async function submitRememberedTarget(
   let libraryPart = {};
   if (target.kind === "smart") {
     if (!identity) return null;
-    const lib = await defaultLibraryFor(identity.kind).catch(() => null);
-    if (!lib) return null;
+    const resolved = await resolveManualDownloadTarget({
+      kind: identity.kind,
+      title: identity.title,
+      year: identity.year,
+      subtitle: request.subtitle,
+      downloader_id: target.downloaderId,
+    }).catch(() => null);
+    if (!resolved?.ok || resolved.status !== "ready" || resolved.tmdb_id == null) return null;
     libraryPart = {
-      library_id: lib.id,
+      auto_route: true,
+      media_kind: identity.kind,
+      tmdb_id: resolved.tmdb_id,
       title: identity.title,
       year: identity.year,
       subtitle: request.subtitle,
@@ -176,8 +185,8 @@ function DialogContent({
   // 可用（启用 + 验证通过）的全部下载器：≥2 台时出现下载器选择
   const [downloaders, setDownloaders] = useState<ConfiguredDownloader[]>([]);
   const [downloaderId, setDownloaderId] = useState<number | null>(null);
-  const [library, setLibrary] = useState<MediaLibrary | null>(null);
-  const [preview, setPreview] = useState<DispatchPreview | null>(null);
+  const [manualTarget, setManualTarget] = useState<ManualDownloadTarget | null>(null);
+  const [selectedCandidateId, setSelectedCandidateId] = useState<number | null>(null);
   const [loading, setLoading] = useState(true);
   const [selected, setSelected] = useState<string | null>(null);
   // 记住选择：默认勾选态跟随已有记忆（勾着提交=保存/刷新，取消勾选提交=清除）
@@ -185,35 +194,63 @@ function DialogContent({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  // 挂载时并行拉取：下载器清单（目录候选 + 分流选择）、默认库 + 投递预检（智能入库项）
+  // 挂载时先拉取下载器清单，再用最终选中的下载器预检。路径映射是下载器
+  // 级配置，不能并行预检默认台后却把种子交给另一台。
+  // 智能入库不再先选类型默认库；只有标题收敛成唯一 TMDB 身份后，才按
+  // 收藏范围选库并复用对应的监听导入目录。
   useEffect(() => {
     let cancelled = false;
     const identity = request.identity;
-    void Promise.all([
-      listDownloaders().catch(() => [] as ConfiguredDownloader[]),
-      identity ? defaultLibraryFor(identity.kind).catch(() => null) : Promise.resolve(null),
-    ]).then(async ([rows, lib]) => {
-      if (cancelled) return;
-      const usable = rows.filter((d) => d.usable);
-      setDownloaders(usable);
-      const remembered = readRememberedTarget(request);
-      const fallback = usable.find((d) => d.is_default) ?? usable[0] ?? null;
-      const rememberedRow =
-        remembered?.downloaderId != null
-          ? usable.find((d) => d.id === remembered.downloaderId)
-          : undefined;
-      setDownloaderId((rememberedRow ?? fallback)?.id ?? null);
-      setLibrary(lib);
-      if (identity && lib) {
-        const p = await getDispatchPreview(identity.kind, lib.id).catch(() => null);
-        if (!cancelled) setPreview(p);
-      }
-      if (!cancelled) setLoading(false);
-    });
+    setSelectedCandidateId(null);
+    void listDownloaders()
+      .catch(() => [] as ConfiguredDownloader[])
+      .then(async (rows) => {
+        if (cancelled) return;
+        const usable = rows.filter((d) => d.usable);
+        const remembered = readRememberedTarget(request);
+        const fallback = usable.find((d) => d.is_default) ?? usable[0] ?? null;
+        const rememberedRow =
+          remembered?.downloaderId != null
+            ? usable.find((d) => d.id === remembered.downloaderId)
+            : undefined;
+        const selectedDownloaderId = (rememberedRow ?? fallback)?.id ?? null;
+        const target = identity
+          ? await resolveManualDownloadTarget({
+              kind: identity.kind,
+              title: identity.title,
+              year: identity.year,
+              subtitle: request.subtitle,
+              downloader_id: selectedDownloaderId,
+            }).catch(() => null)
+          : null;
+        if (cancelled) return;
+        setDownloaders(usable);
+        setDownloaderId(selectedDownloaderId);
+        setManualTarget(target);
+        setLoading(false);
+      });
     return () => {
       cancelled = true;
     };
   }, [request]);
+
+  /** 用当前下载器和（如有）用户确认的歧义候选重跑预检。 */
+  const reloadManualTarget = (nextDownloaderId: number | null, tmdbId: number | null) => {
+    const identity = request.identity;
+    if (!identity) return;
+    setLoading(true);
+    void resolveManualDownloadTarget({
+      kind: identity.kind,
+      title: identity.title,
+      year: identity.year,
+      subtitle: request.subtitle,
+      downloader_id: nextDownloaderId,
+      selected_tmdb_id: tmdbId,
+    })
+      .then(setManualTarget)
+      .catch(() => setManualTarget(null))
+      .finally(() => setLoading(false));
+  };
 
   const downloader = useMemo(
     () => downloaders.find((d) => d.id === downloaderId) ?? null,
@@ -222,23 +259,29 @@ function DialogContent({
 
   const options = useMemo<TargetOption[]>(() => {
     const result: TargetOption[] = [];
-    if (request.identity && library) {
+    if (
+      request.identity &&
+      manualTarget?.status === "ready" &&
+      manualTarget.tmdb_id != null &&
+      manualTarget.library_id != null &&
+      manualTarget.ok
+    ) {
       const folder = `${request.identity.title} (${request.identity.year})`;
       const detail =
-        preview?.mode === "watch"
-          ? preview.staging_path
-            ? `投递到监听导入目录 ${preview.path}，完成后整理到 ${preview.staging_path}（外部流转回库根后入账）`
-            : `投递到监听导入目录 ${preview.path}，完成后自动整理入库`
-          : preview
-            ? `直接下载到 ${preview.path?.replace(/\/+$/, "")}/${folder}，完成后自动入账`
+        manualTarget.mode === "watch"
+          ? manualTarget.staging_path
+            ? `${manualTarget.route_reason ?? ""}；投递到监听导入目录 ${manualTarget.path}，完成后整理到 ${manualTarget.staging_path}（外部流转回库根后入账）`
+            : `${manualTarget.route_reason ?? ""}；投递到监听导入目录 ${manualTarget.path}，完成后自动整理入库`
+          : manualTarget.mode === "inplace"
+            ? `${manualTarget.route_reason ?? ""}；直接下载到 ${manualTarget.path?.replace(/\/+$/, "")}/${folder}，完成后自动入账`
             : null;
       result.push({
         key: "smart",
         kind: "smart",
         savePath: null,
-        label: `自动入库到「${library.name}」`,
+        label: `自动入库到「${manualTarget.library_name}」`,
         detail,
-        warning: preview && !preview.ok ? preview.warning : null,
+        warning: null,
       });
     }
     const seen = new Set<string>();
@@ -270,7 +313,7 @@ function DialogContent({
       warning: null,
     });
     return result;
-  }, [request, library, preview, downloader]);
+  }, [request, manualTarget, downloader]);
 
   // 换下载器后目录候选整组换血：选中的目录项若已不存在，退回未选中让下方
   // 默认选中逻辑重新挑一个
@@ -311,9 +354,11 @@ function DialogContent({
     void submitTorrentDownload({
       site_id: request.site_id,
       download_url: request.download_url,
-      ...(option.kind === "smart" && identity && library
+      ...(option.kind === "smart" && identity && manualTarget?.tmdb_id != null
         ? {
-            library_id: library.id,
+            auto_route: true,
+            media_kind: identity.kind,
+            tmdb_id: manualTarget.tmdb_id,
             title: identity.title,
             year: identity.year,
             subtitle: request.subtitle,
@@ -355,6 +400,42 @@ function DialogContent({
             </div>
           ) : (
             <div className="space-y-2">
+              {request.identity && manualTarget && manualTarget.status !== "ready" && (
+                <p className="rounded-lg border border-amber-400/20 bg-amber-500/10 px-3.5 py-2.5 text-caption leading-relaxed text-amber-100">
+                  {manualTarget.status === "ambiguous"
+                    ? "识别到多个可能条目。请确认正确条目后，系统会继续预演自动入库目录。"
+                    : "未自动入库：无法可靠识别该资源；为避免投错库请手选保存目录。"}
+                </p>
+              )}
+              {request.identity && manualTarget?.status === "ambiguous" && (
+                <div className="flex flex-wrap gap-2">
+                  {manualTarget.candidates.map((candidate) => (
+                    <button
+                      key={candidate.tmdb_id}
+                      type="button"
+                      onClick={() => {
+                        setSelectedCandidateId(candidate.tmdb_id);
+                        reloadManualTarget(downloaderId, candidate.tmdb_id);
+                      }}
+                      className="rounded-full border border-amber-400/35 px-3 py-1 text-caption text-amber-100 transition-colors hover:bg-amber-500/15"
+                    >
+                      {candidate.title}
+                      {candidate.year ? ` (${candidate.year})` : ""}
+                      {candidate.episode_count ? ` · ${candidate.episode_count} 集` : ""}
+                    </button>
+                  ))}
+                </div>
+              )}
+              {request.identity && manualTarget === null && (
+                <p className="rounded-lg border border-amber-400/20 bg-amber-500/10 px-3.5 py-2.5 text-caption leading-relaxed text-amber-100">
+                  自动识别暂不可用；为避免投错库请手选保存目录后再下载。
+                </p>
+              )}
+              {request.identity && manualTarget?.status === "ready" && !manualTarget.ok && (
+                <p className="rounded-lg border border-amber-400/20 bg-amber-500/10 px-3.5 py-2.5 text-caption leading-relaxed text-amber-100">
+                  已识别资源，但当前不能自动入库：{manualTarget.warning ?? "请检查媒体库和监听导入配置。"}
+                </p>
+              )}
               {options.map((option) => (
                 <button
                   key={option.key}
@@ -390,7 +471,11 @@ function DialogContent({
               <span className="shrink-0 text-sub text-[var(--text-muted)]">下载器</span>
               <select
                 value={downloaderId ?? undefined}
-                onChange={(e) => setDownloaderId(Number(e.target.value))}
+                onChange={(e) => {
+                  const nextDownloaderId = Number(e.target.value);
+                  setDownloaderId(nextDownloaderId);
+                  reloadManualTarget(nextDownloaderId, selectedCandidateId);
+                }}
                 className="min-w-0 flex-1 rounded-lg border border-white/[0.08] bg-white/[0.04] px-3 py-1.5 text-sub text-white/90 outline-none focus:border-white/25 [&>option]:bg-[#181c28]"
               >
                 {downloaders.map((d) => (

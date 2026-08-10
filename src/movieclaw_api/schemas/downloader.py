@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from typing import Literal
 
-from pydantic import BaseModel, Field, field_serializer, field_validator
+from pydantic import BaseModel, Field, field_serializer, field_validator, model_validator
 
 from movieclaw_db.models.downloader_client import ClientType, DownloaderClient
 from movieclaw_db.models.site_credential import ConfigStatus
@@ -167,6 +168,13 @@ class DownloadSubmitPayload(BaseModel):
     save_path: str | None = Field(default=None, description="手选保存目录（覆盖库推导）")
     # 指定投递到哪台下载器（配了多台按需分流）；缺省走默认下载器
     downloader_id: int | None = Field(default=None, description="指定下载器；缺省用默认下载器")
+    # 智能入库由服务端重新按 TMDB 身份路由，不能信任前端预检返回的 library_id。
+    # 成功提交后会按 infohash 锚定身份，供共享监听目录完成后直接认领。
+    auto_route: bool = Field(default=False, description="按确认的 TMDB 身份自动匹配媒体库并投递")
+    media_kind: Literal["movie", "tv"] | None = Field(
+        default=None, description="智能入库的媒体类型"
+    )
+    tmdb_id: int | None = Field(default=None, description="智能入库已确认的 TMDB 条目 ID")
 
     @field_validator("save_path")
     @classmethod
@@ -177,6 +185,62 @@ class DownloadSubmitPayload(BaseModel):
         if not value.startswith("/"):
             raise ValueError("保存目录必须是以 / 开头的绝对路径")
         return value
+
+    @model_validator(mode="after")
+    def _validate_auto_route(self) -> DownloadSubmitPayload:
+        """智能入库必须是一组完整、不可被手选目录覆盖的身份锚。"""
+        if not self.auto_route:
+            return self
+        if self.media_kind is None or self.tmdb_id is None or not self.title:
+            raise ValueError("智能入库必须提供媒体类型、TMDB ID 和标题")
+        if self.library_id is not None or self.save_path is not None:
+            raise ValueError("智能入库不能同时指定媒体库或保存目录")
+        return self
+
+
+class ManualDownloadTargetPayload(BaseModel):
+    """手动下载的识别预检输入：只接受搜索结果已解析出的最小身份线索。"""
+
+    kind: Literal["movie", "tv"] = Field(description="搜索结果识别出的媒体类型")
+    title: str = Field(min_length=1, description="搜索结果识别出的主标题")
+    year: int = Field(ge=1888, le=2100, description="搜索结果识别出的发行/首播年份")
+    subtitle: str | None = Field(default=None, description="种子副标题（中文别名等识别补强）")
+    # 缺省按默认下载器预检，与 dl submit 的既有语义一致；前端显式切换
+    # 下载器时带上它，确保路径映射的预检结论与真实提交是同一台机器。
+    downloader_id: int | None = Field(
+        default=None, ge=1, description="预检指定下载器；缺省用默认下载器"
+    )
+    # 歧义时只能从本次返回的候选中确认一个 ID，服务端会再次校验，不能把
+    # 任意 TMDB ID 当成已识别结果直接放行。
+    selected_tmdb_id: int | None = Field(
+        default=None, ge=1, description="用户从本次识别候选中确认的 TMDB 条目 ID"
+    )
+
+
+class ManualDownloadCandidateView(BaseModel):
+    """预检未收敛时留给用户确认的 TMDB 候选。"""
+
+    tmdb_id: int
+    title: str
+    year: int | None = None
+    episode_count: int | None = None
+
+
+class ManualDownloadTargetView(BaseModel):
+    """手动下载的「识别 → 路由 → 投递目录」预检结论。"""
+
+    status: Literal["ready", "ambiguous", "not_found"]
+    tmdb_id: int | None = None
+    candidates: list[ManualDownloadCandidateView] = Field(default_factory=list)
+    library_id: int | None = None
+    library_name: str | None = None
+    mode: Literal["watch", "inplace", "downloader_default"] | None = None
+    path: str | None = Field(default=None, description="movieclaw 视角的实际投递目录")
+    staging_path: str | None = Field(default=None, description="自定义目录规则的整理落点")
+    route_matched: bool | None = Field(default=None, description="是否命中媒体库收藏范围")
+    route_reason: str | None = Field(default=None, description="媒体库路由理由")
+    ok: bool = Field(default=False, description="当前选择的下载器和投递配置能否自动入库")
+    warning: str | None = Field(default=None, description="不可自动入库时的中文指引")
 
 
 class DownloadSubmitView(BaseModel):

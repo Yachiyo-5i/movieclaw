@@ -19,19 +19,53 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
 from movieclaw_api.exceptions import BadRequestException, UpstreamServiceException
 from movieclaw_api.services.site_access import SiteUnavailableError, get_site_access
-from movieclaw_db.models import DownloaderClient, DownloadHint, utcnow
+from movieclaw_db.models import DownloaderClient, DownloadHint, ManualDownloadIntent, utcnow
 from movieclaw_db.models.site_credential import ConfigStatus
 from movieclaw_db.repositories.downloader_repo import DownloaderRepository
 from movieclaw_downloader.factory import create_downloader
 from movieclaw_downloader.models import DownloaderConfig, DownloadRequest, SubmitResult
+from movieclaw_enrich import enrich
+from movieclaw_media.models import MediaKind
 
 logger = logging.getLogger("movieclaw_api.torrent_submit")
+
+
+@dataclass(frozen=True)
+class ManualTargetResolution:
+    """手动种子识别的只读结论。
+
+    预检只负责把搜索结果的标题收敛为 TMDB 身份，不创建媒体条目也不提前
+    选择目录。真正提交时会按该 TMDB 锚再次路由并建档，避免前端预检结果
+    过期或被篡改后错误投递。
+    """
+
+    tmdb_id: int | None
+    candidates: list
+
+
+async def resolve_manual_target(
+    *, kind: str, title: str, year: int, subtitle: str | None = None
+) -> ManualTargetResolution:
+    """收敛手动搜索结果的身份，副标题中的中文名仅作失败后的备选查询词。"""
+    from movieclaw_api.services.library.resolve import LocalEvidence, resolve_with_candidates
+    from movieclaw_api.services.media_discover import get_tmdb_client
+
+    subtitle_attrs = enrich(subtitle or "") if subtitle else None
+    alt_title = subtitle_attrs.titles_zh[0] if subtitle_attrs and subtitle_attrs.titles_zh else None
+    outcome = await resolve_with_candidates(
+        get_tmdb_client(),
+        MediaKind(kind),
+        LocalEvidence(title=title, year=year, alt_title=alt_title),
+    )
+    return ManualTargetResolution(tmdb_id=outcome.tmdb_id, candidates=outcome.candidates)
 
 
 def _best_match(
@@ -221,6 +255,70 @@ async def submit_torrent(
                 "下载线索写入失败（目录 %s），副标题识别信号将缺失", save_path, exc_info=True
             )
     return submit_result, row
+
+
+async def anchor_manual_download(
+    session: AsyncSession,
+    *,
+    info_hash: str | None,
+    media_item_id: int,
+    library_id: int,
+    site_id: str,
+) -> None:
+    """按 infohash 保存手动下载的已确认身份，供监听导入完成后直接认领。
+
+    下载器已存在同一任务时会返回同一个 hash。此时保留首次提交时确认的
+    身份/库，不能让一次后来的重复点击覆盖原任务的入库归属。
+    """
+    if not info_hash:
+        logger.warning("手动下载未返回 infohash，监听导入将无法复用已确认身份")
+        return
+    normalized = info_hash.lower()
+    existing = (
+        await session.execute(
+            select(ManualDownloadIntent).where(ManualDownloadIntent.info_hash == normalized)
+        )
+    ).scalar_one_or_none()
+    if existing is None:
+        session.add(
+            ManualDownloadIntent(
+                info_hash=normalized,
+                media_item_id=media_item_id,
+                library_id=library_id,
+                site_id=site_id,
+            )
+        )
+        try:
+            await session.commit()
+        except IntegrityError:
+            # 下载器的重复提交已是幂等的；两次请求恰好同时经过上面的查询时，
+            # 第二个写入也必须保持同样语义，不能把「任务已成功加入」报成 500。
+            await session.rollback()
+            existing = (
+                await session.execute(
+                    select(ManualDownloadIntent).where(ManualDownloadIntent.info_hash == normalized)
+                )
+            ).scalar_one_or_none()
+            if existing is None:
+                raise
+        if existing is None:
+            logger.info(
+                "已锚定手动下载身份：hash=%s media_item=%s library=%s",
+                normalized,
+                media_item_id,
+                library_id,
+            )
+            return
+    if existing.media_item_id != media_item_id or existing.library_id != library_id:
+        logger.warning(
+            "手动下载 hash=%s 已锚定到 media_item=%s/library=%s；"
+            "忽略本次不同目标 media_item=%s/library=%s",
+            normalized,
+            existing.media_item_id,
+            existing.library_id,
+            media_item_id,
+            library_id,
+        )
 
 
 async def _upsert_hint(

@@ -215,12 +215,19 @@ async def dispatch(
 
 
 async def preview_dispatch_route(
-    session: AsyncSession, *, kind: str, library_id: int | None, tmdb_id: int | None = None
+    session: AsyncSession,
+    *,
+    kind: str,
+    library_id: int | None,
+    tmdb_id: int | None = None,
+    downloader_id: int | None = None,
 ) -> dict:
     """预演一次投递的路由结论（订阅弹窗/下载弹窗的预检数据源）。
 
     与 dispatch() 的三级兜底同源：监听规则源目录 → 库主根（条目目录的
     基底）→ 下载器默认目录；再叠加 submit_torrent 的映射覆盖守门判定。
+    ``downloader_id`` 缺省时维持默认下载器语义，显式传入时则用该台的
+    可用状态与路径映射预演，供手动下载弹窗的多下载器选择复用。
     只读不投，返回结构化结论让前端在**订阅那一刻**就把问题亮给用户，
     而不是等投递失败/落点告警才发现。
 
@@ -254,21 +261,33 @@ async def preview_dispatch_route(
     decision = await resolve_save_path(session, library, kind=kind)
     base = decision.path
 
-    result = await session.execute(
-        select(DownloaderClient).where(
-            DownloaderClient.is_default.is_(True),  # type: ignore[attr-defined]
-            DownloaderClient.enabled.is_(True),  # type: ignore[attr-defined]
-            DownloaderClient.status == ConfigStatus.ACTIVE,
+    if downloader_id is not None:
+        # 手动下载弹窗可以显式选第二台下载器。预检必须以该台的路径映射
+        # 判断，不能仍偷看默认下载器，否则「预检可投、提交被拒」会重新出现。
+        downloader = await session.get(DownloaderClient, downloader_id)
+    else:
+        result = await session.execute(
+            select(DownloaderClient).where(
+                DownloaderClient.is_default.is_(True),  # type: ignore[attr-defined]
+                DownloaderClient.enabled.is_(True),  # type: ignore[attr-defined]
+                DownloaderClient.status == ConfigStatus.ACTIVE,
+            )
         )
-    )
-    downloader = result.scalars().first()
+        downloader = result.scalars().first()
 
     mode = decision.mode
     ok = True
     warning: str | None = None
     if downloader is None:
         ok = False
-        warning = "没有可用的默认下载器，请先在「设置 → 下载器」添加并确保连接测试通过"
+        warning = (
+            f"指定下载器 #{downloader_id} 不存在"
+            if downloader_id is not None
+            else "没有可用的默认下载器，请先在「设置 → 下载器」添加并确保连接测试通过"
+        )
+    elif not downloader.enabled or downloader.status != ConfigStatus.ACTIVE:
+        ok = False
+        warning = f"下载器「{downloader.name}」当前不可用（已停用或连接验证未通过）"
     elif base is None:
         ok = False
         warning = "没有可用的媒体库（或库未配置根路径），下载会落到下载器默认目录且不会自动入库"
