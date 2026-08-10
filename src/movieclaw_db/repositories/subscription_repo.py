@@ -6,7 +6,7 @@ from sqlmodel import select
 
 from movieclaw_db.models.base import utcnow
 from movieclaw_db.models.rule_set import RuleSet
-from movieclaw_db.models.subscription import Subscription, WantedItem
+from movieclaw_db.models.subscription import Subscription, SubscriptionFollower, WantedItem
 from movieclaw_db.models.subscription_activity import SubscriptionActivity
 
 
@@ -119,6 +119,60 @@ class SubscriptionRepository:
         """删除订阅；工单随外键级联删除（不动已下载的文件与下载器任务）。"""
         await self._session.delete(row)
         await self._session.commit()
+
+    # ------------------------------------------------------------------
+    # 关注（docs/design/member-management.md §3.5：订阅全局唯一，
+    # 第二个成员再订同一部转为关注；取消互不影响）
+    # ------------------------------------------------------------------
+
+    async def add_follower(self, subscription_id: int, member_id: int) -> bool:
+        """成员关注订阅（幂等）。返回是否新增了关注行。"""
+        existing = await self._get_follower(subscription_id, member_id)
+        if existing is not None:
+            return False
+        self._session.add(
+            SubscriptionFollower(subscription_id=subscription_id, member_id=member_id)
+        )
+        await self._session.commit()
+        return True
+
+    async def remove_follower(self, subscription_id: int, member_id: int) -> bool:
+        """取消关注。返回是否真的删了一行（本就没关注返回 False）。"""
+        row = await self._get_follower(subscription_id, member_id)
+        if row is None:
+            return False
+        await self._session.delete(row)
+        await self._session.commit()
+        return True
+
+    async def _get_follower(
+        self, subscription_id: int, member_id: int
+    ) -> SubscriptionFollower | None:
+        result = await self._session.execute(
+            select(SubscriptionFollower).where(
+                SubscriptionFollower.subscription_id == subscription_id,
+                SubscriptionFollower.member_id == member_id,
+            )
+        )
+        return result.scalar_one_or_none()
+
+    async def follower_member_ids(self, subscription_id: int) -> list[int]:
+        """订阅的关注成员 id，按关注先后（发起人转移时取最早的一个）。"""
+        result = await self._session.execute(
+            select(SubscriptionFollower.member_id)
+            .where(SubscriptionFollower.subscription_id == subscription_id)
+            .order_by(SubscriptionFollower.id)
+        )
+        return list(result.scalars().all())
+
+    async def followed_subscription_ids(self, member_id: int) -> set[int]:
+        """成员关注中的订阅 id 集合（"我的订阅"列表的第二个来源）。"""
+        result = await self._session.execute(
+            select(SubscriptionFollower.subscription_id).where(
+                SubscriptionFollower.member_id == member_id
+            )
+        )
+        return set(result.scalars().all())
 
     # ------------------------------------------------------------------
     # 工单

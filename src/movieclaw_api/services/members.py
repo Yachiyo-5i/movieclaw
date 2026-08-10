@@ -111,12 +111,29 @@ async def update_member(
     return member
 
 
+async def _drop_jellyfin_devices(session: AsyncSession, member_id: int) -> None:
+    """删除该成员的全部 Jellyfin 设备凭据。
+
+    协议侧的设备 token 长期有效且无版本机制（jellyfin_device 模型注释），
+    停用/删除成员时直接删行是让电视端即刻失效的唯一手段。
+    """
+    from sqlalchemy import delete as sa_delete
+
+    from movieclaw_db.models import JellyfinDevice
+
+    await session.execute(sa_delete(JellyfinDevice).where(JellyfinDevice.member_id == member_id))
+    await session.commit()
+
+
 async def set_member_status(session: AsyncSession, member_id: int, *, enabled: bool) -> Member:
-    """启用/停用成员。停用即时踢下线（token_version+1），数据全部保留。"""
+    """启用/停用成员。停用即时踢下线（token_version+1 + 删 Jellyfin 设备），
+    数据全部保留。"""
     repo = MemberRepository(session)
     member = await get_member(session, member_id)
     member.status = "active" if enabled else "disabled"
     member = await repo.bump_token_version(member)
+    if not enabled:
+        await _drop_jellyfin_devices(session, member_id)
     logger.info("成员 %s 已%s", member.username, "启用" if enabled else "停用")
     return member
 
@@ -133,15 +150,28 @@ async def reset_member_password(session: AsyncSession, member_id: int) -> tuple[
 
 
 async def delete_member(session: AsyncSession, member_id: int) -> None:
-    """删除成员：清理个人数据（头像；白名单行靠外键级联），保留公共资源。
+    """删除成员：清理个人数据，保留公共资源（§3.9.1 生命周期语义）。
 
-    P1 扩展点：播放进度清理、订阅关注行清理、其发起的订阅转为超管发起——
-    这些数据维度落地时在此处补充显式清理，绝不静默删除订阅与下载任务。
+    - 头像文件、Jellyfin 设备、播放进度/收藏：显式清理（播放状态的
+      member_id 是哨兵值非外键，不能依赖级联）；
+    - 库/站点白名单、订阅关注行：外键级联自动清理；
+    - 其发起的订阅：外键 SET NULL 自动转为超管发起——绝不静默删除
+      订阅与下载任务，已下载内容不受影响。
     """
+    from sqlalchemy import delete as sa_delete
+
+    from movieclaw_db.models import PlaybackState
+
     member = await get_member(session, member_id)
     avatar_media.delete_avatar(avatar_media.member_stem(member_id))
+    await _drop_jellyfin_devices(session, member_id)
+    await session.execute(sa_delete(PlaybackState).where(PlaybackState.member_id == member_id))
     await MemberRepository(session).delete(member)
-    logger.info("已删除成员账号：%s（id=%d）", member.username, member_id)
+    logger.info(
+        "已删除成员账号：%s（id=%d，个人数据已清理，订阅已转由管理员接管）",
+        member.username,
+        member_id,
+    )
 
 
 # ---------------------------------------------------------------------------

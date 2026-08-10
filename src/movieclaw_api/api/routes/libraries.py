@@ -8,7 +8,7 @@ from fastapi.responses import FileResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
-from movieclaw_api.api.deps import require_admin
+from movieclaw_api.api.deps import require_admin, require_login
 from movieclaw_api.core.config import get_settings
 from movieclaw_api.exceptions import BadRequestException, ConflictException, NotFoundException
 from movieclaw_api.schemas.library import (
@@ -70,7 +70,12 @@ from movieclaw_api.schemas.library import (
 )
 from movieclaw_api.schemas.response import ApiResponse, ok
 from movieclaw_api.services import media_scrape
+from movieclaw_api.services.auth import Principal
 from movieclaw_api.services.library import claim as library_claim
+from movieclaw_api.services.library.access import (
+    assert_library_visible,
+    visible_library_ids,
+)
 from movieclaw_api.services.library.config import LibraryConfigService
 from movieclaw_api.services.library.items import (
     build_item_detail,
@@ -130,10 +135,26 @@ from movieclaw_media.models import MediaKind
 router = APIRouter(prefix="/libraries", tags=["libraries"])
 
 
+async def require_library_visible(
+    library_id: int,
+    principal: Principal = Depends(require_login),
+    session: AsyncSession = Depends(get_session),
+) -> Principal:
+    """成员库可见性依赖（docs/design/member-management.md §3.6）。
+
+    挂在带 {library_id} 路径参数的**浏览类**路由上；白名单外的库对成员
+    返回 404（与"库不存在"不可区分，不泄露存在性）。管理类路由已挂
+    require_admin，管理员不受限，无需本依赖。
+    """
+    await assert_library_visible(session, principal, library_id)
+    return principal
+
+
 @router.get(
     "/{library_id}/cover",
     summary="库封面拼贴（氛围光货架，服务端渲染）",
     operation_id="libraries.cover",
+    dependencies=[Depends(require_library_visible)],
     openapi_extra={"x-cli-hidden": True},
 )
 async def get_library_cover(library_id: int, request: Request) -> Response:
@@ -298,27 +319,35 @@ async def _stats_by_library(session: AsyncSession) -> dict[int, LibraryStats]:
 )
 async def list_libraries(
     kind: str | None = Query(default=None, description="movie / tv，缺省全部"),
+    principal: Principal = Depends(require_login),
     session: AsyncSession = Depends(get_session),
 ) -> ApiResponse[list[LibraryView]]:
     service = LibraryConfigService(session)
     rows = await service.list_all(kind=kind)
+    # 成员：按可见性白名单过滤，并抹掉落盘路径（成员不该知道服务器目录结构）
+    visible = await visible_library_ids(session, principal)
+    if visible is not None:
+        rows = [r for r in rows if r.id in visible]
     stats = await _stats_by_library(session)
-    return ok(
-        [
-            LibraryView.from_model(
-                r,
-                stats=stats.get(r.id or -1),
-                scanning=is_scanning(r.id or -1),
-                scan_progress=_scan_progress_view(r.id or -1),
-                last_scan=_last_scan_view(r.id or -1),
-                organizing=is_organizing(r.id or -1),
-                organize_progress=_organize_progress_view(r.id or -1),
-                last_organize=_last_organize_view(r.id or -1),
-                metadata_refresh=_metadata_refresh_view(r.id or -1),
-            )
-            for r in rows
-        ]
-    )
+    views = [
+        LibraryView.from_model(
+            r,
+            stats=stats.get(r.id or -1),
+            scanning=is_scanning(r.id or -1),
+            scan_progress=_scan_progress_view(r.id or -1),
+            last_scan=_last_scan_view(r.id or -1),
+            organizing=is_organizing(r.id or -1),
+            organize_progress=_organize_progress_view(r.id or -1),
+            last_organize=_last_organize_view(r.id or -1),
+            metadata_refresh=_metadata_refresh_view(r.id or -1),
+        )
+        for r in rows
+    ]
+    if not principal.is_admin:
+        for view in views:
+            view.root_paths = []
+            view.primary_root = None
+    return ok(views)
 
 
 @router.get(
@@ -557,6 +586,7 @@ async def search_libraries(
     keyword: str = Query(
         ..., min_length=1, max_length=100, description="搜索关键词（标题或原名的子串，忽略大小写）"
     ),
+    principal: Principal = Depends(require_login),
     session: AsyncSession = Depends(get_session),
 ) -> ApiResponse[list[LibrarySearchGroupView]]:
     """搜索页「媒体库」垂直的数据源：回答「这部片我有没有」。
@@ -564,9 +594,13 @@ async def search_libraries(
     只搜已识别入库的条目（待识别文件没有可靠标题，去待识别清单处理）；
     本地查询毫秒级返回。刻意不写入搜索历史——搜自己的库是翻家底，
     不是一次对外搜索，历史里混进它只会淹没真正要回放的记录。
+    成员的结果按库可见性白名单过滤。
     """
     matched = await search_library_items(session, keyword)
     libraries = await LibraryConfigService(session).list_all()
+    visible = await visible_library_ids(session, principal)
+    if visible is not None:
+        libraries = [lib for lib in libraries if lib.id in visible]
     # 分组顺序沿用库列表的顺序（与媒体库首页一致），空组不出现
     return ok(
         [
@@ -587,28 +621,33 @@ async def search_libraries(
     response_model=ApiResponse[LibraryView],
     summary="获取单个媒体库详情",
     operation_id="lib.show",
+    dependencies=[Depends(require_library_visible)],
 )
 async def get_library(
     library_id: int,
+    principal: Principal = Depends(require_login),
     session: AsyncSession = Depends(get_session),
 ) -> ApiResponse[LibraryView]:
     service = LibraryConfigService(session)
     row = await service.get(library_id)
     # 字段口径与列表接口保持一致（stats/metadata_refresh 一个不缺）：
     # 单库接口少给字段就是给调用方埋雷——stats 会静默回全零默认值
-    return ok(
-        LibraryView.from_model(
-            row,
-            stats=(await _stats_by_library(session)).get(library_id),
-            scanning=is_scanning(library_id),
-            scan_progress=_scan_progress_view(library_id),
-            last_scan=_last_scan_view(library_id),
-            organizing=is_organizing(library_id),
-            organize_progress=_organize_progress_view(library_id),
-            last_organize=_last_organize_view(library_id),
-            metadata_refresh=_metadata_refresh_view(library_id),
-        )
+    view = LibraryView.from_model(
+        row,
+        stats=(await _stats_by_library(session)).get(library_id),
+        scanning=is_scanning(library_id),
+        scan_progress=_scan_progress_view(library_id),
+        last_scan=_last_scan_view(library_id),
+        organizing=is_organizing(library_id),
+        organize_progress=_organize_progress_view(library_id),
+        last_organize=_last_organize_view(library_id),
+        metadata_refresh=_metadata_refresh_view(library_id),
     )
+    if not principal.is_admin:
+        # 成员不暴露服务器目录结构（与列表接口同一口径）
+        view.root_paths = []
+        view.primary_root = None
+    return ok(view)
 
 
 @router.post(
@@ -1073,6 +1112,7 @@ async def start_organize(
     response_model=ApiResponse[list[LibraryItemView]],
     summary="库内媒体条目的库存聚合（单库海报墙数据源）",
     operation_id="lib.items.list",
+    dependencies=[Depends(require_library_visible)],
 )
 async def list_library_items(
     library_id: int,
@@ -1098,6 +1138,7 @@ async def list_library_items(
     response_model=ApiResponse[list[int]],
     summary="库内条目 id 集合（前端判定「已入库」用）",
     operation_id="lib.items.ids",
+    dependencies=[Depends(require_library_visible)],
 )
 async def list_library_item_ids(
     library_id: int,
@@ -1123,6 +1164,7 @@ async def list_library_item_ids(
     response_model=ApiResponse[list[LibraryIndexEntryView]],
     summary="海报墙的 A-Z 首字母索引（按标题排序下的分档与起始位置）",
     operation_id="lib.items.index",
+    dependencies=[Depends(require_library_visible)],
 )
 async def list_library_item_index(
     library_id: int,
@@ -1243,10 +1285,12 @@ def _file_view(row: LibraryFile, external_subs: list[str]) -> LibraryFileView:
     response_model=ApiResponse[LibraryItemDetailView],
     summary="条目详情：基本信息 + NFO 本地刮削元数据 + 逐文件真实介质规格",
     operation_id="lib.items.show",
+    dependencies=[Depends(require_library_visible)],
 )
 async def get_library_item(
     library_id: int,
     media_item_id: int,
+    principal: Principal = Depends(require_login),
     session: AsyncSession = Depends(get_session),
 ) -> ApiResponse[LibraryItemDetailView]:
     """媒体库条目详情页的数据源。规格来自 ffprobe 对文件本体的探测，
@@ -1316,6 +1360,15 @@ async def get_library_item(
         seasons = sorted({s for s in meta_seasons if s > 0} | owned_seasons)
 
     assert item.id is not None
+    file_views = [
+        _file_view(row, bundle.external_subtitles.get(row.id or -1, [])) for row in rows
+    ]
+    entry_dirs = bundle.entry_dirs
+    if not principal.is_admin:
+        # 成员不暴露落盘路径：文件行只留文件名与规格，条目目录整个不给
+        for fv in file_views:
+            fv.file_path = ""
+        entry_dirs = []
     return ok(
         LibraryItemDetailView(
             media_item_id=item.id,
@@ -1328,10 +1381,8 @@ async def get_library_item(
             poster_url=poster_url,
             backdrop_url=backdrop_url,
             local_meta=local_meta,
-            entry_dirs=bundle.entry_dirs,
-            files=[
-                _file_view(row, bundle.external_subtitles.get(row.id or -1, [])) for row in rows
-            ],
+            entry_dirs=entry_dirs,
+            files=file_views,
             file_count=len(rows),
             total_size_bytes=sum(row.size_bytes for row in rows),
             seasons=seasons,
@@ -1348,6 +1399,7 @@ async def get_library_item(
     response_model=ApiResponse[SeasonEpisodesView],
     summary="剧集条目一季的分集清单（集名/简介/剧照 + 拥有状态，分集横滚区数据源）",
     operation_id="lib.items.episodes",
+    dependencies=[Depends(require_library_visible)],
 )
 async def list_item_episodes(
     library_id: int,
@@ -1388,12 +1440,16 @@ async def list_item_episodes(
 )
 async def get_file_thumb(
     file_id: int,
+    principal: Principal = Depends(require_login),
     session: AsyncSession = Depends(get_session),
 ) -> FileResponse:
     """路径由台账行推导（客户端只给 id），不存在路径注入面。"""
     row = await session.get(LibraryFile, file_id)
     if row is None:
         raise NotFoundException("台账文件不存在")
+    # 成员按文件归属库做可见性判定（不可见与不存在同样 404）
+    if row.library_id is not None:
+        await assert_library_visible(session, principal, row.library_id)
     thumb = find_episode_thumb(Path(row.file_path))
     if thumb is None:
         raise NotFoundException("该文件没有本地缩略图")
@@ -1405,6 +1461,7 @@ async def get_file_thumb(
     response_class=FileResponse,
     summary="条目目录里的本地美术图（poster/fanart，Kodi/Emby 命名惯例）",
     operation_id="lib.items.artwork-download",
+    dependencies=[Depends(require_library_visible)],
 )
 async def get_item_artwork(
     library_id: int,

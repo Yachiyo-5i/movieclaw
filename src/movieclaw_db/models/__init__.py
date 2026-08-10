@@ -44,6 +44,7 @@ from movieclaw_db.models.site_torrent import (
 from movieclaw_db.models.site_user_profile import SiteUserProfile
 from movieclaw_db.models.subscription import (
     Subscription,
+    SubscriptionFollower,
     SubscriptionStatus,
     WantedItem,
     WantedStatus,
@@ -90,6 +91,7 @@ __all__ = [
     "MediaSeason",
     "RuleSet",
     "Subscription",
+    "SubscriptionFollower",
     "SubscriptionStatus",
     "WantedItem",
     "WantedStatus",

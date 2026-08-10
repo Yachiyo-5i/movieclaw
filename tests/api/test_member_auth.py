@@ -269,6 +269,46 @@ def test_subscribe_capability_gate(client: TestClient) -> None:
     assert denied.status_code == 403
 
 
+def test_library_visibility_whitelist(client: TestClient) -> None:
+    """库可见性（P1）：白名单成员的列表被过滤、白名单外的库 404、
+    可见库的落盘路径对成员抹除。"""
+    admin_cookie, member_cookie, member_id = _setup_admin_and_member(client)
+    _use(client, admin_cookie)
+
+    lib_a = client.post(
+        "/api/v1/libraries",
+        json={"name": "电影库", "kind": "movie", "root_paths": ["/data/vis-movies"]},
+    ).json()["data"]["id"]
+    lib_b = client.post(
+        "/api/v1/libraries",
+        json={"name": "私藏库", "kind": "movie", "root_paths": ["/data/vis-private"]},
+    ).json()["data"]["id"]
+
+    # 默认全可见（含路径抹除语义）
+    _use(client, member_cookie)
+    rows = client.get("/api/v1/libraries").json()["data"]
+    assert {r["id"] for r in rows} == {lib_a, lib_b}
+    assert all(r["root_paths"] == [] and r["primary_root"] is None for r in rows)
+
+    # 切白名单只留 lib_a
+    _use(client, admin_cookie)
+    client.put(f"{_MEMBERS}/{member_id}", json={"all_libraries": False, "library_ids": [lib_a]})
+
+    _use(client, member_cookie)
+    rows = client.get("/api/v1/libraries").json()["data"]
+    assert [r["id"] for r in rows] == [lib_a]
+    assert client.get(f"/api/v1/libraries/{lib_a}").status_code == 200
+    # 白名单外与不存在同样 404，不泄露存在性
+    assert client.get(f"/api/v1/libraries/{lib_b}").status_code == 404
+    assert client.get(f"/api/v1/libraries/{lib_b}/items").status_code == 404
+
+    # 管理员不受影响，且看得到真实路径
+    _use(client, admin_cookie)
+    admin_rows = client.get("/api/v1/libraries").json()["data"]
+    assert {r["id"] for r in admin_rows} == {lib_a, lib_b}
+    assert all(r["root_paths"] for r in admin_rows)
+
+
 # ---------------------------------------------------------------------------
 # 守护测试：成员越权默认拒绝兜底
 # ---------------------------------------------------------------------------

@@ -13,6 +13,7 @@ from enum import StrEnum
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from movieclaw_api.api.deps import require_login
 from movieclaw_api.exceptions import (
     AppException,
     NotFoundException,
@@ -20,7 +21,9 @@ from movieclaw_api.exceptions import (
     UpstreamUnreachableException,
 )
 from movieclaw_api.schemas.response import ApiResponse, ok
+from movieclaw_api.services.auth import Principal
 from movieclaw_api.services.discover_library import DiscoverLibraryProjectionService
+from movieclaw_api.services.library.access import visible_library_ids
 from movieclaw_api.services.media_discover import get_douban_media_service, get_media_service
 from movieclaw_db.engine import get_session
 from movieclaw_db.repositories.search_history_repo import SearchHistoryRepository
@@ -44,6 +47,17 @@ from movieclaw_media import (
 logger = logging.getLogger("movieclaw_api.discover")
 
 router = APIRouter(prefix="/discover", tags=["discover"])
+
+
+async def get_projection(
+    principal: Principal = Depends(require_login),
+    session: AsyncSession = Depends(get_session),
+) -> DiscoverLibraryProjectionService:
+    """库存投影服务（按主体可见库过滤——成员的"已入库"徽标与深链
+    只反映他看得见的库，避免点进去 404）。"""
+    return DiscoverLibraryProjectionService(
+        session, visible_library_ids=await visible_library_ids(session, principal)
+    )
 
 
 class DiscoverSource(StrEnum):
@@ -122,7 +136,7 @@ async def search_media(
 )
 async def get_douban_full_collection(
     collection_id: str,
-    session: AsyncSession = Depends(get_session),
+    projection: DiscoverLibraryProjectionService = Depends(get_projection),
 ) -> ApiResponse[MediaRow]:
     """分页聚合返回一份完整榜单（如 Top 250、豆瓣高分电影 500 条）。
 
@@ -133,7 +147,7 @@ async def get_douban_full_collection(
         row = await get_douban_media_service().full_collection(collection_id)
     except DoubanError as exc:
         raise _translate(exc) from exc
-    await DiscoverLibraryProjectionService(session).apply_cards(row.items)
+    await projection.apply_cards(row.items)
     return ok(row)
 
 
@@ -145,14 +159,14 @@ async def get_douban_full_collection(
 )
 async def get_douban_media_detail(
     douban_id: str,
-    session: AsyncSession = Depends(get_session),
+    projection: DiscoverLibraryProjectionService = Depends(get_projection),
 ) -> ApiResponse[MediaDetail]:
     """返回豆瓣轻量详情；条目类型由豆瓣响应自动识别。"""
     try:
         detail = await get_douban_media_service().media_detail(douban_id)
     except DoubanError as exc:
         raise _translate(exc) from exc
-    await DiscoverLibraryProjectionService(session).apply_detail(detail)
+    await projection.apply_detail(detail)
     return ok(detail)
 
 
@@ -223,14 +237,14 @@ async def get_discover_hero(
     source: DiscoverSource = Query(
         default=DiscoverSource.TMDB, description="数据来源：tmdb（热门榜单）/ douban（豆瓣榜单）"
     ),
-    session: AsyncSession = Depends(get_session),
+    projection: DiscoverLibraryProjectionService = Depends(get_projection),
 ) -> ApiResponse[list[MediaCard]]:
     """返回 Hero 轮播精选；布局声明无 Hero 的数据源（豆瓣）返回空列表。"""
     try:
         hero = await _discover_service(source).discover_hero(kind)
     except (TmdbError, DoubanError) as exc:
         raise _translate(exc) from exc
-    await DiscoverLibraryProjectionService(session).apply_cards(hero)
+    await projection.apply_cards(hero)
     return ok(hero)
 
 
@@ -246,7 +260,7 @@ async def get_discover_row(
     source: DiscoverSource = Query(
         default=DiscoverSource.TMDB, description="数据来源：tmdb（热门榜单）/ douban（豆瓣榜单）"
     ),
-    session: AsyncSession = Depends(get_session),
+    projection: DiscoverLibraryProjectionService = Depends(get_projection),
 ) -> ApiResponse[MediaRow]:
     """返回布局中一行的条目数据；条目太少的行返回空 items，由前端收起。"""
     try:
@@ -255,7 +269,7 @@ async def get_discover_row(
         raise _translate(exc) from exc
     if row is None:
         raise NotFoundException(f"发现页布局中没有 id 为 {row_id} 的行")
-    await DiscoverLibraryProjectionService(session).apply_cards(row.items)
+    await projection.apply_cards(row.items)
     return ok(row)
 
 
@@ -268,12 +282,12 @@ async def get_discover_row(
 async def get_media_detail(
     kind: MediaKind,
     tmdb_id: int,
-    session: AsyncSession = Depends(get_session),
+    projection: DiscoverLibraryProjectionService = Depends(get_projection),
 ) -> ApiResponse[MediaDetail]:
     """返回单个条目的详情：回填片长/季数的卡片字段、演职员等词条信息、相似推荐。"""
     try:
         detail = await get_media_service().media_detail(kind, tmdb_id)
     except TmdbError as exc:
         raise _translate(exc) from exc
-    await DiscoverLibraryProjectionService(session).apply_detail(detail)
+    await projection.apply_detail(detail)
     return ok(detail)

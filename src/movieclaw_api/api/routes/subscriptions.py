@@ -3,7 +3,11 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from movieclaw_api.api.deps import require_admin, require_subscribe_capability
+from movieclaw_api.api.deps import (
+    require_admin,
+    require_login,
+    require_subscribe_capability,
+)
 from movieclaw_api.exceptions import BadRequestException, NotFoundException
 from movieclaw_api.schemas.response import ApiResponse, ok
 from movieclaw_api.schemas.subscription import (
@@ -26,6 +30,7 @@ from movieclaw_api.schemas.subscription import (
     SubscriptionUpdatePayload,
     SubscriptionView,
 )
+from movieclaw_api.services.auth import Principal
 from movieclaw_api.services.media_discover import get_tmdb_client
 from movieclaw_api.services.media_library import MediaLibraryService
 from movieclaw_api.services.subscription import SubscriptionService
@@ -126,22 +131,28 @@ async def prepare_subscription(
     response_model=ApiResponse[SubscriptionDetailView],
     summary="创建订阅（生成初始工单；同条目重复订阅幂等返回已有）",
     operation_id="sub.create",
-    dependencies=[Depends(require_subscribe_capability)],
 )
 async def create_subscription(
     payload: SubscriptionCreatePayload,
+    principal: Principal = Depends(require_subscribe_capability),
     session: AsyncSession = Depends(get_session),
 ) -> ApiResponse[SubscriptionDetailView]:
-    """创建订阅。"立即踢一次缺口搜索"由 service 层统一触发，路由不用管。"""
+    """创建订阅。"立即踢一次缺口搜索"由 service 层统一触发，路由不用管。
+
+    成员发起时记录归属；同条目已有订阅时成员的"再订"幂等转为关注（§3.5）。
+    成员没有"选库/选规则组"的入口，这两个参数只对管理员生效。
+    """
     service = _service(session)
+    is_member = not principal.is_admin
     subscription = await service.create(
         payload.kind,
         payload.tmdb_id,
         selected_seasons=payload.selected_seasons,
         follow_future=payload.follow_future,
-        rule_set_id=payload.rule_set_id,
-        library_id=payload.library_id,
+        rule_set_id=None if is_member else payload.rule_set_id,
+        library_id=None if is_member else payload.library_id,
         douban_id=payload.douban_id,
+        member_id=principal.member_id if is_member else None,
     )
     assert subscription.id is not None
     sub, item, wanted = await service.detail(subscription.id)
@@ -202,10 +213,15 @@ async def pipeline_health_check(
 )
 async def list_subscriptions(
     kind: str | None = Query(default=None, description="movie / tv，缺省全部"),
+    principal: Principal = Depends(require_login),
     session: AsyncSession = Depends(get_session),
 ) -> ApiResponse[list[SubscriptionView]]:
+    """超管看全部；成员只看"自己发起的 + 自己关注的"（§3.5）。"""
     service = _service(session)
-    rows = await service.list_with_progress(kind=kind)
+    rows = await service.list_with_progress(
+        kind=kind,
+        member_id=None if principal.is_admin else principal.member_id,
+    )
     return ok([SubscriptionView.from_model(s, m, c) for s, m, c in rows])
 
 
@@ -270,14 +286,17 @@ async def list_subscription_activities(
     response_model=ApiResponse[SubscriptionDetailView],
     summary="修改订阅（季选择/追新/规则组，diff 重算工单）",
     operation_id="sub.update",
-    dependencies=[Depends(require_subscribe_capability)],
 )
 async def update_subscription(
     subscription_id: int,
     payload: SubscriptionUpdatePayload,
+    principal: Principal = Depends(require_subscribe_capability),
     session: AsyncSession = Depends(get_session),
 ) -> ApiResponse[SubscriptionDetailView]:
     service = _service(session)
+    await service.assert_can_manage(
+        subscription_id, None if principal.is_admin else principal.member_id
+    )
     await service.update(
         subscription_id,
         selected_seasons=payload.selected_seasons,
@@ -296,15 +315,18 @@ async def update_subscription(
     response_model=ApiResponse[SearchNowView],
     summary="立即搜索：缺口工单跳过冷却重新排队，随即触发一轮缺口搜索",
     operation_id="sub.search-now",
-    dependencies=[Depends(require_subscribe_capability)],
 )
 async def search_subscription_now(
     subscription_id: int,
+    principal: Principal = Depends(require_subscribe_capability),
     session: AsyncSession = Depends(get_session),
 ) -> ApiResponse[SearchNowView]:
     """只重置"本来就能搜"的缺口（未定档/待播出/在途的不碰）；订阅暂停中、
     或没有可搜缺口时给可读中文错误。"""
     service = _service(session)
+    await service.assert_can_manage(
+        subscription_id, None if principal.is_admin else principal.member_id
+    )
     reset = await service.search_now(subscription_id)
     return ok(SearchNowView(reset_count=reset), message=f"{reset} 个缺口已重新排队，正在搜索")
 
@@ -355,14 +377,17 @@ async def grab_subscription_torrent(
     response_model=ApiResponse[SubscriptionDetailView],
     summary="暂停 / 恢复订阅",
     operation_id="sub.pause",
-    dependencies=[Depends(require_subscribe_capability)],
 )
 async def pause_subscription(
     subscription_id: int,
     payload: SubscriptionPausePayload,
+    principal: Principal = Depends(require_subscribe_capability),
     session: AsyncSession = Depends(get_session),
 ) -> ApiResponse[SubscriptionDetailView]:
     service = _service(session)
+    await service.assert_can_manage(
+        subscription_id, None if principal.is_admin else principal.member_id
+    )
     await service.set_paused(subscription_id, payload.paused)
     sub, item, wanted = await service.detail(subscription_id)
     message = "已暂停，匹配与搜索将跳过该订阅" if payload.paused else "已恢复追踪"
@@ -375,12 +400,17 @@ async def pause_subscription(
     summary="删除订阅（不影响已下载内容）",
     operation_id="sub.delete",
     openapi_extra={"x-cli-dangerous": "confirm"},
-    dependencies=[Depends(require_subscribe_capability)],
 )
 async def delete_subscription(
     subscription_id: int,
+    principal: Principal = Depends(require_subscribe_capability),
     session: AsyncSession = Depends(get_session),
 ) -> ApiResponse[dict]:
+    """超管真删；成员按 §3.5 语义：非发起人取关、发起人退出时转移给最早的
+    关注者、无人关注才真删——绝不影响别人正在追的内容。"""
     service = _service(session)
-    await service.delete(subscription_id)
-    return ok({}, message="已取消订阅")
+    message = await service.delete(
+        subscription_id,
+        member_id=None if principal.is_admin else principal.member_id,
+    )
+    return ok({}, message=message)
