@@ -55,7 +55,10 @@ _TOP_LEVEL_LINES = [
 # - logs：对 Agent 是 bash 的弱化重复——日志就是同容器内的本地文件（路径已写进
 #   系统提示词环境段），grep/tail 能力更强；且 logs tail -f 永不退出，模型误用
 #   会干等到工具超时。CLI 命令保留，服务远程管理的人类用户。
-_EXCLUDED_DOMAINS = {"agent", "logs"}
+# - members：成员管理是高敏感操作（建号、重置密码、启停、改权限），属于
+#   部署者本人的账号治理，绝不该由对话式 Agent 代劳（Agent 令牌是超管级，
+#   放进目录等于把开号/改权限的能力交给模型）。CLI 命令保留给人类管理员。
+_EXCLUDED_DOMAINS = {"agent", "logs", "members"}
 
 
 def spec_domains() -> set[str]:

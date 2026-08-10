@@ -6,7 +6,7 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, File, UploadFile
 from fastapi.responses import FileResponse, Response
 
-from movieclaw_api.api.deps import require_login
+from movieclaw_api.api.deps import require_admin
 from movieclaw_api.core.config import get_settings
 from movieclaw_api.exceptions import BadRequestException, NotFoundException
 from movieclaw_api.schemas.appearance import (
@@ -65,7 +65,7 @@ async def get_appearance() -> ApiResponse[AppearanceView]:
     "/backdrops",
     response_model=ApiResponse[AppearanceView],
     summary="上传一张新背景图（加入图库并设为生效）",
-    dependencies=[Depends(require_login)],
+    dependencies=[Depends(require_admin)],
     operation_id="appearance.backdrops.upload",
 )
 async def upload_backdrop(file: UploadFile = File(...)) -> ApiResponse[AppearanceView]:
@@ -97,7 +97,7 @@ async def upload_backdrop(file: UploadFile = File(...)) -> ApiResponse[Appearanc
     "/active",
     response_model=ApiResponse[AppearanceView],
     summary="切换当前生效的背景图",
-    dependencies=[Depends(require_login)],
+    dependencies=[Depends(require_admin)],
     operation_id="appearance.active.set",
 )
 async def set_active_backdrop(
@@ -113,7 +113,7 @@ async def set_active_backdrop(
     "/backdrops/{backdrop_id}",
     response_model=ApiResponse[AppearanceView],
     summary="从图库删除一张背景图",
-    dependencies=[Depends(require_login)],
+    dependencies=[Depends(require_admin)],
     operation_id="appearance.backdrops.delete",
     openapi_extra={"x-cli-dangerous": "confirm"},
 )

@@ -230,6 +230,31 @@ def test_change_password_kicks_other_sessions(client: TestClient) -> None:
     assert new_login.status_code == 200
 
 
+def test_throttle_lock_survives_bucket_flood() -> None:
+    """限速桶淘汰不能变成解锁通道：海量随机用户名注水后，
+    被锁定账号的桶必须原地存活（无差别 LRU 会被 128 个新桶挤掉）。"""
+    from movieclaw_api.exceptions import AppException
+    from movieclaw_api.services import auth as auth_service
+
+    auth_service.reset_auth_state()
+    try:
+        target = auth_service._throttle_for("admin")
+        for _ in range(auth_service.LoginThrottle.THRESHOLD):
+            target.record_failure()
+        with pytest.raises(AppException):
+            target.ensure_allowed()  # 已锁定
+
+        for i in range(auth_service._MAX_THROTTLE_BUCKETS * 2):
+            auth_service._throttle_for(f"flood-{i}")
+
+        # 注水后同名桶还是那一个，锁定仍然生效
+        assert auth_service._throttle_for("admin") is target
+        with pytest.raises(AppException):
+            auth_service._throttle_for("admin").ensure_allowed()
+    finally:
+        auth_service.reset_auth_state()
+
+
 # ---------------------------------------------------------------------------
 # 守护测试：默认拒绝兜底
 # ---------------------------------------------------------------------------

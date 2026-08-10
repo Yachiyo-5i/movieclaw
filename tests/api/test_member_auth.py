@@ -109,6 +109,11 @@ def test_member_crud_flow(client: TestClient) -> None:
         json={"all_libraries": False, "library_ids": [library_id, 9999]},
     )
     assert invalid.status_code == 400
+    # 校验失败必须整体不生效：不能留下"白名单模式已开、白名单却没存上"
+    # 的半套权限（成员会瞬间全库不可见）
+    after_invalid = client.get(f"{_MEMBERS}/{member_id}").json()["data"]
+    assert after_invalid["all_libraries"] is True
+    assert after_invalid["library_ids"] == []
 
     updated = client.put(
         f"{_MEMBERS}/{member_id}",
@@ -376,12 +381,10 @@ _MEMBER_ALLOWLIST = {
     ("PUT", "/api/v1/auth/password"),
     ("POST", "/api/v1/auth/avatar"),
     ("GET", "/api/v1/auth/avatar"),
-    # 外观（读公开；写为全局共享的界面偏好，家庭场景暂不隔离，P2 per-member 化）
+    # 外观（读公开；背景图库是全局共享资源，写已收口管理员——成员的
+    # 界面个性化走 per-member 的 ui.preferences）
     ("GET", "/api/v1/appearance"),
     ("GET", "/api/v1/appearance/backdrops/{backdrop_id}"),
-    ("PUT", "/api/v1/appearance/active"),
-    ("POST", "/api/v1/appearance/backdrops"),
-    ("DELETE", "/api/v1/appearance/backdrops/{backdrop_id}"),
     # 界面偏好（同上，P2 per-member 化）
     ("GET", "/api/v1/ui/preferences"),
     ("PUT", "/api/v1/ui/preferences"),
@@ -396,9 +399,6 @@ _MEMBER_ALLOWLIST = {
     ("GET", "/api/v1/people/{tmdb_person_id}"),
     ("GET", "/api/v1/images/assets/{path}"),
     ("GET", "/api/v1/images/proxy"),
-    # 系统通知（展示与本人已读回执）
-    ("GET", "/api/v1/system/notices"),
-    ("POST", "/api/v1/system/notices/{notice_id}/dismiss"),
     # 媒体库：浏览面（管理动作全部在库路由级挂 require_admin）
     ("GET", "/api/v1/libraries"),
     ("GET", "/api/v1/libraries/search"),

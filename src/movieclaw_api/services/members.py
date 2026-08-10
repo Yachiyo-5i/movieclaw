@@ -85,6 +85,15 @@ async def update_member(
     repo = MemberRepository(session)
     member = await get_member(session, member_id)
 
+    # 全部校验先行，之后才落任何写——校验失败时不能留下半套权限
+    # （比如 all_libraries 已切白名单模式、白名单却没存上 = 成员瞬间全库不可见）
+    if library_ids is not None:
+        # 校验库存在性给出友好错误（关联表有外键，无效 id 落库会炸 500）
+        existing = {row.id for row in await LibraryRepository(session).list_all()}
+        unknown = [i for i in library_ids if i not in existing]
+        if unknown:
+            raise BadRequestException(f"媒体库不存在：id={unknown}，请刷新后重试")
+
     if nickname is not None:
         member.nickname = nickname.strip()
     if allow_subscribe is not None:
@@ -100,11 +109,6 @@ async def update_member(
     member = await repo.save(member)
 
     if library_ids is not None:
-        # 校验库存在性给出友好错误（关联表有外键，无效 id 落库会炸 500）
-        existing = {row.id for row in await LibraryRepository(session).list_all()}
-        unknown = [i for i in library_ids if i not in existing]
-        if unknown:
-            raise BadRequestException(f"媒体库不存在：id={unknown}，请刷新后重试")
         await repo.set_library_access(member_id, library_ids)
     if site_ids is not None:
         await repo.set_site_access(member_id, site_ids)
@@ -160,12 +164,15 @@ async def delete_member(session: AsyncSession, member_id: int) -> None:
     """
     from sqlalchemy import delete as sa_delete
 
-    from movieclaw_db.models import PlaybackState
+    from movieclaw_db.models import PlaybackState, SearchHistory
 
     member = await get_member(session, member_id)
     avatar_media.delete_avatar(avatar_media.member_stem(member_id))
     await _drop_jellyfin_devices(session, member_id)
     await session.execute(sa_delete(PlaybackState).where(PlaybackState.member_id == member_id))
+    # 搜索历史必须跟人清：member_id 是哨兵值非外键，SQLite 复用行 id 时
+    # 新成员会"继承"已删成员的历史与快照——跨人隐私泄漏
+    await session.execute(sa_delete(SearchHistory).where(SearchHistory.member_id == member_id))
     await MemberRepository(session).delete(member)
     logger.info(
         "已删除成员账号：%s（id=%d，个人数据已清理，订阅已转由管理员接管）",

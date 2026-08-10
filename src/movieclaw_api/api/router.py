@@ -74,7 +74,6 @@ _MEMBER_ROUTERS = [
     images_router,
     subscriptions_router,
     libraries_router,
-    system_notices_router,
     people_router,
 ]
 for _router in _MEMBER_ROUTERS:
@@ -95,6 +94,9 @@ api_router.include_router(
 _ADMIN_ROUTERS = [
     members_router,
     sites_router,
+    # 系统通知是运维告警（站点认证过期等），dismiss 是全局操作——成员一点
+    # 全家消失、管理员错过故障；且告警详情本就是管理员视角的信息
+    system_notices_router,
     downloaders_router,
     llm_router,
     agent_router,

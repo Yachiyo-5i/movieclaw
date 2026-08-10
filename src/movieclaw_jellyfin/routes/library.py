@@ -56,6 +56,32 @@ from movieclaw_jellyfin.security import RequestIdentity, require_device
 router = APIRouter(dependencies=[Depends(require_device)])
 
 
+async def _item_visible(session: AsyncSession, item_id: int, scope: ViewerScope) -> bool:
+    """条目对该观看者是否可见：在其可见库里有任一在位文件。
+
+    直接按条目 GUID 访问（/Items/{id}、Shows/*、ids= 查询）不经过库枚举，
+    必须单独判定——GUID 是可枚举的结构化编码，只挡浏览不挡直达等于没挡。
+    """
+    if scope.visible is None:
+        return True
+    from sqlalchemy import select as sa_select
+
+    from movieclaw_db.models import LibraryFile
+
+    row = (
+        await session.execute(
+            sa_select(LibraryFile.id)
+            .where(
+                LibraryFile.media_item_id == item_id,
+                LibraryFile.missing_since.is_(None),
+                LibraryFile.library_id.in_(scope.visible),
+            )
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    return row is not None
+
+
 @dataclass(frozen=True)
 class ViewerScope:
     """一次请求的观看者范围：身份 + 可见库（None=不受限）。
@@ -466,6 +492,8 @@ async def _entries_for_ids(
 ) -> list[Entry]:
     refs = [r for r in (decode_guid(i) for i in ids_raw) if r is not None]
     scoped = {r.entity_id for r in refs if r.kind != EntityKind.LIBRARY}
+    # 直达 id 也过可见性筛（与浏览口径一致，不给可枚举 GUID 留后门）
+    scoped = {i for i in scoped if await _item_visible(session, i, scope)}
     bundles = await load_bundles(
         session, list(scoped), member_id=scope.member_id, dto_options=options
     )
@@ -543,6 +571,8 @@ async def _entries_for_parent(
         return _build_entries(bundles, types)
 
     if ref.kind == EntityKind.ITEM:
+        if not await _item_visible(session, ref.entity_id, scope):
+            raise not_found()
         bundles = await load_bundles(
             session, [ref.entity_id], member_id=scope.member_id, dto_options=options
         )
@@ -550,6 +580,8 @@ async def _entries_for_parent(
         return _build_entries(bundles, types)
 
     if ref.kind == EntityKind.SEASON:
+        if not await _item_visible(session, ref.entity_id, scope):
+            raise not_found()
         bundles = await load_bundles(
             session, [ref.entity_id], member_id=scope.member_id, dto_options=options
         )
@@ -866,7 +898,9 @@ async def get_item(
                     ctx, library, stats.get(library.id), await _cover_tag(library.id)
                 )
             )
-        # 单条目是全字段语义，People 恒输出
+        # 单条目是全字段语义，People 恒输出；可见性先行（GUID 可枚举）
+        if not await _item_visible(session, ref.entity_id, scope):
+            raise not_found()
         bundles = await load_bundles(
             session, [ref.entity_id], member_id=scope.member_id, dto_options=options
         )
@@ -983,6 +1017,8 @@ async def shows_seasons(
     if ref is None or ref.kind != EntityKind.ITEM:
         raise not_found()
     async with get_database().session() as session:
+        if not await _item_visible(session, ref.entity_id, scope):
+            raise not_found()
         bundles = await load_bundles(
             session, [ref.entity_id], member_id=scope.member_id, dto_options=options
         )
@@ -1027,6 +1063,8 @@ async def shows_episodes(
             season_scope = int(season_param)
 
     async with get_database().session() as session:
+        if not await _item_visible(session, target_item_id, scope):
+            raise not_found_message("Series not found")
         bundles = await load_bundles(
             session, [target_item_id], member_id=scope.member_id, dto_options=options
         )

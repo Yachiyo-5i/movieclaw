@@ -160,11 +160,20 @@ class LoginThrottle:
         self._locked_until = 0.0
 
 
-# 桶上限：防止攻击者用海量随机用户名注水内存。超限时按 LRU 淘汰最旧的桶——
-# 被淘汰的桶等于计数清零，但攻击者为此必须持续换用户名，对单一账号的爆破
-# 仍被各自的桶挡住。
+# 桶上限：防止攻击者用海量随机用户名注水内存。淘汰规则是安全关键：
+# 绝不能无差别 LRU——否则攻击者交替"猜一次目标账号 + 128 个随机用户名"
+# 即可把目标账号的锁定桶挤出去，让按账号锁定形同虚设。因此：
+# - 软上限内正常收；超软上限先淘汰"干净"的桶（无失败计数、未锁定）；
+# - 有失败/锁定中的桶只有超过硬上限才淘汰最旧的（攻击者要顶到硬上限，
+#   每个脏桶都得花真实的失败请求，成本翻数量级）。
 _MAX_THROTTLE_BUCKETS = 128
+_HARD_MAX_THROTTLE_BUCKETS = 4096
 _throttles: OrderedDict[str, LoginThrottle] = OrderedDict()
+
+
+def _bucket_dirty(bucket: LoginThrottle) -> bool:
+    """桶是否携带安全状态（失败计数或仍在锁定期）——脏桶不轻易淘汰。"""
+    return bucket._failures > 0 or bucket._locked_until > time.monotonic()
 
 
 def _throttle_for(username: str) -> LoginThrottle:
@@ -174,7 +183,15 @@ def _throttle_for(username: str) -> LoginThrottle:
     if bucket is None:
         bucket = LoginThrottle()
         _throttles[key] = bucket
-        while len(_throttles) > _MAX_THROTTLE_BUCKETS:
+        if len(_throttles) > _MAX_THROTTLE_BUCKETS:
+            # 先淘汰最旧的干净桶（成功登录过/从未失败的），锁定与计数不受影响
+            for stale_key, stale in list(_throttles.items()):
+                if stale_key != key and not _bucket_dirty(stale):
+                    del _throttles[stale_key]
+                    if len(_throttles) <= _MAX_THROTTLE_BUCKETS:
+                        break
+        while len(_throttles) > _HARD_MAX_THROTTLE_BUCKETS:
+            # 硬上限兜底：全是脏桶时才淘汰最旧的，防内存无界
             _throttles.popitem(last=False)
     else:
         _throttles.move_to_end(key)

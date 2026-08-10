@@ -521,11 +521,19 @@ function AppSection() {
  * 草稿自动撤销（组件卸载即触发既有的清理逻辑）。
  */
 function AppearanceSection() {
-  const [tab, setTab] = useState<"backdrop" | "texture">("backdrop");
-  const tabs = [
-    { id: "backdrop" as const, label: "背景图" },
-    { id: "texture" as const, label: "界面质感" },
-  ] as const;
+  // 背景图库是全局共享资源（换图/删图波及全家，接口也已收口管理员）；
+  // 成员的外观分区只剩界面质感——那份偏好按成员各存各的（ui_prefs）
+  const { session } = useSession();
+  const isMember = session.role === "member";
+  const [tab, setTab] = useState<"backdrop" | "texture">(
+    isMember ? "texture" : "backdrop",
+  );
+  const tabs = isMember
+    ? ([{ id: "texture" as const, label: "界面质感" }] as const)
+    : ([
+        { id: "backdrop" as const, label: "背景图" },
+        { id: "texture" as const, label: "界面质感" },
+      ] as const);
 
   return (
     <div className="space-y-5">
@@ -546,7 +554,7 @@ function AppearanceSection() {
           </button>
         ))}
       </div>
-      {tab === "backdrop" ? <BackdropGroup /> : <InterfaceTextureGroup />}
+      {tab === "backdrop" && !isMember ? <BackdropGroup /> : <InterfaceTextureGroup />}
     </div>
   );
 }

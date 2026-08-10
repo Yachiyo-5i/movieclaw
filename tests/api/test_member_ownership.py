@@ -186,14 +186,20 @@ async def test_duplicate_subscribe_becomes_follow_and_cancel_semantics(db) -> No
 async def test_member_deletion_transfers_subscription_to_admin(db) -> None:
     """删除成员：其发起的订阅经外键 SET NULL 转为超管发起，绝不连带删。"""
     from movieclaw_api.services import members as members_service
+    from movieclaw_db.repositories.search_history_repo import SearchHistoryRepository
 
     async with db.session() as session:
         a = await _create_member(session, "alice")
         service = _service(session)
         sub = await service.create(MediaKind.MOVIE, 100, member_id=a)
         sub_id = sub.id
+        history_repo = SearchHistoryRepository(session)
+        await history_repo.record("敏感搜索", member_id=a)
 
         await members_service.delete_member(session, a)
+
+        # 搜索历史必须跟人清：SQLite 复用行 id 时新成员会"继承"旧历史
+        assert await history_repo.list_recent_groups(member_id=a) == []
 
         # SET NULL 发生在数据库侧；同一 session 的身份映射里还是旧对象，先失效
         session.expire_all()
