@@ -59,16 +59,24 @@ def extract_audio(text: str) -> dict[str, object]:
     return {"audio": hits} if hits else {}
 
 
+# 「字幕(?!组)」：「无字幕组水印」说的是发布组水印，不是没有字幕
 _NO_SUBTITLE_RE = re.compile(
-    r"(?:无|没有|不含)(?:任何|全部|中文|简体中文)?字幕|"
+    r"(?:无|没有|不含)(?:任何|全部|中文|简体中文)?字幕(?!组)|"
+    r"字幕(?:语言|語言)?\s*[:：]\s*(?:无|無|没有|沒有)|"
     r"(?<![A-Za-z])NO[\s._-]*SUBS?(?![A-Za-z])",
     re.I,
 )
 
+# 音轨/配音语境守卫。两处易错边界：
+# ① 「(?<!字幕)语言」——「字幕语言：简体」是字幕声明，不能被当成语言字段吃掉；
+# ② 结尾负向前瞻——「国语配音 简体中文字幕」里「简体」属于其后的字幕声明，
+#   守卫若把「配音 简体中文」删掉会连带毁掉字幕证据。
 _NON_SUBTITLE_SIMPLIFIED_RE = re.compile(
-    r"(?:简体(?:中文)?|簡體(?:中文)?)(?:配音|音轨|音軌|语音|語音|剧情简介|劇情簡介)|"
-    r"(?:配音|音轨|音軌|语音|語音|语言|語言)\s*[:：]?\s*"
-    r"(?:简体(?:中文)?|簡體(?:中文)?)",
+    r"(?:简体(?:中文)?|簡體(?:中文)?|简中|簡中)\s*"
+    r"(?:配音|音轨|音軌|语音|語音|剧情简介|劇情簡介)|"
+    r"(?:配音|音轨|音軌|语音|語音|(?<!字幕)语言|(?<!字幕)語言)\s*[:：]?\s*"
+    r"(?:简体(?:中文)?|簡體(?:中文)?|简中|簡中)"
+    r"(?!(?:特效|硬|软|軟)?(?:中文)?字幕|中字)",
     re.I,
 )
 
@@ -83,10 +91,17 @@ _FULL_SIMPLIFIED_SUBTITLE_RE = re.compile(
     re.I,
 )
 
+# 桥接段：配对/分隔标记与「字幕」尾词之间允许的填充。不跨句读（逗号即换了
+# 从句，「简繁双语配音，内封英文字幕」不能把简繁桥到英文字幕上），也不跨
+# 配音/音轨词（同一从句里「简繁双语配音 内封字幕」同理）。
+_BRIDGE = r"(?:(?!配音|音轨|音軌)[^。，；;！？!?\n]){0,24}?"
+
+# 配对标记：简+第二语言（简英/简日/简韩/简繁及其 体/中 插入变体，如
+# 「简体日语双字幕」「简中英三语字幕」），繁在前的 繁简 也算含简体
 _PAIRED_SIMPLIFIED_SUBTITLE_RE = re.compile(
-    r"(?:简英|簡英|简繁|簡繁|繁简|繁簡)[^。\n]{0,24}?"
+    r"(?:(?:简|簡)(?:体|體|中)?(?:英|日|韩|韓|繁)|繁简|繁簡)" + _BRIDGE +
     r"(?:字幕|中字|软字幕|軟字幕|硬字幕|SUP)|"
-    r"(?:简英|簡英)\s*双语",
+    r"(?:简|簡)(?:体|體)?(?:英|日)\s*(?:双语|雙語)",
     re.I,
 )
 
@@ -99,14 +114,18 @@ _SHORT_SIMPLIFIED_SUBTITLE_RE = re.compile(
 )
 
 _DELIMITED_SIMPLIFIED_SUBTITLE_RE = re.compile(
-    r"(?:简体|簡體|简|簡)\s*[|/、+][^。\n]{0,24}?"
+    r"(?:简体|簡體|简|簡)\s*[|/、+&]" + _BRIDGE +
     r"(?:字幕|中字|软字幕|軟字幕|硬字幕|SUP)",
     re.I,
 )
 
 
 def extract_subtitle_languages(text: str) -> dict[str, object]:
-    """提取明确声明的字幕语言；「中字」等泛称不推断简繁，避免误筛。"""
+    """提取明确声明的字幕语言；「中字」等泛称不推断简繁，避免误筛。
+
+    不进 ``EXTRACTORS`` 注册表：「无字幕」等否定要跨主/副标题生效（标题带
+    CHS、描述写「无字幕」时后者推翻前者），由管线用双段合并文本单独调用一次。
+    """
     # 「无字幕」是全局否定；「无内嵌字幕，外挂简中」只否定一种承载方式，不应误杀。
     if _NO_SUBTITLE_RE.search(text):
         return {}
@@ -202,7 +221,6 @@ EXTRACTORS: list[tuple[str, object]] = [
     ("resolution", extract_resolution),
     ("video_codec", extract_video_codec),
     ("audio", extract_audio),
-    ("subtitle_languages", extract_subtitle_languages),
     ("hdr", extract_hdr),
     ("media_source", extract_media_source),
     ("remux", extract_remux),

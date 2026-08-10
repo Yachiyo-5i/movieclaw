@@ -55,7 +55,10 @@ logger = logging.getLogger("movieclaw_enrich")
 #      多 YEAR 候选按"主标题优先+段内置信度最高"抉择（片名自带年份不再盖过真年份）
 # v12: 从主标题/副标题里的明确标记提取简体中文字幕语言标签，供搜索结果筛选；
 #      泛称「中字/中文字幕」不猜简繁，继续保持未知
-ENRICH_VERSION = 12
+# v13: 字幕识别修误报/漏报：音轨守卫覆盖「简中」且不再吞掉「字幕语言：简体」；
+#      「无字幕组」不再当「无字幕」；配对/分隔桥接不跨句读与配音词；
+#      新增简日/简韩配对与 & 分隔符、「字幕：无」否定
+ENRICH_VERSION = 13
 
 # 场景命名的两类粘连（站点生成器丢空格所致），喂模型前拆开：
 # ① 季号紧贴分辨率："S021080p" → "S02 1080p"
@@ -106,9 +109,12 @@ def enrich(title: str, subtitle: str = "", category: str | None = None) -> Torre
                 fields[key] = value
 
     # 字幕的明确否定需要跨主标题/副标题生效，例如标题带 CHS、描述却写「无字幕」。
-    # 其它技术字段仍保持逐段提取、主标题优先；这里只对字幕字段用合并文本复核一次。
-    fields.pop("subtitle_languages", None)
-    fields.update(extract_subtitle_languages("\n".join(filter(None, (title, subtitle)))))
+    # 其它技术字段仍保持逐段提取、主标题优先；字幕字段只对合并文本提取这一次
+    # （不在 EXTRACTORS 注册表里），失败与其它提取器同一铁律：只跳过自己。
+    try:
+        fields.update(extract_subtitle_languages("\n".join(filter(None, (title, subtitle)))))
+    except Exception:  # noqa: BLE001
+        logger.warning("字幕语言提取失败，已跳过：%.80r", title)
 
     # 模型通道：片名/年份/季集/题材，双段联合推理一次产出。
     # 模型缺席/失败返回空字典，相关字段保持空值——绝不拖垮整条数据。
