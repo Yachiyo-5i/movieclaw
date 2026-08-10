@@ -81,6 +81,24 @@ bash）、文件系统浏览这些等价于服务器控制权的功能。
 - **方案 C：只做 Jellyfin 侧多用户，不做 Web 成员**——播放隔离了，但"家人
   自助订阅"这个核心诉求落空，且 Web 端仍是共享管理员密码，否决。
 
+关于"要不要上通用权限模型以灵活控制一切资源"（评审追问，2026-08-10）：
+仍然否决通用形态（RBAC 角色表或多态 ACL 表 `(subject, resource_type,
+resource_id, level)`），理由比"表达力过剩"更具体：
+
+1. 多态 `resource_id` 上不了外键——库/站点删除后授权行悬空，引用完整性
+   这个刚拿到手的好处（§3.6）又丢回去；
+2. 管理 UI 从"每个成员几个勾选框"劣化为"主体 × 资源 × 动作的权限矩阵"，
+   家庭管理员没有义务理解权限矩阵；
+3. 守护测试没法静态枚举权限点——权限成了数据而不是代码，CI 无从断言
+   "新路由必须声明归属"。
+
+**"灵活控制"的正解是统一范式，而不是统一表**：每类需要管控的资源都复制
+同一个三件套——①成员能力开关（这类功能给不给）→ ②"成员 × 资源"关联表
+（给了之后能见哪些，默认全部 + 白名单模式）→ ③服务层单点收口（判定只在
+一处）。库（§3.6）与 PT 站点（§3.6 末）是范式的前两个应用，未来新资源类型
+（如 IM 通道）照抄三件套即可。范式统一保证管理 UI 与守护测试形态一致，
+又不付出通用 ACL 的概念税。
+
 ### 2.2 成员能做什么
 
 **成员基线能力**（登录即有，不可关）：
@@ -97,6 +115,7 @@ bash）、文件系统浏览这些等价于服务器控制权的功能。
 | `allow_subscribe` | 开 | 发起订阅 / 关注已有订阅；可查看并暂停/删除自己发起的订阅 |
 | `allow_search` | 关 | 站点聚合搜索。消耗站点配额、暴露站点存在，默认不给 |
 | 可见库 | 全部 | 默认全部库可见（含以后新建的）；管理员可切换为白名单模式并逐库勾选（§3.6） |
+| 可用站点 | 全部 | 仅 `allow_search` 开启时有意义；默认全部启用站点，可切白名单逐站点勾选（§3.6 末） |
 
 **管理员专属**（除上述外的一切）：库 CRUD/扫描/刮削/整理/删除、订阅链路
 运维（grab/体检/预览）、全部系统设置、成员管理本身。
@@ -138,6 +157,7 @@ class Member(TimestampMixin, table=True):
     allow_subscribe: bool = True
     allow_search: bool = False
     all_libraries: bool = True                        # True=全部库可见（含未来新建）；False=查关联表
+    all_sites: bool = True                            # 同上语义，作用于站点（仅 allow_search 开启时生效）
 ```
 
 库可见性白名单是独立关联表（选型理由与演进路径见 §3.6）：
@@ -357,6 +377,40 @@ class LibraryAccessService:
 路径。若这个语义在实际使用中反直觉（"我订的东西我看不到"），再考虑"订阅
 路由限制在可见库内"，属于 `LibraryAccessService` 内的可逆小改。
 
+#### 范式的第二个应用：PT 站点可见性
+
+`allow_search` 开启后，管理员还可以限定该成员能用哪些站点——典型诉求是
+"配额金贵的站不给家人挥霍，公开站随便搜"。照抄库的三件套，但有一处
+因站点的身份形态而不同：**站点不是数据库实体**——站点身份是声明式 YAML
+注册表里的字符串 `site_id`（如 `mteam`，见 `site_credential.py:65`），
+库里没有 `site` 表可以挂外键。因此：
+
+```python
+class MemberSiteAccess(TimestampMixin, table=True):
+    """成员 × 站点 的访问关系。仅 member.all_sites=False 时生效。
+
+    site_id 是 YAML 注册表标识（字符串），非外键——站点从注册表移除后
+    留下的悬空行在判定时自然失效（等价于不可用），无需清理。
+    """
+    __tablename__ = "member_site_access"
+
+    id: int | None = Field(default=None, primary_key=True)
+    member_id: int = Field(foreign_key="member.id", ondelete="CASCADE")
+    site_id: str = Field(index=True)
+    # UNIQUE(member_id, site_id)
+```
+
+- **收口点**：搜索服务展开"本次搜哪些站"的那一处（交互式搜索的唯一站点
+  枚举入口），按主体过滤；搜索页的站点筛选 chips、筛选弹层的站点选项同源，
+  成员看不到白名单外的站点名；
+- **语义边界**：站点可见性只作用于**成员发起的交互式搜索**。订阅链路的
+  被动匹配与主动缺口搜索是系统行为，始终用全部启用站点——资源共享原则：
+  下载成果全家共享，不因发起人的站点受限而缩小搜索面、拉低命中质量；
+- **凭据永远隔离**：成员任何时候接触不到站点配置与 Cookie（`/sites` 整组
+  在 admin 区），可见的只是搜索结果上的站点名标签；
+- **演进**：未来的每站点限频/配额就是这张表加列（`daily_quota` 等），
+  与库访问表的 `level` 演进同构。
+
 ### 3.7 Jellyfin 兼容层多用户
 
 协议天生多用户，改造是"把硬编码换真数据"：
@@ -404,7 +458,8 @@ class LibraryAccessService:
 
 ### 3.10 迁移与发布
 
-- 新增：`member`、`member_library_access`、`subscription_follower` 三张表；加列：
+- 新增：`member`、`member_library_access`、`member_site_access`、
+  `subscription_follower` 四张表；加列：
   `playback_state.member_id`、`subscription.created_by_member_id`、
   `jellyfin_device.member_id`。全部是"新表 + 带默认值的加列"，符合
   "迁移只能向前兼容"的发布铁律；唯一约束重建走 batch 模式；
@@ -440,9 +495,11 @@ class LibraryAccessService:
 
 **P2——外围收口（按需求热度排期）**
 
-10. 搜索历史 / 搜索偏好 / UI 偏好 per-member 化；
-11. IM 通道绑定成员化（受限指令集，不接 Agent）;
-12. 视需求：订阅审批流、成员配额、`allow_search` 细化（限站点/限频）。
+10. 站点可见性白名单（§3.6 末，范式第二应用）→ 验证：白名单成员的搜索
+    只发向允许的站点、筛选器不出现其余站点名；
+11. 搜索历史 / 搜索偏好 / UI 偏好 per-member 化；
+12. IM 通道绑定成员化（受限指令集，不接 Agent）;
+13. 视需求：订阅审批流、成员配额、每站点限频。
 
 ## 5. 开放问题（需要用户拍板）
 
