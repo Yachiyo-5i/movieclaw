@@ -16,6 +16,7 @@ from fastapi import APIRouter, Depends, Request
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
 from sqlalchemy import select
 
+from movieclaw_api.services.library.access import member_visible_ids
 from movieclaw_db.engine import get_database
 from movieclaw_db.models import LibraryFile
 from movieclaw_jellyfin.catalog import media_source_dto
@@ -34,13 +35,21 @@ from movieclaw_playback.streaming import (
 router = APIRouter(dependencies=[Depends(require_device)])
 
 
-async def _files_for_ref(ref) -> list[LibraryFile]:
-    """按条目/单元 GUID 取在位文件行（多版本多行，稳定排序）。"""
+async def _files_for_ref(ref, member_id: int = 0) -> list[LibraryFile]:
+    """按条目/单元 GUID 取在位文件行（多版本多行，稳定排序）。
+
+    成员的库可见性在这里强制（三个播放处理器共用本装载点）：白名单外
+    库里的文件直接不出现，条目因此对该成员表现为 404——GUID 可枚举，
+    不能只在浏览路径挡、放播放路径直进（member-management.md §3.6）。
+    """
     async with get_database().session() as session:
+        visible = await member_visible_ids(session, member_id)
         q = select(LibraryFile).where(
             LibraryFile.media_item_id == ref.entity_id,
             LibraryFile.missing_since.is_(None),
         )
+        if visible is not None:
+            q = q.where(LibraryFile.library_id.in_(visible))
         if ref.kind == EntityKind.EPISODE:
             q = q.where(
                 LibraryFile.season_number == ref.season,
@@ -71,7 +80,11 @@ def _select_source(
 
 @router.get("/Items/{item_id}/PlaybackInfo")
 @router.post("/Items/{item_id}/PlaybackInfo")
-async def playback_info(request: Request, item_id: str) -> JSONResponse:
+async def playback_info(
+    request: Request,
+    item_id: str,
+    identity: RequestIdentity = Depends(require_device),
+) -> JSONResponse:
     ref = decode_guid(item_id)
     if ref is None or ref.kind not in (EntityKind.ITEM, EntityKind.EPISODE):
         raise not_found()
@@ -89,7 +102,7 @@ async def playback_info(request: Request, item_id: str) -> JSONResponse:
             raw = lowered.get("mediasourceid")
             media_source_id = str(raw) if raw else None
 
-    files = await _files_for_ref(ref)
+    files = await _files_for_ref(ref, identity.device.member_id)
     selected = _select_source(files, media_source_id, item_id)
     if not selected:
         return JSONResponse(
@@ -126,7 +139,7 @@ async def video_stream(
         # 无 static=true 本应转码；我们不转码（偏离⑨）
         raise bad_request_text()
 
-    files = await _files_for_ref(ref)
+    files = await _files_for_ref(ref, identity.device.member_id)
     selected = _select_source(files, request.query_params.get("mediaSourceId"), item_id)
     if not selected:
         raise not_found()
@@ -163,7 +176,11 @@ async def video_stream(
 @router.head("/Items/{item_id}/Download")
 @router.get("/Items/{item_id}/File")
 @router.head("/Items/{item_id}/File")
-async def download_item(request: Request, item_id: str) -> Response:
+async def download_item(
+    request: Request,
+    item_id: str,
+    identity: RequestIdentity = Depends(require_device),
+) -> Response:
     """整文件下载（Jellyfin LibraryController 的 Download/File 两条路由）。
 
     我们在 UserDto.Policy 里宣告了 ``EnableContentDownloading: true``，客户端
@@ -181,7 +198,7 @@ async def download_item(request: Request, item_id: str) -> Response:
     if ref is None or ref.kind not in (EntityKind.ITEM, EntityKind.EPISODE):
         raise not_found()
 
-    files = await _files_for_ref(ref)
+    files = await _files_for_ref(ref, identity.device.member_id)
     selected = _select_source(files, request.query_params.get("mediaSourceId"), item_id)
     if not selected:
         raise not_found()

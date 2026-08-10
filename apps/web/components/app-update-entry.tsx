@@ -24,6 +24,7 @@ import { useCallback, useEffect, useState } from "react";
 
 import { ChevronRightIcon, UpgradeIcon } from "@/components/icons";
 import { getPendingUpdate, type PendingUpdateView } from "@/lib/api/app";
+import { useSession } from "@/lib/session";
 
 /** 轮询间隔：后端每小时才检查一次，前端跟得再紧也没有新信息，10 分钟足够 */
 const POLL_MS = 600_000;
@@ -36,7 +37,7 @@ const UPDATE_COLOR = "#6aa7ff";
  * 读取待更新快照。返回 null 表示"无可用更新"（含尚未检查、非 Docker 部署、
  * 接口不可用）——一切不确定的情况都按"没有更新"处理，绝不误报。
  */
-export function usePendingUpdate(): PendingUpdateView | null {
+export function usePendingUpdate(enabled: boolean = true): PendingUpdateView | null {
   const [pending, setPending] = useState<PendingUpdateView | null>(null);
 
   const refresh = useCallback(() => {
@@ -48,6 +49,8 @@ export function usePendingUpdate(): PendingUpdateView | null {
   }, []);
 
   useEffect(() => {
+    // 成员会话不轮询：更新接口是管理员专属，成员打过去只会收获一排 403
+    if (!enabled) return;
     refresh();
     const timer = window.setInterval(refresh, POLL_MS);
     const onFocus = () => refresh();
@@ -56,9 +59,9 @@ export function usePendingUpdate(): PendingUpdateView | null {
       window.clearInterval(timer);
       window.removeEventListener("focus", onFocus);
     };
-  }, [refresh]);
+  }, [refresh, enabled]);
 
-  return pending;
+  return enabled ? pending : null;
 }
 
 /**
@@ -73,7 +76,9 @@ export function AppUpdateEntry({
   /** 跳到「设置 → 应用」，那一页进去就会直接摆出新版本卡片 */
   onOpen: () => void;
 }) {
-  const pending = usePendingUpdate();
+  // 更新是管理员的事：成员看不到入口，也不发起轮询（接口是管理员专属）
+  const { session } = useSession();
+  const pending = usePendingUpdate(session.role !== "member");
   if (!pending) return null;
 
   // 应用与模型可能同时有更新：标题只说更要紧的那个（应用版本），

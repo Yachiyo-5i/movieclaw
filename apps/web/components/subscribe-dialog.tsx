@@ -21,6 +21,7 @@ import {
 } from "@/lib/api/subscriptions";
 import { cachedImageUrl } from "@/lib/image-proxy";
 import type { MediaType } from "@/lib/media-types";
+import { usePermissions } from "@/lib/permissions";
 
 /**
  * 订阅弹层的打开参数：TMDB 入口带 tmdbId；豆瓣入口带 doubanId + title(+year)，
@@ -56,6 +57,7 @@ export function SubscribeDialog({
   onClose: () => void;
   onChanged?: () => void;
 }) {
+  const { canManageSubscriptions } = usePermissions();
   const [prepared, setPrepared] = useState<PrepareResult | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [ruleSets, setRuleSets] = useState<RuleSet[]>([]);
@@ -74,7 +76,7 @@ export function SubscribeDialog({
   const [routed, setRouted] = useState<{ libraryId: number; reason: string | null } | null>(null);
 
   useEffect(() => {
-    if (!target || libraryId === null) {
+    if (!canManageSubscriptions || !target || libraryId === null) {
       setDispatchPreview(null);
       return;
     }
@@ -90,7 +92,7 @@ export function SubscribeDialog({
     return () => {
       cancelled = true;
     };
-  }, [target, libraryId]);
+  }, [canManageSubscriptions, target, libraryId]);
 
   /** 预检并按结果初始化表单默认值（候选确认后会带着 tmdbId 再次进入）。 */
   const runPrepare = useCallback(
@@ -98,7 +100,7 @@ export function SubscribeDialog({
       setPrepared(null);
       setError(null);
       try {
-        const [result, rules, libs] = await Promise.all([
+        const [result, adminOptions] = await Promise.all([
           prepareSubscription(
             t.source === "douban" && !t.tmdbId
               ? {
@@ -110,9 +112,11 @@ export function SubscribeDialog({
                 }
               : { source: "tmdb", kind: t.kind, tmdb_id: t.tmdbId, douban_id: t.doubanId },
           ),
-          listRuleSets(),
-          listLibraries(t.kind),
+          canManageSubscriptions
+            ? Promise.all([listRuleSets(), listLibraries(t.kind)])
+            : Promise.resolve(null),
         ]);
+        const [rules, libs] = adminOptions ?? [[], []];
         setRuleSets(rules);
         setRuleSetId(rules.find((r) => r.is_default)?.id ?? rules[0]?.id ?? null);
         setLibraries(libs);
@@ -121,7 +125,7 @@ export function SubscribeDialog({
         const fallbackId = libs.find((l) => l.is_default)?.id ?? libs[0]?.id ?? null;
         setRouted(null);
         let pickedId = fallbackId;
-        if (result.status === "ready" && result.media) {
+        if (canManageSubscriptions && result.status === "ready" && result.media) {
           const p = await getDispatchPreview(t.kind, null, result.media.tmdb_id).catch(
             () => null,
           );
@@ -144,7 +148,7 @@ export function SubscribeDialog({
         setError(e instanceof Error ? e.message : "预检失败，请稍后重试");
       }
     },
-    [],
+    [canManageSubscriptions],
   );
 
   useEffect(() => {
@@ -174,8 +178,8 @@ export function SubscribeDialog({
         tmdb_id: prepared.media.tmdb_id,
         selected_seasons: [...selectedSeasons].sort((a, b) => a - b),
         follow_future: followFuture,
-        rule_set_id: ruleSetId,
-        library_id: libraryId,
+        rule_set_id: canManageSubscriptions ? ruleSetId : null,
+        library_id: canManageSubscriptions ? libraryId : null,
         douban_id: target.doubanId ?? null,
       });
       onChanged?.();
@@ -347,7 +351,7 @@ export function SubscribeDialog({
                 </section>
               )}
 
-              {ruleSets.length > 0 && (
+              {canManageSubscriptions && ruleSets.length > 0 && (
                 <section>
                   <div className="mb-2 flex items-center justify-between">
                     <h3 className="text-ui font-semibold text-white/85">资源规则</h3>
@@ -401,7 +405,7 @@ export function SubscribeDialog({
                 </section>
               )}
 
-              {libraries.length > 0 && (
+              {canManageSubscriptions && libraries.length > 0 && (
                 <section>
                   <h3 className="mb-2 text-ui font-semibold text-white/85">入库到</h3>
                   <select
@@ -490,7 +494,7 @@ export function SubscribeDialog({
             </div>
           )}
       </div>
-      {creatingRuleSet && (
+      {canManageSubscriptions && creatingRuleSet && (
         <RuleSetEditorDialog
           ruleSet={null}
           raised

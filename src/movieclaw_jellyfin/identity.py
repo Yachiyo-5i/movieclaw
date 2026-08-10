@@ -10,7 +10,8 @@ from typing import Any
 
 from movieclaw_api.services import auth as auth_service
 from movieclaw_api.settings.schemas import JellyfinCompatSetting, get_jellyfin_compat
-from movieclaw_jellyfin.ids import user_guid
+from movieclaw_db.models.member import Member
+from movieclaw_jellyfin.ids import library_guid, user_guid, user_guid_for
 
 # 对外报的 Jellyfin 版本：真实存在的 10.10 系版本号，命中客户端兼容分支
 REPORTED_VERSION = "10.10.7"
@@ -51,7 +52,23 @@ def user_configuration() -> dict[str, Any]:
     }
 
 
-def user_policy() -> dict[str, Any]:
+def user_policy(
+    member: Member | None = None,
+    visible_library_ids: set[int] | None = None,
+) -> dict[str, Any]:
+    """用户 Policy。超管（member=None）保持全开；成员按权限投影：
+    非管理员、不可删内容、库可见性经 EnabledFolders 下发给客户端
+    （客户端据此过滤其自建的合集/快捷入口；服务端查询侧另有强制过滤）。"""
+    if member is not None:
+        policy = user_policy()  # 以超管全开为底，只改差异字段
+        policy["IsAdministrator"] = False
+        policy["IsDisabled"] = member.status != "active"
+        if not member.all_libraries and visible_library_ids is not None:
+            policy["EnableAllFolders"] = False
+            policy["EnabledFolders"] = [
+                library_guid(i) for i in sorted(visible_library_ids)
+            ]
+        return policy
     return {
         "IsAdministrator": True,
         "IsHidden": False,  # /Users/Public 按 hidden 过滤，true 会让登录页空列表
@@ -103,7 +120,25 @@ def user_policy() -> dict[str, Any]:
     }
 
 
-async def user_dto(server_id: str) -> dict[str, Any]:
+async def user_dto(
+    server_id: str,
+    member: Member | None = None,
+    visible_library_ids: set[int] | None = None,
+) -> dict[str, Any]:
+    """用户 DTO。member=None → 超管（原单用户形态，GUID 不变）；
+    传入成员 → 以其登录名/GUID/Policy 投影（电视登录页的多头像来源）。"""
+    if member is not None:
+        return {
+            "Name": member.username,
+            "ServerId": server_id,
+            "Id": user_guid_for(member.id),
+            "HasPassword": True,
+            "HasConfiguredPassword": True,
+            "HasConfiguredEasyPassword": False,
+            "EnableAutoLogin": False,
+            "Configuration": user_configuration(),
+            "Policy": user_policy(member, visible_library_ids),
+        }
     account = await auth_service.get_admin_account()
     return {
         "Name": account.username,
@@ -127,11 +162,12 @@ def session_info_dto(
     device_name: str,
     version: str,
     user_name: str,
+    member_id: int = 0,
 ) -> dict[str, Any]:
     now = _now_iso()
     return {
         "Id": session_id,
-        "UserId": user_guid(),
+        "UserId": user_guid_for(member_id),
         "UserName": user_name,
         "Client": client,
         "DeviceId": device_id,

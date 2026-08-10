@@ -11,6 +11,7 @@ import {
 
 import * as appearanceApi from "@/lib/api/appearance";
 import type { BackdropItem } from "@/lib/api/appearance";
+import { BACKDROP_CACHE_KEY } from "@/lib/backdrop-cache";
 import { BACKDROP } from "@/lib/glass";
 
 /**
@@ -22,9 +23,9 @@ import { BACKDROP } from "@/lib/glass";
  *
  * 因此"换背景图"不能只改 CSS——必须让上面两者同步切换。这里用一个 React Context
  * 作为唯一数据源：
- *   - 背景图存在**服务端**的「图库」里（data/uploads/backdrops 持久化目录）：
- *     用户上传的图全部保留、可点选切换，至多一张生效；生效图为空时用内置默认。
- *     跨设备/浏览器访问同一实例即一致，Docker 重启也不丢；
+ *   - 背景图存在**服务端**按账号隔离的「图库」里：用户上传的图全部保留、
+ *     可点选切换，至多一张生效；同一账号跨设备保持一致，不同成员互不可见；
+ *     生效图为空时用内置默认，Docker 重启也不丢；
  *   - 启动时向后端要图库与生效图，之后的每次写操作都以后端返回的最新视图回写状态；
  *   - 每次变更时把 CSS 变量 --backdrop-image 写到 <html> 上，body::before 立即换图；
  *   - 所有玻璃组件通过 useBackdrop() 拿到同一个 URL 传给着色器，随之重建纹理。
@@ -56,9 +57,6 @@ interface BackdropContextValue {
 }
 
 const BackdropContext = createContext<BackdropContextValue | null>(null);
-
-/** 首帧恢复缓存的 localStorage key（读取方是 app/layout.tsx 的内联脚本）。 */
-const BACKDROP_CACHE_KEY = "movieclaw.backdrop";
 
 /** 把 URL 同步到 <html> 的 CSS 变量，供 body::before 使用；传 null 则回退默认。
 

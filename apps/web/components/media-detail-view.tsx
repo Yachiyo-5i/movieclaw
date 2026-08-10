@@ -33,6 +33,7 @@ import { buildDiscoveryReturnPath } from "@/lib/discovery-return-path";
 import { useDoubanAppHref } from "@/lib/douban-app-link";
 import { getMediaOrigin, getMediaSeed, useMediaDetail } from "@/lib/media-detail";
 import { usePageTitle } from "@/lib/use-page-title";
+import { usePermissions } from "@/lib/permissions";
 import type { MediaSource, MediaType } from "@/lib/media-types";
 import {
   subscriptionProgressNote,
@@ -77,13 +78,18 @@ export function MediaDetailView({
   id: string;
   source?: MediaSource;
 }) {
+  const { canSearch } = usePermissions();
   const { close } = useMediaDetail();
   const [detail, setDetail] = useState<MediaDetailData | null>(null);
   // 详情拉取失败状态：仅在无 seed（硬刷新/分享直达）时才需要整页兜底
   const [loadFailed, setLoadFailed] = useState(false);
   // 该条目的订阅：与海报卡片同一份全站订阅状态（subscribe-entry 收口），
   // 订阅/取消后 refresh 一次，详情页与所有卡片同步更新
-  const { subscriptionOf, refresh: refreshSubscriptions } = useSubscribeEntry();
+  const {
+    canSubscribe,
+    subscriptionOf,
+    refresh: refreshSubscriptions,
+  } = useSubscribeEntry();
   const sub = subscriptionOf({ id, source, type: type ?? "movie" });
   // 订阅弹层的打开参数；null = 关闭
   const [subscribeTarget, setSubscribeTarget] = useState<SubscribeTarget | null>(null);
@@ -308,7 +314,7 @@ export function MediaDetailView({
 
           {/* 操作区：已订阅的影片主按钮变为状态展示（点击进入管理弹层可取消订阅） */}
           <div className="mt-5 flex flex-wrap items-center gap-3 max-md:mt-3.5 max-md:gap-2">
-            {sub ? (
+            {canSubscribe && (sub ? (
               <button
                 type="button"
                 onClick={openSubscribe}
@@ -329,15 +335,15 @@ export function MediaDetailView({
                 <BellIcon className="size-4" />
                 订阅追踪
               </button>
-            )}
+            ))}
             {/* 搜索资源：不订阅、只想手动找种子下一次的直达口（此前只能回 ⌘K 重打片名） */}
-            <Link
+            {canSearch && <Link
               href={`/search?q=${encodeURIComponent(item.title)}` as Route}
               className="btn-glass flex h-10 items-center gap-2 bg-white/10 px-5 text-ui font-medium backdrop-blur-md transition hover:bg-white/15"
             >
               <SearchIcon className="size-4" />
               搜索资源
-            </Link>
+            </Link>}
             {sub && (
               <span className="text-on-image flex items-center gap-1.5 text-sub text-[var(--text-muted)]">
                 <span

@@ -31,6 +31,9 @@ class EntityKind(IntEnum):
     EPISODE = 0x04
     MEDIA_SOURCE = 0x05
     PERSON = 0x06
+    # 成员用户（多用户，docs/design/member-management.md §3.7）。超管保持
+    # FIXED_USER 的原 GUID——已配对的客户端升级后不掉线。
+    MEMBER_USER = 0x07
 
 
 # 固定实体的载荷常量（FIXED 类型下细分）
@@ -83,6 +86,16 @@ def person_guid(person_id: int) -> str:
 
 def user_guid() -> str:
     return _pack(EntityKind.FIXED, FIXED_USER)
+
+
+def member_user_guid(member_id: int) -> str:
+    """成员的用户 GUID（按 member.id 无状态编码）。"""
+    return _pack(EntityKind.MEMBER_USER, member_id)
+
+
+def user_guid_for(member_id: int) -> str:
+    """按登录身份（0=超管哨兵）取用户 GUID。"""
+    return user_guid() if member_id == 0 else member_user_guid(member_id)
 
 
 def root_guid() -> str:

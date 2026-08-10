@@ -37,6 +37,7 @@ import {
 } from "@/lib/subscription-ui";
 import { formatDateTime, formatRelativeTime } from "@/lib/time";
 import { useVisiblePolling } from "@/lib/use-visible-polling";
+import { usePermissions } from "@/lib/permissions";
 
 /**
  * 订阅详情分析页（/subscriptions/[id]）：订阅透明化的落点。
@@ -57,7 +58,8 @@ export function SubscriptionInspectorView({ id }: { id: number }) {
   const router = useRouter();
   const confirm = useConfirm();
   // 暂停/取消订阅会改变全站订阅状态（海报卡片的「已订阅」徽标），操作后同步刷新
-  const { refresh: refreshSubscriptions } = useSubscribeEntry();
+  const { canSubscribe, refresh: refreshSubscriptions } = useSubscribeEntry();
+  const { canManageSubscriptions, canSearch } = usePermissions();
   const [detail, setDetail] = useState<SubscriptionDetail | null>(null);
   const [activities, setActivities] = useState<SubscriptionActivity[]>([]);
   const [ruleSets, setRuleSets] = useState<RuleSet[]>([]);
@@ -74,7 +76,7 @@ export function SubscriptionInspectorView({ id }: { id: number }) {
     Promise.all([
       getSubscription(id),
       listSubscriptionActivities(id),
-      listRuleSets(),
+      canManageSubscriptions ? listRuleSets() : Promise.resolve([]),
     ])
       .then(([d, acts, rules]) => {
         setDetail(d);
@@ -82,7 +84,7 @@ export function SubscriptionInspectorView({ id }: { id: number }) {
         setRuleSets(rules);
       })
       .catch(() => setFailed(true));
-  }, [id]);
+  }, [canManageSubscriptions, id]);
 
   useEffect(() => {
     reload();
@@ -275,23 +277,23 @@ export function SubscriptionInspectorView({ id }: { id: number }) {
               {!isMovie && <ParamChip>持续追新 {detail.follow_future ? "开" : "关"}</ParamChip>}
               {/* 规则组徽片可点击换组：删除被引用规则组前"先把订阅改到其他组"的
                   唯一 Web 入口，也是新建规则组后应用到已有订阅的路 */}
-              <button
+              {canManageSubscriptions && <button
                 type="button"
                 onClick={() => setSwitchingRule(true)}
                 title="更换本订阅使用的规则组"
                 className="rounded-full bg-white/[0.09] px-2.5 py-1 text-caption text-white/75 backdrop-blur-sm transition hover:bg-white/[0.18] hover:text-white"
               >
                 规则组「{ruleSetName}」<span className="ml-0.5 text-white/50">更换 ›</span>
-              </button>
+              </button>}
               {/* 调整订阅：季选择/追新/入库库（后端 diff 重算工单，无需取消重订） */}
-              <button
+              {canSubscribe && <button
                 type="button"
                 onClick={() => setAdjusting(true)}
                 title={isMovie ? "更换入库目标库" : "修改季选择、持续追新或入库目标库"}
                 className="rounded-full bg-white/[0.09] px-2.5 py-1 text-caption text-white/75 backdrop-blur-sm transition hover:bg-white/[0.18] hover:text-white"
               >
                 调整订阅<span className="ml-0.5 text-white/50">›</span>
-              </button>
+              </button>}
             </div>
 
             <ProgressStrip progress={detail.progress} />
@@ -299,7 +301,7 @@ export function SubscriptionInspectorView({ id }: { id: number }) {
 
           <div className="flex shrink-0 flex-wrap gap-2.5 pt-0.5 max-md:w-full">
             {/* 缺口存在且未暂停时才有意义；其余情况后端会给可读错误，按钮直接隐藏更干净 */}
-            {detail.progress.wanted > 0 && detail.status !== "paused" && (
+            {canSubscribe && detail.progress.wanted > 0 && detail.status !== "paused" && (
               <button
                 type="button"
                 disabled={busy}
@@ -309,7 +311,7 @@ export function SubscriptionInspectorView({ id }: { id: number }) {
                 立即搜索
               </button>
             )}
-            {detail.progress.wanted > 0 && (
+            {canSubscribe && canSearch && detail.progress.wanted > 0 && (
               <Link
                 href={
                   `/search?q=${encodeURIComponent(detail.media.title)}&for_sub=${detail.id}` as Route
@@ -320,22 +322,22 @@ export function SubscriptionInspectorView({ id }: { id: number }) {
                 手动选种
               </Link>
             )}
-            <button
+            {canSubscribe && <button
               type="button"
               disabled={busy || detail.status === "completed"}
               onClick={togglePause}
               className="btn-glass h-9 bg-white/10 px-4 text-sub font-medium backdrop-blur-md disabled:opacity-40"
             >
               {detail.status === "paused" ? "恢复追踪" : "暂停"}
-            </button>
-            <button
+            </button>}
+            {canSubscribe && <button
               type="button"
               disabled={busy}
               onClick={remove}
               className="h-9 rounded-full border border-red-400/30 bg-red-500/10 px-4 text-sub font-medium text-red-200 transition hover:bg-red-500/20 disabled:opacity-40"
             >
               取消订阅
-            </button>
+            </button>}
           </div>
         </div>
       </div>
@@ -370,7 +372,7 @@ export function SubscriptionInspectorView({ id }: { id: number }) {
         )}
       </div>
 
-      {adjusting && (
+      {canSubscribe && adjusting && (
         <SubscriptionAdjustDialog
           detail={detail}
           onClose={() => setAdjusting(false)}
@@ -382,7 +384,7 @@ export function SubscriptionInspectorView({ id }: { id: number }) {
         />
       )}
 
-      {switchingRule && (
+      {canManageSubscriptions && switchingRule && (
         <RuleSetSwitchDialog
           ruleSets={ruleSets}
           currentId={detail.rule_set_id}

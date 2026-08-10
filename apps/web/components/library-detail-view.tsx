@@ -64,6 +64,7 @@ import { formatBytes } from "@/lib/format";
 import { formatRelativeTime } from "@/lib/time";
 import { cachedImageUrl, imageUrl } from "@/lib/image-proxy";
 import { keepIfEqual, reconcileList } from "@/lib/poll-reconcile";
+import { usePermissions } from "@/lib/permissions";
 import { useVisiblePolling } from "@/lib/use-visible-polling";
 import {
   subscriptionProgressNote,
@@ -96,6 +97,7 @@ function busyText(progress: ScanProgress | null): string {
 const WALL_PAGE_SIZE = 60;
 
 export function LibraryDetailView({ libraryId }: { libraryId: number }) {
+  const { canManageLibraries } = usePermissions();
   const [libraries, setLibraries] = useState<MediaLibrary[] | null>(null);
   const [items, setItems] = useState<LibraryItem[]>([]);
   // 服务端还有没有下一页；滚动加载的哨兵据此决定是否继续观察
@@ -147,10 +149,10 @@ export function LibraryDetailView({ libraryId }: { libraryId: number }) {
       }).catch(() => []),
       listLibraryItemIds(libraryId).catch(() => []),
       listLibraryItemIndex(libraryId).catch(() => []),
-      listUnidentified(libraryId).catch(() => []),
-      listIdentityReview(libraryId).catch(() => []),
-      listIgnored(libraryId).catch(() => []),
-      listMissing(libraryId).catch(() => []),
+      canManageLibraries ? listUnidentified(libraryId).catch(() => []) : Promise.resolve([]),
+      canManageLibraries ? listIdentityReview(libraryId).catch(() => []) : Promise.resolve([]),
+      canManageLibraries ? listIgnored(libraryId).catch(() => []) : Promise.resolve([]),
+      canManageLibraries ? listMissing(libraryId).catch(() => []) : Promise.resolve([]),
       listSubscriptions().catch(() => []),
     ])
       .then(([libs, libraryItems, ids, index, unknown, reviewGroups, ignoredGroups, missingItems, subs]) => {
@@ -185,7 +187,7 @@ export function LibraryDetailView({ libraryId }: { libraryId: number }) {
       .catch(() => {
         if (seq === reloadSeq.current) setFailed(true);
       });
-  }, [libraryId]);
+  }, [canManageLibraries, libraryId]);
 
   useEffect(() => {
     reload();
@@ -246,10 +248,14 @@ export function LibraryDetailView({ libraryId }: { libraryId: number }) {
 
   // 进入页面先探一次元数据刷新状态（可能是别的入口/上次会话发起的）
   useEffect(() => {
+    if (!canManageLibraries) {
+      setMetaRefresh(null);
+      return;
+    }
     getMetadataRefreshProgress(libraryId)
       .then(setMetaRefresh)
       .catch(() => {});
-  }, [libraryId]);
+  }, [canManageLibraries, libraryId]);
 
   // 刷新进行中每 2 秒轮询状态，结束自动重拉库存（海报/档案已更新）。
   // 2 秒是"阶段文字跟得上"与"别把接口打太密"的折中：单部片的一个阶段
@@ -268,7 +274,7 @@ export function LibraryDetailView({ libraryId }: { libraryId: number }) {
         // （曾是线上实况）。刷新真结束时成功响应会带 refreshing=false 收尾
         .catch(() => {});
     },
-    refreshingMeta ? 2000 : null,
+    canManageLibraries && refreshingMeta ? 2000 : null,
   );
 
   const library = libraries?.find((l) => l.id === libraryId) ?? null;
@@ -394,7 +400,7 @@ export function LibraryDetailView({ libraryId }: { libraryId: number }) {
   const { stats } = library;
 
   // 库操作全部收进 ⋯ 菜单，顶栏只留这一个入口；运行状态看头部下方的胶囊
-  const actionsMenu = (
+  const actionsMenu = canManageLibraries ? (
     <LibraryActionsMenu
       scanning={Boolean(library.scanning)}
       scanPhase={library.scan_progress?.phase ?? null}
@@ -453,7 +459,7 @@ export function LibraryDetailView({ libraryId }: { libraryId: number }) {
       }}
       onEdit={() => setEditing(library)}
     />
-  );
+  ) : null;
 
   return (
     <div className="scroll-thin scroll-safe flex-1 overflow-y-auto pb-10">
@@ -506,7 +512,7 @@ export function LibraryDetailView({ libraryId }: { libraryId: number }) {
           </p>
         )}
         {/* —— 健康状态胶囊：工单收进抽屉，海报墙保持干净 —— */}
-        {(missing.length > 0 ||
+        {canManageLibraries && (missing.length > 0 ||
           unidentified.length > 0 ||
           review.length > 0 ||
           importing > 0 ||
@@ -563,7 +569,7 @@ export function LibraryDetailView({ libraryId }: { libraryId: number }) {
           </div>
         )}
         {/* —— 整库刷新进度：全量重刷每部都要重下图，慢，状态给全 —— */}
-        {refreshingMeta && metaRefresh && (
+        {canManageLibraries && refreshingMeta && metaRefresh && (
           <MetadataRefreshPanel
             state={metaRefresh}
             onStop={() => {
@@ -591,18 +597,20 @@ export function LibraryDetailView({ libraryId }: { libraryId: number }) {
       </div>
 
       {/* —— 工单抽屉：缺失 / 待识别 / 身份复核 / 已忽略，从头部胶囊进入 —— */}
-      <IssueDrawer
-        open={issueTab}
-        onClose={() => setIssueTab(null)}
-        onSwitchTab={setIssueTab}
-        libraryId={libraryId}
-        missing={missing}
-        unidentified={unidentified}
-        review={review}
-        ignored={ignored}
-        movie={library.kind === "movie"}
-        onChanged={reload}
-      />
+      {canManageLibraries && (
+        <IssueDrawer
+          open={issueTab}
+          onClose={() => setIssueTab(null)}
+          onSwitchTab={setIssueTab}
+          libraryId={libraryId}
+          missing={missing}
+          unidentified={unidentified}
+          review={review}
+          ignored={ignored}
+          movie={library.kind === "movie"}
+          onChanged={reload}
+        />
+      )}
 
       {/* —— 追踪中（订阅已指向本库、文件未落地）：自动化正在进行的部分，置顶优先 —— */}
       {pending.length > 0 && (
@@ -626,7 +634,9 @@ export function LibraryDetailView({ libraryId }: { libraryId: number }) {
         <p className="mt-16 text-center text-ui leading-7 text-[var(--text-muted)]">
           这个库还没有内容。
           <br />
-          点右上角 ⋯ 里的「扫描库」把根路径下已有的影片识别入库；订阅的内容下载完成后也会自动进来。
+          {canManageLibraries
+            ? "点右上角菜单里的「扫描库」把已有影片识别入库；订阅内容下载完成后也会自动进来。"
+            : "订阅内容下载并入库后会显示在这里。"}
         </p>
       ) : (
         <>
@@ -665,20 +675,23 @@ export function LibraryDetailView({ libraryId }: { libraryId: number }) {
         </>
       )}
 
-      <LibraryFormDialog
-        state={editing}
-        onClose={() => setEditing(null)}
-        onSaved={() => {
-          setEditing(null);
-          reload();
-        }}
-      />
-
-      <LibraryOrganizeDialog
-        library={organizeTarget}
-        onClose={() => setOrganizeTarget(null)}
-        onChanged={reload}
-      />
+      {canManageLibraries && (
+        <>
+          <LibraryFormDialog
+            state={editing}
+            onClose={() => setEditing(null)}
+            onSaved={() => {
+              setEditing(null);
+              reload();
+            }}
+          />
+          <LibraryOrganizeDialog
+            library={organizeTarget}
+            onClose={() => setOrganizeTarget(null)}
+            onChanged={reload}
+          />
+        </>
+      )}
     </div>
   );
 }

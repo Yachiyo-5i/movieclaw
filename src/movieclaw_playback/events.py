@@ -166,6 +166,7 @@ async def build_marked_events(
     event: str,
     units: list[Unit],
     *,
+    member_id: int,
     client: ClientInfo | None = None,
 ) -> list[OutboundEvent]:
     """装配标记已看/未看事件：级联多单元逐条发，共享 batch_id 供下游聚合。"""
@@ -174,7 +175,7 @@ async def build_marked_events(
     item = await session.get(MediaItem, units[0][0])
     if item is None:
         return []
-    states = await get_states(session, [u[0] for u in units])
+    states = await get_states(session, [u[0] for u in units], member_id=member_id)
     titles = (
         await _episode_titles(session, units[0][0], units) if item.kind != "movie" else {}
     )

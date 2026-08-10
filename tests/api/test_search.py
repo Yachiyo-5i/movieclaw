@@ -73,10 +73,11 @@ def client(tmp_path, monkeypatch):
 
     from movieclaw_api.api.deps import require_login
     from movieclaw_api.app import create_app
+    from movieclaw_api.services.auth import Principal
 
     app = create_app()
     # 本文件只测搜索业务，登录鉴权用依赖覆盖绕过（鉴权本身在 test_auth 覆盖）
-    app.dependency_overrides[require_login] = lambda: "tester"
+    app.dependency_overrides[require_login] = lambda: Principal(kind="admin", name="tester")
     with TestClient(app) as c:  # with 块内触发 lifespan：建库、迁移、加载站点目录
         yield c
     get_settings.cache_clear()

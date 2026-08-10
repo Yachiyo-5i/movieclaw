@@ -7,6 +7,7 @@ import Link from "next/link";
 import { createPortal } from "react-dom";
 
 import { DirectoryPicker } from "@/components/directory-picker";
+import { ContentEmptyState } from "@/components/content-empty-state";
 import { useConfirm } from "@/components/feedback";
 import { HScroller } from "@/components/h-scroller";
 import { FilmIcon, FolderIcon, MoreIcon, PlusIcon, TvIcon, XIcon } from "@/components/icons";
@@ -37,6 +38,7 @@ import type { Subscription } from "@/lib/api/subscriptions";
 import { publicEnv } from "@/lib/env";
 import { imageUrl } from "@/lib/image-proxy";
 import type { MediaItem, MediaType } from "@/lib/media-types";
+import { usePermissions } from "@/lib/permissions";
 import { useVisiblePolling } from "@/lib/use-visible-polling";
 
 /** 库类型 → 展示名与图标 */
@@ -162,13 +164,14 @@ function routingOverlapWarnings(libraries: MediaLibrary[]): string[] {
  *     「缺失重下」够不着，建订阅是唯一补齐路径；订阅按 E−H 只补缺的集）。
  *     缺口按跨库判定：同一部剧的集分散在多个库时任一库有即算拥有，与订阅
  *     生成工单的口径一致，否则会出现「提示补齐但订阅一个工单都不生成」；
- *   - 其余（电影 / 完结齐全 / 播出状态未知）→ 静态「已入库」标识，不给死按钮。
+ *   - 其余（电影 / 完结齐全 / 播出状态未知）→ 不显示悬浮操作。媒体库语境已经
+ *     明确表示内容在库，再展示「已入库」只会增加一次无价值的触摸展开。
  */
 export function libraryCardAction(item: LibraryItem): PosterCardAction {
-  if (item.kind !== "tv") return "owned";
+  if (item.kind !== "tv") return "none";
   if (item.air_status === "airing") return "follow";
   if (item.air_status === "ended" && item.missing_episode_count > 0) return "backfill";
-  return "owned";
+  return "none";
 }
 
 /**
@@ -195,6 +198,7 @@ export function effectiveLibraryId(
  * 落账的文件聚合，不再用订阅占位。
  */
 export function LibraryView() {
+  const { canManageLibraries } = usePermissions();
   const [libraries, setLibraries] = useState<MediaLibrary[] | null>(null);
   const [itemsByLibrary, setItemsByLibrary] = useState<Map<number, LibraryItem[]>>(
     new Map(),
@@ -318,7 +322,7 @@ export function LibraryView() {
   }, [highlightId, libraries]);
 
   // 每个非空库一行「最近添加」：服务端已按最近入账倒序给到前 20，复用发现页的
-  // 横滚海报行；悬浮动作按条目三分支（追新/补齐/已入库，见 libraryCardAction）
+  // 横滚海报行；悬浮动作按条目三分支（追新/补齐/无操作，见 libraryCardAction）
   const recentRows = useMemo(
     () =>
       (libraries ?? [])
@@ -339,7 +343,7 @@ export function LibraryView() {
           return {
             library,
             items: recent.map(libraryItemToMediaItem),
-            actionOf: (m: MediaItem) => actions.get(m.id) ?? ("owned" as const),
+            actionOf: (m: MediaItem) => actions.get(m.id) ?? ("none" as const),
             hrefOf: (m: MediaItem) => hrefs.get(m.id),
           };
         })
@@ -358,14 +362,16 @@ export function LibraryView() {
             你的影视收藏在这里安家：订阅与下载的内容按「入库到哪个库」落盘，Plex / Emby 可直接识别
           </p>
         </div>
-        <button
-          type="button"
-          onClick={() => setEditing("new")}
-          className="btn-accent flex shrink-0 items-center justify-center gap-1 rounded-full py-2 pl-3 pr-4 text-ui font-semibold max-md:self-start"
-        >
-          <PlusIcon className="size-4" />
-          添加媒体库
-        </button>
+        {canManageLibraries && (
+          <button
+            type="button"
+            onClick={() => setEditing("new")}
+            className="btn-accent flex shrink-0 items-center justify-center gap-1 rounded-full py-2 pl-3 pr-4 text-ui font-semibold max-md:self-start"
+          >
+            <PlusIcon className="size-4" />
+            添加媒体库
+          </button>
+        )}
       </div>
 
       {error && (
@@ -376,7 +382,7 @@ export function LibraryView() {
 
       {/* 收藏范围重叠提示（只读不阻断）：同类型两库范围重叠且特异性相同时，
           命中顺序只能靠创建先后——亮出来让用户自己拍板要不要加条件消解 */}
-      {routingWarnings.map((w) => (
+      {canManageLibraries && routingWarnings.map((w) => (
         <div
           key={w}
           className="mx-6 mt-4 rounded-xl border border-amber-400/25 bg-amber-500/10 px-4 py-3 text-sub leading-relaxed text-amber-200 max-md:mx-4"
@@ -414,22 +420,27 @@ export function LibraryView() {
       )}
 
       {libraries !== null && libraries.length === 0 && (
-        <div className="mt-20 flex flex-col items-center gap-4 px-6 text-center">
-          <p className="text-body-lg font-semibold text-[var(--text)]">还没有媒体库</p>
-          <p className="max-w-[440px] text-ui leading-relaxed text-[var(--text-muted)]">
-            媒体库定义「内容放在哪」：订阅和下载完成的影片会整理进对应库的根目录，
-            Plex / Emby 指向同一目录即可识别。建议按类型分别创建，比如电影库、剧集库，
-            根路径选到你的媒体盘（Docker 部署时是挂进容器的那个路径）。
-          </p>
-          <button
-            type="button"
-            onClick={() => setEditing("new")}
-            className="btn-accent flex items-center gap-1 rounded-full py-2 pl-3 pr-4 text-ui font-semibold"
-          >
-            <PlusIcon className="size-4" />
-            创建第一个媒体库
-          </button>
-        </div>
+        <ContentEmptyState
+          variant="library"
+          title={canManageLibraries ? "为收藏准备一个家" : "还没有可浏览的媒体库"}
+          description={
+            canManageLibraries
+              ? "创建电影库或剧集库，选好根目录后，订阅完成的内容会自动整理到这里。"
+              : "当前账号暂时没有可浏览的媒体库，请联系管理员分配媒体库权限。"
+          }
+          action={
+            canManageLibraries ? (
+              <button
+                type="button"
+                onClick={() => setEditing("new")}
+                className="btn-accent flex items-center gap-1 rounded-full py-2 pl-3 pr-4 text-ui font-semibold"
+              >
+                <PlusIcon className="size-4" />
+                创建第一个媒体库
+              </button>
+            ) : undefined
+          }
+        />
       )}
 
       {/* 库卡片横排：库多了不换行堆高，改为一行横滚（与下方「最近添加」
@@ -447,6 +458,7 @@ export function LibraryView() {
               <LibraryCard
                 library={library}
                 items={itemsByLibrary.get(library.id) ?? []}
+                canManage={canManageLibraries}
                 onEdit={() => setEditing(library)}
                 onOrganize={() => setOrganizeTarget(library)}
                 onRefresh={reload}
@@ -480,24 +492,27 @@ export function LibraryView() {
         </div>
       )}
 
-      <LibraryFormDialog
-        state={editing}
-        onClose={() => setEditing(null)}
-        onSaved={(saved) => {
-          const isNew = editing === "new";
-          setEditing(null);
-          // 新库排在末位（按创建顺序），卡片区又是横滚——库多了新卡片直接
-          // 落在可视区外，用户以为"没建上"。滚进视野并短暂高亮
-          if (isNew) setHighlightId(saved.id);
-          reload();
-        }}
-      />
-
-      <LibraryOrganizeDialog
-        library={organizeTarget}
-        onClose={() => setOrganizeTarget(null)}
-        onChanged={reload}
-      />
+      {canManageLibraries && (
+        <>
+          <LibraryFormDialog
+            state={editing}
+            onClose={() => setEditing(null)}
+            onSaved={(saved) => {
+              const isNew = editing === "new";
+              setEditing(null);
+              // 新库排在末位（按创建顺序），卡片区又是横滚——库多了新卡片直接
+              // 落在可视区外，用户以为"没建上"。滚进视野并短暂高亮
+              if (isNew) setHighlightId(saved.id);
+              reload();
+            }}
+          />
+          <LibraryOrganizeDialog
+            library={organizeTarget}
+            onClose={() => setOrganizeTarget(null)}
+            onChanged={reload}
+          />
+        </>
+      )}
     </div>
   );
 }
@@ -538,6 +553,7 @@ function libraryItemToMediaItem(item: LibraryItem): MediaItem {
 function LibraryCard({
   library,
   items,
+  canManage,
   onEdit,
   onOrganize,
   onRefresh,
@@ -548,6 +564,7 @@ function LibraryCard({
 }: {
   library: MediaLibrary;
   items: LibraryItem[];
+  canManage: boolean;
   onEdit: () => void;
   onOrganize: () => void;
   onRefresh: () => void;
@@ -642,21 +659,23 @@ function LibraryCard({
         )}
       </div>
       {/* 管理操作：悬停浮现在右上角（Link 外层，避免点菜单触发跳转） */}
-      <LibraryCardMenu
-        library={library}
-        onEdit={onEdit}
-        onScan={() => {
-          void startLibraryScan(library.id)
-            .then(onRefresh)
-            .catch((e) => onError((e as Error).message));
-        }}
-        onOrganize={onOrganize}
-        onRefresh={onRefresh}
-        onError={onError}
-        canMoveLeft={canMoveLeft}
-        canMoveRight={canMoveRight}
-        onMove={onMove}
-      />
+      {canManage && (
+        <LibraryCardMenu
+          library={library}
+          onEdit={onEdit}
+          onScan={() => {
+            void startLibraryScan(library.id)
+              .then(onRefresh)
+              .catch((e) => onError((e as Error).message));
+          }}
+          onOrganize={onOrganize}
+          onRefresh={onRefresh}
+          onError={onError}
+          canMoveLeft={canMoveLeft}
+          canMoveRight={canMoveRight}
+          onMove={onMove}
+        />
+      )}
     </div>
   );
 }

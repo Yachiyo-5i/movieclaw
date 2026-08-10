@@ -1,10 +1,12 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { useRouter } from "next/navigation";
+import type { Route } from "next";
+import { usePathname, useRouter } from "next/navigation";
 
 import { getBootstrapStatus, getSession, type SessionView } from "@/lib/api/auth";
 import { SessionProvider } from "@/lib/session";
+import { accessiblePathFor } from "@/lib/permissions";
 
 /**
  * 首页的鉴权门：在确认登录状态之前不渲染工作台，消除
@@ -18,6 +20,7 @@ import { SessionProvider } from "@/lib/session";
  */
 export function AuthGate({ children }: { children: React.ReactNode }) {
   const router = useRouter();
+  const pathname = usePathname();
   const [session, setSession] = useState<SessionView | null>(null);
 
   useEffect(() => {
@@ -31,7 +34,13 @@ export function AuthGate({ children }: { children: React.ReactNode }) {
           return;
         }
         const view = await getSession(); // 未登录时抛 401，http.ts 拦截并整页跳 /login
-        if (!cancelled) setSession(view);
+        if (cancelled) return;
+        const allowedPath = accessiblePathFor(view, pathname);
+        if (allowedPath !== pathname) {
+          router.replace(allowedPath as Route);
+          return;
+        }
+        setSession(view);
       } catch {
         // 401 的跳转已由 http.ts 发起；其他异常（后端未起）保持启动页，
         // 用户刷新即可重试，不至于把挂掉的工作台渲染出来。
@@ -40,7 +49,7 @@ export function AuthGate({ children }: { children: React.ReactNode }) {
     return () => {
       cancelled = true;
     };
-  }, [router]);
+  }, [pathname, router]);
 
   if (!session) {
     // 启动页：背景大图由 body::before 提供，这里不需要渲染任何内容

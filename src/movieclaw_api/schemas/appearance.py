@@ -17,9 +17,9 @@ class BackdropItem(BaseModel):
 class AppearanceView(BaseModel):
     """外观设置的对外视图。
 
-    背景图是一个「图库」：用户上传的图全部保留（``backdrops``，按上传时间升序），
-    其中至多一张为当前生效图（``active_id`` / ``active_url``）。二者为空表示
-    正在使用内置默认背景——默认背景是前端内置资源，不出现在图库列表里。
+    背景图是按账号隔离的「图库」：用户上传的图全部保留（``backdrops``，按上传
+    时间升序），其中至多一张为当前生效图（``active_id`` / ``active_url``）。
+    二者为空表示正在使用内置默认背景——默认背景是前端内置资源，不出现在图库列表里。
     """
 
     active_id: str | None = Field(

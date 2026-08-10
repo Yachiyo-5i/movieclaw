@@ -24,6 +24,7 @@ import {
   type SeasonOverview,
   type SubscriptionDetail,
 } from "@/lib/api/subscriptions";
+import { usePermissions } from "@/lib/permissions";
 
 export function SubscriptionAdjustDialog({
   detail,
@@ -35,6 +36,7 @@ export function SubscriptionAdjustDialog({
   /** 保存成功后由调用方刷新详情 */
   onSaved: () => void;
 }) {
+  const { canManageSubscriptions } = usePermissions();
   const toast = useToast();
   const isMovie = detail.media.kind === "movie";
   // null = 加载中；[] 也是有效结果（电影没有季）
@@ -59,7 +61,9 @@ export function SubscriptionAdjustDialog({
             kind: detail.media.kind,
             tmdb_id: detail.media.tmdb_id,
           }),
-      listLibraries(detail.media.kind),
+      canManageSubscriptions
+        ? listLibraries(detail.media.kind)
+        : Promise.resolve([]),
     ])
       .then(([prepared, libs]) => {
         if (cancelled) return;
@@ -72,10 +76,14 @@ export function SubscriptionAdjustDialog({
     return () => {
       cancelled = true;
     };
-  }, [detail.media.kind, detail.media.tmdb_id, isMovie]);
+  }, [canManageSubscriptions, detail.media.kind, detail.media.tmdb_id, isMovie]);
 
   // 选库即预演投递落点（与订阅弹窗同一套提示；null=该类型默认库也预演）
   useEffect(() => {
+    if (!canManageSubscriptions) {
+      setPreview(null);
+      return;
+    }
     let cancelled = false;
     setPreview(null);
     getDispatchPreview(detail.media.kind, libraryId, detail.media.tmdb_id)
@@ -86,7 +94,7 @@ export function SubscriptionAdjustDialog({
     return () => {
       cancelled = true;
     };
-  }, [detail.media.kind, detail.media.tmdb_id, libraryId]);
+  }, [canManageSubscriptions, detail.media.kind, detail.media.tmdb_id, libraryId]);
 
   const toggleSeason = (n: number) =>
     setSelectedSeasons((prev) => {
@@ -115,9 +123,9 @@ export function SubscriptionAdjustDialog({
     return {
       seasons: seasonsChanged,
       follow: !isMovie && followFuture !== detail.follow_future,
-      library: libraryId !== detail.library_id,
+      library: canManageSubscriptions && libraryId !== detail.library_id,
     };
-  }, [detail, followFuture, isMovie, libraryId, selectedSeasons]);
+  }, [canManageSubscriptions, detail, followFuture, isMovie, libraryId, selectedSeasons]);
   const dirty = changed.seasons || changed.follow || changed.library;
 
   const save = async () => {
@@ -130,7 +138,7 @@ export function SubscriptionAdjustDialog({
           : {}),
         ...(changed.follow ? { follow_future: followFuture } : {}),
         // 显式带上 null 即「清除指定库、改回默认库路由」（后端区分未传与 null）
-        ...(changed.library ? { library_id: libraryId } : {}),
+        ...(canManageSubscriptions && changed.library ? { library_id: libraryId } : {}),
       });
       toast.success("订阅已调整");
       onSaved();
@@ -204,7 +212,7 @@ export function SubscriptionAdjustDialog({
             </section>
           )}
 
-          {libraries.length > 0 && (
+          {canManageSubscriptions && libraries.length > 0 && (
             <section>
               <h3 className="mb-2 text-ui font-semibold text-white/85">入库到</h3>
               {/* 旧订阅 library_id 可能为 null（按默认库路由）：给它一个显式占位项，

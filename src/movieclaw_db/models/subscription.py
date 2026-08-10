@@ -94,6 +94,53 @@ class Subscription(TimestampMixin, table=True):
         description="active / paused / completed（见 SubscriptionStatus 注释）",
     )
 
+    # -- 归属（docs/design/member-management.md §3.5）-----------------------
+    # NULL = 超管发起。成员被删除时外键 SET NULL——订阅自动转为超管发起，
+    # 绝不连带删除订阅与下载任务（资源是全家的）。
+    created_by_member_id: int | None = Field(
+        default=None,
+        sa_column=Column(
+            Integer,
+            ForeignKey("member.id", ondelete="SET NULL"),
+            nullable=True,
+            index=True,
+        ),
+        description="发起成员；NULL=超管发起",
+    )
+
+
+class SubscriptionFollower(TimestampMixin, table=True):
+    """订阅关注——成员 × 订阅 的多对多（docs/design/member-management.md §3.5）。
+
+    订阅保持全局唯一（同一作品一份下载全家共享），第二个成员再订同一部时
+    幂等转为关注：订阅出现在他的「我的订阅」里，但期望集合 E 不变。
+    取消关注只删本行；发起人取消且仍有关注者时，发起人转移给最早的关注者
+    （订阅继续活着）——成员的取消永远不影响别人正在追的内容。
+    """
+
+    __tablename__ = "subscription_follower"
+    __table_args__ = (
+        UniqueConstraint("subscription_id", "member_id", name="uq_subscription_follower"),
+    )
+
+    id: int | None = Field(default=None, primary_key=True)
+    subscription_id: int = Field(
+        sa_column=Column(
+            Integer,
+            ForeignKey("subscription.id", ondelete="CASCADE"),
+            nullable=False,
+            index=True,
+        )
+    )
+    member_id: int = Field(
+        sa_column=Column(
+            Integer,
+            ForeignKey("member.id", ondelete="CASCADE"),
+            nullable=False,
+            index=True,
+        )
+    )
+
 
 class WantedItem(TimestampMixin, table=True):
     """工单——期望单元及其满足状态的物化（不只是缺口）。

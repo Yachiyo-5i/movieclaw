@@ -238,12 +238,21 @@ async def load_bundles(
     session: AsyncSession,
     item_ids: list[int],
     *,
+    member_id: int = 0,
     library_id: int | None = None,
+    visible_library_ids: set[int] | None = None,
     include_people: bool = False,
     include_fileless: bool = False,
     dto_options: DtoOptions | None = None,
 ) -> dict[int, ItemBundle]:
-    """批量装载条目素材。library_id 限定时只装该库的文件行。
+    """批量装载条目素材。库参数限定时只装对应范围内的文件行。
+
+    ``member_id``：观看者（0=超管哨兵）——bundle 里的播放状态只装该
+    成员自己的行，UserData（进度/已看/收藏）随之按人投影。
+
+    ``visible_library_ids``：成员可见库范围。条目可能同时存在于多个库，
+    不能只在进入详情前判断“至少有一份可见”，否则 DTO 会夹带隐藏库的
+    MediaSourceId，播放器选择后又在取流层被 404，形成“能看见但播不了”。
 
     ``include_people`` 只在输出会用到 People 时为 True（fields=People 或
     单条目全字段）：演职员是量最大的关联（条目数 × 十余人的 join +
@@ -292,6 +301,8 @@ async def load_bundles(
     )
     if library_id is not None:
         file_q = file_q.where(LibraryFile.library_id == library_id)
+    if visible_library_ids is not None:
+        file_q = file_q.where(LibraryFile.library_id.in_(visible_library_ids))
     if summary_columns is not None:
         file_q = file_q.options(load_only(*summary_columns[2]))
     for f in (await session.execute(file_q)).scalars():
@@ -314,7 +325,10 @@ async def load_bundles(
 
     for st in (
         await session.execute(
-            select(PlaybackState).where(PlaybackState.media_item_id.in_(item_ids))
+            select(PlaybackState).where(
+                PlaybackState.media_item_id.in_(item_ids),
+                PlaybackState.member_id == member_id,
+            )
         )
     ).scalars():
         b = bundles.get(st.media_item_id)
@@ -350,7 +364,9 @@ async def load_bundles(
 async def latest_unit_candidates(
     session: AsyncSession,
     *,
+    member_id: int = 0,
     library_id: int | None = None,
+    visible_library_ids: set[int] | None = None,
     is_played: bool | None = None,
 ) -> list[LatestUnitCandidate]:
     """只查询 Latest 的排序单元，延后到选页后再装载 bundle。
@@ -378,6 +394,8 @@ async def latest_unit_candidates(
     )
     if library_id is not None:
         q = q.where(LibraryFile.library_id == library_id)
+    if visible_library_ids is not None:
+        q = q.where(LibraryFile.library_id.in_(visible_library_ids))
     if is_played is not None:
         q = q.outerjoin(
             PlaybackState,
@@ -385,6 +403,7 @@ async def latest_unit_candidates(
                 PlaybackState.media_item_id == LibraryFile.media_item_id,
                 PlaybackState.season_number == LibraryFile.season_number,
                 PlaybackState.episode_number == LibraryFile.episode_number,
+                PlaybackState.member_id == member_id,
             ),
         )
         if is_played:
@@ -418,18 +437,22 @@ async def latest_unit_candidates(
     ]
 
 
-async def resume_unit_candidates(session: AsyncSession) -> list[ResumeUnitCandidate]:
-    """查询有续播位置且文件仍在位的单元，不加载未进入结果页的 bundle。"""
-    file_exists = (
-        select(LibraryFile.id)
-        .where(
-            LibraryFile.media_item_id == PlaybackState.media_item_id,
-            LibraryFile.season_number == PlaybackState.season_number,
-            LibraryFile.episode_number == PlaybackState.episode_number,
-            LibraryFile.missing_since.is_(None),
-        )
-        .exists()
-    )
+async def resume_unit_candidates(
+    session: AsyncSession,
+    *,
+    member_id: int = 0,
+    visible_library_ids: set[int] | None = None,
+) -> list[ResumeUnitCandidate]:
+    """查询该成员有续播位置且文件仍在位的单元，不加载未进入结果页的 bundle。"""
+    file_conditions = [
+        LibraryFile.media_item_id == PlaybackState.media_item_id,
+        LibraryFile.season_number == PlaybackState.season_number,
+        LibraryFile.episode_number == PlaybackState.episode_number,
+        LibraryFile.missing_since.is_(None),
+    ]
+    if visible_library_ids is not None:
+        file_conditions.append(LibraryFile.library_id.in_(visible_library_ids))
+    file_exists = select(LibraryFile.id).where(*file_conditions).exists()
     q = (
         select(
             PlaybackState.media_item_id,
@@ -438,6 +461,7 @@ async def resume_unit_candidates(session: AsyncSession) -> list[ResumeUnitCandid
         )
         .join(MediaItem, MediaItem.id == PlaybackState.media_item_id)
         .where(
+            PlaybackState.member_id == member_id,
             PlaybackState.position_ms > 0,
             file_exists,
             or_(
@@ -468,9 +492,9 @@ async def resume_unit_candidates(session: AsyncSession) -> list[ResumeUnitCandid
 
 
 async def next_up_item_ids(
-    session: AsyncSession, *, series_id: int | None = None
+    session: AsyncSession, *, member_id: int = 0, series_id: int | None = None
 ) -> list[int]:
-    """返回有在位文件和播放活动的剧集 id，供 NextUp 延后加载。"""
+    """返回该成员有在位文件和播放活动的剧集 id，供 NextUp 延后加载。"""
     file_exists = (
         select(LibraryFile.id)
         .where(
@@ -486,6 +510,7 @@ async def next_up_item_ids(
         .join(MediaItem, MediaItem.id == PlaybackState.media_item_id)
         .where(
             MediaItem.kind == "tv",
+            PlaybackState.member_id == member_id,
             PlaybackState.season_number != 0,
             or_(PlaybackState.played.is_(True), PlaybackState.position_ms > 0),
             file_exists,
@@ -540,8 +565,10 @@ async def item_ids_with_files(
     *,
     kind: str | None = None,
     library_id: int | None = None,
+    visible_library_ids: set[int] | None = None,
 ) -> list[int]:
-    """有在位文件的条目 id 集合（粗筛）。"""
+    """有在位文件的条目 id 集合（粗筛）。``visible_library_ids`` 限定成员
+    可见库（None=不受限）——跨库递归查询的可见性收口点。"""
     q = (
         select(LibraryFile.media_item_id)
         .where(LibraryFile.media_item_id.is_not(None), LibraryFile.missing_since.is_(None))
@@ -549,6 +576,8 @@ async def item_ids_with_files(
     )
     if library_id is not None:
         q = q.where(LibraryFile.library_id == library_id)
+    if visible_library_ids is not None:
+        q = q.where(LibraryFile.library_id.in_(visible_library_ids))
     ids = [row for row in (await session.execute(q)).scalars()]
     if kind is None or not ids:
         return ids
@@ -560,8 +589,14 @@ async def item_ids_with_files(
     return list(kind_ids)
 
 
-async def list_libraries(session: AsyncSession) -> list[Library]:
-    return list((await session.execute(select(Library))).scalars())
+async def list_libraries(
+    session: AsyncSession, *, visible_ids: set[int] | None = None
+) -> list[Library]:
+    """全部库；``visible_ids`` 限定成员可见库（None=不受限）。"""
+    q = select(Library)
+    if visible_ids is not None:
+        q = q.where(Library.id.in_(visible_ids))
+    return list((await session.execute(q)).scalars())
 
 
 @dataclass

@@ -11,6 +11,7 @@ import { AvatarBadge } from "@/components/avatar-badge";
 import { DownloaderConfigSection } from "@/components/downloader-config-section";
 import { useConfirm } from "@/components/feedback";
 import { ImportWatchSection } from "@/components/import-watch-section";
+import { MembersSection } from "@/components/members-section";
 import { LlmConfigSection } from "@/components/llm-config-section";
 import { ImPushSection } from "@/components/im-push-section";
 import { NetworkConfigSection } from "@/components/network-config-section";
@@ -26,7 +27,7 @@ import { changePassword, updateProfile, uploadAvatar } from "@/lib/api/auth";
 import { DEFAULT_UI_PREFS } from "@/lib/api/ui";
 import { HttpError } from "@/lib/http";
 import { useSession } from "@/lib/session";
-import { settingsSectionGroups, settingsSections } from "@/lib/mock-data";
+import { settingsSectionGroupsFor, settingsSections } from "@/lib/mock-data";
 import { useUiPrefs } from "@/lib/ui-prefs";
 
 /**
@@ -41,13 +42,16 @@ export interface SettingsSidebarProps {
 
 export function SettingsSidebar({ active, onSelect, onBack }: SettingsSidebarProps) {
   const { backdrop } = useBackdrop();
+  // 成员只看到「通用」组（个人信息/外观）；管理分区后端一律 403，前端不给入口
+  const { session } = useSession();
+  const sectionGroups = settingsSectionGroupsFor(session.role);
   // 与工作台侧栏共用同一份用户偏好（透明度/明暗）；外观分区拖动滑杆时，
   // 这块面板就是实时预览的对象。
   const { prefs } = useUiPrefs();
   const glass = sidebarGlass(prefs.sidebar);
   // 有可用更新时给「应用」分区行点一颗小蓝点：从别的入口进了设置，也能
   // 一眼看出更新在哪一栏（与侧栏更新入口同一份快照数据）
-  const pendingUpdate = usePendingUpdate();
+  const pendingUpdate = usePendingUpdate(session.role !== "member");
   return (
     <GlassPanel
       backgroundImage={backdrop}
@@ -79,7 +83,7 @@ export function SettingsSidebar({ active, onSelect, onBack }: SettingsSidebarPro
       {/* 分区列表：标准 SaaS 设置菜单——紧凑单行（小图标内联 + 标签），
           描述只在右侧面板头部展示，选中态仍用亮胶囊表达 */}
       <nav className="scroll-thin flex-1 space-y-4 overflow-y-auto px-3 pb-4">
-        {settingsSectionGroups.map((group) => (
+        {sectionGroups.map((group) => (
           <div key={group.label}>
             <h3 className="group-label mb-1.5 px-2">{group.label}</h3>
             <div className="space-y-0.5">
@@ -118,7 +122,12 @@ export interface SettingsPanelProps {
 }
 
 export function SettingsPanel({ active }: SettingsPanelProps) {
-  const section = settingsSections.find((s) => s.id === active) ?? settingsSections[0];
+  // 成员直达管理分区地址（书签/手输 URL）时回退到个人信息——界面兜底，
+  // 真正的安全边界在后端 403
+  const { session } = useSession();
+  const allowed = settingsSectionGroupsFor(session.role).flatMap((g) => g.items);
+  const section =
+    allowed.find((s) => s.id === active) ?? allowed[0] ?? settingsSections[0];
   const Icon = section.icon;
 
   return (
@@ -167,6 +176,8 @@ export function SettingsPanel({ active }: SettingsPanelProps) {
           <LlmConfigSection />
         ) : section.id === "im-push" ? (
           <ImPushSection />
+        ) : section.id === "members" ? (
+          <MembersSection />
         ) : section.id === "app" ? (
           <AppSection />
         ) : section.id === "webhook" ? (
@@ -259,7 +270,7 @@ function ProfileSection() {
           <div className="flex flex-wrap items-center gap-x-2.5 gap-y-1">
             <p className="text-xl font-semibold tracking-tight">{session.nickname}</p>
             <span className="rounded-full border border-white/[0.12] bg-[var(--accent-soft)] px-2.5 py-0.5 text-caption font-semibold text-[var(--accent)]">
-              超级管理员
+              {session.role === "member" ? "成员" : "超级管理员"}
             </span>
           </div>
           <p className="mt-1 text-body text-[var(--text-muted)]">@{session.username}</p>
@@ -465,6 +476,7 @@ function ChangePasswordCard() {
  */
 function AppSection() {
   const [tab, setTab] = useState<"update" | "maintain">("update");
+  // 本分区只对管理员渲染（成员的分区清单里没有 app），无需再按角色关轮询
   const pendingUpdate = usePendingUpdate();
   const tabs = [
     { id: "update" as const, label: "版本与更新" },
@@ -548,8 +560,8 @@ function AppearanceSection() {
  *      当前项带高亮环 + 对勾；hover 自定义瓷砖浮出 × 可单独删除；上传是「+」瓷砖；
  *   3) 大预览即投放区：hover 浮出更换按钮，拖图片进来直接换，点击任意处打开文件选择。
  *
- * 上传的图**全部保留**在服务端图库（data/uploads/backdrops），想传几张传几张
- * （上限 20 张），随时点选切换；切回默认不删图，只有点瓷砖上的 × 才真正删除。
+ * 上传的图**全部保留**在当前账号的服务端图库，成员之间互不可见；每个账号
+ * 最多 20 张，可随时点选切换。切回默认不删图，只有点瓷砖上的 × 才真正删除。
  * 生效图同时驱动 body::before 铺底与所有液态玻璃面板的折射纹理（见 lib/backdrop.tsx）。
  */
 function BackdropGroup() {

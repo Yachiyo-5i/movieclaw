@@ -10,6 +10,7 @@ import { PosterImage } from "@/components/poster-image";
 import { useSubscribeEntry } from "@/components/subscribe-entry";
 import { useMediaDetail } from "@/lib/media-detail";
 import type { MediaItem, MediaLibraryStatus, MediaType } from "@/lib/media-types";
+import { usePermissions } from "@/lib/permissions";
 import { useMediaQuery } from "@/lib/use-media-query";
 import { useTapGuard } from "@/lib/use-tap-guard";
 
@@ -99,10 +100,20 @@ export function PosterCardVisual({
   href?: Route;
   action?: PosterCardAction;
 }) {
-  // 触摸端没有 hover，信息层（类型/简介/订阅操作）原本永远展不开。交互对齐
-  // 桌面的两段式：第一次点按只「展开」信息层（等价于鼠标悬停），看清操作后
-  // 再点海报才进详情；点卡片外任意处收起。之前的方案是在海报角上常驻一枚
-  // 订阅圆键，但图标无文案表意不清，且张张海报都印着按钮、墙面很吵。
+  const { canSubscribe } = usePermissions();
+  const hasSubscribeAction =
+    action === "subscribe" || action === "follow" || action === "backfill";
+  const showOverlayAction = action === "owned" || (hasSubscribeAction && canSubscribe);
+  const showOverlay = Boolean(
+    item.genres?.length || item.overview?.trim() || showOverlayAction,
+  );
+  // 触摸端只有存在可点击的次级操作时才需要「首次展开」。纯信息层或无权限
+  // 动作直接进入详情，避免用户点到一个空层后还得再点一次。
+  const revealOnTouch = hasSubscribeAction && canSubscribe;
+  // 触摸端没有 hover：存在订阅操作时，第一次点按只「展开」信息层（等价于
+  // 鼠标悬停），看清操作后再点海报才进详情；没有次级操作则单击直达详情。
+  // 点卡片外任意处收起。之前的方案是在海报角上常驻一枚订阅圆键，但图标
+  // 无文案表意不清，且张张海报都印着按钮、墙面很吵。
   const noHover = useMediaQuery("(hover: none)");
   const [revealed, setRevealed] = useState(false);
   const rootRef = useRef<HTMLElement | null>(null);
@@ -123,7 +134,7 @@ export function PosterCardVisual({
   const tapGuard = useTapGuard(
     onClick &&
       (() => {
-        if (noHover && !revealed) {
+        if (noHover && revealOnTouch && !revealed) {
           setRevealed(true);
           return;
         }
@@ -134,12 +145,19 @@ export function PosterCardVisual({
   const onLinkClick = (e: MouseEvent) => {
     tapGuard.onClick(e);
     if (e.defaultPrevented) return;
-    if (noHover && !revealed) {
+    if (noHover && revealOnTouch && !revealed) {
       e.preventDefault();
       setRevealed(true);
     }
   };
-  const content = <PosterCardContent item={item} action={action} />;
+  const content = (
+    <PosterCardContent
+      item={item}
+      action={action}
+      showOverlay={showOverlay}
+      showOverlayAction={showOverlayAction}
+    />
+  );
   const interactiveClass =
     "group/card block w-full cursor-pointer rounded-2xl text-left outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent-ring)]";
   if (href) {
@@ -174,9 +192,13 @@ export function PosterCardVisual({
 function PosterCardContent({
   item,
   action = "subscribe",
+  showOverlay,
+  showOverlayAction,
 }: {
   item: PosterVisualItem;
   action?: PosterCardAction;
+  showOverlay: boolean;
+  showOverlayAction: boolean;
 }) {
   const badges = item.badges ?? [];
   const genres = item.genres ?? [];
@@ -207,26 +229,28 @@ function PosterCardContent({
           </span>
         )}
 
-        {/* hover 信息层：底部渐变升起，展示类型 / 简介 / 快捷操作。
-            触摸端由「首次点按」触发（根节点的 data-revealed，见 PosterCardVisual），
-            与桌面 hover 是同一层——手机上不再另设常驻的角落圆键。 */}
-        <div className="absolute inset-x-0 bottom-0 translate-y-3 bg-gradient-to-t from-black/90 via-black/60 to-transparent px-3 pb-3 pt-10 opacity-0 transition-all duration-300 ease-out group-hover/card:translate-y-0 group-hover/card:opacity-100 group-data-[revealed=true]/card:translate-y-0 group-data-[revealed=true]/card:opacity-100">
-          {genres.length > 0 && (
-            <p className="text-caption font-medium text-[var(--accent-2)]">
-              {genres.join(" · ")}
-            </p>
-          )}
-          {overview && (
-            <p className="mt-1 line-clamp-3 text-caption leading-4 text-white/75">
-              {overview}
-            </p>
-          )}
-          {action !== "none" && (
-            <div className="mt-2.5 flex items-center gap-2">
-              <PosterCardActionButton item={item} action={action} />
-            </div>
-          )}
-        </div>
+        {/* hover 信息层：底部渐变升起，展示类型 / 简介 / 快捷操作。有可点击的
+            次级操作时，触摸端由首次点按触发（根节点的 data-revealed）；纯信息层
+            不拦截主导航——手机单击直接进入详情。 */}
+        {showOverlay && (
+          <div className="absolute inset-x-0 bottom-0 translate-y-3 bg-gradient-to-t from-black/90 via-black/60 to-transparent px-3 pb-3 pt-10 opacity-0 transition-all duration-300 ease-out group-hover/card:translate-y-0 group-hover/card:opacity-100 group-data-[revealed=true]/card:translate-y-0 group-data-[revealed=true]/card:opacity-100">
+            {genres.length > 0 && (
+              <p className="text-caption font-medium text-[var(--accent-2)]">
+                {genres.join(" · ")}
+              </p>
+            )}
+            {overview && (
+              <p className="mt-1 line-clamp-3 text-caption leading-4 text-white/75">
+                {overview}
+              </p>
+            )}
+            {showOverlayAction && (
+              <div className="mt-2.5 flex items-center gap-2">
+                <PosterCardActionButton item={item} action={action} />
+              </div>
+            )}
+          </div>
+        )}
       </div>
 
       {/* 文字区：常显标题 + 元信息（压在背景大图上，需 text-on-image 投影保证可读） */}
@@ -265,7 +289,7 @@ function PosterCardActionButton({
   item: PosterVisualItem;
   action: PosterCardAction;
 }) {
-  const { open: openSubscribe, subscriptionOf } = useSubscribeEntry();
+  const { canSubscribe, open: openSubscribe, subscriptionOf } = useSubscribeEntry();
   // 订阅入口类动作（subscribe/follow/backfill）才需要判断订阅状态；owned/none 不查询
   const subscribeMeta =
     action === "subscribe" || action === "follow" || action === "backfill"
@@ -286,6 +310,7 @@ function PosterCardActionButton({
       </span>
     );
   }
+  if (!canSubscribe) return null;
 
   const label = existingSub
     ? `管理《${item.title}》的订阅`

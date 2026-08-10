@@ -5,6 +5,38 @@ import { useEffect, useState } from "react";
 import { CheckIcon, CopyIcon } from "@/components/icons";
 
 /**
+ * 统一写入剪贴板：HTTPS/localhost 优先使用 Clipboard API；局域网 HTTP 环境下
+ * Clipboard API 通常不可用，因此回退到临时 textarea + execCommand。
+ */
+export async function copyText(text: string): Promise<void> {
+  if (navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return;
+    } catch {
+      // 权限策略或非安全上下文可能拒绝，继续走兼容路径。
+    }
+  }
+
+  const textarea = document.createElement("textarea");
+  textarea.value = text;
+  textarea.readOnly = true;
+  textarea.style.position = "fixed";
+  textarea.style.left = "-9999px";
+  textarea.style.opacity = "0";
+  document.body.appendChild(textarea);
+  textarea.select();
+  textarea.setSelectionRange(0, text.length);
+  let copied = false;
+  try {
+    copied = document.execCommand("copy");
+  } finally {
+    textarea.remove();
+  }
+  if (!copied) throw new Error("浏览器拒绝访问剪贴板");
+}
+
+/**
  * 复制按钮（全站统一）：点一下把 text 写进剪贴板，图标切成对勾并停留 1.6 秒
  * ——复制是「无声成功」的操作，没有这一下回执，用户不知道到底复制上没有。
  *
@@ -37,7 +69,9 @@ export function CopyButton({
       aria-label={label ? undefined : copied ? "已复制" : "复制"}
       onClick={(event) => {
         event.stopPropagation();
-        void navigator.clipboard?.writeText(text).then(() => setCopied(true));
+        void copyText(text)
+          .then(() => setCopied(true))
+          .catch(() => {});
       }}
       className={`inline-flex items-center gap-1 rounded-md transition-colors ${className}`}
     >

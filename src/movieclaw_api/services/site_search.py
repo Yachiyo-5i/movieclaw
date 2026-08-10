@@ -112,6 +112,7 @@ async def stream_search_all_sites(
     site_ids: list[str] | None = None,
     label: str | None = None,
     page: int = 1,
+    allowed_site_ids: set[str] | None = None,
 ) -> AsyncIterator[tuple[str, BaseModel]]:
     """流式跨站搜索：按「站点实际完成的先后」逐个产出事件，供 SSE 端点直接转发。
 
@@ -129,8 +130,13 @@ async def stream_search_all_sites(
         （禁用/验证未通过）时直接跳过，不产生错误——口径与「全部站点」一致。
     :param label: 本次搜索的展示名（分类中文名/自定义分类名），原样回显给前端。
     :param page: 页码（各站点独立分页，不做跨站统一分页）。
+    :param allowed_site_ids: 成员的可用站点白名单（None=不受限）。这是站点
+        可见性的**服务端强制点**：白名单外的站点静默排除（不产生错误事件，
+        白名单外的站点名因此不出现在任何响应里），前端勾选也绕不过。
     """
     sites = await _active_sites()
+    if allowed_site_ids is not None:
+        sites = [c for c in sites if c.site_id in allowed_site_ids]
     if site_ids:
         wanted = set(site_ids)
         sites = [c for c in sites if c.site_id in wanted]
@@ -209,6 +215,7 @@ async def search_all_sites(
     site_ids: list[str] | None = None,
     label: str | None = None,
     page: int = 1,
+    allowed_site_ids: set[str] | None = None,
 ) -> SearchResponse:
     """并发搜索可用站点并合并结果（阻塞版：等全部站点返回后一次性给出）。
 
@@ -218,7 +225,12 @@ async def search_all_sites(
     items: list[TorrentHit] = []
     statuses: list[SiteSearchStatus] = []
     async for event, payload in stream_search_all_sites(
-        keyword=keyword, categories=categories, site_ids=site_ids, label=label, page=page
+        keyword=keyword,
+        categories=categories,
+        site_ids=site_ids,
+        label=label,
+        page=page,
+        allowed_site_ids=allowed_site_ids,
     ):
         if event == "site_result":
             assert isinstance(payload, SiteStreamResult)

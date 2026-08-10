@@ -5,11 +5,14 @@ import { useCallback, useEffect, useState } from "react";
 import type { Route } from "next";
 import Link from "next/link";
 
+import { ContentEmptyState } from "@/components/content-empty-state";
+import { CompassIcon } from "@/components/icons";
 import { PosterCardVisual, type PosterVisualItem } from "@/components/poster-card";
 import { useSubscribeEntry } from "@/components/subscribe-entry";
 import { getPipelineHealth, type Subscription } from "@/lib/api/subscriptions";
 import { cachedImageUrl } from "@/lib/image-proxy";
 import { usePageChrome } from "@/lib/page-chrome";
+import { usePermissions } from "@/lib/permissions";
 import {
   subscriptionProgressNote,
   subscriptionStatusMeta,
@@ -29,6 +32,7 @@ import { useIsMobile } from "@/lib/use-media-query";
  * 让用户不点进详情也能扫读全部订阅的追踪进度。
  */
 export function SubscriptionsView() {
+  const { canManageSubscriptions, canSubscribe } = usePermissions();
   const [mediaType, setMediaType] = useState<"movie" | "tv">("movie");
   const { subscriptions, refresh } = useSubscribeEntry();
   const [failed, setFailed] = useState(false);
@@ -39,12 +43,16 @@ export function SubscriptionsView() {
   const reload = useCallback(() => {
     setFailed(false);
     void refresh().then((ok) => setFailed(!ok));
-    void getPipelineHealth()
-      .then((h) =>
-        setHealthIssue(h.status === "error" ? { libraryErrors: h.error_count } : null),
-      )
-      .catch(() => setHealthIssue(null));
-  }, [refresh]);
+    if (canManageSubscriptions) {
+      void getPipelineHealth()
+        .then((h) =>
+          setHealthIssue(h.status === "error" ? { libraryErrors: h.error_count } : null),
+        )
+        .catch(() => setHealthIssue(null));
+    } else {
+      setHealthIssue(null);
+    }
+  }, [canManageSubscriptions, refresh]);
 
   useEffect(() => {
     reload();
@@ -81,7 +89,7 @@ export function SubscriptionsView() {
 
       {/* 链路警示横幅：只在体检整体为 error 时出现——订阅不会丢（工单退避
           重试），但在修好之前无法自动下载入库。点击进订阅设定看全景与修复 */}
-      {healthIssue && (
+      {canManageSubscriptions && healthIssue && (
         <Link
           href={"/settings/subscription" as Route}
           className="mx-6 mt-4 block rounded-xl border border-amber-400/25 bg-amber-500/10 px-4 py-3 text-sub leading-relaxed text-amber-200 transition hover:bg-amber-500/15 max-md:mx-4"
@@ -114,18 +122,39 @@ export function SubscriptionsView() {
       )}
 
       {subscriptions !== null && !failed && visible.length === 0 && (
-        <p className="mt-16 text-center text-ui leading-7 text-[var(--text-muted)]">
-          还没有订阅任何{mediaType === "movie" ? "电影" : "剧集"}。
-          <br />
-          在发现页或搜索结果里打开影片详情，点「订阅追踪」即可加入。
-        </p>
+        <ContentEmptyState
+          variant="subscription"
+          title={
+            subscriptions.length === 0
+              ? "从一部想看的作品开始"
+              : `还没有${mediaType === "movie" ? "电影" : "剧集"}订阅`
+          }
+          description={
+            canSubscribe
+              ? `去发现页挑选一部${mediaType === "movie" ? "电影" : "剧集"}，打开详情并点击「订阅追踪」，有合适资源时会自动下载入库。`
+              : "当前账号暂未开启订阅权限，请联系管理员为你开启。"
+          }
+          action={
+            canSubscribe ? (
+              <Link
+                href={`/discover/${mediaType}` as Route}
+                className="btn-accent flex items-center gap-1.5 rounded-full px-4 py-2 text-ui font-semibold"
+              >
+                <CompassIcon className="size-4" />
+                去发现{mediaType === "movie" ? "电影" : "剧集"}
+              </Link>
+            ) : undefined
+          }
+        />
       )}
 
-      <div className="mt-6 grid gap-x-4 gap-y-7 px-6 [grid-template-columns:repeat(auto-fill,minmax(148px,1fr))] max-md:mt-4 max-md:gap-x-3 max-md:gap-y-5 max-md:px-4 max-md:[grid-template-columns:repeat(auto-fill,minmax(140px,1fr))]">
-        {visible.map((sub) => (
-          <SubscriptionCell key={sub.id} sub={sub} />
-        ))}
-      </div>
+      {visible.length > 0 && (
+        <div className="mt-6 grid gap-x-4 gap-y-7 px-6 [grid-template-columns:repeat(auto-fill,minmax(148px,1fr))] max-md:mt-4 max-md:gap-x-3 max-md:gap-y-5 max-md:px-4 max-md:[grid-template-columns:repeat(auto-fill,minmax(140px,1fr))]">
+          {visible.map((sub) => (
+            <SubscriptionCell key={sub.id} sub={sub} />
+          ))}
+        </div>
+      )}
     </div>
   );
 }

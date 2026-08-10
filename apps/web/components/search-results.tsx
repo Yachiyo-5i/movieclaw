@@ -25,6 +25,7 @@ import {
 } from "@/components/download-target-dialog";
 import { getSubscription, grabForSubscription } from "@/lib/api/subscriptions";
 import { cachedImageUrl } from "@/lib/image-proxy";
+import { usePermissions } from "@/lib/permissions";
 import { formatDateTime, formatRelativeTime } from "@/lib/time";
 
 /**
@@ -2306,11 +2307,12 @@ const DOWNLOAD_LABEL: Record<DownloadState, string> = {
  * 供手选。提交结果回填在按钮文字上；失败可悬停看原因、点击重试。
  */
 function DownloadButton({ hit, className }: { hit: TorrentHit; className: string }) {
+  const { canDirectDownload } = usePermissions();
   const toast = useToast();
   const [state, setState] = useState<DownloadState>("idle");
   const [error, setError] = useState<string | null>(null);
   const [request, setRequest] = useState<DownloadTargetRequest | null>(null);
-  if (!hit.download_url) return null;
+  if (!canDirectDownload || !hit.download_url) return null;
 
   const settled = state === "done" || state === "exists";
 
