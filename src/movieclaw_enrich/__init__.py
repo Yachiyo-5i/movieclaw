@@ -25,7 +25,7 @@ from __future__ import annotations
 import logging
 import re
 
-from movieclaw_enrich.extractors import EXTRACTORS
+from movieclaw_enrich.extractors import EXTRACTORS, extract_subtitle_languages
 from movieclaw_enrich.inference import extract_with_model
 from movieclaw_enrich.models import TorrentAttrs
 
@@ -53,7 +53,9 @@ logger = logging.getLogger("movieclaw_enrich")
 #      喂模型会解析出 S80E210 的鬼话）、"Contact1992" 拆出年份
 # v11: 区间桥接支持空间隙（"S01-"+"S05" 分隔符被圈进前段时也能并成完整区间）；
 #      多 YEAR 候选按"主标题优先+段内置信度最高"抉择（片名自带年份不再盖过真年份）
-ENRICH_VERSION = 11
+# v12: 从主标题/副标题里的明确标记提取简体中文字幕语言标签，供搜索结果筛选；
+#      泛称「中字/中文字幕」不猜简繁，继续保持未知
+ENRICH_VERSION = 12
 
 # 场景命名的两类粘连（站点生成器丢空格所致），喂模型前拆开：
 # ① 季号紧贴分辨率："S021080p" → "S02 1080p"
@@ -102,6 +104,11 @@ def enrich(title: str, subtitle: str = "", category: str | None = None) -> Torre
         for key, value in _extract_all(subtitle).items():
             if not _has_value(fields.get(key)):
                 fields[key] = value
+
+    # 字幕的明确否定需要跨主标题/副标题生效，例如标题带 CHS、描述却写「无字幕」。
+    # 其它技术字段仍保持逐段提取、主标题优先；这里只对字幕字段用合并文本复核一次。
+    fields.pop("subtitle_languages", None)
+    fields.update(extract_subtitle_languages("\n".join(filter(None, (title, subtitle)))))
 
     # 模型通道：片名/年份/季集/题材，双段联合推理一次产出。
     # 模型缺席/失败返回空字典，相关字段保持空值——绝不拖垮整条数据。

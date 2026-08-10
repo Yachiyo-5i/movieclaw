@@ -59,6 +59,74 @@ def extract_audio(text: str) -> dict[str, object]:
     return {"audio": hits} if hits else {}
 
 
+_NO_SUBTITLE_RE = re.compile(
+    r"(?:无|没有|不含)(?:任何|全部|中文|简体中文)?字幕|"
+    r"(?<![A-Za-z])NO[\s._-]*SUBS?(?![A-Za-z])",
+    re.I,
+)
+
+_NON_SUBTITLE_SIMPLIFIED_RE = re.compile(
+    r"(?:简体(?:中文)?|簡體(?:中文)?)(?:配音|音轨|音軌|语音|語音|剧情简介|劇情簡介)|"
+    r"(?:配音|音轨|音軌|语音|語音|语言|語言)\s*[:：]?\s*"
+    r"(?:简体(?:中文)?|簡體(?:中文)?)",
+    re.I,
+)
+
+_LATIN_SIMPLIFIED_SUBTITLE_RE = re.compile(
+    r"(?<![A-Za-z])(?:CHS|ZHS|ZH[-_]?HANS)(?![A-Za-z])",
+    re.I,
+)
+
+_FULL_SIMPLIFIED_SUBTITLE_RE = re.compile(
+    r"(?:简体(?:中文)?|簡體(?:中文)?)(?:特效|硬|软|軟)?(?:中文字幕|字幕|中字)|"
+    r"字幕(?:语言|語言)?\s*[:：/]\s*(?:简体(?:中文)?|簡體(?:中文)?)",
+    re.I,
+)
+
+_PAIRED_SIMPLIFIED_SUBTITLE_RE = re.compile(
+    r"(?:简英|簡英|简繁|簡繁|繁简|繁簡)[^。\n]{0,24}?"
+    r"(?:字幕|中字|软字幕|軟字幕|硬字幕|SUP)|"
+    r"(?:简英|簡英)\s*双语",
+    re.I,
+)
+
+_SHORT_SIMPLIFIED_SUBTITLE_RE = re.compile(
+    r"(?:内封|內封|内嵌|內嵌|外挂|外掛)\s*(?:简中|簡中)|"
+    r"(?:简中|簡中)\s*(?:内封|內封|内嵌|內嵌|外挂|外掛)|"
+    r"(?:简中|簡中)(?:SUP|特效|硬|软|軟)*字幕|"
+    r"(?:简中|簡中)(?![A-Za-z0-9\u3400-\u9fff])",
+    re.I,
+)
+
+_DELIMITED_SIMPLIFIED_SUBTITLE_RE = re.compile(
+    r"(?:简体|簡體|简|簡)\s*[|/、+][^。\n]{0,24}?"
+    r"(?:字幕|中字|软字幕|軟字幕|硬字幕|SUP)",
+    re.I,
+)
+
+
+def extract_subtitle_languages(text: str) -> dict[str, object]:
+    """提取明确声明的字幕语言；「中字」等泛称不推断简繁，避免误筛。"""
+    # 「无字幕」是全局否定；「无内嵌字幕，外挂简中」只否定一种承载方式，不应误杀。
+    if _NO_SUBTITLE_RE.search(text):
+        return {}
+
+    # 先抹掉音轨/配音/语言字段里的「简体中文」，再识别字幕上下文，避免词序变化误报。
+    text = _NON_SUBTITLE_SIMPLIFIED_RE.sub("", text)
+    if any(
+        pattern.search(text)
+        for pattern in (
+            _LATIN_SIMPLIFIED_SUBTITLE_RE,
+            _FULL_SIMPLIFIED_SUBTITLE_RE,
+            _PAIRED_SIMPLIFIED_SUBTITLE_RE,
+            _SHORT_SIMPLIFIED_SUBTITLE_RE,
+            _DELIMITED_SIMPLIFIED_SUBTITLE_RE,
+        )
+    ):
+        return {"subtitle_languages": ["zh-Hans"]}
+    return {}
+
+
 def extract_hdr(text: str) -> dict[str, object]:
     hits = match_vocab(text.upper(), HDR_COMPILED, multi=True)
     return {"hdr": hits} if hits else {}
@@ -134,6 +202,7 @@ EXTRACTORS: list[tuple[str, object]] = [
     ("resolution", extract_resolution),
     ("video_codec", extract_video_codec),
     ("audio", extract_audio),
+    ("subtitle_languages", extract_subtitle_languages),
     ("hdr", extract_hdr),
     ("media_source", extract_media_source),
     ("remux", extract_remux),

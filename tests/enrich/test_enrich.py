@@ -163,6 +163,75 @@ class TestChinesePT:
         assert a.release_group == "CHD"  # 词表归一 CHDBits → CHD
         assert "DDP" in a.audio
 
+    @pytest.mark.parametrize(
+        "marker",
+        [
+            "简体中文字幕",
+            "内封简中",
+            "简繁英字幕",
+            "简英双语",
+            "CHS",
+            "ZHS",
+            "zh-Hans",
+            # 以下来自 M-Team 真实搜索结果，覆盖词序、繁体字形和分隔符变体。
+            "简繁特效 / 双语特效字幕",
+            "简体中字",
+            "简英特效字幕",
+            "内封简繁英多国软字幕",
+            "简英繁SUP特效字幕",
+            "国语/简繁中字",
+            "内封简繁中字",
+            "英简繁SUP字幕",
+            "內嵌繁簡字幕",
+            "简中SUP字幕",
+            "【简|繁|英字幕】",
+            "【简意|繁意|简|繁字幕】",
+            "内封简体|繁体|英文字幕",
+            "官方简中字幕",
+            "DiY简繁英字幕",
+            "字幕：简体中文",
+            "简体中文硬字幕",
+            "简中内封",
+            "无内嵌字幕，外挂简中",
+        ],
+    )
+    def test_simplified_chinese_subtitle_markers(self, marker):
+        a = enrich(
+            "Obsession.2025.2160p.UHD.BluRay.x265-UBits",
+            f"痴迷 美版压制 {marker}",
+        )
+        assert a.subtitle_languages == ["zh-Hans"]
+
+    @pytest.mark.parametrize(
+        "marker",
+        [
+            "繁体字幕",
+            "繁中",
+            "CHT",
+            "中字",
+            "中文字幕",
+            "中英字幕",
+            "简体中文配音",
+            "简体音轨",
+            "简体中文语音",
+            "简体中文剧情简介",
+            "音轨：简体中文",
+            "配音：简体中文",
+            "语言：简体中文",
+            "无硬字幕",
+            "缺中字",
+            "无字幕 简体",
+            "CHS NO SUBS",
+        ],
+    )
+    def test_ambiguous_or_traditional_subtitle_markers_are_not_simplified(self, marker):
+        a = enrich("Obsession.2025.1080p.WEB-DL.x265-GROUP", f"痴迷 {marker}")
+        assert a.subtitle_languages == []
+
+    def test_no_subtitle_in_description_overrides_title_marker(self):
+        a = enrich("Obsession.2025.1080p.WEB-DL.CHS.x265-GROUP", "痴迷 无字幕")
+        assert a.subtitle_languages == []
+
 
 class TestAudioAndHDR:
     """音频与 HDR 的掩蔽/归一细节。"""
