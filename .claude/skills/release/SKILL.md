@@ -29,8 +29,13 @@ description: 发布 movieclaw 新版本。当用户要求发版、发布新版�
 ### 2. 发版步骤
 
 ```
-1. bump 两处版本号 → 提交 PR 合入 main（changelog 可同 PR 一起写，见下）
-2. 确认 main 上测试通过（pytest tests/、pnpm web:typecheck、pnpm web:lint）
+1. bump 两处版本号，并重导出 CLI 内置 spec 基线（OpenAPI spec 含应用
+   版本号，漏了这步 CI 的 test_baseline_spec_matches_code 必挂）：
+   `python -m movieclaw_api.export_openapi -o src/movieclaw_cli/data/spec.json`
+   → 提交 PR 合入 main（changelog 可同 PR 一起写，见下）
+2. 以发版 PR 的 CI 全绿为准（CI 会跑 ruff / pytest / web lint / typecheck），
+   无需在本地重跑全量测试——本地跑 pytest 还需先下载 NER 模型，且沙箱
+   代理环境会造成与代码无关的误报
 3. git tag vX.Y.Z && git push origin vX.Y.Z
    （推不了 tag 的环境——如远程会话：到 Actions → release 手动 Run workflow，
    输入 tag，工作流会在 main HEAD 上一并创建 tag）
@@ -106,6 +111,7 @@ docker-image 手动 Run workflow 输入标签即可。本地/离线构建仍可�
 ## 五、发版检查清单
 
 - [ ] 版本号三处一致（应用发版）
+- [ ] bump 版本号后已重导出 `src/movieclaw_cli/data/spec.json`
 - [ ] 本次改动是否触碰运行时依赖？触碰了 → `docker/runtime-version` +1（镜像随发版自动发布）
 - [ ] 数据库迁移向前兼容（alembic 迁移是单向的，用户回退靠自动备份）
 - [ ] Release 产物三件齐全（CI 完成后到 Release 页核对）
