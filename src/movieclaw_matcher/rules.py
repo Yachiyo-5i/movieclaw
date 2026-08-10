@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 from movieclaw_matcher.models import (
+    DvPolicy,
     HdrPolicy,
     HrUnknownPolicy,
     RuleSetSpec,
@@ -65,11 +66,20 @@ def evaluate_rules(
             return _reject("group_not_allowed", f"制作组 {attrs.release_group} 不在白名单中")
 
     # hdr 空列表 = 未提取到 HDR 标记；命名惯例里 HDR 属"缺席即否定"的强标记，
-    # 因此 require 时空列表按"非 HDR"拒绝，forbid 时空列表放行
+    # 因此 require 时空列表按"非 HDR"拒绝，forbid 时空列表放行。
+    # hdr 轴判断整个 HDR 家族（含 DV），dv 轴单独判断杜比视界，两轴正交：
+    # 如"必须 HDR 但不要 DV"= hdr=require + dv=forbid，组合语义自然叠加。
     if spec.hdr is HdrPolicy.REQUIRE and not attrs.hdr:
         return _reject("hdr_required", "规则要求 HDR，该资源未标注任何 HDR 格式")
     if spec.hdr is HdrPolicy.FORBID and attrs.hdr:
         return _reject("hdr_forbidden", f"规则排除 HDR，该资源标注了 {'/'.join(attrs.hdr)}")
+
+    # 词表已把 DoVi/Dolby Vision 等写法归一化为 "DV"，直接查成员即可
+    has_dv = "DV" in attrs.hdr
+    if spec.dv is DvPolicy.REQUIRE and not has_dv:
+        return _reject("dv_required", "规则要求杜比视界（DV），该资源未标注 DV")
+    if spec.dv is DvPolicy.FORBID and has_dv:
+        return _reject("dv_forbidden", "规则排除杜比视界（DV），该资源标注了 DV")
 
     if spec.free_only and candidate.is_free is not True:
         state = "非免费" if candidate.is_free is False else "促销状态未知（按非免费处理）"

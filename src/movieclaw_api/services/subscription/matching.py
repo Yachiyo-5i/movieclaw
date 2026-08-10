@@ -116,7 +116,10 @@ async def load_match_context(session: AsyncSession) -> dict[int, MediaContext]:
         return {}
 
     contexts: dict[int, MediaContext] = {}
-    specs: dict[int, RuleSetSpec] = {}
+    # None = spec 解析失败的坏规则组（如版本回退后 JSON 里有当前版本不认识的
+    # 枚举值）：跳过引用它的订阅并大声报错，绝不让一条脏配置拖垮整轮匹配，
+    # 也不静默降级为"全不限"（那会乱抓资源）。
+    specs: dict[int, RuleSetSpec | None] = {}
     for wanted, subscription in rows:
         ctx = contexts.get(wanted.media_item_id)
         if ctx is None:
@@ -125,9 +128,22 @@ async def load_match_context(session: AsyncSession) -> dict[int, MediaContext]:
                 continue
             if subscription.rule_set_id not in specs:
                 rule_set = await session.get(RuleSet, subscription.rule_set_id)
-                specs[subscription.rule_set_id] = RuleSetSpec.model_validate(
-                    rule_set.spec if rule_set else {}
-                )
+                try:
+                    specs[subscription.rule_set_id] = RuleSetSpec.model_validate(
+                        rule_set.spec if rule_set else {}
+                    )
+                except ValueError:
+                    specs[subscription.rule_set_id] = None
+                    logger.exception(
+                        "规则组「%s」(id=%s) 的过滤参数无法解析，引用它的订阅本轮"
+                        "跳过匹配。常见原因：应用回退到旧版本后规则组包含新版本"
+                        "字段值，请在规则组页面重新保存修正",
+                        rule_set.name if rule_set else "已删除",
+                        subscription.rule_set_id,
+                    )
+            spec = specs[subscription.rule_set_id]
+            if spec is None:
+                continue
             ctx = MediaContext(
                 item=item,
                 identity=MediaIdentity(
@@ -139,7 +155,7 @@ async def load_match_context(session: AsyncSession) -> dict[int, MediaContext]:
                     season_numbers=(),  # 先占位，收集完工单后统一回填
                 ),
                 subscription=subscription,
-                spec=specs[subscription.rule_set_id],
+                spec=spec,
                 open_wanted={},
             )
             contexts[wanted.media_item_id] = ctx

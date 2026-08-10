@@ -48,11 +48,31 @@ def _candidate(**kwargs) -> TorrentCandidate:
             "group_not_allowed",
         ),
         ({}, {"release_groups_allow": ["OurTV"]}, False, "group_unknown"),
-        # HDR：空列表=未标注（命名惯例缺席即否定）
+        # HDR：空列表=未标注（命名惯例缺席即否定）；hdr 轴判整个家族（含 DV）
         ({"hdr": ["HDR10", "DV"]}, {"hdr": "require"}, True, None),
+        ({"hdr": ["DV"]}, {"hdr": "require"}, True, None),  # 纯 DV 也是 HDR 家族
         ({}, {"hdr": "require"}, False, "hdr_required"),
         ({"hdr": ["DV"]}, {"hdr": "forbid"}, False, "hdr_forbidden"),
         ({}, {"hdr": "forbid"}, True, None),
+        # DV：独立轴，只判断杜比视界标记
+        ({"hdr": ["DV"]}, {"dv": "require"}, True, None),
+        ({"hdr": ["HDR10", "DV"]}, {"dv": "require"}, True, None),
+        ({"hdr": ["HDR10"]}, {"dv": "require"}, False, "dv_required"),
+        ({}, {"dv": "require"}, False, "dv_required"),
+        ({"hdr": ["DV"]}, {"dv": "forbid"}, False, "dv_forbidden"),
+        ({"hdr": ["HDR10", "DV"]}, {"dv": "forbid"}, False, "dv_forbidden"),
+        ({"hdr": ["HDR10"]}, {"dv": "forbid"}, True, None),
+        ({}, {"dv": "forbid"}, True, None),
+        # 两轴叠加：必须 HDR 且排除 DV（PR #112 的原始诉求）
+        ({"hdr": ["HDR10"]}, {"hdr": "require", "dv": "forbid"}, True, None),
+        (
+            {"hdr": ["HDR10", "DV"]},
+            {"hdr": "require", "dv": "forbid"},
+            False,
+            "dv_forbidden",
+        ),
+        ({"hdr": ["DV"]}, {"hdr": "require", "dv": "forbid"}, False, "dv_forbidden"),
+        ({}, {"hdr": "require", "dv": "forbid"}, False, "hdr_required"),
         # 仅免费：None=未知按非免费
         ({"is_free": True}, {"free_only": True}, True, None),
         ({"is_free": False}, {"free_only": True}, False, "not_free"),
@@ -92,6 +112,12 @@ def test_size_amortized_for_season_pack() -> None:
     single = evaluate_rules(pack, spec, pack_episode_count=1)
     assert single.accepted is False
     assert single.reason_code == "size_too_large"
+
+
+def test_spec_rejects_contradictory_hdr_dv_combo() -> None:
+    """「排除 HDR」+「必须 DV」逻辑无解（DV 属 HDR 家族），校验层直接拒绝。"""
+    with pytest.raises(ValueError, match="矛盾"):
+        RuleSetSpec.model_validate({"hdr": "forbid", "dv": "require"})
 
 
 def test_size_unknown_rejected_when_bounds_set() -> None:

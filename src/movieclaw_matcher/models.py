@@ -15,17 +15,35 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from movieclaw_enrich.models import TorrentAttrs
 
 
 class HdrPolicy(StrEnum):
-    """HDR 三态要求。"""
+    """HDR 三态要求（判断整个 HDR 家族：HDR10/HDR10+/HLG/DV/…）。
+
+    DV（杜比视界）也属于 HDR 家族，因此本轴对它同样生效——这是历史语义，
+    存量规则组依赖它（如"排除 HDR"的 SDR 用户不该收到纯 DV 资源）。
+    需要单独控制 DV 时用正交的 ``DvPolicy``（``RuleSetSpec.dv``），
+    如"必须 HDR 但不要 DV" = ``hdr=require + dv=forbid``。
+    """
 
     ANY = "any"  # 不限（默认）
-    REQUIRE = "require"  # 必须是 HDR
-    FORBID = "forbid"  # 必须不是 HDR
+    REQUIRE = "require"  # 必须是 HDR（任意 HDR 家族标记，含 DV）
+    FORBID = "forbid"  # 必须不是 HDR（任何 HDR 家族标记都排除，含 DV）
+
+
+class DvPolicy(StrEnum):
+    """DV（杜比视界）三态要求，与 ``HdrPolicy`` 正交的独立轴。
+
+    发布名常见 ``HDR.DV`` 双标（DV Profile 8 自带 HDR10 基础层），单一枚举
+    无法同时表达"要不要 HDR"与"要不要 DV"，故拆成两轴各自判断。
+    """
+
+    ANY = "any"  # 不限（默认）
+    REQUIRE = "require"  # 必须含 DV 标记（可同时带 HDR10 等基础层）
+    FORBID = "forbid"  # 排除含 DV 标记的资源（不影响其他 HDR 格式）
 
 
 class HrUnknownPolicy(StrEnum):
@@ -60,7 +78,12 @@ class RuleSetSpec(BaseModel):
     release_groups_block: list[str] = Field(
         default_factory=list, description="制作组黑名单"
     )
-    hdr: HdrPolicy = Field(default=HdrPolicy.ANY, description="HDR 三态要求")
+    hdr: HdrPolicy = Field(
+        default=HdrPolicy.ANY, description="HDR 三态要求（整个 HDR 家族，含 DV）"
+    )
+    dv: DvPolicy = Field(
+        default=DvPolicy.ANY, description="DV（杜比视界）三态要求，与 hdr 正交"
+    )
     free_only: bool = Field(default=False, description="只接受当前免费（free）的种子")
     min_seeders: int | None = Field(default=None, description="做种数下限；None=不限")
     # 体积区间按"每集均摊"评估：整季包用总体积 ÷ 集数比较，避免整季包被误杀
@@ -78,6 +101,16 @@ class RuleSetSpec(BaseModel):
     cutoff_resolution: str | None = Field(
         default=None, description="[预留] 洗版上限（P6 启用）"
     )
+
+    @model_validator(mode="after")
+    def _reject_hdr_dv_conflict(self) -> RuleSetSpec:
+        """拦截逻辑矛盾的组合：DV 属于 HDR 家族，排除 HDR 的同时无法要求 DV。"""
+        if self.hdr is HdrPolicy.FORBID and self.dv is DvPolicy.REQUIRE:
+            raise ValueError(
+                "hdr=forbid 与 dv=require 互相矛盾：DV 属于 HDR 家族，"
+                "「排除 HDR」会排除一切 DV 资源，无法同时「必须 DV」"
+            )
+        return self
 
 
 # ---------------------------------------------------------------------------
