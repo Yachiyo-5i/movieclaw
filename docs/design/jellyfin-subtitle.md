@@ -1,15 +1,16 @@
 # movieclaw 字幕支持计划：媒体库能力与 Jellyfin 适配的分层设计
 
-> 状态：设计定稿 v3.1（2026-08-10），待实施。
-> v1 定接口与台账；v2 补齐与 Jellyfin master 入库/播放两线的细节比对；
-> v3 按 [jellyfin-compat.md](jellyfin-compat.md) §8.5 的分层原则重切职责：
-> **哪些是媒体库业务本来就该有的能力、哪些是播放领域的共享服务、哪些只是
-> Jellyfin 协议翻译**——三层各自成章，边界字段级明确。顺带修复 v2 的一处
-> 分层违规（轨记忆存 Jellyfin 流序号=方言渗入领域层），修复本身还消灭了
-> v2 遗留的编号漂移缺陷（§3.3）。
-> v3.1 补 §2.4 元数据存储与探测成本模型（用户提出）：内封/外挂全部落
-> 元数据、失效键显式化，并记录现状缺陷——秒过不比对 mtime，原地替换的
-> 视频永不重探，本设计顺带修复。
+> 状态：**最终定稿 v4（2026-08-10），可实施**。
+> 版本轨迹：v1 定接口与台账；v2 补齐与 Jellyfin master 入库/播放两线的
+> 细节比对；v3 按 [jellyfin-compat.md](jellyfin-compat.md) §8.5 分层原则
+> 重切职责（A 媒体库 / B 播放领域 / C Jellyfin 适配），修复轨记忆存
+> Jellyfin 流序号的分层违规（顺带消灭编号漂移缺陷，§3.3）；v3.1 补
+> §2.4 元数据存储与探测成本模型（内封/外挂全落元数据、失效键显式化，
+> 记录并修复"秒过不比对 mtime、视频原地替换永不重探"的现状缺陷）；
+> v4 终审修正 §3.4 默认轨排序的 forced 方向错误（对照
+> MediaStreamSelector 复核：非 forced 完整字幕优先、forced 沉底），补
+> 原盘条目边界、中文语言别名、strm"仅字幕流"形态、query 键归一化
+> 实施要点四处。
 > 源起：jellyfin-compat.md §6.5 与 §11 开放问题 1。
 > 关联：[library.md](library.md)、[strm-workflow.md](strm-workflow.md)。
 
@@ -65,7 +66,13 @@ Attachments/FallbackFont（转码与网页 libass 场景）、字幕管理五接
   扩展名——四种扩展名语义明确，`.sub` 歧义源已排除在外；坏文件在 B 层
   服务期以 404+中文日志显性暴露，另省下云盘挂载上的逐文件子进程开销）；
 - strm 条目同样适用：strm 占位文件旁的字幕在本地，照常发现——云端媒体 +
-  本地中文字幕正是 strm 工作流的常见形态。
+  本地中文字幕正是 strm 工作流的常见形态；
+- 原盘条目（iso/BDMV 目录）v1 不做发现：原盘播放本就由播放器整盘处理，
+  外挂字幕对齐成本高价值低，台账恒 `[]`；
+- 已知行为（对齐 Jellyfin，非缺陷）：多版本同目录时短 stem 是长 stem 的
+  前缀（`Movie.mkv` 与 `Movie.2160p.mkv`），`Movie.2160p.chs.srt` 会同时
+  匹配到 `Movie.mkv`（剩余 token 进 title）——前缀匹配的固有特性，
+  真 Jellyfin 同样如此。
 
 接入点：全量/增量扫描在视频行建立/秒过时顺带匹配（目录列表已在内存，
 零额外 IO 轮次）；watchdog 的字幕扩展名事件映射到同目录同前缀视频行触发
@@ -74,7 +81,8 @@ Attachments/FallbackFont（转码与网页 libass 场景）、字幕管理五接
 
 ### 2.2 命名解析（对照 ExternalPathParser，纯函数）
 
-stem 之后的剩余段按 `.` 分隔，**从右往左**逐 token：
+stem 之后的剩余段按 `.` 分隔，**从右往左**逐 token（判定一律大小写
+不敏感）：
 
 1. 等于 `default` → `default=true`；
 2. 等于 `forced`/`foreign` → `forced=true`；
@@ -84,10 +92,12 @@ stem 之后的剩余段按 `.` 分隔，**从右往左**逐 token：
 
 与 Jellyfin 的两处有意差异：旗标用**整段相等**而非 Contains（中文命名里
 巧合子串误判风险 > 宽松收益）；语言表**不收 `hi`**（印地语/听障旗标撞名，
-Jellyfin 为此写特判，我们直接规避）。语言映射十几行常量：
+Jellyfin 为此写特判，我们直接规避）。语言映射十几行常量落 A 层（台账存
+ISO 639-2/B 三字码；C 层展示表 `_LANG_DISPLAY` 是另一件事，各归各层）：
 `chs/cht/zh/zh-cn/zh-hans/zh-hant/chi/zho→chi`、`en/eng→eng`、
-`ja/jp/jpn→jpn` 等，落 A 层（台账存 ISO 639-2/B 三字码；C 层展示表
-`_LANG_DISPLAY` 是另一件事，各归各层）。
+`ja/jp/jpn→jpn` 等——并比 Jellyfin 多收**中文命名别名**（它的
+FindLanguageInfo 只认 ISO 码与英文名）：`简中/简体/繁中/繁体/中字/
+中英/双语→chi`，这是面向中文字幕组命名习惯的差异化价值，成本只是表行。
 
 ### 2.3 台账：`library_file.external_subtitles`（可空 JSON 列）
 
@@ -208,10 +218,13 @@ pick_default_subtitle(file: LibraryFile) -> str | None   # 中性引用或 None
 
 单用户模型只实现 Default 模式语义（UserDto 宣告值），语言偏好空串=通配，
 对照 Jellyfin MediaStreamSelector 在通配下的化简：候选按
-`外挂 ↓ → default 旗标 ↓ → forced 旗标 ↓ → 稳定序` 排序，过滤条件
+`外挂 ↓ → default 旗标 ↓ → 非 forced ↓ → 稳定序` 排序（**forced 沉底**：
+它是"只在说外语片段显示"的部分字幕，Jellyfin 的排序键在通配语言下正是
+非 forced 完整字幕优先，v3 曾把方向写反，定稿修正），过滤条件
 `外挂 || default || forced`，取首个；全不命中 → None（不自动开字幕）。
 效果：装了外挂字幕就预选外挂（中文用户装了就是要看的），否则尊重内封
-旗标。音轨侧维持现状算法（default 旗标优先），仅接入记忆优先级。
+default 旗标，仅当只有 forced 轨可选时才选 forced。音轨侧维持现状算法
+（default 旗标优先），仅接入记忆优先级。
 
 优先级组合（PlaybackInfo 时由 C 层调用）：
 记忆值（有效）→ 选择策略 → None；记忆值 `"off"` 原样生效。
@@ -257,6 +270,12 @@ Codec 惯用名 srt→`subrip`、vtt→`webvtt`、ass/ssa 原名；DisplayTitle 
   PlaybackInfo 填充）；内封流照旧不填 DeliveryMethod（DirectPlay 播放器
   自解，真 Jellyfin 无 profile 时同样不填，无偏离）。
 
+- **strm 源的特殊形态点名**：strm 条目不探测云端，`MediaStreams` 此前
+  可为空数组；外挂字幕入台账后会变成"只有 Subtitle 流、无 Video/Audio
+  流"的合法形态——这正是"云端媒体 + 本地字幕"的核心价值场景。协议上
+  无禁忌（客户端 DirectPlay 时自行探测音视频轨），但属于真 Jellyfin
+  不会出现的组合（它对 strm 强制远程探测），列入 S2 手测第一优先。
+
 - `DefaultSubtitleStreamIndex`：调 B 层（记忆→策略），中性引用换算成
   Index；`"off"` → `-1`（协议里"-1=用户明确不要字幕"是有效值）；None →
   省略字段。`DefaultAudioStreamIndex` 同理接入记忆优先。
@@ -280,7 +299,11 @@ GET /Videos/{itemId}/{mediaSourceId}/Subtitles/{index}/Stream.{format}
   `application/x-subrip`、vtt→`text/vtt`、ass/ssa→`text/x-ssa`，对齐
   Jellyfin MimeTypes 表）；
 - 错误形态照本层惯例 404 空 body；日志中文说明原因（文件不在/解析失败/
-  编码不明），非开发者可读。
+  编码不明），非开发者可读；
+- 实施要点：新增 query 参数名（`itemId/index/startPositionTicks`，
+  `mediaSourceId/format` 已有）要登记进 router 的 `_KNOWN_QUERY_KEYS`
+  大小写归一化表，否则 PascalCase 客户端的 query 覆盖取不到；路径段
+  `Subtitles`/`Stream.` 由路由模板自动进归一化映射，无需额外处理。
 
 ### 4.5 进度上报消费（playstate 路由）
 
@@ -305,9 +328,9 @@ GET /Videos/{itemId}/{mediaSourceId}/Subtitles/{index}/Stream.{format}
 
 | 期 | 层 | 内容 | 验收 |
 |---|---|---|---|
-| S1 | A | 台账列 + 迁移 + 扫描/watchdog 发现 + 命名解析 + 内封重探挂钩（§2.4） | 单测:前缀匹配边界（stem 相等/带分隔/撞名不误收）、token 矩阵（语言/旗标/中文命名/从右往左序）、mtime 变→重探/不变→零探测;扫描后台账正确,strm 旁挂同样入账 |
-| S2 | B+C | 内容服务（编码归一+srt↔vtt）+ 编号双向换算 + 外挂流 DTO + 投递字段 + Subtitles 路由 | 单测:编号换算互逆、GBK→UTF-8、srt→vtt 金样、坏文件 404+中文日志;手测:Infuse/VidHub 外挂字幕可选可显、GBK 不乱码 |
-| S3 | B+C | 中性轨引用 + playback_state 增列 + 记忆读写 + 默认轨策略 + DefaultSubtitleStreamIndex/上报消费 | 单测:策略排序矩阵、记忆往返（含 off/-1）、引用失效回落、悬空索引丢弃;手测:切轨重进沿用、关字幕重进仍关 |
+| S1 | A | 台账列 + 迁移 + 扫描/watchdog 发现 + 命名解析 + 内封重探挂钩（§2.4） | 单测:前缀匹配边界（stem 相等/带分隔/撞名不误收/多版本前缀重叠）、token 矩阵（语言含中文别名/旗标/大小写/从右往左序）、mtime 变→重探/不变→零探测;扫描后台账正确,strm 旁挂同样入账,原盘条目恒 [] |
+| S2 | B+C | 内容服务（编码归一+srt↔vtt）+ 编号双向换算 + 外挂流 DTO + 投递字段 + Subtitles 路由 + query 键归一登记 | 单测:编号换算互逆、GBK→UTF-8、srt→vtt 金样、坏文件 404+中文日志;手测:Infuse/VidHub 外挂字幕可选可显、GBK 不乱码、**strm"仅字幕流"源可播可显字幕（第一优先）** |
+| S3 | B+C | 中性轨引用 + playback_state 增列 + 记忆读写 + 默认轨策略 + DefaultSubtitleStreamIndex/上报消费 | 单测:策略排序矩阵（**含 forced 沉底、仅 forced 可选才选 forced**）、记忆往返（含 off/-1）、引用失效回落、悬空索引丢弃;手测:切轨重进沿用、关字幕重进仍关 |
 
 S1/S2 一起交付才有用户可见价值；S3 可独立后行。B 层全部函数不 import
 `movieclaw_jellyfin`（架构守护测试加一条断言）。合并前照例全绿：
