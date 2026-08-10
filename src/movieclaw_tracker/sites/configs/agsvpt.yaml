@@ -1,0 +1,37 @@
+# Arctic Global Seed Vault（AGSVPT）站点配置
+# 官网：https://www.agsvpt.com/
+
+site_id: agsvpt
+display_name: AGSVPT
+base_url: https://www.agsvpt.com
+framework: nexusphp
+
+selectors:
+  # 列表数据行内嵌 table.torrentname；分类 ID 来自 ?cat=<id> 链接。
+  torrent_row_css: "table.torrents > tr:has(table.torrentname)"
+  torrent_category_css: "a[href^='?cat=']::attr(href)"
+
+  # torrents.php 的第 1 页是 page=0，应用层页码需减 1。
+  page_offset: -1
+
+  # 文件大小位于“基本信息”单元格第一个粗体标签后的文本节点。
+  detail_size_css: "td.rowhead:contains('基本信息') + td.rowfollow > b::next_sibling_text"
+
+  # 无参数资料页没有 h1；顶部 User_Name 链接和统计值始终可用。
+  profile_uid_css: "a[class*='User_Name']::attr(href)"
+  profile_username_css: "a[class*='User_Name']"
+  profile_class_css: "a[class*='User_Name']::attr(class)"
+  profile_uploaded_css: "font.color_uploaded::next_sibling_text"
+  profile_downloaded_css: "font.color_downloaded::next_sibling_text"
+  profile_ratio_css: "font.color_ratio::next_sibling_text"
+  profile_seeding_css: "img[alt='Torrents seeding']::next_sibling_text"
+  profile_leeching_css: "img[alt='Torrents leeching']::next_sibling_text"
+
+categories:
+  movie:       [401]
+  tv:          [402, 403, 407, 419]  # 电视剧 / 综艺 / 体育 / 短剧
+  documentary: [404]
+  anime:       [405]
+  music:       [406, 408, 411]       # MV / 音频 / 音乐
+  game:        [413]
+  other:       [415]                 # 电子书 / 有声书
