@@ -19,6 +19,7 @@ import {
   StarIcon,
   TrashIcon,
 } from "@/components/icons";
+import { useConfirm } from "@/components/feedback";
 import { Modal } from "@/components/modal";
 import { PosterImage } from "@/components/poster-image";
 import { ReidentifyDialog } from "@/components/reidentify-dialog";
@@ -51,6 +52,7 @@ import { getDiscoveryReturnPath } from "@/lib/discovery-return-path";
 import { formatBytes } from "@/lib/format";
 import { resolveRequestUrl } from "@/lib/http";
 import { cachedImageUrl } from "@/lib/image-proxy";
+import { refreshItemConfirm } from "@/lib/library-confirm";
 import { usePermissions } from "@/lib/permissions";
 import { formatRelativeTime } from "@/lib/time";
 import { usePageTitle } from "@/lib/use-page-title";
@@ -84,6 +86,7 @@ export function LibraryItemDetailView({
   const { canManageLibraries } = usePermissions();
   const router = useRouter();
   const discoveryReturnPath = getDiscoveryReturnPath(returnTo);
+  const confirm = useConfirm();
   const [detail, setDetail] = useState<LibraryItemDetail | null>(null);
   const [library, setLibrary] = useState<MediaLibrary | null>(null);
   const [failed, setFailed] = useState(false);
@@ -219,6 +222,8 @@ export function LibraryItemDetailView({
       ];
 
   const runMetadataRefresh = async () => {
+    // 重操作先确认：单条目刷新是 force 语义（图片覆盖重下），说清再动手
+    if (!(await confirm(refreshItemConfirm(detail?.title ?? "此条目")))) return;
     setKicking(true);
     try {
       await refreshItemMetadata(libraryId, mediaItemId);

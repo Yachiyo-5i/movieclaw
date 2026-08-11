@@ -6,7 +6,9 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Depends, Query, Request
@@ -42,6 +44,7 @@ from movieclaw_jellyfin.ids import (
     EntityKind,
     decode_guid,
     is_empty_guid,
+    library_guid,
 )
 from movieclaw_jellyfin.routes.common import (
     dto_context,
@@ -165,6 +168,105 @@ async def user_views(
         for lib in libraries
     ]
     return JSONResponse(query_result(dtos, len(dtos)))
+
+
+@router.get("/UserViews/GroupingOptions")
+@router.get("/Users/{user_id}/GroupingOptions")
+async def user_views_grouping_options(
+    user_id: str | None = None,
+    scope: ViewerScope = Depends(viewer_scope),
+) -> JSONResponse:
+    """可分组视图清单（issue #124，Infuse 添加媒体库时请求）。
+
+    对齐 UserViewsController.GetGroupingOptions：movies/tvshows 库天然可
+    分组（IsEligibleForGrouping），映射可见库、按名称排序；legacy 路由
+    /Users/{userId}/GroupingOptions 一并注册。
+    """
+    async with get_database().session() as session:
+        libraries = await list_libraries(session, visible_ids=scope.visible)
+    return JSONResponse(
+        [
+            {"Name": lib.name, "Id": library_guid(lib.id)}
+            for lib in sorted(libraries, key=lambda lib: lib.name)
+        ]
+    )
+
+
+def _refresh_status(library_id: int) -> tuple[str, float | None]:
+    """把本库的扫描/元数据刷新任务线映射到 Jellyfin 的三态语义（LibraryManager.cs）。
+
+    真实现：有进度值 → Active，在队列里 → Queued，其余 → Idle；RefreshProgress
+    是 0~100 的百分数，非 Active 时为 null（省略输出）。我们两条任务线
+    （scan 扫描 + media_scrape 整库元数据刷新）任一在跑即 Active——分母未知的
+    遍历阶段报 0.0（客户端画不确定态转圈）；元数据刷新"已启动但状态尚未就绪"
+    的间隙映射为 Queued。
+    """
+    from movieclaw_api.services import media_scrape
+    from movieclaw_api.services.library.scan import scan_progress
+
+    for state in (
+        scan_progress(library_id),
+        media_scrape.library_refresh_state(library_id),
+    ):
+        if state is not None:
+            if state.total > 0:
+                return "Active", round(state.processed / state.total * 100, 1)
+            return "Active", 0.0
+    if media_scrape.is_library_refreshing(library_id):
+        return "Queued", None
+    return "Idle", None
+
+
+@router.get("/Library/VirtualFolders")
+async def library_virtual_folders(
+    scope: ViewerScope = Depends(viewer_scope),
+) -> JSONResponse:
+    """媒体库 → VirtualFolderInfo 映射（issue #124，Infuse 添加媒体库时请求）。
+
+    真 Jellyfin 此接口仅管理员可用（RequiresElevation）；这里放开给已认证
+    设备（Infuse 普通链路也会请求），但成员设备只见白名单库、服务器文件
+    系统路径只对主账号设备下发。LibraryOptions 按真实现的实体默认值给一份
+    静态子集——客户端只读，我们不开放库管理写端点。
+    """
+    async with get_database().session() as session:
+        libraries = await list_libraries(session, visible_ids=scope.visible)
+    infos = []
+    for lib in libraries:
+        roots = [str(p) for p in (lib.root_paths or [])] if scope.member_id == 0 else []
+        status, progress = _refresh_status(lib.id)
+        infos.append(
+            {
+                "Name": lib.name,
+                "Locations": roots,
+                "CollectionType": "movies" if lib.kind == "movie" else "tvshows",
+                "ItemId": library_guid(lib.id),
+                "RefreshStatus": status,
+                "LibraryOptions": {
+                    "Enabled": True,
+                    "EnablePhotos": False,
+                    "EnableRealtimeMonitor": True,
+                    "EnableChapterImageExtraction": False,
+                    "ExtractChapterImagesDuringLibraryScan": False,
+                    "EnableTrickplayImageExtraction": False,
+                    "ExtractTrickplayImagesDuringLibraryScan": False,
+                    "PathInfos": [{"Path": p} for p in roots],
+                    "SaveLocalMetadata": False,
+                    "EnableAutomaticSeriesGrouping": False,
+                    "EnableEmbeddedTitles": False,
+                    "EnableEmbeddedExtrasTitles": False,
+                    "EnableEmbeddedEpisodeInfos": False,
+                    "AutomaticRefreshIntervalDays": 0,
+                    "SeasonZeroDisplayName": "Specials",
+                    "DisabledLocalMetadataReaders": [],
+                    "DisabledSubtitleFetchers": [],
+                    "SubtitleFetcherOrder": [],
+                },
+            }
+        )
+        # 对齐真实现：RefreshProgress 仅 Active 时输出（可空 double 的 null 省略约定）
+        if progress is not None:
+            infos[-1]["RefreshProgress"] = progress
+    return JSONResponse(infos)
 
 
 # ---------------------------------------------------------------------------
@@ -867,6 +969,63 @@ async def items_filters(request: Request) -> JSONResponse:
 # ---------------------------------------------------------------------------
 
 
+async def _overlay_layered_meta(dto: dict[str, Any], bundle: ItemBundle) -> None:
+    """单条目详情叠加分层元数据（与 Web 详情页同一份读策略，layered_item_meta）。
+
+    列表装配只读库内档案（批量性能不容 NFO 磁盘 IO 与 TMDB 兜底）；点进
+    详情的这一条走完整分层——NFO 里人工维护的简介优先生效，还没刮过的
+    条目当场用 TMDB 兜底填充文本（后台自愈刮削由分层读内部触发）。
+    People 不叠加：人物页要靠关系表里的影人 id，NFO/TMDB 兜底给不出稳定
+    id，缺口由自愈刮削收敛。库内档案来源与 DTO 同源，无需二次装配。
+    """
+    from movieclaw_api.services.library.items import layered_item_meta, resolve_entry_dirs
+    from movieclaw_media.models import MediaKind
+
+    async with get_database().session() as session:
+        rows = (
+            await session.execute(
+                select_files_with_roots(bundle.item.id)  # type: ignore[arg-type]
+            )
+        ).all()
+        if not rows:
+            return
+        files = [f for f, _ in rows]
+        roots: list[Path] = []
+        for _, lib in rows:
+            for p in lib.root_paths:
+                path = Path(p)
+                if path not in roots:
+                    roots.append(path)
+        entry_dirs = resolve_entry_dirs(roots, files)
+        meta = await layered_item_meta(
+            session, bundle.item, entry_dirs, files, MediaKind(bundle.item.kind)
+        )
+    if meta is None or meta.source not in ("nfo", "tmdb"):
+        return
+    if meta.plot:
+        dto["Overview"] = meta.plot
+    if meta.rating:
+        dto["CommunityRating"] = meta.rating
+    if meta.genres:
+        dto["Genres"] = list(meta.genres)
+
+
+def select_files_with_roots(media_item_id: int):
+    """条目的在册文件 + 所属库（取根路径用），单条目详情与图片接口同款联查。"""
+    from sqlalchemy import select as sa_select
+
+    from movieclaw_db.models import LibraryFile
+
+    return (
+        sa_select(LibraryFile, Library)
+        .join(Library, Library.id == LibraryFile.library_id)
+        .where(
+            LibraryFile.media_item_id == media_item_id,
+            LibraryFile.missing_since.is_(None),
+        )
+    )
+
+
 @router.get("/Items/{item_id}")
 @router.get("/Users/{user_id}/Items/{item_id}")
 async def get_item(
@@ -935,12 +1094,30 @@ async def get_item(
     bundle = bundles.get(ref.entity_id)
     if bundle is None:
         raise not_found()
+    # 自愈刮削的第二触发条件：档案里有 cast 但影人关系表为空——影人功能
+    # 上线前刮的存量条目，cast 非空证明 TMDB 有数据，补刮一次关系落库后
+    # 条件即不再成立（收敛，不会对"确实没有演职员"的条目反复触发）。
+    # 第一触发条件（档案缺失/从未刮过）由 _overlay_layered_meta 里的分层读
+    # 内部触发（与网页详情完全同一份逻辑），这里不重复。只挂单条目详情、
+    # 不挂列表查询：列表一次装配几十条，逐条自愈会放大成 TMDB 请求风暴。
+    needs_heal = (
+        bundle.metadata is not None
+        and bundle.metadata.scraped_at is not None
+        and not bundle.people
+        and bool(bundle.metadata.cast)
+    )
+    if needs_heal:
+        from movieclaw_api.services.media_scrape import scrape_media_item
+
+        assert bundle.item.id is not None
+        asyncio.get_running_loop().create_task(scrape_media_item(bundle.item.id))
     if ref.kind == EntityKind.ITEM:
         dto = (
             movie_dto(ctx, bundle, options)
             if bundle.item.kind == "movie"
             else series_dto(ctx, bundle, options)
         )
+        await _overlay_layered_meta(dto, bundle)
     elif ref.kind == EntityKind.SEASON:
         dto = season_dto(ctx, bundle, ref.season, options)
     elif ref.kind == EntityKind.EPISODE:

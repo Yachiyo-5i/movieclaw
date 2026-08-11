@@ -53,6 +53,8 @@ const nextConfig: NextConfig = {
       "PlayingItems",
       "Branding",
       "QuickConnect",
+      "Plugins",
+      "DisplayPreferences",
       "emby",
     ];
     const jellyfinRewrites = [
@@ -61,6 +63,24 @@ const nextConfig: NextConfig = {
       source: `/${ns}/:path*`,
       destination: `${proxyTarget}/${ns}/:path*`,
     }));
+    // Library 命名空间不能整段通配（issue #124）：Next 的 rewrite source 匹配
+    // 大小写**不敏感**，且 afterFiles rewrites 在动态路由之前求值——
+    // `/Library/:path*` 会连带劫持本应用自己的媒体库详情页 /library/[id]。
+    // 只反代真 Jellyfin 在该命名空间下的字面 API 子路径
+    // （LibraryController.cs / LibraryStructureController.cs），
+    // 与页面的数字 id 段互不相交。
+    for (const sub of ["VirtualFolders", "MediaFolders", "PhysicalPaths", "Refresh"]) {
+      jellyfinRewrites.push(
+        {
+          source: `/Library/${sub}/:path*`,
+          destination: `${proxyTarget}/Library/${sub}/:path*`,
+        },
+        {
+          source: `/Library/${sub}`,
+          destination: `${proxyTarget}/Library/${sub}`,
+        },
+      );
+    }
 
     return [
       {

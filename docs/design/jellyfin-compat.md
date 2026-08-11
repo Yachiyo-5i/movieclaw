@@ -911,6 +911,29 @@ id），调同一套领域服务——**不**让自家前端去消费 Jellyfin �
 **query 键大小写不敏感**语义补进了 §1 同款归一化中间件（v1.1 调研只覆盖
 了路径，实为同一差异的两半——教训记档）。
 
+**补遗（2026-08-11，issue #124）**：新版 Infuse 添加媒体库时的探测链路比
+v1.1 调研更长，还会请求 `/Plugins`、`/Library/VirtualFolders`、
+`/UserViews/GroupingOptions`、`/DisplayPreferences/{id}`（GET+POST）——
+这些接口经前端端口返回 Next.js 404 HTML 会让 Infuse 在"验证媒体库"一步
+失败。已补齐后端敷衍/映射实现与前端 `Plugins`/`DisplayPreferences` 命名空间
+转发。**Library 命名空间不能整段通配**：Next 的 rewrite source 匹配大小写
+不敏感、且 afterFiles rewrites 先于动态路由求值，`/Library/:path*` 会劫持
+控制台自己的 `/library/[id]` 页面——只按字面注册 VirtualFolders/
+MediaFolders/PhysicalPaths/Refresh 四个 API 子路径。
+实现已对照 v10.10.7 源码逐条复核：DisplayPreferencesDto 的 Id 按
+`GetMD5`（**UTF-16LE**，即 C# Encoding.Unicode + .NET Guid 小端字节序）
+派生（金样 `usersettings` → `3ce5b65d-…`），CustomPrefs 对齐新建实体
+默认值；GroupingOptions 按名称排序并注册 legacy
+`/Users/{userId}/GroupingOptions`；VirtualFolderInfo 带 LibraryOptions
+静态子集，RefreshStatus 接扫描/元数据刷新任务线（Active+百分比/Queued/
+Idle）。有意放宽的偏离：真 Jellyfin 的 /Plugins 与 /Library/VirtualFolders
+是仅管理员（RequiresElevation）接口，这里放开给已认证设备但成员只见
+白名单库、不下发文件系统路径。
+考古备注：2026-08-04 曾在 `jellyfin-compat` 分支按真实 Infuse 逐轮实测
+修过同一问题（a50127f，含上述 rewrite 劫持教训与任务线映射），但该分支
+尾部 5 个提交从未合并进 main，v0.8.0 因此不含此修复——本次已吸收其成果
+（并修正其 GetMD5 误用 UTF-8 的编码差异），另补齐了它没覆盖的 /Plugins。
+
 **已知差距**（有意留下的小缺口，不影响 Infuse 主链路）：
 - `GET /Search/Hints` 未实现（P2 兜底项，主流播放器搜索走 /Items?searchTerm）；
 - `imageTypeLimit`/`enableImageTypes`/`enableTotalRecordCount` 接受但忽略
@@ -919,6 +942,20 @@ id），调同一套领域服务——**不**让自家前端去消费 Jellyfin �
 - `/Persons/*` 独立命名空间未实现（人物条目走 `/Items/{personGuid}` +
   `personIds` 过滤已覆盖主流客户端的演员页链路）；
 - 图片两种 404 body 未细分（均给 text 文案；客户端不解析 body）。
+
+**与产品侧读策略的对齐记录**（2026-08-04，Infuse 联调后重构）：
+- 单条目详情与图片接口已复用 Web 的共享读策略（`library/items.py` 的
+  `layered_item_meta` / `local_item_artwork`）：详情叠加 NFO/TMDB 分层文本，
+  条目 Primary/Backdrop 走「目录美术图 > 刮削资产 > TMDB 图床（经代理缓存）」
+  三层；列表装配仍只读库内档案（批量性能）。ImageTags 在资产未落地时以
+  TMDB 路径兜底出 tag——否则客户端不发图片请求，兜底层永远走不到。
+- 自愈刮削两条触发：档案缺失/从未刮过（分层读内部，与 Web 同源）；
+  档案有 cast 但影人关系为空（存量补齐，收敛条件）。仅挂单条目详情。
+- **仍独立实现**：/Items 的搜索与排序口径（`_search_match` 只匹配
+  标题/原名/别名，与 Web 搜索服务的拼音等能力不同源）；People 不做
+  NFO 叠加（人物页需要关系表影人 id，NFO 给不出，靠自愈收敛）；
+  季/集图片未接目录美术图层（`season{NN}-poster.jpg` 目前只在镜像写出，
+  读取仍走资产）。
 
 1. **外挂字幕台账**：library_file 目前只有内封 `subtitle_streams`；同目录
    `.srt/.ass` 的发现、命名解析（语言后缀）、台账落位是独立小设计（§6.5
