@@ -110,41 +110,61 @@ def resolve_external_subtitle(file: LibraryFile, track: str) -> SubtitleRef | No
     return None
 
 
-_CHINESE_ENCODINGS = ("gb18030", "gbk", "gb2312", "big5", "big5hkscs")
+# 高频汉字集（简繁通用字为主）：中文编码判定的打分依据——GBK/Big5 互解
+# 出来的错字几乎不落在高频集内，真中文过半命中。与生产端
+# movieclaw_api.services.subtitle_gen.extract 同一策略的重复实现（分层
+# 守护禁止两端互相 import，subtitle-ai-translate.md §7）。
+_COMMON_CJK = set(
+    "的一是不了人我在有他这中大来上国个到说们为子和你地出道也时年得就那要下以"
+    "生会自着去之过家学对可她里后小么心多天而能好都然没日于起还发成事只作当想"
+    "看文无开手十用主行方又如前所本见经头面公同三已老从动两长知民样现分将外但"
+    "身些与高意进把法此实回二理美点月明其种声全工己话儿者向情部正名定女问力机"
+    "给等几很业最间新什打便位因重被走电四第门相次东西再平真听世气信北少关并内"
+    "加化由却代军产入先山五太水万市眼体别处总才场师书比住员九笑性通目华报立马"
+    "命张活难神数件安表原车白应路期叫死常提感金何更反题必论字幕电影视对白话讲"
+)
+
+
+def _chinese_score(text: str) -> float:
+    cjk = [c for c in text if "一" <= c <= "鿿"]
+    if not cjk:
+        return 0.0
+    return sum(c in _COMMON_CJK for c in cjk) / len(cjk)
 
 
 def _decode_to_utf8_text(raw: bytes, path: Path) -> str:
     """编码归一：非 UTF-8/ASCII（GBK/GB18030/BIG5 常见）统一解码为文本。
 
-    **中文优先偏置**（有意决策）：GBK 与 CP949（韩）/EUC-JP（日）在短样本
-    下高度歧义，charset-normalizer 的首选常判成韩文编码、中文字幕全成乱码。
-    候选列表里出现中文系编码时优先取用——本项目面向中文用户，中文字幕
-    判对是硬需求；真正的韩/日字幕如今几乎都是 UTF-8，走不到这个分支。
-    GBK/GB2312 按 gb18030 严格超集解码、big5 按 big5hkscs（向前兼容），
-    全部失败退 errors="replace" 保底出字——出错的字幕也比 404 强，但要
-    留下日志。
+    **中文判定不信探测器排序**（有意决策）：GBK 与 Big5/CP949（韩）在短
+    样本下高度歧义，charset-normalizer 的首选时常判错、中文字幕全成乱码。
+    直接用 gb18030/big5hkscs 各解一遍按高频字占比打分取优（错误编码解出
+    的字几乎不命中高频集）；都不像中文再退探测器（韩/日/西文编码）。
+    全部失败退 errors="replace" 保底出字——出错的字幕也比 404 强。
     """
     try:
         return raw.decode("utf-8")
     except UnicodeDecodeError:
         pass
+
+    scored: list[tuple[float, str]] = []
+    for encoding in ("gb18030", "big5hkscs"):
+        try:
+            text = raw.decode(encoding)
+        except (UnicodeDecodeError, LookupError):
+            continue
+        scored.append((_chinese_score(text), text))
+    if scored:
+        scored.sort(key=lambda t: t[0], reverse=True)
+        best_score, best_text = scored[0]
+        if best_score >= 0.25:
+            return best_text
+
     from charset_normalizer import from_bytes
 
-    results = from_bytes(raw)
-    chosen = results.best()
-    if chosen is not None and chosen.encoding.lower() not in _CHINESE_ENCODINGS:
-        for match in results:
-            if match.encoding.lower() in _CHINESE_ENCODINGS:
-                chosen = match
-                break
-    encoding = (chosen.encoding if chosen is not None else "") or ""
-    if encoding.lower() in ("gbk", "gb2312"):
-        encoding = "gb18030"
-    elif encoding.lower() == "big5":
-        encoding = "big5hkscs"
-    if encoding:
+    match = from_bytes(raw).best()
+    if match is not None:
         try:
-            return raw.decode(encoding)
+            return raw.decode(match.encoding)
         except (UnicodeDecodeError, LookupError):
             pass
     logger.warning("字幕文件编码无法确定，已按 UTF-8 宽容解码（可能出现乱码字符）：%s", path)
