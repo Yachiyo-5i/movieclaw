@@ -1186,7 +1186,7 @@ async def test_tv_episodes_merge_local_and_tmdb(db, tmp_path) -> None:
 
     # 本地缩略图接口按台账行回吐文件
     async with db.session() as session:
-        thumb_resp = await get_file_thumb(ep1.file_ids[0], session)
+        thumb_resp = await get_file_thumb(ep1.file_ids[0], _ADMIN, session)
         assert str(thumb_resp.path).endswith("-thumb.jpg")
 
 
