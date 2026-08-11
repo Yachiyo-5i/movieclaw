@@ -78,7 +78,7 @@ RUN python -c "import tomllib; deps = tomllib.load(open('pyproject.toml', 'rb'))
 # ---------------------------------------------------------------------------
 # 模型文件与架构无关，同样跑在构建机原生架构上
 FROM --platform=$BUILDPLATFORM debian:bookworm-slim AS ner-model
-ARG NER_MODEL_BASE=https://github.com/yipengfei329/movieclaw/releases/download/torrent-ner-v1
+ARG NER_MODEL_BASE=https://github.com/yipengfei329/movieclaw/releases/download/torrent-ner-v2
 ARG APT_MIRROR=""
 RUN if [ -n "$APT_MIRROR" ]; then \
         sed -i "s|deb.debian.org|$APT_MIRROR|g" /etc/apt/sources.list.d/debian.sources; \

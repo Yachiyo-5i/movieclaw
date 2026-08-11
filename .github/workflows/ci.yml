@@ -19,7 +19,7 @@ on:
 
 # NER 模型的 Release tag；模型发新版时同步改这里（发版流程见 .claude/skills/release）
 env:
-  NER_MODEL_TAG: torrent-ner-v1
+  NER_MODEL_TAG: torrent-ner-v2
 
 jobs:
   python:
