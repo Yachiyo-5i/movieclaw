@@ -159,6 +159,8 @@ def _list_load_columns(
         MediaMetadata.genres,
     ]
     if options.enable_images:
+        # TMDB 路径兜底出 tag（资产未落地时）也在列表路径读，短字符串列
+        item_columns.extend([MediaItem.poster_path, MediaItem.backdrop_path])
         metadata_columns.extend(
             [
                 MediaMetadata.poster_file,

@@ -414,7 +414,9 @@ def test_watcher_ignores_non_video_file_events() -> None:
     assert not watch_mod._is_relevant_event(events.FileCreatedEvent("/lib/movie.nfo"))
     assert not watch_mod._is_relevant_event(events.FileModifiedEvent("/lib/poster.jpg"))
     assert not watch_mod._is_relevant_event(events.FileModifiedEvent("/lib/movie.mkv.!qB"))
-    assert not watch_mod._is_relevant_event(events.FileCreatedEvent("/lib/sub.chs.srt"))
+    # 字幕自外挂字幕台账起是盘点对象（jellyfin-subtitle.md §2.1）：
+    # 用户把 .srt 丢进目录要即时可见
+    assert watch_mod._is_relevant_event(events.FileCreatedEvent("/lib/sub.chs.srt"))
     # 下载完成改名成视频（终点是视频扩展名）：触发
     assert watch_mod._is_relevant_event(
         events.FileMovedEvent("/lib/movie.mkv.!qB", "/lib/movie.mkv")
