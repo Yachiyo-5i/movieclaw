@@ -20,6 +20,7 @@
 #   --build-arg PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
 #   --build-arg NPM_REGISTRY=https://registry.npmmirror.com
 #   --build-arg NER_MODEL_BASE=<GitHub Release 的镜像加速地址>
+#   --build-arg SECONV_BASE=<Subtitle Edit Release 的镜像加速地址>
 # =============================================================================
 
 # ---------------------------------------------------------------------------
@@ -65,9 +66,12 @@ FROM python:3.12-slim-bookworm AS py-deps
 ARG PIP_INDEX_URL=https://pypi.org/simple
 WORKDIR /build
 COPY pyproject.toml ./
+# 构建会下载多个带原生 wheel 的大包；NAS/跨境链路偶发 TLS EOF 时，pip
+# 默认 5 次短重试不够。显式放宽只影响构建容错，不改变依赖解析结果。
 RUN python -c "import tomllib; deps = tomllib.load(open('pyproject.toml', 'rb'))['project']['dependencies']; open('requirements.txt', 'w').write('\n'.join(deps))" \
     && python -m venv /venv \
-    && /venv/bin/pip install --no-cache-dir -i "$PIP_INDEX_URL" -r requirements.txt
+    && /venv/bin/pip install --no-cache-dir --retries 10 --timeout 60 \
+        -i "$PIP_INDEX_URL" -r requirements.txt
 
 # ---------------------------------------------------------------------------
 # 阶段 3：NER 模型（从 GitHub Release 下载，烧进镜像作为默认模型）
@@ -93,27 +97,77 @@ RUN mkdir -p /model \
     && echo "${NER_BASE_TRIMMED##*/}" > /model/.release-tag
 
 # ---------------------------------------------------------------------------
-# 阶段 4：目标架构的 node 二进制来源
+# 阶段 4：PGS 转换器（按目标架构选 Subtitle Edit seconv 官方产物）
 # ---------------------------------------------------------------------------
-FROM node:22-bookworm-slim AS node-dist
-
-# ---------------------------------------------------------------------------
-# 阶段 5：运行镜像
-# ---------------------------------------------------------------------------
-FROM python:3.12-slim-bookworm
-
-# - libstdc++6：onnxruntime / tokenizers 的 manylinux wheel 依赖（slim 基础镜像不带）
-# - ffmpeg：介质规格探测（ffprobe）的运行时依赖。库存画质的真相来自文件本体
-#   而非种子名，缺了它整个「视频/音频/字幕规格」区块都是空的。装全套 ffmpeg
-#   约 160MB（ffprobe 在 Debian 里不单独成包，且 libavdevice 硬依赖 SDL 那串），
-#   这是为「开箱即用」付的确定成本——降级路径虽然存在，但不该是默认体验
+# 这里只下载/校验/解包，不执行目标架构二进制，因此固定在构建机架构上跑，
+# 交叉构建 amd64/arm64 时不需要 QEMU。SHA256 锁定 v5.1.0 官方 Release，
+# 防下载镜像或上游资产被替换；LICENSE 随二进制一起进入最终镜像。
+FROM --platform=$BUILDPLATFORM debian:bookworm-slim AS seconv-dist
+ARG TARGETARCH
+ARG SECONV_BASE=https://github.com/SubtitleEdit/subtitleedit/releases/download/v5.1.0
 ARG APT_MIRROR=""
 RUN if [ -n "$APT_MIRROR" ]; then \
         sed -i "s|deb.debian.org|$APT_MIRROR|g" /etc/apt/sources.list.d/debian.sources; \
     fi \
     && apt-get update \
-    && apt-get install -y --no-install-recommends libstdc++6 ca-certificates ffmpeg \
+    && apt-get install -y --no-install-recommends curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
+RUN case "$TARGETARCH" in \
+        amd64) SECONV_ARCH=x64; SECONV_SHA=3354dfeb4452b0dd8a11d8f3066c31a3116e2cbc137f271ac6b7e4f91896ba11 ;; \
+        arm64) SECONV_ARCH=ARM64; SECONV_SHA=ab58891abd54a1604fdf5956c340159bd2efbcaef8cf2c69d97fcc55b83b4718 ;; \
+        *) echo "不支持的 seconv 目标架构：$TARGETARCH（仅 amd64/arm64）" >&2; exit 1 ;; \
+    esac \
+    && curl -fSL --retry 3 -o /tmp/seconv.tar.gz \
+        "$SECONV_BASE/SeConv-Linux-$SECONV_ARCH.tar.gz" \
+    && echo "$SECONV_SHA  /tmp/seconv.tar.gz" | sha256sum -c - \
+    && mkdir -p /out \
+    && tar -xzf /tmp/seconv.tar.gz -C /out \
+    && chmod +x /out/seconv \
+    && test -s /out/LICENSE
+
+# ---------------------------------------------------------------------------
+# 阶段 5：目标架构的 node 二进制来源
+# ---------------------------------------------------------------------------
+FROM node:22-bookworm-slim AS node-dist
+
+# ---------------------------------------------------------------------------
+# 阶段 6：运行镜像
+# ---------------------------------------------------------------------------
+FROM python:3.12-slim-bookworm
+
+# - libstdc++6：onnxruntime / tokenizers 的 manylinux wheel 依赖（slim 基础镜像不带）
+# - ffmpeg：介质规格探测（ffprobe）与 PGS 轨道抽取的运行时依赖。库存画质的真相来自文件本体
+#   而非种子名，缺了它整个「视频/音频/字幕规格」区块都是空的。装全套 ffmpeg
+#   约 160MB（ffprobe 在 Debian 里不单独成包，且 libavdevice 硬依赖 SDL 那串），
+#   这是为「开箱即用」付的确定成本——降级路径虽然存在，但不该是默认体验
+# - tesseract-ocr + 常用字幕语言：seconv 的跨架构保底 OCR。覆盖简繁中、英、
+#   日、韩、法、德、西、意、葡、俄；语言数据约增加 22MB（镜像展开后）。
+#   预检仍会按 PGS 语言检测，未知语言不会回退到英语生成乱码
+# - fontconfig + DejaVu：seconv 随附的 libSkiaSharp.so 依赖 Fontconfig；内置一套
+#   跨架构字体也让构建期可以真正生成 PGS，再 OCR 回 SRT 验证完整调用链
+# - libicu72：seconv 自包含 .NET 运行时仍需要 ICU 提供区域/Unicode 数据；
+#   缺失时进程会在加载字幕格式类型前直接 FailFast
+ARG APT_MIRROR=""
+RUN if [ -n "$APT_MIRROR" ]; then \
+        sed -i "s|deb.debian.org|$APT_MIRROR|g" /etc/apt/sources.list.d/debian.sources; \
+    fi \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+        libstdc++6 ca-certificates ffmpeg fontconfig fonts-dejavu-core libicu72 \
+        tesseract-ocr \
+        tesseract-ocr-eng tesseract-ocr-chi-sim tesseract-ocr-chi-tra \
+        tesseract-ocr-jpn tesseract-ocr-kor \
+        tesseract-ocr-fra tesseract-ocr-deu tesseract-ocr-spa \
+        tesseract-ocr-ita tesseract-ocr-por tesseract-ocr-rus \
+    && rm -rf /var/lib/apt/lists/*
+
+# PGS OCR：每个多架构镜像只带与自身匹配的一份 seconv，不在运行时下载。
+COPY --from=seconv-dist /out /opt/movieclaw/seconv
+COPY docker/subtitle-smoke-test.sh /usr/local/bin/movieclaw-subtitle-smoke-test
+# 构建期就在目标架构执行真实 PGS → SRT：架构、延迟加载的动态库、字体、
+# ffmpeg 或任一承诺的语言包不完整时，直接阻断镜像产出。
+RUN chmod +x /usr/local/bin/movieclaw-subtitle-smoke-test \
+    && /usr/local/bin/movieclaw-subtitle-smoke-test
 
 # Node 运行时：只拷贝 node 二进制（跑 Next standalone server 足够），不装 npm。
 # 注意必须取自目标架构的 node 镜像（web-builder 是构建机架构，二进制不通用）。
@@ -175,7 +229,8 @@ ENV PATH="/venv/bin:${PATH}" \
     APP_RELOAD=false \
     # 发布镜像默认真实投递订阅（代码默认 dry-run 是开发期的保护）
     SUBSCRIPTION_DISPATCH_DRY_RUN=false \
-    MOVIECLAW_NER_DIR=/app/models/torrent-ner
+    MOVIECLAW_NER_DIR=/app/models/torrent-ner \
+    MOVIECLAW_SECONV_PATH=/opt/movieclaw/seconv/seconv
 
 # 运行期数据（SQLite、日志、缓存、上传、密钥）全部落在这个目录
 VOLUME /app/data

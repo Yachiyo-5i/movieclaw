@@ -387,3 +387,52 @@ class TestGluedTokens:
         from movieclaw_enrich import _pre_normalize
 
         assert _pre_normalize("Show Ep07 20260707 HDTV") == "Show Ep07 20260707 HDTV"
+
+
+class TestModelDeclChannel:
+    """模型通道（torrent-ner v2+）的装配路径与护栏否决——测试环境挂 R9 走不到
+    这些分支，用 monkeypatch 模拟模型输出补齐 CI 覆盖。"""
+
+    def _patch_model(self, monkeypatch, payload: dict):
+        import movieclaw_enrich as m
+
+        monkeypatch.setattr(m, "extract_with_model", lambda *_args, **_kw: dict(payload))
+
+    def test_model_decl_fields_flow_into_attrs(self, monkeypatch):
+        from movieclaw_enrich import enrich
+
+        self._patch_model(monkeypatch, {
+            "subtitle_decl_supported": True,
+            "subtitle_languages": ["zh-Hans", "en"],
+            "subtitle_carriers": ["embedded"],
+            "audio_languages": ["cmn"],
+        })
+        attrs = enrich("Some.Show.2026.1080p.WEB-DL", "示例 | 内封简英字幕 国语")
+        assert attrs.subtitle_languages == ["zh-Hans", "en"]
+        assert attrs.subtitle_carriers == ["embedded"]
+        assert attrs.audio_languages == ["cmn"]
+
+    def test_negation_guard_vetoes_model_output(self, monkeypatch, caplog):
+        from movieclaw_enrich import enrich
+
+        self._patch_model(monkeypatch, {
+            "subtitle_decl_supported": True,
+            "subtitle_languages": ["zh-Hans"],
+            "subtitle_carriers": ["embedded"],
+            "audio_languages": ["ja"],
+        })
+        # 合并文本命中否定正则：模型判有字幕 → 护栏否决字幕，音轨不受影响
+        attrs = enrich("Concert.2021.1080p.BluRay", "演唱会 | 无字幕")
+        assert attrs.subtitle_languages == []
+        assert attrs.subtitle_carriers == []
+        assert attrs.audio_languages == ["ja"]
+        assert any("字幕护栏否决" in r.message for r in caplog.records)
+
+    def test_legacy_fallback_without_capability(self, monkeypatch):
+        from movieclaw_enrich import enrich
+
+        # 旧模型：无能力位 → 回落正则通道（仅 zh-Hans）
+        self._patch_model(monkeypatch, {})
+        attrs = enrich("Some.Show.2026.1080p.WEB-DL", "示例 | 内封简中字幕")
+        assert attrs.subtitle_languages == ["zh-Hans"]
+        assert attrs.audio_languages == []

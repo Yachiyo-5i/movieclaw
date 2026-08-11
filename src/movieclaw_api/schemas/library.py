@@ -319,6 +319,23 @@ class SubtitleStreamView(BaseModel):
     file_name: str | None = Field(default=None, description="外挂字幕的文件名")
 
 
+class SubtitleCueView(BaseModel):
+    """字幕预览中的一条对白；时间统一使用毫秒，前端只负责格式化。"""
+
+    start_ms: int = Field(ge=0)
+    end_ms: int = Field(ge=0)
+    text: str
+
+
+class SubtitlePreviewView(BaseModel):
+    """详情页字幕预览：格式元数据 + 已去样式的时间轴对白。"""
+
+    track: str = Field(description="本次预览的中性轨引用")
+    format: str | None = None
+    event_count: int = Field(ge=0)
+    cues: list[SubtitleCueView] = Field(default_factory=list)
+
+
 class LibraryFileView(BaseModel):
     """条目详情页的一个物理文件（一个版本 / 一集）。"""
 

@@ -80,6 +80,44 @@ jobs:
             TMDB_API_KEY=${{ secrets.TMDB_API_KEY }}
           outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
 
+      # Dockerfile 已在构建层跑过真实 PGS → SRT；这里再拉回“已经推送的 digest”
+      # 验证最终产物，避免导出/推送或架构标记错误后仍进入 manifest。
+      - name: 验证已推送镜像的字幕运行时
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          EXPECTED_PLATFORM: ${{ matrix.platform }}
+        run: |
+          REF="$IMAGE@$DIGEST"
+          docker pull "$REF"
+          ACTUAL_PLATFORM="$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$REF")"
+          if [ "$ACTUAL_PLATFORM" != "$EXPECTED_PLATFORM" ]; then
+            echo "::error::镜像架构错误：期望 $EXPECTED_PLATFORM，实际 $ACTUAL_PLATFORM"
+            exit 1
+          fi
+          docker run --rm \
+            --entrypoint /usr/local/bin/movieclaw-subtitle-smoke-test \
+            "$REF"
+          docker run --rm -i \
+            --entrypoint /venv/bin/python \
+            "$REF" - <<'PY'
+          from movieclaw_api.services.subtitle_gen import pgs
+
+          failures = []
+          for code in pgs.OCR_LANGUAGE_LABELS:
+              capability = pgs.detect_capability(code)
+              expected_language = pgs._TESSERACT_LANGUAGES[code]
+              if not (
+                  capability.available
+                  and capability.platform == "Linux"
+                  and capability.engine == "tesseract"
+                  and capability.ocr_language == expected_language
+              ):
+                  failures.append(f"{code}: {capability}")
+          if failures:
+              raise SystemExit("MovieClaw PGS 能力预检失败：\n" + "\n".join(failures))
+          print(f"MovieClaw PGS 能力预检通过：{len(pgs.OCR_LANGUAGE_LABELS)} 种语言")
+          PY
+
       - name: 导出 digest 供合并作业使用
         run: |
           mkdir -p /tmp/digests
@@ -127,4 +165,13 @@ jobs:
           docker buildx imagetools create "${TAGS[@]}" $(printf "$IMAGE@sha256:%s " *)
 
       - name: 检查推送结果
-        run: docker buildx imagetools inspect "$IMAGE:${{ inputs.tag }}"
+        run: |
+          REF="$IMAGE:${{ inputs.tag }}"
+          docker buildx imagetools inspect "$REF"
+          PLATFORMS="$(docker buildx imagetools inspect --raw "$REF" \
+            | jq -r '[.manifests[].platform | select(.os == "linux") | "\(.os)/\(.architecture)"] | unique | sort | join(",")')"
+          if [ "$PLATFORMS" != "linux/amd64,linux/arm64" ]; then
+            echo "::error::多架构 manifest 不完整：$PLATFORMS"
+            exit 1
+          fi
+          echo "多架构 manifest 校验通过：$PLATFORMS"

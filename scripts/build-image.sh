@@ -47,6 +47,33 @@ fi
 
 # 交叉构建（如在 Apple Silicon 上给 x86_64 NAS 出镜像）
 if [[ -n "${PLATFORM:-}" ]]; then
+    case "$PLATFORM" in
+        linux/amd64|linux/arm64) ;;
+        *)
+            echo "错误：PLATFORM 只支持 linux/amd64 或 linux/arm64，当前为 $PLATFORM" >&2
+            exit 1
+            ;;
+    esac
+
+    # 目标架构不是 Docker 守护进程原生架构时，必须先有 binfmt/QEMU。
+    # 提前检测可以避免跑完整个前端构建后，才在 seconv 自检层报 exec format error。
+    docker_arch="$(docker info --format '{{.Architecture}}' 2>/dev/null || true)"
+    case "$docker_arch" in
+        x86_64) docker_arch="amd64" ;;
+        aarch64) docker_arch="arm64" ;;
+    esac
+    target_arch="${PLATFORM#linux/}"
+    if [[ "$docker_arch" != "$target_arch" ]]; then
+        builder_platforms="$(docker buildx inspect --bootstrap 2>/dev/null \
+            | sed -n 's/^Platforms:[[:space:]]*//p' \
+            | tr ',' '\n' \
+            | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+        if ! grep -Fxq "$PLATFORM" <<<"$builder_platforms"; then
+            echo "错误：当前 Docker builder 不能执行 $PLATFORM。" >&2
+            echo "请先安装/启用 binfmt(QEMU)，或在对应架构设备上原生构建。" >&2
+            exit 1
+        fi
+    fi
     BUILD_ARGS+=(--platform "$PLATFORM")
 fi
 
@@ -71,4 +98,6 @@ fi
 
 echo "构建 $IMAGE ……"
 docker build "${BUILD_ARGS[@]}" -t "$IMAGE" .
-echo "完成：$IMAGE"
+echo "验证 $IMAGE 的字幕运行时 ……"
+docker run --rm --entrypoint /usr/local/bin/movieclaw-subtitle-smoke-test "$IMAGE"
+echo "完成：${IMAGE}（字幕运行时已通过 PGS → SRT 端到端自检）"

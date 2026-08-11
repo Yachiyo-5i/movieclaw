@@ -1,5 +1,6 @@
 import { AppShell } from "@/components/app-shell";
 import { AuthGate } from "@/components/auth-gate";
+import { LlmCapabilityProvider } from "@/components/llm-gate";
 
 /**
  * (app) 路由组：工作台全部页面共用的外壳布局。
@@ -10,7 +11,9 @@ import { AuthGate } from "@/components/auth-gate";
 export default function AppLayout({ children }: { children: React.ReactNode }) {
   return (
     <AuthGate>
-      <AppShell>{children}</AppShell>
+      <LlmCapabilityProvider>
+        <AppShell>{children}</AppShell>
+      </LlmCapabilityProvider>
     </AuthGate>
   );
 }

@@ -77,11 +77,15 @@ def main() -> None:
     content_counts: Counter = Counter()
     review_count = 0
     negatives = 0
+    bad_clean = 0
     for item in items:
         problems = validate_item(item)
         if problems:
             bad += 1
-            print(f"[问题] {item['id']}: {'; '.join(problems)}")
+            quarantined = "（已隔离）" if item.get("review") else ""
+            if not item.get("review"):
+                bad_clean += 1
+            print(f"[问题{quarantined}] {item['id']}: {'; '.join(problems)}")
         for span in item.get("spans", []):
             field_counts[span.get("field")] += 1
         split_counts[split_of(item["id"])] += 1
@@ -93,7 +97,8 @@ def main() -> None:
         if not item.get("spans"):
             negatives += 1
 
-    print(f"\n共 {len(items)} 条；结构问题 {bad} 条；重复 id {len(duplicated)} 个；"
+    print(f"\n共 {len(items)} 条；结构问题 {bad} 条（清洁层 {bad_clean} 条——训练门禁要求"
+          f"清洁层必须为 0，隔离层问题随裁决/正规化处理）；重复 id {len(duplicated)} 个；"
           f"待复核 {review_count} 条；负样本（无 span）{negatives} 条")
     print(f"切分分布: {dict(split_counts)}")
     print(f"标注器分布: {dict(annotator_counts)}")

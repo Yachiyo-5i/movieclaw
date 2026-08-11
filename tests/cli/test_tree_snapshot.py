@@ -28,6 +28,7 @@ KNOWN_NON_GENERATED = {
     "images.asset",
     "images.proxy",
     "libraries.cover",  # 二进制图片直出（<img> 引用），CLI 无消费场景
+    "lib.files.subtitles.preview",  # 详情页弹窗按需读取，CLI 无交互消费场景
     "system.spec",
     "auth.login",  # 精选命令 mclaw login 负责（要持久化本地凭证）
     "auth.logout",  # 精选命令 mclaw logout 负责

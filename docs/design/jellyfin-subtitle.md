@@ -246,19 +246,18 @@ default 旗标，仅当只有 forced 轨可选时才选 forced。音轨侧维持
 
 ### 4.1 流编号（Index 方言的唯一产地）
 
-现有合成编号扩展：video=0、audio 1..n、内封字幕 n+1..m、**外挂字幕
-m+1..k**（台账数组序）。双向换算函数与 DTO 构建同源，供三处使用：
-MediaStream 输出、Subtitles 路由反解、进度上报换算。
+合成编号对齐 Jellyfin master：**外挂字幕 0..e-1**（台账数组序），随后是
+video=e、audio e+1..n、内封字幕继续编号。双向换算函数与 DTO 构建同源，
+供三处使用：MediaStream 输出、Subtitles 路由反解、进度上报换算。
 
-记录一处与 Jellyfin master 的有意偏离：master 把外挂流插在容器流**之前**
-统一重编号（10.x 旧版在后）；我们维持在后——增删 sidecar 不漂移内封编号，
-且客户端只认下发的 Index 值。编号漂移对记忆的影响已由 B 层中性引用消除
-（§3.3），协议层内单次会话自洽即可。
+此前曾把外挂流接在容器流之后，以避免增删 sidecar 漂移内封编号；VidHub
+实测会因此过滤外挂流，说明客户端并不都只依赖 Index 自洽。现改为严格对齐
+官方顺序；编号漂移对记忆的影响由 B 层中性引用消除（§3.3）。
 
 ### 4.2 MediaStream 输出（列表/详情/PlaybackInfo 通用）
 
 ```json
-{"Type": "Subtitle", "Index": 3, "Codec": "subrip", "Language": "chi",
+{"Type": "Subtitle", "Index": 0, "Codec": "subrip", "Language": "chi",
  "IsExternal": true, "SupportsExternalStream": true,
  "IsTextSubtitleStream": true, "IsDefault": false, "IsForced": false,
  "IsHearingImpaired": false, "DisplayTitle": "Chinese - SUBRIP - External"}
@@ -303,6 +302,9 @@ GET /Videos/{itemId}/{mediaSourceId}/Subtitles/{index}/Stream.{format}
 - 带 ticks 版转调不带 ticks 版，ticks 接受并忽略（不转码无 seek 平移；
   DeliveryUrl 恒填 0）；route 段同名 query 可覆盖（对齐 ParameterObsolete
   行为）；
+- 路由 `format` 同时接受文件格式名与 Jellyfin/FFmpeg codec 名：
+  `subrip→srt`、`webvtt→vtt`。VidHub 会按 `MediaStream.Codec`
+  自行构造无 ticks 的 `Stream.subrip`，别名归一后再交 B 层判断是否转换；
 - 鉴权 `require_device`（偏离③照旧：真 Jellyfin 匿名，我们要 token，
   DeliveryUrl 自带 `?ApiKey=`）；
 - **库可见性强制**（成员体系同步）：文件装载复用

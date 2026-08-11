@@ -210,7 +210,8 @@ def _apply_default_tracks(
     """
     audio_index = resolve_default_audio(f, audio_mem)
     if audio_index is not None:
-        source["DefaultAudioStreamIndex"] = 1 + audio_index
+        # Jellyfin 把外挂流置前，video/audio 的协议编号随外挂数量整体后移。
+        source["DefaultAudioStreamIndex"] = len(f.external_subtitles or []) + 1 + audio_index
 
     track = resolve_default_subtitle(f, subtitle_mem)
     if track == SUBTITLE_OFF:
@@ -326,6 +327,23 @@ async def download_item(
 # 路由模板用小写 stream.{fmt}：大小写归一化中间件的 "stream." 前缀规范
 # 形态已被取流路由（/Videos/{id}/stream.{container}）注册为小写，任何
 # 大小写的来路（含 DeliveryUrl 的协议形态 Stream.srt）都会被归一到小写
+_SUBTITLE_FORMAT_ALIASES = {
+    "subrip": "srt",
+    "webvtt": "vtt",
+}
+
+
+def _normalize_subtitle_format(value: str) -> str:
+    """Jellyfin/FFmpeg codec 名 → 字幕服务使用的文件格式名。
+
+    MediaStream.Codec 按 Jellyfin 惯例输出 subrip/webvtt，VidHub 会用它
+    自行构造 Stream.{format}，而不是照抄 DeliveryUrl 的 srt/vtt 后缀。
+    这里仅归一协议方言；是否需要实际文本转换仍由 B 层比较源/目标格式。
+    """
+    normalized = value.strip().lower()
+    return _SUBTITLE_FORMAT_ALIASES.get(normalized, normalized)
+
+
 @router.get("/Videos/{item_id}/{media_source_id}/Subtitles/{stream_index}/stream.{fmt}")
 @router.get(
     "/Videos/{item_id}/{media_source_id}/Subtitles/{stream_index}/{start_ticks}/stream.{fmt}"
@@ -366,6 +384,8 @@ async def subtitle_stream(
     out_format: str | None = fmt
     if "format" in qp:
         out_format = qp.get("format") or None
+    if out_format is not None:
+        out_format = _normalize_subtitle_format(out_format)
 
     ref = decode_guid(item_id)
     if ref is None or ref.kind not in (EntityKind.ITEM, EntityKind.EPISODE):

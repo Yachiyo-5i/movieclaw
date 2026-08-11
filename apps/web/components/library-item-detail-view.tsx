@@ -47,6 +47,7 @@ import {
   transferLibraryItem,
 } from "@/lib/api/libraries";
 import { SubtitleGenPanel } from "@/components/subtitle-gen-panel";
+import { SubtitlePreviewDialog } from "@/components/subtitle-preview-dialog";
 import { useBackdrop } from "@/lib/backdrop";
 import { getDiscoveryReturnPath } from "@/lib/discovery-return-path";
 import { formatBytes } from "@/lib/format";
@@ -630,6 +631,8 @@ const VIDEO_CODEC_LABELS: Record<string, string> = {
 };
 
 const LANGUAGE_LABELS: Record<string, string> = {
+  chs: "简体中文",
+  cht: "繁体中文",
   chi: "中文",
   zho: "中文",
   cmn: "中文",
@@ -680,14 +683,36 @@ function audioLabel(stream: AudioStream): string {
 }
 
 /** 字幕 → 一行徽章文案：语言/标题 · 格式 (+ 强制/外挂标记在徽章样式上体现)。 */
+function generatedSubtitleLabel(stream: SubtitleStream): string | null {
+  const title = stream.title?.toLowerCase();
+  if (!title) return null;
+  if (title.startsWith("ai-bilingual-")) {
+    const languages = title.slice("ai-bilingual-".length).split("-");
+    if (languages.length === 2) {
+      return `${languageLabel(languages[0]) ?? languages[0]} + ${languageLabel(languages[1]) ?? languages[1]}`;
+    }
+  }
+  if (title === "ai-chs") return "简体中文";
+  if (title === "ai-cht") return "繁体中文";
+  return null;
+}
+
 function subtitleLabel(stream: SubtitleStream): string {
   const codec = stream.codec
     ? (SUBTITLE_CODEC_LABELS[stream.codec.toLowerCase()] ?? stream.codec.toUpperCase())
     : null;
-  const name = languageLabel(stream.language) ?? stream.title ?? null;
+  const name = generatedSubtitleLabel(stream) ?? languageLabel(stream.language) ?? stream.title ?? null;
   const parts = [name, codec].filter(Boolean);
   if (stream.forced) parts.push("强制");
   return parts.join(" · ") || "未知字幕";
+}
+
+function externalSubtitleSuffix(stream: SubtitleStream): string | undefined {
+  if (!stream.external) return undefined;
+  const tokens = stream.file_name?.toLowerCase().split(".") ?? [];
+  if (tokens.some((token) => token === "ai" || token.startsWith("ai-"))) return "AI 外挂";
+  if (tokens.includes("pgs-ocr")) return "PGS 转换";
+  return "外挂";
 }
 
 function videoCodecLabel(codec: string | null): string | null {
@@ -796,52 +821,94 @@ function MovieVersionSpecs({
         )}
       </div>
       <div className="rounded-2xl border border-white/[0.07] bg-[rgba(14,16,22,0.45)] p-6 backdrop-blur-xl">
-        <SpecRows file={active} />
-        <SubtitleGenPanel file={active} onChanged={onChanged} />
+        <SpecRows key={active.id} file={active} onChanged={onChanged} />
       </div>
     </section>
   );
 }
 
 /** 一个文件的规格三行：视频 / 音频 / 字幕（文件区逐集展开时共用）。 */
-function SpecRows({ file }: { file: LibraryItemFile }) {
+function SpecRows({
+  file,
+  onChanged,
+}: {
+  file: LibraryItemFile;
+  onChanged?: () => void;
+}) {
+  const [previewTarget, setPreviewTarget] = useState<{
+    stream: SubtitleStream;
+    track: string;
+    label: string;
+  } | null>(null);
+
   return (
-    <div className="space-y-4">
-      <SpecRow label="视频">
-        {videoBadges(file).length > 0 ? (
-          videoBadges(file).map((b) => <SpecBadge key={b} text={b} />)
-        ) : (
-          <span className="text-sub text-[var(--text-muted)]">未能探测（ffprobe 缺失或文件不可达）</span>
-        )}
-      </SpecRow>
-      <SpecRow label="音频">
-        {file.audio_streams === null ? (
-          <span className="text-sub text-[var(--text-muted)]">
-            尚未探测——在媒体库页对本库执行「重新扫描」即可补齐规格；
-            扫描后仍为空请检查文件是否可达，以及（源码部署时）是否装了 ffmpeg
-          </span>
-        ) : file.audio_streams.length === 0 ? (
-          <span className="text-sub text-[var(--text-muted)]">文件内没有音轨</span>
-        ) : (
-          file.audio_streams.map((a, i) => (
-            <SpecBadge key={i} text={audioLabel(a)} accent={a.default} />
-          ))
-        )}
-      </SpecRow>
-      <SpecRow label="字幕">
-        {file.subtitle_streams.length === 0 ? (
-          <span className="text-sub text-[var(--text-muted)]">无内封或外挂字幕</span>
-        ) : (
-          file.subtitle_streams.map((s, i) => (
-            <SpecBadge
-              key={i}
-              text={subtitleLabel(s)}
-              suffix={s.external ? "外挂" : undefined}
-            />
-          ))
-        )}
-      </SpecRow>
-    </div>
+    <>
+      <div className="space-y-4">
+        <SpecRow label="视频">
+          {videoBadges(file).length > 0 ? (
+            videoBadges(file).map((b) => <SpecBadge key={b} text={b} />)
+          ) : (
+            <span className="text-sub text-[var(--text-muted)]">
+              未能探测（ffprobe 缺失或文件不可达）
+            </span>
+          )}
+        </SpecRow>
+        <SpecRow label="音频">
+          {file.audio_streams === null ? (
+            <span className="text-sub text-[var(--text-muted)]">
+              尚未探测——在媒体库页对本库执行「重新扫描」即可补齐规格；
+              扫描后仍为空请检查文件是否可达，以及（源码部署时）是否装了 ffmpeg
+            </span>
+          ) : file.audio_streams.length === 0 ? (
+            <span className="text-sub text-[var(--text-muted)]">文件内没有音轨</span>
+          ) : (
+            file.audio_streams.map((a, i) => (
+              <SpecBadge key={i} text={audioLabel(a)} accent={a.default} />
+            ))
+          )}
+        </SpecRow>
+        <SpecRow label="字幕">
+          {file.subtitle_streams.length === 0 ? (
+            <span className="text-sub text-[var(--text-muted)]">无内封或外挂字幕</span>
+          ) : (
+            file.subtitle_streams.map((s, i) => {
+              const label = subtitleLabel(s);
+              const track = s.external
+                ? s.file_name
+                  ? `external:${s.file_name}`
+                  : null
+                : `embedded:${i}`;
+              return (
+                <SpecBadge
+                  key={track ?? `external:${i}`}
+                  text={label}
+                  suffix={
+                    externalSubtitleSuffix(s)
+                  }
+                  onClick={
+                    track ? () => setPreviewTarget({ stream: s, track, label }) : undefined
+                  }
+                />
+              );
+            })
+          )}
+          {/* AI 入口也是一种“将要产生的字幕”，与已有字幕徽章使用同一布局；
+              key 隔离不同片源的预检与确认状态，切版本不会串任务。 */}
+          <SubtitleGenPanel key={file.id} file={file} onChanged={onChanged} />
+        </SpecRow>
+      </div>
+      {previewTarget && (
+        <SubtitlePreviewDialog
+          open
+          file={file}
+          stream={previewTarget.stream}
+          track={previewTarget.track}
+          label={previewTarget.label}
+          onClose={() => setPreviewTarget(null)}
+          onChanged={onChanged}
+        />
+      )}
+    </>
   );
 }
 
@@ -858,25 +925,34 @@ function SpecBadge({
   text,
   accent = false,
   suffix,
+  onClick,
 }: {
   text: string;
   accent?: boolean;
   suffix?: string;
+  onClick?: () => void;
 }) {
-  return (
-    <span
-      className={`tnum inline-flex items-center gap-1 rounded-md border px-2 py-0.5 text-caption ${
-        accent
-          ? "border-white/30 bg-white/[0.1] text-white"
-          : "border-white/[0.12] bg-white/[0.04] text-white/80"
-      }`}
-    >
+  const className = `tnum inline-flex items-center gap-1 rounded-md border px-2 py-0.5 text-caption ${
+    accent
+      ? "border-white/30 bg-white/[0.1] text-white"
+      : "border-white/[0.12] bg-white/[0.04] text-white/80"
+  } ${onClick ? "cursor-pointer transition hover:border-white/25 hover:bg-white/[0.09] hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent-2)]" : ""}`;
+  const content = (
+    <>
       {text}
       {suffix && (
         <span className="rounded-sm bg-white/[0.12] px-1 text-micro text-white/70">{suffix}</span>
       )}
-    </span>
+    </>
   );
+  if (onClick) {
+    return (
+      <button type="button" onClick={onClick} className={className} title={`预览字幕：${text}`}>
+        {content}
+      </button>
+    );
+  }
+  return <span className={className}>{content}</span>;
 }
 
 /** 外部信息源链接：新窗口打开站点词条，样式与「在 TMDB 打开核对」保持一致。 */
@@ -1094,8 +1170,7 @@ function SeasonEpisodesSection({
                         </button>}
                       </div>
                       <div className="mt-3.5">
-                        <SpecRows file={file} />
-                        <SubtitleGenPanel file={file} onChanged={onChanged} />
+                        <SpecRows file={file} onChanged={onChanged} />
                       </div>
                     </div>
                   ))}
@@ -1310,8 +1385,7 @@ function FileRow({
       </div>
       {expanded && !isMovie && (
         <div className="border-t border-white/[0.04] bg-white/[0.02] px-5 py-4">
-          <SpecRows file={file} />
-          <SubtitleGenPanel file={file} onChanged={onChanged} />
+          <SpecRows file={file} onChanged={onChanged} />
         </div>
       )}
     </div>

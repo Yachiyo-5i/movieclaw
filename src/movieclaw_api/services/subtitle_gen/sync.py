@@ -246,9 +246,20 @@ def _best_offset(reference: np.ndarray, candidate: np.ndarray) -> tuple[int, flo
     fc = np.fft.rfft(cand, size)
     corr = np.fft.irfft(fr * np.conj(fc), size)
     # corr[k] = sum ref[i+k]*cand[i]（k>=0：cand 需右移 k 格）；负位移在尾部
-    max_shift = _MAX_SHIFT_S * 1000 // _RASTER_MS
-    lags = np.concatenate([np.arange(0, max_shift), np.arange(-max_shift, 0)])
-    values = np.concatenate([corr[:max_shift], corr[-max_shift:]])
+    # 搜索窗不能超过真实信号长度。短片的 FFT padding 可能小于固定 ±120s
+    # 窗口；直接用超长切片会把 corr 尾部的负 lag 重复塞进“正 lag”区，进而
+    # 把 -3s 这类正常校准误报成 +70s 以上、且相关分仍很高。
+    max_shift = min(
+        _MAX_SHIFT_S * 1000 // _RASTER_MS,
+        len(reference) - 1,
+        len(candidate) - 1,
+    )
+    if max_shift <= 0:
+        return 0, 0.0
+    lags = np.concatenate(
+        [np.arange(0, max_shift + 1), np.arange(-max_shift, 0)]
+    )
+    values = np.concatenate([corr[: max_shift + 1], corr[-max_shift:]])
     peak = int(np.argmax(values))
     denom = float(np.sqrt((ref**2).sum() * (cand**2).sum())) or 1.0
     return int(lags[peak]) * _RASTER_MS, float(values[peak] / denom)

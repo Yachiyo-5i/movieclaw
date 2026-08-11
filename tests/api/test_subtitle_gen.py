@@ -5,13 +5,16 @@
 
 from __future__ import annotations
 
+import asyncio
+import inspect
 import json
 from pathlib import Path
 
 import numpy as np
 import pytest
 
-from movieclaw_api.services.subtitle_gen import extract, source, sync, translate, validate
+from movieclaw_api.exceptions import BadRequestException
+from movieclaw_api.services.subtitle_gen import extract, source, sync, tasks, translate, validate
 from movieclaw_db.models import LibraryFile
 
 # ---------------------------------------------------------------------------
@@ -67,6 +70,87 @@ def test_rank_embedded_wins_tie_over_external() -> None:
     assert usable[0].candidate.kind == "embedded"
 
 
+def test_default_reference_prefers_english_over_original_language() -> None:
+    """确认弹窗默认英语，但没有英语时仍沿用原语言优先的质量排序。"""
+    row = _file(
+        [
+            {"codec": "subrip", "language": "jpn"},
+            {"codec": "subrip", "language": "eng"},
+        ],
+        [],
+    )
+    ranked = source.rank_candidates(row, original_language="jpn", target_language="chs")
+
+    selected = tasks._select_reference(ranked, None)
+
+    assert selected is not None
+    assert tasks.candidate_key(selected) == "embedded:1"
+
+
+def test_reference_can_explicitly_select_pgs() -> None:
+    row = _file(
+        [
+            {"codec": "subrip", "language": "eng"},
+            {"codec": "hdmv_pgs_subtitle", "language": "jpn"},
+        ],
+        [],
+    )
+    ranked = source.rank_candidates(row, original_language="jpn", target_language="chs")
+
+    selected = tasks._select_reference(ranked, "embedded:1")
+
+    assert selected is not None
+    assert selected.exclusion_code == "pgs"
+    assert tasks.candidate_selectable(selected)
+
+
+def test_reference_rejects_stale_or_unsupported_candidate() -> None:
+    row = _file([{"codec": "dvd_subtitle", "language": "eng"}], [])
+    ranked = source.rank_candidates(row, original_language="eng", target_language="chs")
+
+    with pytest.raises(BadRequestException, match="不能用于翻译"):
+        tasks._select_reference(ranked, "embedded:0")
+    with pytest.raises(BadRequestException, match="已不存在"):
+        tasks._select_reference(ranked, "embedded:9")
+
+
+async def test_preview_loads_only_the_requested_reference(monkeypatch) -> None:
+    row = _file(
+        [
+            {"codec": "subrip", "language": "jpn"},
+            {"codec": "subrip", "language": "eng"},
+        ],
+        [],
+    )
+    loaded: list[str] = []
+    complete = [(i * 100_000, i * 100_000 + 2000, f"line {i}") for i in range(60)]
+
+    async def fake_load_row(_session, _file_id):  # noqa: ANN001
+        return row
+
+    async def fake_context(_session, _row):  # noqa: ANN001
+        return CTX, "jpn"
+
+    async def fake_load(_row, candidate):  # noqa: ANN001
+        loaded.append(candidate.key)
+        return complete
+
+    monkeypatch.setattr(tasks, "_load_row", fake_load_row)
+    monkeypatch.setattr(tasks, "_film_context", fake_context)
+    monkeypatch.setattr(extract, "load_candidate_events", fake_load)
+
+    result = await tasks.preview(
+        None,  # type: ignore[arg-type]
+        7,
+        "chs",
+        source_candidate_key="embedded:0",
+    )
+
+    assert loaded == ["0"]
+    assert result.selected_source_key == "embedded:0"
+    assert result.chosen is not None and result.chosen.candidate.language == "jpn"
+
+
 def test_assess_completeness() -> None:
     few = [(i * 1000, i * 1000 + 500, "x") for i in range(10)]
     assert not source.assess_events(few, 6000).ok  # 条数太少
@@ -74,6 +158,33 @@ def test_assess_completeness() -> None:
     assert not source.assess_events(fragment, 6000).ok  # 只覆盖开头 1 分钟
     full = [(i * 60_000, i * 60_000 + 2000, "x") for i in range(90)]
     assert source.assess_events(full, 6000).ok
+
+
+def test_preview_blocker_explains_graphic_subtitles() -> None:
+    """图片字幕不是“没有字幕”，预检要用普通用户能理解的方式说明下一步。"""
+    file = _file(
+        [
+            {"codec": "hdmv_pgs_subtitle", "language": "eng"},
+            {"codec": "hdmv_pgs_subtitle", "language": "spa"},
+        ],
+        [],
+    )
+    ranked = source.rank_candidates(file, original_language="fre", target_language="chs")
+
+    blocker = tasks._preview_blocker(ranked)
+
+    assert blocker.code == "graphics_only"
+    assert "2 条" in blocker.message
+    assert "图片字幕" in blocker.message
+    assert "PGS" not in blocker.message and "OCR" not in blocker.message
+    assert any("SRT" in suggestion for suggestion in blocker.suggestions)
+
+
+def test_preview_blocker_explains_missing_subtitles() -> None:
+    blocker = tasks._preview_blocker([])
+
+    assert blocker.code == "no_subtitle"
+    assert "不会从音轨听写" in blocker.message
 
 
 # ---------------------------------------------------------------------------
@@ -87,6 +198,29 @@ def test_clean_punctuation_rules() -> None:
     assert validate.clean_punctuation("真的吗？！！") == "真的吗？"
     assert validate.clean_punctuation("１９８４年") == "1984年"
     assert validate.clean_punctuation("等等…") == "等等…"  # 省略号保留
+
+
+def test_non_chinese_output_keeps_its_own_punctuation_and_line_width() -> None:
+    text = "This sentence, unlike Chinese subtitles, keeps its punctuation."
+
+    out, report = validate.finalize_events([(0, 5000, text)], target_language="eng")
+
+    assert "," in out[0][2] and out[0][2].endswith("punctuation.")
+    assert all(len(line) <= 42 for line in out[0][2].splitlines())
+    assert report.cps_overrun == 0
+
+
+def test_bilingual_quality_checks_each_language_line_separately() -> None:
+    events = [(0, 2000, "一句中文\nA concise English line.")]
+
+    out, report = validate.finalize_events(
+        events,
+        target_language="chs",
+        secondary_language="eng",
+    )
+
+    assert out[0][2] == "一句中文\nA concise English line."
+    assert report.cps_overrun == 0
 
 
 def test_fold_line_at_sixteen() -> None:
@@ -125,6 +259,11 @@ def _events(n: int) -> list[extract.SubEvent]:
     return [(i * 2000, i * 2000 + 1500, f"line {i}") for i in range(n)]
 
 
+def _prompt_block(user: str) -> list[dict]:
+    """只解析待翻译 payload，忽略并发窗口附带的上文原文。"""
+    return json.loads(user.split("翻译下列对白：\n", 1)[1])
+
+
 def _good_chat(monkeypatch=None):
     calls = {"n": 0}
 
@@ -132,7 +271,7 @@ def _good_chat(monkeypatch=None):
         calls["n"] += 1
         if "找出其中反复出现的人名" in user:
             return '[{"src": "John", "dst": "约翰"}]'
-        block = json.loads(user[user.index("[") :])
+        block = _prompt_block(user)
         return json.dumps([{"i": e["i"], "t": f"译{e['i']}"} for e in block])
 
     return chat, calls
@@ -142,9 +281,7 @@ async def test_translate_happy_path(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.chdir(tmp_path)  # cache_dir 是相对路径,隔离到临时目录
     chat, calls = _good_chat()
     events = _events(120)  # 3 块
-    out, stats = await translate.translate_events(
-        chat, events, CTX, "chs", file_id=1
-    )
+    out, stats = await translate.translate_events(chat, events, CTX, "chs", file_id=1)
     assert len(out) == 120
     assert out[0][2] == "译0" and out[119][2] == "译119"
     assert out[5][0] == events[5][0]  # 时间轴原样
@@ -155,6 +292,48 @@ async def test_translate_happy_path(tmp_path: Path, monkeypatch) -> None:
         next((tmp_path / "data").rglob("*.checkpoint.json")).read_text(encoding="utf-8")
     )
     assert len(ckpt["blocks"]) == 3
+
+
+async def test_translate_bilingual_keeps_selected_line_order(tmp_path: Path, monkeypatch) -> None:
+    """双语由同一次模型调用生成，且每条严格保持“第一语言 + 第二语言”两行。"""
+    monkeypatch.chdir(tmp_path)
+    systems: list[str] = []
+
+    async def chat(system: str, user: str) -> str:
+        if "找出其中反复出现的人名" in user:
+            return "[]"
+        systems.append(system)
+        block = _prompt_block(user)
+        return json.dumps(
+            [{"i": event["i"], "t": f"译{event['i']}\nEnglish {event['i']}"} for event in block]
+        )
+
+    out, stats = await translate.translate_events(
+        chat,
+        _events(60),
+        CTX,
+        "chs",
+        file_id=33,
+        secondary_language="eng",
+    )
+
+    assert stats.failed_blocks == 0
+    assert out[0][2] == "译0\nEnglish 0"
+    assert "第一行只写简体中文，第二行只写英语" in systems[0]
+    assert next((tmp_path / "data").rglob("*chs-eng*.checkpoint.json")).is_file()
+
+
+def test_standardized_sidecar_names_are_player_compatible() -> None:
+    """末段保留播放器识别的语言码，前段承载 AI 类型与双语组合。"""
+    row = _file([], [])
+
+    assert tasks._sidecar_path(row, "chs").name == "Movie.ai-chs.chi.srt"
+    assert tasks._sidecar_path(row, "eng").name == "Movie.ai.eng.srt"
+    assert tasks._legacy_sidecar_path(row, "chs").name == "Movie.chs.ai.srt"
+    assert tasks._sidecar_path(row, "chs", "eng").name == "Movie.ai-bilingual-chs-eng.chi.srt"
+    assert tasks._pgs_sidecar_path(row, "eng").name == "Movie.pgs-ocr.eng.srt"
+    with pytest.raises(BadRequestException, match="不能选择同一种语言"):
+        tasks.ensure_output_languages("chs", "chs")
 
 
 async def test_translate_block_retry_then_keep_original(tmp_path: Path, monkeypatch) -> None:
@@ -179,7 +358,7 @@ async def test_translate_checkpoint_resume(tmp_path: Path, monkeypatch) -> None:
     async def chat_first(system: str, user: str) -> str:
         if "找出其中反复出现的人名" in user:
             return "[]"
-        block = json.loads(user[user.index("[") :])
+        block = _prompt_block(user)
         if block[0]["i"] >= 50:  # 第二块：模拟中断
             aborted["hit"] = True
             raise RuntimeError("网络中断")
@@ -195,15 +374,40 @@ async def test_translate_checkpoint_resume(tmp_path: Path, monkeypatch) -> None:
         if "找出其中反复出现的人名" in user:
             raise AssertionError("术语表也该从断点恢复,不该再调")
         block_calls["n"] += 1
-        block = json.loads(user[user.index("[") :])
+        block = _prompt_block(user)
         assert block[0]["i"] == 50  # 只翻第二块
         return json.dumps([{"i": e["i"], "t": f"译{e['i']}"} for e in block])
 
-    out, stats = await translate.translate_events(
-        chat_second, events, CTX, "chs", file_id=3
-    )
+    out, stats = await translate.translate_events(chat_second, events, CTX, "chs", file_id=3)
     assert block_calls["n"] == 1
     assert len(out) == 100 and out[99][2] == "译99"
+
+
+async def test_translate_checkpoint_cannot_bypass_failure_fuse(tmp_path: Path, monkeypatch) -> None:
+    """失败块跨重跑累计，不能靠反复续传把整片原文洗成成功结果。"""
+    monkeypatch.chdir(tmp_path)
+
+    async def bad_chat(system: str, user: str) -> str:
+        if "找出其中反复出现的人名" in user:
+            return "[]"
+        return "不是 JSON"
+
+    events = _events(500)  # 10 块；每轮失败率都必须包含断点里的历史失败块
+    with pytest.raises(translate.TranslationAborted):
+        await translate.translate_events(bad_chat, events, CTX, "chs", file_id=30)
+
+    # 模拟修复前已经落盘的旧格式断点：升级后也必须识别历史原文回退块。
+    checkpoint_path = next((tmp_path / "data").rglob("*.checkpoint.json"))
+    legacy = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+    legacy.pop("failed_blocks")
+    checkpoint_path.write_text(json.dumps(legacy), encoding="utf-8")
+    for _ in range(4):
+        with pytest.raises(translate.TranslationAborted):
+            await translate.translate_events(bad_chat, events, CTX, "chs", file_id=30)
+
+    checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+    # 有界并发允许同一批调用一起完成，因此熔断最多产生一个并发窗口的超调。
+    assert checkpoint["failed_blocks"] == list(range(translate.TRANSLATION_CONCURRENCY))
 
 
 async def test_translate_untranslated_block_detected(tmp_path: Path, monkeypatch) -> None:
@@ -213,7 +417,7 @@ async def test_translate_untranslated_block_detected(tmp_path: Path, monkeypatch
     async def chat(system: str, user: str) -> str:
         if "找出其中反复出现的人名" in user:
             return "[]"
-        block = json.loads(user[user.index("[") :])
+        block = _prompt_block(user)
         return json.dumps(
             [{"i": e["i"], "t": "This line was not translated at all"} for e in block]
         )
@@ -221,6 +425,80 @@ async def test_translate_untranslated_block_detected(tmp_path: Path, monkeypatch
     events = _events(40)
     with pytest.raises(translate.TranslationAborted):  # 1/1 失败率触发熔断
         await translate.translate_events(chat, events, CTX, "chs", file_id=4)
+
+
+async def test_translate_uses_bounded_concurrency_and_reports_progress(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """单片并发不超过初始上限，进度同时报告活动块和对白完成数。"""
+    monkeypatch.chdir(tmp_path)
+    active = 0
+    peak = 0
+    snapshots: list[translate.TranslationProgress] = []
+
+    async def chat(system: str, user: str) -> str:
+        nonlocal active, peak
+        if "找出其中反复出现的人名" in user:
+            return "[]"
+        block = _prompt_block(user)
+        active += 1
+        peak = max(peak, active)
+        await asyncio.sleep(0.01)
+        active -= 1
+        return json.dumps([{"i": e["i"], "t": f"译{e['i']}"} for e in block])
+
+    events = _events(500)  # 10 块，足以观察首批八路和第二批两路
+    out, stats = await translate.translate_events(
+        chat,
+        events,
+        CTX,
+        "chs",
+        file_id=31,
+        progress=snapshots.append,
+    )
+
+    assert peak == translate.TRANSLATION_CONCURRENCY == 8
+    assert any(len(snapshot.active_blocks) == 8 for snapshot in snapshots)
+    assert snapshots[-1].done_blocks == stats.total_blocks == 10
+    assert snapshots[-1].done_events == snapshots[-1].total_events == 500
+    assert len(out) == 500
+
+
+async def test_translate_rate_limit_reduces_concurrency_and_retries(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """429 不应直接废任务：并发减半，退避后重试原块并保留已完成结果。"""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(translate, "_RATE_LIMIT_MIN_DELAY", 0.01)
+    attempts: dict[int, int] = {}
+    snapshots: list[translate.TranslationProgress] = []
+    messages: list[str] = []
+
+    async def chat(system: str, user: str) -> str:
+        if "找出其中反复出现的人名" in user:
+            return "[]"
+        block = _prompt_block(user)
+        bi = block[0]["i"] // translate.BLOCK_SIZE
+        attempts[bi] = attempts.get(bi, 0) + 1
+        if bi == 0 and attempts[bi] == 1:
+            raise translate.ChatRateLimited(0.01)
+        await asyncio.sleep(0.01)
+        return json.dumps([{"i": e["i"], "t": f"译{e['i']}"} for e in block])
+
+    out, stats = await translate.translate_events(
+        chat,
+        _events(500),
+        CTX,
+        "chs",
+        file_id=32,
+        progress=snapshots.append,
+        phase=lambda _phase, message: messages.append(message),
+    )
+
+    assert len(out) == 500 and stats.failed_blocks == 0
+    assert attempts[0] == 2
+    assert any(snapshot.concurrency == 4 for snapshot in snapshots)
+    assert any("已降至 4 路" in message for message in messages)
 
 
 # ---------------------------------------------------------------------------
@@ -231,9 +509,7 @@ async def test_translate_untranslated_block_detected(tmp_path: Path, monkeypatch
 def _speechy_pcm(intervals_ms: list[tuple[int, int]], total_ms: int) -> np.ndarray:
     """人造音频：语音段为响亮噪声,其余近静音。"""
     rng = np.random.default_rng(seed=7)
-    pcm = rng.normal(0, 0.002, int(sync.SAMPLE_RATE * total_ms / 1000)).astype(
-        np.float32
-    )
+    pcm = rng.normal(0, 0.002, int(sync.SAMPLE_RATE * total_ms / 1000)).astype(np.float32)
     for s, e in intervals_ms:
         a, b = int(s / 1000 * sync.SAMPLE_RATE), int(e / 1000 * sync.SAMPLE_RATE)
         pcm[a:b] = rng.normal(0, 0.3, b - a).astype(np.float32)
@@ -249,9 +525,7 @@ def test_sync_hit_rate_aligned_vs_shifted() -> None:
     aligned = sync.event_hit_rate(speech, [(s, e) for s, e in speech_at])
     assert aligned is not None and aligned > 0.9
     # 人造 +4 秒错位（落进静音带）:命中率显著下降（§10 验收:人造偏移样本低于阈值）
-    shifted = sync.event_hit_rate(
-        speech, [(s + 4000, e + 4000) for s, e in speech_at[:-1]]
-    )
+    shifted = sync.event_hit_rate(speech, [(s + 4000, e + 4000) for s, e in speech_at[:-1]])
     assert shifted is not None and shifted < sync.SYNC_THRESHOLD
 
 
@@ -291,10 +565,7 @@ def test_gbk_external_sidecar_decoded(tmp_path: Path) -> None:
 def test_subtitle_gen_never_imports_playback_layers() -> None:
     import ast
 
-    pkg = (
-        Path(__file__).resolve().parents[2]
-        / "src/movieclaw_api/services/subtitle_gen"
-    )
+    pkg = Path(__file__).resolve().parents[2] / "src/movieclaw_api/services/subtitle_gen"
     for py in pkg.rglob("*.py"):
         tree = ast.parse(py.read_text(encoding="utf-8"))
         for node in ast.walk(tree):
@@ -347,6 +618,24 @@ def test_calibration_recovers_pal_speedup() -> None:
     assert abs(cal.offset_ms - b) <= 60
 
 
+def test_calibration_short_clip_recovers_negative_offset() -> None:
+    """FFT 短于固定搜索窗时，负位移不能被环形索引误映射成巨大正值。"""
+    reference = []
+    t = 500
+    for i in range(25):
+        gap = 900 + (i * 137) % 800
+        duration = 200 + (i * 97) % 600
+        reference.append((t, t + duration))
+        t += gap
+    subtitle = [(s + 3000, e + 3000) for s, e in reference]
+
+    cal = sync.estimate_calibration(reference, subtitle)
+
+    assert cal is not None
+    assert cal.scale == 1.0
+    assert abs(cal.offset_ms + 3000) <= 50
+
+
 def test_calibration_apply_roundtrip() -> None:
     cal = sync.Calibration(scale=1.0, offset_ms=-1500, score=1.0)
     events = [(2000, 3000, "a"), (500, 900, "b")]
@@ -383,6 +672,167 @@ def test_auto_quota_and_skip_logic() -> None:
     assert not auto._has_reference(bare, "chs")  # 只有图形轨 → 无参考
 
 
+async def test_auto_queue_claims_library_before_task_runs(monkeypatch) -> None:
+    """同一轮事件循环连续触发两次扫描收尾，也只能创建一个自动批次。"""
+    from movieclaw_api.services.subtitle_gen import auto
+
+    running_libraries: set[int] = set()
+    monkeypatch.setattr(auto, "_running_libraries", running_libraries)
+    release = asyncio.Event()
+    calls = 0
+
+    async def fake_batch(library_id: int) -> None:
+        nonlocal calls
+        calls += 1
+        try:
+            await release.wait()
+        finally:
+            running_libraries.discard(library_id)
+
+    monkeypatch.setattr(auto, "_run_batch", fake_batch)
+    auto.queue_after_scan(7)
+    auto.queue_after_scan(7)
+    await asyncio.sleep(0)
+    assert calls == 1
+    assert running_libraries == {7}
+
+    release.set()
+    await asyncio.sleep(0)
+    assert running_libraries == set()
+
+
+async def test_supervisor_cancels_generation_without_waiting_for_natural_completion(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """服务重载主动暂停长任务，并保留自动续传所需的持久化意图。"""
+    from movieclaw_api.services import task_supervisor as supervisor_module
+    from movieclaw_api.services.subtitle_gen import tasks
+    from movieclaw_api.services.task_state import TaskState
+
+    states: TaskState[tasks.GenState] = TaskState()
+    supervisor = supervisor_module.TaskSupervisor()
+    entered = asyncio.Event()
+    never_finishes = asyncio.Event()
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(tasks, "_tasks", states)
+    monkeypatch.setattr(tasks, "_generation_lock", asyncio.Lock())
+    monkeypatch.setattr(supervisor_module, "_supervisor", supervisor)
+
+    async def long_generation(file_id, target_language, state):  # noqa: ANN001, ARG001
+        entered.set()
+        await never_finishes.wait()
+        return tasks.GenResult(ok=True, message="不应自然完成")
+
+    monkeypatch.setattr(tasks, "_run", long_generation)
+    assert states.try_start(303, tasks.GenState())
+
+    task = tasks.queue_generation(303, "chs")
+    await entered.wait()
+    assert supervisor.active_count == 1
+    intent_path = tasks._intent_path(tasks.GenerationIntent(303, "chs"))
+    assert intent_path.exists()
+
+    await asyncio.wait_for(supervisor.close(), timeout=0.5)
+
+    assert task.cancelled()
+    assert states.state_of(303) is None
+    result = tasks.last_result(303)
+    assert result is not None
+    assert "自动继续" in result.message and "已保存进度" in result.message
+    assert intent_path.exists()
+
+
+async def test_interrupted_generation_resumes_automatically(tmp_path: Path, monkeypatch) -> None:
+    """启动扫描持久化意图后应直接入队，无需用户再次点击确认。"""
+    from movieclaw_api.services import task_supervisor as supervisor_module
+    from movieclaw_api.services.subtitle_gen import tasks
+    from movieclaw_api.services.task_state import TaskState
+
+    states: TaskState[tasks.GenState] = TaskState()
+    supervisor = supervisor_module.TaskSupervisor()
+    completed = asyncio.Event()
+    captured: dict[str, object] = {}
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(tasks, "_tasks", states)
+    monkeypatch.setattr(tasks, "_generation_lock", asyncio.Lock())
+    monkeypatch.setattr(supervisor_module, "_supervisor", supervisor)
+
+    async def resumed_run(
+        file_id,
+        target_language,
+        state,
+        *,
+        convert_pgs=False,
+        pgs_candidate_key=None,
+        pgs_ocr_language=None,
+        secondary_language=None,
+        source_candidate_key=None,
+    ):  # noqa: ANN001
+        captured.update(
+            file_id=file_id,
+            target_language=target_language,
+            convert_pgs=convert_pgs,
+            pgs_candidate_key=pgs_candidate_key,
+            pgs_ocr_language=pgs_ocr_language,
+            secondary_language=secondary_language,
+            source_candidate_key=source_candidate_key,
+        )
+        completed.set()
+        return tasks.GenResult(ok=True, message="续传完成")
+
+    monkeypatch.setattr(tasks, "_run", resumed_run)
+    intent = tasks.GenerationIntent(
+        404,
+        "chs",
+        True,
+        "embedded:0",
+        "eng",
+        secondary_language="jpn",
+        source_candidate_key="embedded:0",
+    )
+    tasks._persist_intent(intent)
+
+    assert tasks.resume_interrupted_generations() == 1
+    await completed.wait()
+    while supervisor.active_count:
+        await asyncio.sleep(0)
+
+    assert captured == {
+        "file_id": 404,
+        "target_language": "chs",
+        "convert_pgs": True,
+        "pgs_candidate_key": "embedded:0",
+        "pgs_ocr_language": "eng",
+        "secondary_language": "jpn",
+        "source_candidate_key": "embedded:0",
+    }
+    assert states.state_of(404) is None
+    assert not tasks._intent_path(intent).exists()
+
+
+def test_explicit_stop_prevents_restart_resume(tmp_path: Path, monkeypatch) -> None:
+    """用户明确停止要立即删除意图，不能在下次启动时反向复活。"""
+    from movieclaw_api.services.subtitle_gen import tasks
+    from movieclaw_api.services.task_state import TaskState
+
+    states: TaskState[tasks.GenState] = TaskState()
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(tasks, "_tasks", states)
+    intent = tasks.GenerationIntent(505, "chs")
+    tasks._persist_intent(intent)
+    assert states.try_start(505, tasks.GenState())
+
+    assert tasks.request_stop(505)
+    assert not tasks._intent_path(intent).exists()
+
+
+def test_manual_generation_is_not_bound_to_http_background_tasks() -> None:
+    """防回归：分钟级执行体不能再次挂回 Starlette 响应生命周期。"""
+    from movieclaw_api.api.routes.subtitle_gen import gen_start
+
+    assert "background_tasks" not in inspect.signature(gen_start).parameters
+
+
 # ---------------------------------------------------------------------------
 # 自查改进项（终检轮）：抽取缓存 / 语言 token 校验 / 校准文件名防护
 # ---------------------------------------------------------------------------
@@ -404,6 +854,105 @@ def test_extract_cache_skips_when_fresh(tmp_path: Path, monkeypatch) -> None:
     os.utime(video, ns=(out.stat().st_mtime_ns + 10**9,) * 2)
     with pytest.raises(extract.SourceLoadError):
         extract._extract_embedded_sync(video, 0, out)
+
+
+def test_extract_failure_does_not_leave_cache(tmp_path: Path, monkeypatch) -> None:
+    """ffmpeg 失败时只污染临时文件，最终缓存必须保持不存在。"""
+    video = tmp_path / "Movie.mkv"
+    video.write_bytes(b"fake")
+    out = tmp_path / "cached.srt"
+
+    def failed_run(argv, **_kwargs):  # noqa: ANN001
+        Path(argv[-1]).write_text("partial but non-empty", encoding="utf-8")
+
+        class Result:
+            returncode = 1
+            stderr = b"decode failed"
+
+        return Result()
+
+    monkeypatch.setattr(extract, "ffmpeg_available", lambda: True)
+    monkeypatch.setattr(extract.subprocess, "run", failed_run)
+    with pytest.raises(extract.SourceLoadError):
+        extract._extract_embedded_sync(video, 0, out)
+    assert not out.exists()
+    assert not list(tmp_path.glob("*.part.srt"))
+
+
+async def test_generation_runs_globally_serial(monkeypatch) -> None:
+    """不同文件可同时排队，但实际生成执行体全局最多一个在跑。"""
+    from movieclaw_api.services.subtitle_gen import tasks
+    from movieclaw_api.services.task_state import TaskState
+
+    states: TaskState[tasks.GenState] = TaskState()
+    monkeypatch.setattr(tasks, "_tasks", states)
+    monkeypatch.setattr(tasks, "_generation_lock", asyncio.Lock())
+    running = 0
+    peak = 0
+
+    async def fake_run(file_id, target_language, state):  # noqa: ANN001, ARG001
+        nonlocal running, peak
+        running += 1
+        peak = max(peak, running)
+        await asyncio.sleep(0.01)
+        running -= 1
+        return tasks.GenResult(ok=True, message="ok")
+
+    monkeypatch.setattr(tasks, "_run", fake_run)
+    assert states.try_start(101, tasks.GenState())
+    assert states.try_start(202, tasks.GenState())
+
+    await asyncio.gather(
+        tasks.run_generation(101, "chs"),
+        tasks.run_generation(202, "chs"),
+    )
+
+    assert peak == 1
+
+
+async def test_generation_preserves_safe_business_error(monkeypatch) -> None:
+    """排队后发生的业务异常要给出下一步，不能退化成“未知错误”。"""
+    from movieclaw_api.exceptions import NotFoundException
+    from movieclaw_api.services.subtitle_gen import tasks
+    from movieclaw_api.services.task_state import TaskState
+
+    states: TaskState[tasks.GenState] = TaskState()
+    monkeypatch.setattr(tasks, "_tasks", states)
+
+    async def missing_provider(*_args, **_kwargs):  # noqa: ANN002, ANN003
+        raise NotFoundException("尚未配置模型供应商，请先在「设置 → AI 模型」中接入")
+
+    monkeypatch.setattr(tasks, "_run", missing_provider)
+    assert states.try_start(101, tasks.GenState())
+
+    await tasks.run_generation(101, "chs")
+
+    result = tasks.last_result(101)
+    assert result is not None
+    assert not result.ok
+    assert result.message == "尚未配置模型供应商，请先在「设置 → AI 模型」中接入"
+
+
+async def test_generation_hides_unknown_exception_details(monkeypatch) -> None:
+    """非业务异常继续收敛，避免日志里的敏感细节被返回页面。"""
+    from movieclaw_api.services.subtitle_gen import tasks
+    from movieclaw_api.services.task_state import TaskState
+
+    states: TaskState[tasks.GenState] = TaskState()
+    monkeypatch.setattr(tasks, "_tasks", states)
+
+    async def unexpected_failure(*_args, **_kwargs):  # noqa: ANN002, ANN003
+        raise RuntimeError("secret-upstream-payload")
+
+    monkeypatch.setattr(tasks, "_run", unexpected_failure)
+    assert states.try_start(101, tasks.GenState())
+
+    await tasks.run_generation(101, "chs")
+
+    result = tasks.last_result(101)
+    assert result is not None
+    assert "未知错误" in result.message
+    assert "secret-upstream-payload" not in result.message
 
 
 def test_language_token_validation() -> None:

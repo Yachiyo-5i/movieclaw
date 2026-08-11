@@ -12,14 +12,30 @@ from dataclasses import dataclass, field
 from movieclaw_api.services.subtitle_gen.extract import SubEvent
 
 LINE_LIMIT = 16  # Netflix 简中：每行 ≤16 字
-CPS_LIMIT = 9.0  # 成人内容 ≤9 字/秒
+CPS_LIMIT = 9.0  # 成人简中内容 ≤9 字/秒
+_EAST_ASIAN_LANGUAGES = {"chs", "cht", "chi", "jpn", "kor"}
+_CHINESE_LANGUAGES = {"chs", "cht", "chi"}
 
 # 折行断点偏好：标点/空格之后断，读起来才不别扭
 _BREAK_CHARS = " ，。！？…、；：,!?"
 _FULLWIDTH_DIGITS = str.maketrans("０１２３４５６７８９", "0123456789")
 
 
-def clean_punctuation(text: str) -> str:
+def line_limit(language: str) -> int:
+    """返回单行建议容量；拉丁/西里尔文字按播放器通行的较宽行长处理。"""
+    return 18 if language in _EAST_ASIAN_LANGUAGES else 42
+
+
+def reading_speed_limit(language: str) -> float:
+    """不同书写体系不能共用简中的 9 字/秒阈值。"""
+    if language in {"chs", "cht", "chi", "jpn"}:
+        return 9.0
+    if language == "kor":
+        return 12.0
+    return 17.0
+
+
+def clean_punctuation(text: str, language: str = "chs") -> str:
     """简中字幕标点铁律的机械清理（§3.3）：
 
     - 句尾句号/逗号删除（含半角），省略号/问叹号保留；
@@ -27,6 +43,9 @@ def clean_punctuation(text: str) -> str:
     - 全角数字 → 半角；禁 !?/?? 组合收敛为单个。
     """
     text = text.translate(_FULLWIDTH_DIGITS)
+    if language not in _CHINESE_LANGUAGES:
+        # 英语、法语等语言的逗号和句号承载语法，不能套用简中规则删除。
+        return text.strip()
     text = re.sub(r"[！!？?]{2,}", lambda m: m.group(0)[0], text)
     text = re.sub(r"[，。,]+(?=\s|$)", "", text)  # 行尾（含折行前）
     text = re.sub(r"[，。](?=.)", " ", text)
@@ -75,28 +94,91 @@ class QualityReport:
         return self.cps_overrun / self.event_count if self.event_count else 0.0
 
 
-def overrun_indices(events: list[SubEvent], limit: float = CPS_LIMIT) -> list[int]:
+def _reading_overrun(
+    text: str,
+    duration_s: float,
+    target_language: str,
+    secondary_language: str | None,
+    fixed_limit: float | None = None,
+) -> bool:
+    if secondary_language is None:
+        limit = fixed_limit or reading_speed_limit(target_language)
+        return _visible_len(text) / duration_s > limit
+    lines = text.splitlines()
+    languages = (target_language, secondary_language)
+    return any(
+        _visible_len(line) / duration_s > (fixed_limit or reading_speed_limit(language))
+        for line, language in zip(lines, languages, strict=False)
+    )
+
+
+def overrun_indices(
+    events: list[SubEvent],
+    limit: float | None = None,
+    *,
+    target_language: str = "chs",
+    secondary_language: str | None = None,
+) -> list[int]:
     """超读速事件的下标表（二次压缩的输入）。"""
     out: list[int] = []
     for i, (start, end, text) in enumerate(events):
         duration_s = max((end - start) / 1000, 0.001)
-        if _visible_len(text) / duration_s > limit:
+        if _reading_overrun(
+            text,
+            duration_s,
+            target_language,
+            secondary_language,
+            fixed_limit=limit,
+        ):
             out.append(i)
     return out
 
 
 def finalize_events(
-    events: list[SubEvent], glossary: dict[str, str] | None = None
+    events: list[SubEvent],
+    glossary: dict[str, str] | None = None,
+    *,
+    target_language: str = "chs",
+    secondary_language: str | None = None,
 ) -> tuple[list[SubEvent], QualityReport]:
     """标点清理 + 折行 + 统计，产出可落盘事件与机检报告。"""
     report = QualityReport(event_count=len(events))
     out: list[SubEvent] = []
     for start, end, text in events:
-        cleaned = fold_line(clean_punctuation(text))
+        if secondary_language is not None:
+            # 双语的换行表达语种顺序，不能再交给单语折行器重排。两行分别做
+            # 标点清理，具体长度由提示词约束，机检只报告不截断。
+            languages = (target_language, secondary_language)
+            cleaned_lines = [
+                clean_punctuation(line, language)
+                for line, language in zip(text.splitlines(), languages, strict=False)
+            ]
+            cleaned = "\n".join(cleaned_lines)
+        else:
+            cleaned = fold_line(
+                clean_punctuation(text, target_language),
+                line_limit(target_language),
+            )
         duration_s = max((end - start) / 1000, 0.001)
-        if _visible_len(cleaned) / duration_s > CPS_LIMIT:
+        if _reading_overrun(
+            cleaned,
+            duration_s,
+            target_language,
+            secondary_language,
+        ):
             report.cps_overrun += 1
-        if _visible_len(cleaned) > LINE_LIMIT * 2:
+        if secondary_language is None:
+            overlong = _visible_len(cleaned) > line_limit(target_language) * 2
+        else:
+            overlong = any(
+                _visible_len(line) > line_limit(language)
+                for line, language in zip(
+                    cleaned.splitlines(),
+                    (target_language, secondary_language),
+                    strict=False,
+                )
+            )
+        if overlong:
             report.overlong += 1
         out.append((start, end, cleaned))
     for dst in (glossary or {}).values():

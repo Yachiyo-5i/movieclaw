@@ -85,6 +85,8 @@
 不用下载源码、不用编译。官方镜像
 [movieclaw/movieclaw](https://hub.docker.com/r/movieclaw/movieclaw)
 单容器跑全部（前端 + 后端 + NER 模型 + 内置 TMDB Key），支持 x86_64 与 ARM64。
+镜像也内置 ffmpeg、Subtitle Edit seconv、Tesseract 和 11 种常用语言包，PGS
+图片字幕转 SRT 无需再进入容器安装依赖。
 唯一前提：机器上装好 Docker（群晖用自带的 Container Manager，其他 NAS 用
 各自的 Docker 套件即可）。
 
@@ -170,6 +172,7 @@ cd movieclaw
 TMDB_API_KEY=你的key ./scripts/build-image.sh
 #   国内网络加速： CN_MIRROR=1 TMDB_API_KEY=... ./scripts/build-image.sh
 #   给 NAS 交叉构建：PLATFORM=linux/amd64 TMDB_API_KEY=... ./scripts/build-image.sh
+#   构建完成会自动生成并从 MKV 抽取测试 PGS，再 OCR 回 SRT；失败即阻断
 
 # 3. 把仓库根目录 docker-compose.yml 的 image 一行改成本地镜像名
 #    movieclaw:latest，按注释改好媒体目录挂载，然后启动
@@ -178,6 +181,8 @@ docker compose up -d
 
 挂载路径的含义与方式一相同，更多可选项（覆盖 TMDB Key、更新加速镜像、
 Emby/Jellyfin 通知等）见 [docker-compose.yml](docker-compose.yml) 内的注释。
+字幕镜像的架构、依赖与发布门禁见
+[Docker 字幕运行时契约](docs/design/docker-subtitle-runtime.md)。
 
 ### 日常升级：应用内更新，无需重拉镜像
 

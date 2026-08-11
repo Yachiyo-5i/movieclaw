@@ -144,3 +144,41 @@ def test_score_resolution_preference_follows_spec_order() -> None:
     v1080 = evaluate_rules(_candidate(resolution="1080p"), spec)
     v2160 = evaluate_rules(_candidate(resolution="2160p"), spec)
     assert v1080.score > v2160.score
+
+
+class TestSubtitleAudioLanguages:
+    """字幕/音轨语言维度：BCP 47 前缀匹配 + 声明式未声明即拒。"""
+
+    def test_generic_zh_requirement_matches_any_chinese(self):
+        spec = RuleSetSpec(subtitle_languages_require=["zh"])
+        assert evaluate_rules(_candidate(subtitle_languages=["zh-Hans"]), spec).accepted
+        assert evaluate_rules(_candidate(subtitle_languages=["zh-Hant"]), spec).accepted
+        assert evaluate_rules(_candidate(subtitle_languages=["zh"]), spec).accepted
+
+    def test_specific_script_requirement_rejects_generic(self):
+        spec = RuleSetSpec(subtitle_languages_require=["zh-Hans"])
+        assert evaluate_rules(_candidate(subtitle_languages=["zh-Hans"]), spec).accepted
+        verdict = evaluate_rules(_candidate(subtitle_languages=["zh"]), spec)
+        assert not verdict.accepted
+        assert verdict.reason_code == "subtitle_language_missing"
+
+    def test_undeclared_subtitle_rejected_when_required(self):
+        spec = RuleSetSpec(subtitle_languages_require=["zh"])
+        verdict = evaluate_rules(_candidate(subtitle_languages=[]), spec)
+        assert not verdict.accepted
+        assert verdict.reason_code == "subtitle_language_missing"
+
+    def test_any_of_semantics(self):
+        spec = RuleSetSpec(subtitle_languages_require=["zh-Hans", "en"])
+        assert evaluate_rules(_candidate(subtitle_languages=["en"]), spec).accepted
+
+    def test_audio_language_requirement(self):
+        spec = RuleSetSpec(audio_languages_require=["cmn"])
+        assert evaluate_rules(_candidate(audio_languages=["cmn", "ja"]), spec).accepted
+        verdict = evaluate_rules(_candidate(audio_languages=["yue"]), spec)
+        assert not verdict.accepted
+        assert verdict.reason_code == "audio_language_missing"
+
+    def test_unset_dimensions_do_not_filter(self):
+        assert evaluate_rules(_candidate(subtitle_languages=[], audio_languages=[]),
+                              RuleSetSpec()).accepted

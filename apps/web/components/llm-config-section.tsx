@@ -4,6 +4,7 @@ import { useCallback, useEffect, useState } from "react";
 
 import { useConfirm } from "@/components/feedback";
 import { SparkIcon } from "@/components/icons";
+import { useLlmCapability } from "@/components/llm-gate";
 import {
   type LlmModelInfo,
   type LlmPreset,
@@ -40,6 +41,7 @@ const IN_PROGRESS: LlmProviderStatus[] = ["pending", "verifying"];
  */
 export function LlmConfigSection() {
   const confirm = useConfirm();
+  const { refresh: refreshLlmCapability } = useLlmCapability();
   const [config, setConfig] = useState<LlmProviderConfig | null>(null);
   const [presets, setPresets] = useState<LlmPreset[]>([]);
   const [loading, setLoading] = useState(true);
@@ -97,24 +99,52 @@ export function LlmConfigSection() {
   return (
     <div className="space-y-5">
       {error && (
-        <div className="rounded-xl border border-[#ff6b6b]/30 bg-[#ff6b6b]/10 px-4 py-3 text-body text-[#ff6b6b]">
+        <div
+          role="alert"
+          className="rounded-xl border border-[#ff6b6b]/30 bg-[#ff6b6b]/10 px-4 py-3 text-body text-[#ff6b6b]"
+        >
           {error}
         </div>
       )}
 
-      <p className="text-sub text-[var(--text-muted)]">
-        {loading
-          ? "加载中…"
-          : config == null
-            ? "接入一个大语言模型供应商，AI 能力（智能搜索、内容识别等）将由它驱动。"
-            : "保存后系统会用所选模型发送一次测试消息验证连通性。"}
-      </p>
+      {!editing && (
+        <p className="text-sub leading-relaxed text-[var(--text-muted)]">
+          {loading
+            ? "加载中…"
+            : config == null
+              ? "接入一个大语言模型供应商，AI 能力（智能搜索、内容识别等）将由它驱动。"
+              : "系统会在保存后发送一条测试消息，确认当前模型可以正常使用。"}
+        </p>
+      )}
 
       {loading ? (
         <div className="h-[104px] animate-pulse rounded-xl bg-white/[0.04]" />
+      ) : editing ? (
+        /* 编辑态只保留表单，避免状态卡在小屏重复占据首屏 */
+        <div className="css-glass !rounded-2xl p-5 max-sm:p-4">
+          <div className="mb-6">
+            <p className="text-body font-semibold text-[var(--text)]">
+              {config ? "编辑模型接入" : "接入模型供应商"}
+            </p>
+            <p className="mt-1 text-sub leading-relaxed text-[var(--text-muted)]">
+              保存后系统会自动测试连接。
+            </p>
+          </div>
+          <LlmProviderForm
+            config={config}
+            presets={presets}
+            onSubmit={async (payload) => {
+              setConfig(await saveLlmProvider(payload));
+              setEditing(false);
+              refreshLlmCapability();
+            }}
+            onCancel={() => setEditing(false)}
+            onError={setError}
+          />
+        </div>
       ) : config == null && !editing ? (
         /* 空态：未配置 */
-        <div className="css-glass flex flex-col items-center gap-3 !rounded-2xl px-6 py-12 text-center">
+        <div className="css-glass flex flex-col items-center gap-3 !rounded-2xl px-6 py-12 text-center max-sm:px-4 max-sm:py-9">
           <span className="icon-chip size-12 !rounded-2xl">
             <SparkIcon className="size-6" />
           </span>
@@ -127,7 +157,7 @@ export function LlmConfigSection() {
           <button
             type="button"
             onClick={() => setEditing(true)}
-            className="btn-accent mt-1 rounded-full px-4 py-1.5 text-sub font-semibold"
+            className="btn-accent mt-1 min-h-10 rounded-full px-5 py-2 text-sub font-semibold max-sm:w-full"
           >
             接入模型供应商
           </button>
@@ -135,76 +165,41 @@ export function LlmConfigSection() {
       ) : (
         config != null && (
           /* 已配置：单张状态卡片 */
-          <div className="css-glass !rounded-xl">
-            <div className="flex items-center gap-3.5 p-4">
-              <span className="icon-chip size-10 !rounded-xl">
-                <SparkIcon className="size-5" />
-              </span>
-              <div className="min-w-0 flex-1">
-                <div className="flex items-center gap-2">
-                  <p className="truncate text-body font-semibold text-[var(--text)]">
-                    {preset?.display_name ?? config.provider_type}
+          <div className="css-glass overflow-hidden !rounded-2xl">
+            <div className="p-4 max-sm:p-3.5">
+              <div className="flex items-start gap-3.5">
+                <span className="icon-chip size-10 !rounded-xl">
+                  <SparkIcon className="size-5" />
+                </span>
+                <div className="min-w-0 flex-1">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <p className="truncate text-body font-semibold text-[var(--text)]">
+                      {preset?.display_name ?? config.provider_type}
+                    </p>
+                    <StatusPill status={config.status} />
+                  </div>
+                  <p
+                    className={`mt-1 text-caption leading-relaxed ${
+                      config.status === "failed"
+                        ? "break-words text-[#ff9b9b]"
+                        : "text-[var(--text-faint)]"
+                    }`}
+                  >
+                    {config.status === "failed" && config.last_error
+                      ? config.last_error
+                      : [
+                          config.default_model,
+                          `上次检查 ${formatRelativeTime(config.last_checked_at)}`,
+                        ]
+                          .filter(Boolean)
+                          .join(" · ")}
                   </p>
-                  <StatusPill status={config.status} />
                 </div>
-                <p className="mt-0.5 truncate text-caption text-[var(--text-faint)]">
-                  {config.status === "failed" && config.last_error
-                    ? config.last_error
-                    : [
-                        config.default_model,
-                        `上次检查 ${formatRelativeTime(config.last_checked_at)}`,
-                      ]
-                        .filter(Boolean)
-                        .join(" · ")}
-                </p>
-              </div>
-              <div className="flex shrink-0 items-center gap-2">
-                <button
-                  type="button"
-                  onClick={() => setEditing((v) => !v)}
-                  className="btn-glass px-3 py-1.5 text-sub font-medium"
-                >
-                  {editing ? "收起" : "编辑"}
-                </button>
-                <button
-                  type="button"
-                  disabled={busy || IN_PROGRESS.includes(config.status)}
-                  onClick={() =>
-                    void guard(async () => setConfig(await reverifyLlmProvider()))
-                  }
-                  className="btn-glass px-3 py-1.5 text-sub font-medium disabled:opacity-40"
-                >
-                  重新测试
-                </button>
-                <button
-                  type="button"
-                  disabled={busy}
-                  onClick={() =>
-                    void guard(async () => {
-                      if (
-                        !(await confirm({
-                          title: "删除模型供应商配置？",
-                          description: "AI 助手与微信通道将无法继续对话，可随时重新接入。",
-                          confirmLabel: "删除",
-                          tone: "danger",
-                        }))
-                      ) {
-                        return;
-                      }
-                      await deleteLlmProvider();
-                      setConfig(null);
-                      setEditing(false);
-                    })
-                  }
-                  className="btn-glass px-3 py-1.5 text-sub font-medium !text-[#ff6b6b] disabled:opacity-40"
-                >
-                  删除
-                </button>
               </div>
             </div>
 
             {/* 连接信息带：端点与默认模型，一眼可核对 */}
-            <div className="flex flex-wrap gap-x-7 gap-y-2 border-t border-white/[0.06] px-4 py-3">
+            <div className="grid grid-cols-2 gap-x-7 gap-y-3 border-t border-white/[0.06] px-4 py-3 max-sm:grid-cols-1 max-sm:px-3.5">
               <InfoStat
                 label="API 端点"
                 value={config.base_url ?? preset?.base_url ?? "官方默认"}
@@ -213,24 +208,52 @@ export function LlmConfigSection() {
               {/* 仅在用户覆盖过 UA 时展示——没配的用户不需要知道有这回事 */}
               {config.user_agent && <InfoStat label="User-Agent" value={config.user_agent} />}
             </div>
+
+            {/* 操作独占一行，避免窄屏时与名称、状态互相挤压 */}
+            <div className="grid grid-cols-3 gap-2 border-t border-white/[0.06] p-3 max-[360px]:grid-cols-1">
+              <button
+                type="button"
+                onClick={() => setEditing(true)}
+                className="btn-glass min-h-10 px-3 py-2 text-sub font-medium"
+              >
+                编辑配置
+              </button>
+              <button
+                type="button"
+                disabled={busy || IN_PROGRESS.includes(config.status)}
+                onClick={() => void guard(async () => setConfig(await reverifyLlmProvider()))}
+                className="btn-glass min-h-10 px-3 py-2 text-sub font-medium disabled:opacity-40"
+              >
+                重新测试
+              </button>
+              <button
+                type="button"
+                disabled={busy}
+                onClick={() =>
+                  void guard(async () => {
+                    if (
+                      !(await confirm({
+                        title: "删除模型供应商配置？",
+                        description: "AI 助手与微信通道将无法继续对话，可随时重新接入。",
+                        confirmLabel: "删除",
+                        tone: "danger",
+                      }))
+                    ) {
+                      return;
+                    }
+                    await deleteLlmProvider();
+                    setConfig(null);
+                    setEditing(false);
+                    refreshLlmCapability();
+                  })
+                }
+                className="btn-glass min-h-10 px-3 py-2 text-sub font-medium !text-[#ff7d7d] disabled:opacity-40"
+              >
+                删除配置
+              </button>
+            </div>
           </div>
         )
-      )}
-
-      {/* 配置表单（新增与编辑共用） */}
-      {editing && (
-        <div className="css-glass !rounded-xl p-4">
-          <LlmProviderForm
-            config={config}
-            presets={presets}
-            onSubmit={async (payload) => {
-              setConfig(await saveLlmProvider(payload));
-              setEditing(false);
-            }}
-            onCancel={() => setEditing(false)}
-            onError={setError}
-          />
-        </div>
       )}
     </div>
   );
@@ -253,7 +276,12 @@ function InfoStat({ label, value }: { label: string; value: string }) {
   return (
     <div className="min-w-0">
       <p className="text-micro text-[var(--text-faint)]">{label}</p>
-      <p className="mt-0.5 truncate text-ui font-semibold text-[var(--text)]">{value}</p>
+      <p
+        className="mt-0.5 break-all text-ui font-semibold leading-relaxed text-[var(--text)]"
+        title={value}
+      >
+        {value}
+      </p>
     </div>
   );
 }
@@ -320,8 +348,10 @@ function LlmProviderForm({ config, presets, onSubmit, onCancel, onError }: LlmPr
   );
   const [baseUrl, setBaseUrl] = useState(config?.base_url ?? "");
   const [userAgent, setUserAgent] = useState(config?.user_agent ?? "");
+  const [advancedOpen, setAdvancedOpen] = useState(Boolean(config?.user_agent));
   // 出于安全后端不回传 Key，编辑时需重新填写
   const [apiKey, setApiKey] = useState("");
+  const [showApiKey, setShowApiKey] = useState(false);
   const [model, setModel] = useState(config?.default_model ?? "");
   // 本地已保存的自定义模型目录（随配置持久化）；保存时整体回传，避免丢失
   const [extraModels] = useState<LlmModelInfo[]>(config?.extra_models ?? []);
@@ -361,13 +391,23 @@ function LlmProviderForm({ config, presets, onSubmit, onCancel, onError }: LlmPr
     Number(draft.contextWindow) > 0 &&
     Number(draft.maxOutput) > 0 &&
     (!draft.thinking || Number(draft.thinkingBudget) > 0);
+  const baseUrlValid =
+    baseUrl.trim() === "" ? !needBaseUrl : /^https?:\/\/.+/.test(baseUrl.trim());
   // 请求头值只能是可打印 ASCII（与后端校验同一判据），空即用 SDK 默认
   const userAgentValid = userAgent.trim() === "" || /^[\x20-\x7e]+$/.test(userAgent.trim());
-  const canSubmit =
-    apiKey.trim().length > 0 &&
-    (isNew ? draftValid : model.trim().length > 0) &&
-    (!needBaseUrl || /^https?:\/\/.+/.test(baseUrl.trim())) &&
-    userAgentValid;
+  const submitHint =
+    apiKey.trim().length === 0
+      ? "请填写 API Key。"
+      : !baseUrlValid
+        ? "请填写以 http:// 或 https:// 开头的完整 API 端点。"
+        : isNew && !draftValid
+          ? "请补全新模型参数中标有 * 的项目。"
+          : !isNew && model.trim().length === 0
+            ? "请选择默认模型。"
+            : !userAgentValid
+              ? "User-Agent 包含不支持的字符，请检查高级设置。"
+              : null;
+  const canSubmit = submitHint == null;
 
   function submit() {
     let defaultModel = model.trim();
@@ -411,48 +451,62 @@ function LlmProviderForm({ config, presets, onSubmit, onCancel, onError }: LlmPr
   }
 
   const inputClass =
-    "w-full rounded-xl border border-white/[0.08] bg-white/[0.04] px-3 py-2 text-ui " +
-    "text-[var(--text)] outline-none focus:border-[var(--accent)]/60";
+    "min-h-11 w-full rounded-xl border border-white/[0.08] bg-white/[0.04] px-3 py-2 " +
+    "text-[16px] text-[var(--text)] outline-none transition-colors placeholder:text-[var(--text-faint)] " +
+    "focus:border-[var(--accent)]/60 sm:text-ui";
   const labelClass = "mb-1.5 block text-sub font-medium text-[var(--text-muted)]";
 
   return (
-    <div className="space-y-4">
-      {/* 供应商类型：双列卡片单选（名称 + 端点说明），选中态与侧栏导航同语言 */}
-      <div>
-        <label className={labelClass}>供应商</label>
-        <div className="grid grid-cols-2 gap-2">
-          {presets.map((p) => (
-            <button
-              key={p.id}
-              type="button"
-              onClick={() => {
-                setProviderType(p.id);
-                setBaseUrl("");
-                setUserAgent("");
-                setModel("");
-              }}
-              data-active={providerType === p.id}
-              className="glass-row nav-item !flex-col !items-start !gap-0.5 px-3.5 py-2.5 text-left"
-            >
-              <span className="text-ui font-semibold text-[var(--text)]">
-                {p.display_name}
-              </span>
-              <span className="truncate text-caption text-[var(--text-faint)]">
-                {providerHint(p)}
-              </span>
-            </button>
+    <div className="space-y-6">
+      {/* 供应商会持续增加，使用原生下拉框控制首屏长度；移动端同时获得系统选择器。 */}
+      <div className="min-w-0 space-y-3">
+        <label htmlFor="llm-provider" className={labelClass}>
+          供应商
+        </label>
+        <select
+          id="llm-provider"
+          value={providerType}
+          disabled={presets.length === 0}
+          aria-describedby={preset ? "llm-provider-hint" : undefined}
+          aria-busy={presets.length === 0}
+          onChange={(event) => {
+            const nextProvider = event.target.value as LlmProviderType;
+            if (providerType === nextProvider) return;
+            setProviderType(nextProvider);
+            setBaseUrl("");
+            setUserAgent("");
+            setAdvancedOpen(false);
+            setModel("");
+          }}
+          className={`${inputClass} cursor-pointer disabled:cursor-wait disabled:opacity-50`}
+        >
+          {presets.length === 0 && <option value={providerType}>正在加载供应商…</option>}
+          {presets.map((item) => (
+            <option key={item.id} value={item.id}>
+              {item.display_name}
+            </option>
           ))}
-        </div>
+        </select>
+        {preset && (
+          <div
+            id="llm-provider-hint"
+            className="rounded-xl border border-white/[0.06] bg-white/[0.025] px-3.5 py-3"
+          >
+            <p className="text-ui font-semibold text-[var(--text)]">{preset.display_name}</p>
+            <p className="mt-0.5 text-caption leading-relaxed text-[var(--text-faint)]">
+              {providerHint(preset)}
+            </p>
+          </div>
+        )}
       </div>
 
-      {/* 端点固定的官方渠道（百炼/DeepSeek/Kimi/GLM）不展示端点输入；
-          OpenAI 保留可选输入（代理/镜像场景），通用兼容端点必填。
-          User-Agent 与端点同进退：能自定义端点才谈得上按对端要求改 UA */}
-      {canCustomizeEndpoint && (
-        <>
+      <div className="min-w-0 space-y-4 border-t border-white/[0.07] pt-6">
+        {/* 端点固定的官方渠道（百炼/DeepSeek/Kimi/GLM）不展示端点输入；
+            OpenAI 保留可选输入（代理/镜像场景），通用兼容端点必填。 */}
+        {canCustomizeEndpoint && (
           <div>
             <label className={labelClass}>
-              API 端点{needBaseUrl ? "" : "（可选）"}
+              API 端点{needBaseUrl ? " *" : "（可选）"}
             </label>
             <input
               type="text"
@@ -468,200 +522,250 @@ function LlmProviderForm({ config, presets, onSubmit, onCancel, onError }: LlmPr
               </p>
             )}
           </div>
+        )}
 
-          <div>
-            <label className={labelClass}>User-Agent（可选）</label>
+        <div>
+          <label className={labelClass}>API Key *</label>
+          {/* text + CSS 圆点遮罩：视觉等同密码框，但浏览器不识别为密码，
+              不会触发「保存密码 / 自动填充」弹窗。 */}
+          <div className="relative">
             <input
               type="text"
-              value={userAgent}
-              onChange={(e) => setUserAgent(e.target.value)}
-              // 占位符直接展示留空时实际发送的 SDK 自带 UA（后端按 SDK 版本现算），
-              // 排查网关按 UA 放行时用户第一眼就能看到「当前到底在发什么」
-              placeholder={preset?.default_user_agent ?? "留空使用 SDK 默认标识"}
-              className={inputClass}
+              value={apiKey}
+              onChange={(e) => setApiKey(e.target.value)}
+              placeholder={config ? "出于安全，请重新填写" : "sk-…"}
+              className={`${inputClass} pr-16 ${
+                showApiKey ? "" : "[-webkit-text-security:disc]"
+              }`}
               {...NO_AUTOFILL}
             />
-            <p
-              className={`mt-1.5 text-caption leading-relaxed ${
-                userAgentValid ? "text-[var(--text-faint)]" : "text-[#ff6b6b]"
-              }`}
+            <button
+              type="button"
+              onClick={() => setShowApiKey((value) => !value)}
+              className="absolute inset-y-1 right-1 rounded-lg px-3 text-sub font-medium text-[var(--text-muted)] transition-colors hover:bg-white/[0.06] hover:text-[var(--text)]"
+              aria-label={showApiKey ? "隐藏 API Key" : "显示 API Key"}
             >
-              {userAgentValid
-                ? "留空时按上述 SDK 默认标识发送；网关或 WAF 按 UA 放行、限流时，在此填写它要求的标识。"
-                : "只能包含可打印的 ASCII 字符（不能含换行或中文）。"}
-            </p>
+              {showApiKey ? "隐藏" : "显示"}
+            </button>
           </div>
-        </>
-      )}
+          {config && (
+            <p className="mt-1.5 text-caption leading-relaxed text-[var(--text-faint)]">
+              已保存的密钥不会回显，修改其他配置时也需要重新填写。
+            </p>
+          )}
+        </div>
 
-      <div>
-        <label className={labelClass}>API Key</label>
-        {/* text + CSS 圆点遮罩：视觉等同密码框，但浏览器不识别为密码，
-            不会触发「保存密码 / 自动填充」弹窗 */}
-        <input
-          type="text"
-          value={apiKey}
-          onChange={(e) => setApiKey(e.target.value)}
-          placeholder={config ? "出于安全，请重新填写" : "sk-…"}
-          className={`${inputClass} [-webkit-text-security:disc]`}
-          {...NO_AUTOFILL}
-        />
-      </div>
-
-      <div>
-        <label className={labelClass}>默认模型</label>
-        <select
-          aria-label="默认模型"
-          value={model}
-          onChange={(e) => setModel(e.target.value)}
-          className={`${inputClass} appearance-none`}
-        >
-          <option value="" disabled>
-            {options.length > 0 ? "请选择模型…" : "暂无可选模型，请新增…"}
-          </option>
-          {/* 已保存的模型不在任何目录时保留为可选项，编辑旧配置不至于被清空 */}
-          {model && !selected && !isNew && <option value={model}>{model}（当前配置）</option>}
-          {catalog.map((m) => (
-            <option key={m.id} value={m.id}>
-              {m.id}
-              {modelHints(m) ? `（${modelHints(m)}）` : ""}
-            </option>
-          ))}
-          {extras.map((m) => (
-            <option key={m.id} value={m.id}>
-              {m.id}（自定义{modelHints(m) ? ` · ${modelHints(m)}` : ""}）
-            </option>
-          ))}
-          {/* 其它预设目录的模型（仅无目录端点展示）：选中后参数随保存复用 */}
-          {borrowedGroups.map((g) => (
-            <optgroup key={g.label} label={`${g.label} 目录（同名模型参数复用）`}>
-              {g.models.map((m) => (
-                <option key={m.id} value={m.id}>
-                  {m.id}
-                  {modelHints(m) ? `（${modelHints(m)}）` : ""}
-                </option>
-              ))}
-            </optgroup>
-          ))}
-          {isCustomEndpoint && <option value={NEW_MODEL}>＋ 新增模型（需填写参数）…</option>}
-        </select>
-        {selected && !isNew && (
-          <p className="mt-1.5 text-caption leading-relaxed text-[var(--text-faint)]">
-            {modelSpecs(selected) || "该模型的详细规格以官方文档为准。"}
-          </p>
+        {/* User-Agent 是排障用低频字段，默认折叠以缩短主流程。 */}
+        {canCustomizeEndpoint && (
+          <details
+            className="group rounded-xl border border-white/[0.07] bg-white/[0.025]"
+            open={advancedOpen}
+            onToggle={(event) => setAdvancedOpen(event.currentTarget.open)}
+          >
+            <summary className="flex min-h-11 cursor-pointer list-none items-center justify-between gap-3 px-3.5 py-2 text-sub font-medium text-[var(--text-muted)] [&::-webkit-details-marker]:hidden">
+              高级设置
+              <span className="text-caption font-normal text-[var(--text-faint)] group-open:hidden">
+                User-Agent
+              </span>
+              <span className="hidden text-caption font-normal text-[var(--text-faint)] group-open:inline">
+                收起
+              </span>
+            </summary>
+            <div className="border-t border-white/[0.06] px-3.5 pb-3.5 pt-3">
+              <label className={labelClass}>User-Agent（可选）</label>
+              <input
+                type="text"
+                value={userAgent}
+                onChange={(e) => setUserAgent(e.target.value)}
+                // 占位符直接展示留空时实际发送的 SDK 自带 UA（后端按 SDK 版本现算）。
+                placeholder={preset?.default_user_agent ?? "留空使用 SDK 默认标识"}
+                className={inputClass}
+                {...NO_AUTOFILL}
+              />
+              <p
+                className={`mt-1.5 text-caption leading-relaxed ${
+                  userAgentValid ? "text-[var(--text-faint)]" : "text-[#ff6b6b]"
+                }`}
+              >
+                {userAgentValid
+                  ? "仅当网关或 WAF 对请求标识有要求时填写，留空使用上方显示的 SDK 默认值。"
+                  : "只能包含可打印的 ASCII 字符（不能含换行或中文）。"}
+              </p>
+            </div>
+          </details>
         )}
       </div>
 
-      {/* 新增模型的参数子表单：这些参数是 agent 做上下文/思考预算决策的依据，必填 */}
-      {isNew && (
-        <div className="space-y-3.5 rounded-xl border border-white/[0.08] bg-white/[0.03] p-3.5">
-          <p className="text-sub font-medium text-[var(--text-muted)]">
-            新模型参数
-            <span className="ml-2 font-normal text-[var(--text-faint)]">
-              按端点实际部署的模型规格填写，保存后计入本地模型目录
-            </span>
-          </p>
-          <div>
-            <label className={labelClass}>模型 id *</label>
-            <input
-              type="text"
-              value={draft.id}
-              onChange={(e) => setDraft({ ...draft, id: e.target.value })}
-              placeholder="如：my-vllm-model"
-              className={inputClass}
-              {...NO_AUTOFILL}
-            />
-          </div>
-          <div className="grid grid-cols-3 gap-3 max-md:grid-cols-1">
-            <div>
-              <label className={labelClass}>上下文长度 *</label>
-              <input
-                type="number"
-                min={1}
-                value={draft.contextWindow}
-                onChange={(e) => setDraft({ ...draft, contextWindow: e.target.value })}
-                placeholder="131072"
-                className={inputClass}
-                {...NO_AUTOFILL}
-              />
-            </div>
-            <div>
-              <label className={labelClass}>最大输出 *</label>
-              <input
-                type="number"
-                min={1}
-                value={draft.maxOutput}
-                onChange={(e) => setDraft({ ...draft, maxOutput: e.target.value })}
-                placeholder="8192"
-                className={inputClass}
-                {...NO_AUTOFILL}
-              />
-            </div>
-            <div>
-              <label className={labelClass}>最大输入（可选）</label>
-              <input
-                type="number"
-                min={1}
-                value={draft.maxInput}
-                onChange={(e) => setDraft({ ...draft, maxInput: e.target.value })}
-                placeholder="不单独限制可留空"
-                className={inputClass}
-                {...NO_AUTOFILL}
-              />
-            </div>
-          </div>
-          <div className="flex flex-wrap gap-x-5 gap-y-2">
-            <CheckField
-              label="支持工具调用"
-              checked={draft.supportsTools}
-              onChange={(v) => setDraft({ ...draft, supportsTools: v, parallel: v && draft.parallel })}
-            />
-            <CheckField
-              label="支持并发工具调用"
-              checked={draft.parallel}
-              disabled={!draft.supportsTools}
-              onChange={(v) => setDraft({ ...draft, parallel: v })}
-            />
-            <CheckField
-              label="输出思考内容"
-              checked={draft.thinking}
-              onChange={(v) => setDraft({ ...draft, thinking: v })}
-            />
-            <CheckField
-              label="支持图片输入"
-              checked={draft.vision}
-              onChange={(v) => setDraft({ ...draft, vision: v })}
-            />
-          </div>
-          {draft.thinking && (
-            <div>
-              <label className={labelClass}>思考预算上限 *</label>
-              <input
-                type="number"
-                min={1}
-                value={draft.thinkingBudget}
-                onChange={(e) => setDraft({ ...draft, thinkingBudget: e.target.value })}
-                placeholder="如：81920"
-                className={inputClass}
-                {...NO_AUTOFILL}
-              />
-              <p className="mt-1.5 text-caption leading-relaxed text-[var(--text-faint)]">
-                思维链可用的最大 token 数（thinking_budget 上限），超配供应商会直接报错。
-              </p>
-            </div>
+      <div className="min-w-0 space-y-4 border-t border-white/[0.07] pt-6">
+        <div>
+          <label className={labelClass}>默认模型 *</label>
+          <select
+            aria-label="默认模型"
+            value={model}
+            onChange={(e) => setModel(e.target.value)}
+            className={`${inputClass} appearance-none`}
+          >
+            <option value="" disabled>
+              {options.length > 0 ? "请选择模型…" : "暂无可选模型，请新增…"}
+            </option>
+            {/* 已保存的模型不在任何目录时保留为可选项，编辑旧配置不至于被清空 */}
+            {model && !selected && !isNew && <option value={model}>{model}（当前配置）</option>}
+            {catalog.map((m) => (
+              <option key={m.id} value={m.id}>
+                {m.id}
+                {modelHints(m) ? `（${modelHints(m)}）` : ""}
+              </option>
+            ))}
+            {extras.map((m) => (
+              <option key={m.id} value={m.id}>
+                {m.id}（自定义{modelHints(m) ? ` · ${modelHints(m)}` : ""}）
+              </option>
+            ))}
+            {/* 其它预设目录的模型（仅无目录端点展示）：选中后参数随保存复用 */}
+            {borrowedGroups.map((g) => (
+              <optgroup key={g.label} label={`${g.label} 目录（同名模型参数复用）`}>
+                {g.models.map((m) => (
+                  <option key={m.id} value={m.id}>
+                    {m.id}
+                    {modelHints(m) ? `（${modelHints(m)}）` : ""}
+                  </option>
+                ))}
+              </optgroup>
+            ))}
+            {isCustomEndpoint && (
+              <option value={NEW_MODEL}>＋ 新增模型（需填写参数）…</option>
+            )}
+          </select>
+          {selected && !isNew && (
+            <p className="mt-1.5 text-caption leading-relaxed text-[var(--text-faint)]">
+              {modelSpecs(selected) || "该模型的详细规格以官方文档为准。"}
+            </p>
           )}
         </div>
+
+        {/* 新增模型的参数子表单：这些参数是 agent 做上下文/思考预算决策的依据，必填 */}
+        {isNew && (
+          <div className="space-y-3.5 rounded-xl border border-white/[0.08] bg-white/[0.03] p-3.5 max-sm:p-3">
+            <p className="text-sub font-medium text-[var(--text-muted)]">
+              新模型参数
+              <span className="mt-1 block font-normal leading-relaxed text-[var(--text-faint)]">
+                按端点实际部署的模型规格填写，保存后计入本地模型目录
+              </span>
+            </p>
+            <div>
+              <label className={labelClass}>模型 id *</label>
+              <input
+                type="text"
+                value={draft.id}
+                onChange={(e) => setDraft({ ...draft, id: e.target.value })}
+                placeholder="如：my-vllm-model"
+                className={inputClass}
+                {...NO_AUTOFILL}
+              />
+            </div>
+            <div className="grid grid-cols-3 gap-3 max-md:grid-cols-1">
+              <div>
+                <label className={labelClass}>上下文长度 *</label>
+                <input
+                  type="number"
+                  min={1}
+                  value={draft.contextWindow}
+                  onChange={(e) => setDraft({ ...draft, contextWindow: e.target.value })}
+                  placeholder="131072"
+                  className={inputClass}
+                  {...NO_AUTOFILL}
+                />
+              </div>
+              <div>
+                <label className={labelClass}>最大输出 *</label>
+                <input
+                  type="number"
+                  min={1}
+                  value={draft.maxOutput}
+                  onChange={(e) => setDraft({ ...draft, maxOutput: e.target.value })}
+                  placeholder="8192"
+                  className={inputClass}
+                  {...NO_AUTOFILL}
+                />
+              </div>
+              <div>
+                <label className={labelClass}>最大输入（可选）</label>
+                <input
+                  type="number"
+                  min={1}
+                  value={draft.maxInput}
+                  onChange={(e) => setDraft({ ...draft, maxInput: e.target.value })}
+                  placeholder="不单独限制可留空"
+                  className={inputClass}
+                  {...NO_AUTOFILL}
+                />
+              </div>
+            </div>
+            <div className="flex flex-wrap gap-x-5 gap-y-2">
+              <CheckField
+                label="支持工具调用"
+                checked={draft.supportsTools}
+                onChange={(v) =>
+                  setDraft({ ...draft, supportsTools: v, parallel: v && draft.parallel })
+                }
+              />
+              <CheckField
+                label="支持并发工具调用"
+                checked={draft.parallel}
+                disabled={!draft.supportsTools}
+                onChange={(v) => setDraft({ ...draft, parallel: v })}
+              />
+              <CheckField
+                label="输出思考内容"
+                checked={draft.thinking}
+                onChange={(v) => setDraft({ ...draft, thinking: v })}
+              />
+              <CheckField
+                label="支持图片输入"
+                checked={draft.vision}
+                onChange={(v) => setDraft({ ...draft, vision: v })}
+              />
+            </div>
+            {draft.thinking && (
+              <div>
+                <label className={labelClass}>思考预算上限 *</label>
+                <input
+                  type="number"
+                  min={1}
+                  value={draft.thinkingBudget}
+                  onChange={(e) => setDraft({ ...draft, thinkingBudget: e.target.value })}
+                  placeholder="如：81920"
+                  className={inputClass}
+                  {...NO_AUTOFILL}
+                />
+                <p className="mt-1.5 text-caption leading-relaxed text-[var(--text-faint)]">
+                  思维链可用的最大 token 数（thinking_budget 上限），超配供应商会直接报错。
+                </p>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+
+      {submitHint && (
+        <p role="status" className="text-caption leading-relaxed text-[var(--text-faint)]">
+          {submitHint}
+        </p>
       )}
 
-      <div className="flex items-center justify-end gap-3 pt-1">
-        <button type="button" onClick={onCancel} className="btn-glass px-3.5 py-2 text-ui font-medium">
+      <div className="sticky bottom-0 z-10 -mx-4 -mb-4 flex items-center gap-3 border-t border-white/[0.08] bg-[rgba(17,20,27,0.94)] px-4 py-3 backdrop-blur-xl sm:static sm:mx-0 sm:mb-0 sm:justify-end sm:border-0 sm:bg-transparent sm:p-0 sm:pt-1 sm:backdrop-blur-none">
+        <button
+          type="button"
+          onClick={onCancel}
+          className="btn-glass min-h-11 flex-1 px-3.5 py-2 text-ui font-medium sm:flex-none"
+        >
           取消
         </button>
         <button
           type="button"
           onClick={submit}
           disabled={busy || !canSubmit}
-          className="btn-accent rounded-full px-4.5 py-2 text-ui font-semibold disabled:opacity-40"
+          className="btn-accent min-h-11 flex-[1.6] rounded-full px-4.5 py-2 text-ui font-semibold disabled:opacity-40 sm:flex-none"
         >
           {busy ? "保存中…" : "保存并测试连接"}
         </button>

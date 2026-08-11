@@ -26,6 +26,17 @@ _FREE_SCORE = 100  # 免费是 PT 场景的第一偏好
 _SEEDERS_CAP = 50  # 做种数计分封顶，防止爆种老资源碾压一切偏好
 
 
+def _any_lang_match(required: list[str], declared: list[str]) -> bool:
+    """任一要求语言被声明列表命中即真。BCP 47 前缀语义：req 等于声明值，
+    或声明值以 ``req-`` 开头（"zh" 命中 "zh-Hans"；反向不成立）。"""
+    lowered = [d.casefold() for d in declared]
+    for req in required:
+        r = req.casefold()
+        if any(d == r or d.startswith(r + "-") for d in lowered):
+            return True
+    return False
+
+
 def evaluate_rules(
     candidate: TorrentCandidate, spec: RuleSetSpec, *, pack_episode_count: int = 1
 ) -> RuleVerdict:
@@ -80,6 +91,30 @@ def evaluate_rules(
         return _reject("dv_required", "规则要求杜比视界（DV），该资源未标注 DV")
     if spec.dv is DvPolicy.FORBID and has_dv:
         return _reject("dv_forbidden", "规则排除杜比视界（DV），该资源标注了 DV")
+
+    # 字幕/音轨语言：BCP 47 前缀匹配（要求 "zh" 命中 zh/zh-Hans/zh-Hant；
+    # 要求 "zh-Hans" 不接受只写泛称"中字"的资源）。声明式语义：资源未声明
+    # 该轴而规则有要求 → 按不合格——种子没写≠没有，但自动下载的代价高于
+    # 漏抓，与 resolution/codec 未知即拒的既有铁律一致
+    if spec.subtitle_languages_require and not _any_lang_match(
+        spec.subtitle_languages_require, attrs.subtitle_languages
+    ):
+        declared = "/".join(attrs.subtitle_languages) or "未声明"
+        return _reject(
+            "subtitle_language_missing",
+            f"规则要求字幕语言（{'/'.join(spec.subtitle_languages_require)}），"
+            f"该资源字幕声明为：{declared}",
+        )
+
+    if spec.audio_languages_require and not _any_lang_match(
+        spec.audio_languages_require, attrs.audio_languages
+    ):
+        declared = "/".join(attrs.audio_languages) or "未声明"
+        return _reject(
+            "audio_language_missing",
+            f"规则要求音轨语言（{'/'.join(spec.audio_languages_require)}），"
+            f"该资源音轨声明为：{declared}",
+        )
 
     if spec.free_only and candidate.is_free is not True:
         state = "非免费" if candidate.is_free is False else "促销状态未知（按非免费处理）"

@@ -62,7 +62,12 @@ def load_split(path: str | Path, split: str, clean_only: bool = False) -> list[d
     实体」，教模型漏抽（假阴性）。因此训练/评估传 True，把它们挡在门外，留在
     文件里等人工修正；人工清掉 review 标记后自动重新入训。统计场景传 False。
     """
-    items = [item for item in read_jsonl(path) if split_of(item["id"]) == split]
+    # 记录内显式 split 优先（内容指纹分组防泄漏的重排结果，见
+    # assign_group_splits.py），未标注的回落 id 稳定哈希
+    items = [
+        item for item in read_jsonl(path)
+        if (item.get("split") or split_of(item["id"])) == split
+    ]
     if clean_only:
         items = [item for item in items if not item.get("review")]
     return items

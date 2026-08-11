@@ -786,6 +786,21 @@ export interface SubtitleStream {
   file_name: string | null;
 }
 
+/** 字幕预览中的一条时间轴对白。 */
+export interface SubtitleCue {
+  start_ms: number;
+  end_ms: number;
+  text: string;
+}
+
+/** 字幕标签点击后加载的结构化预览。 */
+export interface SubtitlePreview {
+  track: string;
+  format: string | null;
+  event_count: number;
+  cues: SubtitleCue[];
+}
+
 /** 条目详情页的一个物理文件（一个版本 / 一集）。 */
 export interface LibraryItemFile {
   id: number;
@@ -939,6 +954,21 @@ export function getLibraryItemDetail(
 ): Promise<LibraryItemDetail> {
   return unwrap(
     request<ApiEnvelope<LibraryItemDetail>>(`/libraries/${libraryId}/items/${mediaItemId}`),
+  );
+}
+
+/** 读取一条外挂或文本内封字幕，并返回去样式后的时间轴对白。 */
+export function getSubtitlePreview(
+  fileId: number,
+  track: string,
+  signal?: AbortSignal,
+): Promise<SubtitlePreview> {
+  const query = new URLSearchParams({ track });
+  return unwrap(
+    request<ApiEnvelope<SubtitlePreview>>(
+      `/libraries/files/${fileId}/subtitles/preview?${query.toString()}`,
+      { signal },
+    ),
   );
 }
 

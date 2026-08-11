@@ -27,17 +27,49 @@ export interface SubgenCandidate {
   excluded: string | null;
   /** 打分明细："为什么选了这条"要能看懂 */
   reasons: string[];
+  /** 文本轨可直接选，PGS 可选后进入 OCR。 */
+  selectable: boolean;
+  requires_ocr: boolean;
 }
 
 export interface SubgenPreview {
   candidates: SubgenCandidate[];
   /** "kind:key"；null = 没有可用参考 */
   chosen_key: string | null;
+  /** 用户指定或默认英语策略实际选中的候选，PGS 也会有值。 */
+  selected_source_key: string | null;
   event_count: number;
   estimated_tokens: number;
   /** 目标语言 AI 字幕已存在（再生成 = 覆盖） */
   already_generated: boolean;
   warnings: string[];
+  /** 仅有 PGS 图形字幕时的转换候选与服务端运行环境检测。 */
+  pgs_conversion: {
+    candidate_key: string;
+    language: string | null;
+    available: boolean;
+    engine: string | null;
+    platform: string;
+    architecture: string;
+    cached: boolean;
+    message: string;
+    suggestions: string[];
+    /** PGS 图片里的语言；与最终翻译目标语言无关。 */
+    ocr_language: string | null;
+    ocr_language_label: string | null;
+    language_confirmation_required: boolean;
+    language_reason: string;
+    language_options: Array<{ code: string; label: string }>;
+  } | null;
+  /** 无法生成时的稳定原因与可执行建议；可生成时为 null。 */
+  blocker: {
+    code: string;
+    title: string;
+    message: string;
+    suggestions: string[];
+  } | null;
+  /** 规范化后的最终外挂字幕文件名。 */
+  output_filename: string | null;
 }
 
 export interface SubgenQuality {
@@ -65,6 +97,15 @@ export interface SubgenProgress {
   message: string | null;
   done_blocks: number;
   total_blocks: number;
+  done_events: number;
+  total_events: number;
+  active_blocks: number[];
+  parallelism: number;
+  uses_ocr: boolean;
+  target_language: string | null;
+  secondary_language: string | null;
+  source_candidate_key: string | null;
+  elapsed_seconds: number;
   last_result: SubgenResult | null;
 }
 
@@ -77,8 +118,15 @@ export interface CalibrateResult {
 }
 
 /** 生成预检：选源结果 + 成本估算（确认框素材，不动 LLM）。 */
-export function subgenPreview(fileId: number, targetLanguage = "chs"): Promise<SubgenPreview> {
+export function subgenPreview(
+  fileId: number,
+  targetLanguage = "chs",
+  secondaryLanguage: string | null = null,
+  sourceCandidateKey: string | null = null,
+): Promise<SubgenPreview> {
   const query = new URLSearchParams({ target_language: targetLanguage });
+  if (secondaryLanguage) query.set("secondary_language", secondaryLanguage);
+  if (sourceCandidateKey) query.set("source_candidate_key", sourceCandidateKey);
   return unwrap(
     request<ApiEnvelope<SubgenPreview>>(
       `/library/files/${fileId}/subtitles/generate/preview?${query}`,
@@ -90,14 +138,35 @@ export function subgenPreview(fileId: number, targetLanguage = "chs"): Promise<S
 export function subgenStart(
   fileId: number,
   targetLanguage = "chs",
+  options: {
+    convertPgs?: boolean;
+    pgsCandidateKey?: string | null;
+    pgsOcrLanguage?: string | null;
+    secondaryLanguage?: string | null;
+    sourceCandidateKey?: string | null;
+  } = {},
 ): Promise<{ preview: SubgenPreview }> {
+  const {
+    convertPgs = false,
+    pgsCandidateKey = null,
+    pgsOcrLanguage = null,
+    secondaryLanguage = null,
+    sourceCandidateKey = null,
+  } = options;
   return unwrap(
     request<ApiEnvelope<{ preview: SubgenPreview }>>(
       `/library/files/${fileId}/subtitles/generate`,
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ target_language: targetLanguage }),
+        body: JSON.stringify({
+          target_language: targetLanguage,
+          secondary_language: secondaryLanguage,
+          source_candidate_key: sourceCandidateKey,
+          convert_pgs: convertPgs,
+          pgs_candidate_key: pgsCandidateKey,
+          pgs_ocr_language: pgsOcrLanguage,
+        }),
       },
     ),
   );

@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from movieclaw_api.services.library.subtitles import LANGUAGE_TOKENS
+from movieclaw_api.services.subtitle_gen import pgs
 from movieclaw_db.models import LibraryFile
 
 # 内封文本字幕 codec（可抽取为 srt 做翻译源）；图形轨（PGS/VobSub）排除
@@ -40,6 +41,7 @@ class SourceCandidate:
 class RankedCandidate:
     candidate: SourceCandidate
     excluded: str | None = None  # 非空 = 被排除的中文原因
+    exclusion_code: str | None = None  # 稳定原因码，供预检生成可执行的用户提示
     reasons: list[str] = field(default_factory=list)  # 打分明细（任务日志）
     rank_key: tuple = ()  # 越大越优
 
@@ -110,13 +112,12 @@ def _rank_one(
     cand: SourceCandidate, original: str | None, target: str | None, *, is_text: bool
 ) -> RankedCandidate:
     r = RankedCandidate(candidate=cand)
-    if not is_text:
-        r.excluded = f"图形字幕轨（{cand.format}）无法做翻译源（OCR 不做）"
-        return r
     if cand.forced:
+        r.exclusion_code = "forced"
         r.excluded = "forced 轨是外语片段部分字幕，对白严重缺失，不能当翻译源"
         return r
     if target is not None and cand.language == target:
+        r.exclusion_code = "target_language"
         r.excluded = "已是目标语言，无需翻译"
         return r
 
@@ -134,6 +135,12 @@ def _rank_one(
     if embedded:
         r.reasons.append("内封轨（多为发行方官方字幕，平分决胜优先）")
     r.rank_key = (lang_rank, 0 if cand.sdh else 1, 1 if embedded else 0)
+    if not is_text:
+        r.exclusion_code = "pgs" if pgs.is_pgs_codec(cand.format) else "graphic"
+        if r.exclusion_code == "pgs":
+            r.excluded = "PGS 图形字幕需先经 OCR 转为 SRT，不能直接做翻译源"
+        else:
+            r.excluded = f"图形字幕轨（{cand.format}）暂不支持自动 OCR"
     return r
 
 

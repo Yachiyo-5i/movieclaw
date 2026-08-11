@@ -224,6 +224,21 @@ export function RuleSetsPanel() {
 /** 分辨率可选项（词表归一值里的常用档；其余档位罕见，需要时再扩）。 */
 const RESOLUTION_OPTIONS = ["2160p", "1080p", "720p"];
 
+// 语言值与 movieclaw_enrich.lang_decl 的 BCP 47 输出对齐；任一命中即过。
+// "zh" 前缀匹配简/繁/未标简繁的一切中文声明——日常"要中文字幕"选它就够
+const SUB_LANG_OPTIONS: [string, string][] = [
+  ["zh", "中文（不限简繁）"],
+  ["zh-Hans", "简体中文"],
+  ["zh-Hant", "繁体中文"],
+  ["en", "英文"],
+];
+const AUDIO_LANG_OPTIONS: [string, string][] = [
+  ["cmn", "国语"],
+  ["yue", "粤语"],
+  ["ja", "日语"],
+  ["en", "英语"],
+];
+
 /**
  * 编码按"家族"选择：词表把 x265 / H.265 / HEVC 归一成不同值，而用户想表达的
  * 是"要 H.265 这一族"——UI 选一族即把全部等价写法写进白名单，避免因发布组
@@ -255,6 +270,14 @@ export function specSummary(spec: RuleSetSpec): string[] {
   if (spec.hdr === "forbid") chips.push("排除 HDR");
   if (spec.dv === "require") chips.push("必须 DV");
   if (spec.dv === "forbid") chips.push("排除 DV");
+  if (spec.subtitle_languages_require?.length)
+    chips.push(
+      `字幕: ${spec.subtitle_languages_require.map((v) => SUB_LANG_OPTIONS.find(([code]) => code === v)?.[1] ?? v).join("/")}`,
+    );
+  if (spec.audio_languages_require?.length)
+    chips.push(
+      `音轨: ${spec.audio_languages_require.map((v) => AUDIO_LANG_OPTIONS.find(([code]) => code === v)?.[1] ?? v).join("/")}`,
+    );
   if (spec.free_only) chips.push("仅免费");
   if (spec.min_seeders != null) chips.push(`做种 ≥ ${spec.min_seeders}`);
   if (spec.size_min_mb != null || spec.size_max_mb != null) {
@@ -309,6 +332,12 @@ export function RuleSetEditorDialog({
   );
   const [hdr, setHdr] = useState<"any" | "require" | "forbid">(spec.hdr ?? "any");
   const [dv, setDv] = useState<"any" | "require" | "forbid">(spec.dv ?? "any");
+  const [subLangs, setSubLangs] = useState<string[]>(
+    spec.subtitle_languages_require ?? [],
+  );
+  const [audioLangs, setAudioLangs] = useState<string[]>(
+    spec.audio_languages_require ?? [],
+  );
   const [freeOnly, setFreeOnly] = useState(spec.free_only ?? false);
   const [excludeHr, setExcludeHr] = useState(spec.exclude_hr ?? false);
   const [hrStrict, setHrStrict] = useState(spec.hr_unknown_policy === "strict");
@@ -362,6 +391,8 @@ export function RuleSetEditorDialog({
     if (codecs.length) next.video_codecs = codecs;
     if (hdr !== "any") next.hdr = hdr;
     if (dv !== "any") next.dv = dv;
+    if (subLangs.length) next.subtitle_languages_require = subLangs;
+    if (audioLangs.length) next.audio_languages_require = audioLangs;
     if (freeOnly) next.free_only = true;
     if (excludeHr) {
       next.exclude_hr = true;
@@ -518,6 +549,52 @@ export function RuleSetEditorDialog({
                     // 「必须 DV」与「排除 HDR」矛盾（DV 属于 HDR 家族），自动复位后者
                     if (value === "require" && hdr === "forbid") setHdr("any");
                   }}
+                >
+                  {label}
+                </ToggleChip>
+              ))}
+            </div>
+          </Field>
+
+          <Field
+            label="字幕语言"
+            hint="任一命中即通过；按种子标题声明判断——未声明字幕的资源会被排除，不选 = 不限"
+          >
+            <div className="flex flex-wrap gap-1.5">
+              {SUB_LANG_OPTIONS.map(([value, label]) => (
+                <ToggleChip
+                  key={value}
+                  active={subLangs.includes(value)}
+                  onClick={() =>
+                    setSubLangs((prev) =>
+                      prev.includes(value)
+                        ? prev.filter((v) => v !== value)
+                        : [...prev, value],
+                    )
+                  }
+                >
+                  {label}
+                </ToggleChip>
+              ))}
+            </div>
+          </Field>
+
+          <Field
+            label="音轨语言"
+            hint="任一命中即通过；按种子标题声明判断——未声明音轨的资源会被排除，不选 = 不限"
+          >
+            <div className="flex flex-wrap gap-1.5">
+              {AUDIO_LANG_OPTIONS.map(([value, label]) => (
+                <ToggleChip
+                  key={value}
+                  active={audioLangs.includes(value)}
+                  onClick={() =>
+                    setAudioLangs((prev) =>
+                      prev.includes(value)
+                        ? prev.filter((v) => v !== value)
+                        : [...prev, value],
+                    )
+                  }
                 >
                   {label}
                 </ToggleChip>

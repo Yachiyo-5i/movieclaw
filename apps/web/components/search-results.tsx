@@ -271,12 +271,56 @@ const SHEET_KEYS = [
 ] as const;
 type SheetKey = (typeof SHEET_KEYS)[number];
 
+// 语言值来自 movieclaw_enrich.lang_decl（BCP 47）；zh 是"中字"类泛称声明，
+// 刻意不猜简繁。未收录的语言码直接展示原值
 const SUBTITLE_LANGUAGE_LABELS: Record<string, string> = {
+  zh: "中文字幕（未标简繁）",
   "zh-Hans": "简体中文字幕",
+  "zh-Hant": "繁体中文字幕",
+  en: "英文字幕",
+  ja: "日文字幕",
+  ko: "韩文字幕",
+  yue: "粤语字幕",
 };
 
 function subtitleLanguageLabel(language: string): string {
   return SUBTITLE_LANGUAGE_LABELS[language] ?? language;
+}
+
+// —— 结果行紧凑徽标：多语言聚合成单徽标（"字幕 简·繁·英"），全称留给筛选弹层
+const SUB_LANG_SHORT: Record<string, string> = {
+  "zh-Hans": "简",
+  "zh-Hant": "繁",
+  zh: "中",
+  en: "英",
+  ja: "日",
+  ko: "韩",
+  yue: "粤",
+};
+const AUDIO_LANG_SHORT: Record<string, string> = {
+  cmn: "国",
+  yue: "粤",
+  en: "英",
+  ja: "日",
+  ko: "韩",
+};
+
+/** "字幕 简·繁·英［·硬］"；仅泛称时显示"中字"；无声明返回 null。 */
+function compactSubtitleBadge(attrs: TorrentAttrs): string | null {
+  let langs = attrs.subtitle_languages ?? [];
+  if (!langs.length) return null;
+  // 有具体简繁时泛称 zh 被蕴含，不重复展示
+  if (langs.some((v) => v.startsWith("zh-"))) langs = langs.filter((v) => v !== "zh");
+  const hard = (attrs.subtitle_carriers ?? []).includes("hardcoded") ? "·硬" : "";
+  if (langs.length === 1 && langs[0] === "zh") return `中字${hard}`;
+  return `字幕 ${langs.map((v) => SUB_LANG_SHORT[v] ?? v).join("·")}${hard}`;
+}
+
+/** "音轨 国·粤"；无声明返回 null。 */
+function compactAudioBadge(attrs: TorrentAttrs): string | null {
+  const langs = attrs.audio_languages ?? [];
+  if (!langs.length) return null;
+  return `音轨 ${langs.map((v) => AUDIO_LANG_SHORT[v] ?? v).join("·")}`;
 }
 
 function sheetSelectionCount(f: Filters): number {
@@ -356,9 +400,14 @@ const FILTER_DIMENSIONS: { dim: FilterDim; pass: (hit: TorrentHit, f: Filters) =
   },
   {
     dim: "subtitle",
+    // BCP 47 前缀语义与订阅选种规则一致：勾 "zh" 命中 zh/zh-Hans/zh-Hant，
+    // 勾 "zh-Hans" 只命中简体（泛称"中字"资源不算简体）
     pass: (hit, f) =>
       !f.subtitle.size ||
-      (hit.attrs?.subtitle_languages ?? []).some((v) => f.subtitle.has(v)),
+      (hit.attrs?.subtitle_languages ?? []).some((v) =>
+        f.subtitle.has(v) ||
+        [...f.subtitle].some((sel) => v.startsWith(`${sel}-`)),
+      ),
   },
   {
     dim: "group",
@@ -475,7 +524,14 @@ function collectFacetMaps(items: TorrentHit[], filters: Filters | null): FacetMa
     if (want("hdr")) for (const v of a.hdr) bump(maps.hdr, v);
     if (want("audio")) for (const v of a.audio) bump(maps.audio, v);
     if (want("subtitle")) {
-      for (const v of a.subtitle_languages ?? []) bump(maps.subtitles, v);
+      {
+        // 分面计数与前缀筛选语义对齐："中文（不限简繁）"的计数要涵盖
+        // 声明了 zh-Hans/zh-Hant 的资源（每条资源对每个分面键至多计一次）
+        const langs = a.subtitle_languages ?? [];
+        const keys = new Set(langs);
+        if (langs.some((v) => v.startsWith("zh-"))) keys.add("zh");
+        for (const v of keys) bump(maps.subtitles, v);
+      }
     }
     if (want("group") && a.release_group) bump(maps.groups, a.release_group);
   }
@@ -2490,7 +2546,8 @@ function specSummary(attrs: TorrentAttrs): string | null {
     attrs.remux && "Remux",
     attrs.video_codec,
     ...attrs.hdr,
-    ...(attrs.subtitle_languages ?? []).map(subtitleLanguageLabel),
+    compactSubtitleBadge(attrs),
+    compactAudioBadge(attrs),
     ...attrs.audio.slice(0, 2),
     attrs.release_group,
   ].filter(Boolean);
@@ -2708,9 +2765,10 @@ function AttrBadges({ attrs }: { attrs: TorrentAttrs }) {
   if (attrs.resolution) chips.push({ text: attrs.resolution });
   if (attrs.remux) chips.push({ text: "Remux", cls: "text-[#9cc2ff]" });
   for (const v of attrs.hdr) chips.push({ text: v, cls: "text-[#c8a6ff]" });
-  for (const v of attrs.subtitle_languages ?? []) {
-    chips.push({ text: subtitleLanguageLabel(v), cls: "text-[#7ee2b8]" });
-  }
+  const subBadge = compactSubtitleBadge(attrs);
+  if (subBadge) chips.push({ text: subBadge, cls: "text-[#7ee2b8]" });
+  const audioBadge = compactAudioBadge(attrs);
+  if (audioBadge) chips.push({ text: audioBadge, cls: "text-[#ffd08a]" });
   if (attrs.release_group) chips.push({ text: attrs.release_group, cls: "text-[var(--accent)]" });
   if (attrs.media_source) chips.push({ text: attrs.media_source });
   if (attrs.video_codec) chips.push({ text: attrs.video_codec });

@@ -94,6 +94,60 @@ def make_insertion(record: dict, rng: random.Random, mode: str) -> dict | None:
     return {**record, "subtitle": record["subtitle"][:pos] + ins + record["subtitle"][pos:], "spans": spans}
 
 
+# —— 字幕/音轨两轴的对抗合成（v13 新增，见 docs/design/subtitle-audio-ner.md）
+# 尾词定轴对：同一语言词 + 不同尾词 → 不同轴，强迫模型只能靠尾词判别
+AXIS_PAIRS = [
+    ("中文字幕", "SUBTITLE", "中文配音", "AUDIO"),
+    ("粤语字幕", "SUBTITLE", "粤语配音", "AUDIO"),
+    ("日语字幕", "SUBTITLE", "日语配音", "AUDIO"),
+    ("简繁字幕", "SUBTITLE", "国语音轨", "AUDIO"),
+]
+NEGATIONS = ["无字幕", "字幕：无", "無字幕", "NO SUBS"]
+AUDIO_TAGS = ["[国语]", "[粤语]", "*日语*", "[英语]"]  # 括号里的语言词打 AUDIO
+COMMENTARY = ["评论音轨", "多规格音轨", "2Audios", "双音轨"]  # 无语言信息，不打标签
+
+
+def _append_subtitle(record: dict, text: str, label_ranges: list[tuple[int, int, str]]) -> dict:
+    """在副标题尾部追加 " <text>"，并按相对区间打标签（不影响既有 span）。"""
+    base = record["subtitle"]
+    sep = " " if base and not base.endswith(" ") else ""
+    pos = len(base) + len(sep)
+    spans = [dict(s) for s in record["spans"]]
+    for rel_start, rel_end, field in label_ranges:
+        spans.append({"source": "subtitle", "field": field,
+                      "start": pos + rel_start, "end": pos + rel_end})
+    spans.sort(key=lambda s: (s["source"], s["start"]))
+    return {**record, "subtitle": base + sep + text, "spans": spans}
+
+
+def make_decl_injection(record: dict, rng: random.Random, mode: str) -> list[dict] | None:
+    has_axis = {s["field"] for s in record["spans"] if s["field"] in ("SUBTITLE", "AUDIO")}
+    if mode == "dub_vs_sub":
+        # 成对产出：偏好本就无两轴声明的样本，对比信号最干净
+        if has_axis:
+            return None
+        sub_text, sub_field, dub_text, dub_field = rng.choice(AXIS_PAIRS)
+        return [
+            _append_subtitle(record, sub_text, [(0, len(sub_text), sub_field)]),
+            _append_subtitle(record, dub_text, [(0, len(dub_text), dub_field)]),
+        ]
+    if mode == "sub_negation":
+        if "SUBTITLE" in has_axis:
+            return None
+        neg = rng.choice(NEGATIONS)
+        return [_append_subtitle(record, neg, [(0, len(neg), "SUBTITLE")])]
+    if mode == "audio_tag":
+        if "AUDIO" in has_axis:
+            return None
+        tag = rng.choice(AUDIO_TAGS)
+        # 只给括号内的语言词打标（规范：独立成标签的语言词抽词本身）
+        return [_append_subtitle(record, tag, [(1, len(tag) - 1, "AUDIO")])]
+    if mode == "commentary":
+        word = rng.choice(COMMENTARY)
+        return [_append_subtitle(record, word, [])]  # 负监督：不打任何标签
+    return None
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="结构化合成增强")
     parser.add_argument("--data", default="ml/data/labeled/annotations.jsonl")
@@ -107,19 +161,29 @@ def main() -> None:
     collections = [r for r in records if r.get("media_type") == "collection"]
 
     plan = [("decoration", 300), ("trailing_stop", 250), ("version_suffix", 250), ("chapter", 200),
-            ("variant_inject", 250)]
+            ("variant_inject", 250),
+            # 字幕/音轨两轴对抗合成（v13）：尾词定轴对/否定式/独立标签/无语言负监督
+            ("dub_vs_sub", 300), ("sub_negation", 250), ("audio_tag", 250), ("commentary", 200)]
+    decl_modes = {"dub_vs_sub", "sub_negation", "audio_tag", "commentary"}
     rows = []
     for mode, quota in plan:
         made = 0
         for record in rng.sample(base, len(base)):
             if made >= quota:
                 break
-            out = make_decoration(record, rng) if mode == "decoration" else make_insertion(record, rng, mode)
-            if out is None:
+            if mode in decl_modes:
+                outs = make_decl_injection(record, rng, mode)
+            elif mode == "decoration":
+                outs = [make_decoration(record, rng)]
+            else:
+                one = make_insertion(record, rng, mode)
+                outs = [one] if one else None
+            if not outs:
                 continue
-            rows.append({**out, "id": f"aug-{mode}:{record['id']}",
-                         "annotator": f"synthetic:{mode}"})
-            made += 1
+            for j, out in enumerate(outs):
+                rows.append({**out, "id": f"aug-{mode}{j}:{record['id']}",
+                             "annotator": f"synthetic:{mode}"})
+                made += 1
         print(f"{mode}: 合成 {made} 条")
 
     # collection 过采样 ×5（真实 collection 太稀有，分类头需要更强监督；

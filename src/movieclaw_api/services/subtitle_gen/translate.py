@@ -10,16 +10,19 @@ tasks 层用 movieclaw_llm 包装真实现，测试注入假实现。
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
 import re
+import time
+from collections import deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from movieclaw_api.services.subtitle_gen.extract import SubEvent, cache_dir
-from movieclaw_api.services.subtitle_gen.validate import looks_translated
+from movieclaw_api.services.subtitle_gen.validate import looks_translated, reading_speed_limit
 
 logger = logging.getLogger("movieclaw_api.subtitle_gen")
 
@@ -29,8 +32,29 @@ BLOCK_SIZE = 50  # 每块事件数（§3.1）
 _CONTEXT_LINES = 3  # 滚动上下文条数
 _BLOCK_RETRIES = 2  # 结构不符/漏翻的重试次数
 FAILED_BLOCK_ABORT_RATE = 0.2  # 失败块超 20% 中止任务（§3.6 熔断）
+# 单文件从 8 路并发起步；遇到 429 后协调器会自动降并发并退避，稳定完成
+# 一段时间后再逐级恢复。高延迟模型因此无需被最保守的供应商永久拖慢。
+TRANSLATION_CONCURRENCY = 8
+_RATE_LIMIT_MAX_RETRIES = 5
+_RATE_LIMIT_MIN_DELAY = 1.0
+_RATE_LIMIT_MAX_DELAY = 60.0
+_CONCURRENCY_RECOVERY_SUCCESSES = 8
 
-_LANG_NAMES = {"chs": "简体中文", "chi": "简体中文", "cht": "繁体中文"}
+_LANG_NAMES = {
+    "chs": "简体中文",
+    "chi": "简体中文",
+    "cht": "繁体中文",
+    "eng": "英语",
+    "jpn": "日语",
+    "kor": "韩语",
+    "fre": "法语",
+    "ger": "德语",
+    "spa": "西班牙语",
+    "ita": "意大利语",
+    "por": "葡萄牙语",
+    "rus": "俄语",
+    "tha": "泰语",
+}
 
 
 @dataclass(frozen=True)
@@ -51,8 +75,28 @@ class TranslationStats:
     glossary: dict[str, str] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class TranslationProgress:
+    """翻译协调器对任务层发布的实时进度快照。"""
+
+    done_blocks: int
+    total_blocks: int
+    done_events: int
+    total_events: int
+    active_blocks: tuple[int, ...]  # 面向用户的一基块序号
+    concurrency: int
+
+
 class TranslationAborted(Exception):
     """失败块超熔断阈值 / 用户取消（中文信息面向任务日志）。"""
+
+
+class ChatRateLimited(Exception):
+    """接入层归一化后的模型限流信号，避免翻译管线依赖具体 LLM SDK。"""
+
+    def __init__(self, retry_after: float | None = None) -> None:
+        self.retry_after = retry_after
+        super().__init__("模型请求触发限流")
 
 
 def _film_intro(ctx: FilmContext) -> str:
@@ -67,9 +111,34 @@ def _film_intro(ctx: FilmContext) -> str:
     return intro
 
 
-def system_prompt(ctx: FilmContext, glossary: dict[str, str], target_language: str) -> str:
+def _output_description(target_language: str, secondary_language: str | None = None) -> str:
+    primary = _LANG_NAMES.get(target_language, target_language)
+    if secondary_language is None:
+        return primary
+    secondary = _LANG_NAMES.get(secondary_language, secondary_language)
+    return f"{primary}（第一行）+ {secondary}（第二行）双语"
+
+
+def _formatting_rule(language: str, position: str) -> str:
+    """把排版约束绑定到具体语言，避免外语误套简中标点与行长规则。"""
+    name = _LANG_NAMES.get(language, language)
+    if language in {"chs", "cht", "chi"}:
+        detail = "尽量不超过 16 字；句尾不用句号或逗号，停顿用空格或省略号"
+    elif language in {"jpn", "kor"}:
+        detail = "尽量不超过 18 个字符，使用该语言自然的标点和口语断句"
+    else:
+        detail = "尽量不超过 42 个字符，保留该语言自然且必要的标点"
+    return f"{position}{name}：{detail}；数字使用半角字符"
+
+
+def system_prompt(
+    ctx: FilmContext,
+    glossary: dict[str, str],
+    target_language: str,
+    secondary_language: str | None = None,
+) -> str:
     """§3.4 的七条铁律（Netflix 简中 TTSG 与 FAR 模型调研蒸馏）。"""
-    lang = _LANG_NAMES.get(target_language, target_language)
+    lang = _output_description(target_language, secondary_language)
     lines = [
         f"你是资深影视字幕翻译，正在为影片翻译{lang}字幕。影片：{_film_intro(ctx)}",
         "",
@@ -77,15 +146,23 @@ def system_prompt(ctx: FilmContext, glossary: dict[str, str], target_language: s
         "1. 语气忠实：语域、正式度、阶层感、年代感对齐原文；粗口保持同等强度，"
         "不消毒不审查；角色语气差异要能听出是谁在说话",
         "2. 口语自然：译文必须“说得出口”，禁书面翻译腔；称谓全片一致",
-        "3. 浓缩优先：每行尽量不超过 16 字、单条不超过 32 字；超长时压缩表达"
-        "而非直译堆字——删冗余语气词、保核心语义；绝不截断句意",
-        "4. 标点：句尾不用句号和逗号（直接结束）；停顿和中断用省略号；"
-        "问号感叹号保留；禁斜体标记",
-        "5. 数字：一到十用汉字，其余用半角阿拉伯数字",
-        "6. 文化专有项：给观众可直接理解的对应说法，禁加括号注释或译者注",
-        "7. 结构：逐条对应翻译，禁合并、拆分、增删条目；只输出译文不带原文；"
-        "[音效] 类标记按原格式保留并翻译内容",
+        "3. 浓缩优先：在不丢核心语义的前提下删冗余语气词、化长句为短句；绝不截断句意",
+        "4. 排版：遵守下方对应语言的行长和标点规则；禁斜体标记",
+        "5. 文化专有项：给观众可直接理解的对应说法，禁加括号注释或译者注",
+        "6. 结构：逐条对应翻译，禁合并、拆分、增删条目；[音效] 类标记按原格式保留并翻译内容",
     ]
+    if secondary_language is None:
+        lines.append("7. 单语格式：每个 t 只输出目标语言译文，不附带原文或其他语言")
+        lines.append(_formatting_rule(target_language, "8. "))
+    else:
+        primary = _LANG_NAMES.get(target_language, target_language)
+        secondary = _LANG_NAMES.get(secondary_language, secondary_language)
+        lines.append(
+            f"7. 双语格式：每个 t 必须恰好两行，第一行只写{primary}，第二行只写{secondary}；"
+            "两行语义一致，用换行符分隔，不加语言名、序号或括号"
+        )
+        lines.append(_formatting_rule(target_language, "8. 第一行 "))
+        lines.append(_formatting_rule(secondary_language, "9. 第二行 "))
     if glossary:
         pairs = "；".join(f"{k}→{v}" for k, v in list(glossary.items())[:40])
         lines.append(f"术语表（人名地名译名必须全片一致）：{pairs}")
@@ -117,12 +194,16 @@ def _parse_json_block(raw: str):
 
 
 async def build_glossary(
-    chat: ChatFn, events: list[SubEvent], ctx: FilmContext, target_language: str
+    chat: ChatFn,
+    events: list[SubEvent],
+    ctx: FilmContext,
+    target_language: str,
+    secondary_language: str | None = None,
 ) -> dict[str, str]:
     """第一遍：抽样建术语表（失败不阻断任务——空表照样翻，§3.1）。"""
     step = max(1, len(events) // 300)
     sample = "\n".join(t for _, _, t in events[::step][:300])
-    lang = _LANG_NAMES.get(target_language, target_language)
+    lang = _output_description(target_language, secondary_language)
     try:
         raw = await chat(
             f"你是影视字幕翻译助理。影片：{_film_intro(ctx)}",
@@ -153,6 +234,10 @@ class Checkpoint:
         self.path = cache_dir() / f"{file_id}.{target_language}.checkpoint.json"
         self.fingerprint = fingerprint
         self.blocks: dict[int, list[str]] = {}
+        # 失败后保留原文的块必须单独记账。否则重跑时它们会被当成正常译文
+        # 跳过，失败计数又从零开始，反复续传即可绕过 20% 熔断。
+        self.failed_blocks: set[int] = set()
+        self.legacy_without_failure_metadata = False
         self.glossary: dict[str, str] = {}
 
     def load(self) -> None:
@@ -163,6 +248,10 @@ class Checkpoint:
         if data.get("fingerprint") != self.fingerprint:
             return  # 源字幕/目标语言变了：旧暂存不可续
         self.blocks = {int(k): v for k, v in data.get("blocks", {}).items()}
+        self.failed_blocks = {
+            int(k) for k in data.get("failed_blocks", []) if int(k) in self.blocks
+        }
+        self.legacy_without_failure_metadata = bool(self.blocks) and "failed_blocks" not in data
         self.glossary = dict(data.get("glossary", {}))
         if self.blocks:
             logger.info("发现字幕翻译断点，续传 %d 个已完成块", len(self.blocks))
@@ -175,6 +264,7 @@ class Checkpoint:
                     "fingerprint": self.fingerprint,
                     "glossary": self.glossary,
                     "blocks": {str(k): v for k, v in self.blocks.items()},
+                    "failed_blocks": sorted(self.failed_blocks),
                 },
                 ensure_ascii=False,
             ),
@@ -188,8 +278,13 @@ class Checkpoint:
             self.path.unlink(missing_ok=True)
 
 
-def source_fingerprint(events: list[SubEvent], target_language: str) -> str:
-    payload = target_language + "\x00" + "\x1f".join(t for _, _, t in events)
+def source_fingerprint(
+    events: list[SubEvent], target_language: str, secondary_language: str | None = None
+) -> str:
+    output_key = (
+        target_language if secondary_language is None else f"{target_language}-{secondary_language}"
+    )
+    payload = output_key + "\x00" + "\x1f".join(t for _, _, t in events)
     return hashlib.sha1(payload.encode("utf-8")).hexdigest()
 
 
@@ -198,20 +293,61 @@ def source_fingerprint(events: list[SubEvent], target_language: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _block_user_prompt(block: list[tuple[int, str]], context: list[tuple[str, str]]) -> str:
+def _block_user_prompt(
+    block: list[tuple[int, str]],
+    context: list[tuple[str, str]],
+    previous_source: list[str],
+) -> str:
     lines = []
     if context:
         ctx_lines = "\n".join(f"{src} → {dst}" for src, dst in context)
         lines.append(f"上文衔接（前一段的原文与译文，保持连贯）：\n{ctx_lines}\n")
-    payload = json.dumps(
-        [{"i": i, "s": text} for i, text in block], ensure_ascii=False
-    )
+    elif previous_source:
+        # 并发窗口内的上一块还没有译文可引用，但原文仍能提供人物、语气和
+        # 对话场景；术语一致性由全片 glossary 兜底。明确要求不要输出上文，
+        # 避免模型把重叠上下文误当成本块条目。
+        lines.append(
+            "上文原文（仅供理解衔接，不要翻译或输出这些行）：\n" + "\n".join(previous_source) + "\n"
+        )
+    payload = json.dumps([{"i": i, "s": text} for i, text in block], ensure_ascii=False)
     lines.append(f"翻译下列对白：\n{payload}")
     return "\n".join(lines)
 
 
+async def _translate_block(
+    chat: ChatFn,
+    system: str,
+    user: str,
+    block: list[tuple[int, str]],
+    block_index: int,
+    target_language: str,
+    secondary_language: str | None = None,
+) -> tuple[int, list[str], bool]:
+    """翻译一个块；仅返回结果，不在并发协程里写共享断点。"""
+    result: list[str] | None = None
+    for attempt in range(_BLOCK_RETRIES + 1):
+        try:
+            raw = await chat(system, user)
+            result = _validate_block(raw, block, target_language, secondary_language)
+            break
+        except (ValueError, json.JSONDecodeError) as exc:
+            logger.warning(
+                "字幕翻译第 %d 块校验失败（第 %d 次尝试）：%s",
+                block_index + 1,
+                attempt + 1,
+                exc,
+            )
+    if result is not None:
+        return block_index, result, False
+    # 输出结构连续失败时保留原文；失败率熔断由中央协调器统一判断。
+    return block_index, [text for _, text in block], True
+
+
 def _validate_block(
-    raw: str, block: list[tuple[int, str]], target_language: str
+    raw: str,
+    block: list[tuple[int, str]],
+    target_language: str,
+    secondary_language: str | None = None,
 ) -> list[str]:
     """结构校验（§3.2/§3.5）：条数、序号、漏翻。不符抛 ValueError 触发重试。"""
     parsed = _parse_json_block(raw)
@@ -229,8 +365,18 @@ def _validate_block(
         if i not in by_index:
             raise ValueError(f"缺少序号 {i} 的译文")
         text = by_index[i] or src
-        if not looks_translated(text, target_language):
-            untranslated += 1
+        if secondary_language is None:
+            if not looks_translated(text, target_language):
+                untranslated += 1
+        else:
+            lines = [line.strip() for line in text.splitlines() if line.strip()]
+            if len(lines) != 2:
+                raise ValueError(f"序号 {i} 的双语译文不是两行")
+            if not looks_translated(lines[0], target_language) or not looks_translated(
+                lines[1], secondary_language
+            ):
+                untranslated += 1
+            text = "\n".join(lines)
         out.append(text)
     if untranslated > len(block) // 2:
         raise ValueError(f"{untranslated}/{len(block)} 条疑似未翻译（仍是源语言）")
@@ -244,67 +390,260 @@ async def translate_events(
     target_language: str,
     *,
     file_id: int,
-    progress: Callable[[int, int], None] | None = None,
+    secondary_language: str | None = None,
+    progress: Callable[[TranslationProgress], None] | None = None,
+    phase: Callable[[str, str], None] | None = None,
     cancelled: Callable[[], bool] | None = None,
 ) -> tuple[list[SubEvent], TranslationStats]:
     """整片翻译：术语表 → 分块翻译（带断点/重试/熔断）→ 保时间轴回填。"""
     stats = TranslationStats()
+    output_key = (
+        target_language if secondary_language is None else f"{target_language}-{secondary_language}"
+    )
     checkpoint = Checkpoint(
-        file_id, target_language, source_fingerprint(events, target_language)
+        file_id,
+        output_key,
+        source_fingerprint(events, target_language, secondary_language),
     )
     checkpoint.load()
 
+    numbered = list(enumerate((t for _, _, t in events), start=0))
+    blocks = [numbered[i : i + BLOCK_SIZE] for i in range(0, len(numbered), BLOCK_SIZE)]
+    if checkpoint.legacy_without_failure_metadata:
+        # 兼容修复前已经产生的断点：旧格式没有失败标记，但失败回退保存的是
+        # 整块原文。整块逐字等于源文可可靠识别为回退结果，补标后立即升级格式。
+        checkpoint.failed_blocks = {
+            bi
+            for bi, result in checkpoint.blocks.items()
+            if 0 <= bi < len(blocks) and result == [text for _, text in blocks[bi]]
+        }
+        checkpoint.save()
+        logger.info(
+            "旧版字幕翻译断点已升级：识别到 %d 个历史失败块",
+            len(checkpoint.failed_blocks),
+        )
+
+    stats.total_blocks = len(blocks)
+    translated = {
+        bi: result for bi, result in checkpoint.blocks.items() if 0 <= bi < stats.total_blocks
+    }
+    checkpoint.failed_blocks.intersection_update(translated)
+    stats.failed_blocks = len(checkpoint.failed_blocks)
+    stats.kept_original = sum(
+        len(translated[bi]) for bi in checkpoint.failed_blocks if bi in translated
+    )
+    target_concurrency = TRANSLATION_CONCURRENCY
+
+    def notify(active: tuple[int, ...] = ()) -> None:
+        if progress is None:
+            return
+        progress(
+            TranslationProgress(
+                done_blocks=len(translated),
+                total_blocks=stats.total_blocks,
+                done_events=sum(len(blocks[bi]) for bi in translated),
+                total_events=len(events),
+                active_blocks=active,
+                concurrency=target_concurrency,
+            )
+        )
+
+    notify()
     if checkpoint.glossary:
         glossary = checkpoint.glossary
     else:
-        glossary = await build_glossary(chat, events, ctx, target_language)
+        if phase is not None:
+            phase("glossary", "正在统一人名和专有名词")
+        glossary = await build_glossary(chat, events, ctx, target_language, secondary_language)
         checkpoint.glossary = glossary
         checkpoint.save()
     stats.glossary = glossary
-    system = system_prompt(ctx, glossary, target_language)
+    system = system_prompt(ctx, glossary, target_language, secondary_language)
+    if phase is not None:
+        phase("translating", f"正在使用 {target_concurrency} 路并行翻译对白")
 
-    numbered = list(enumerate((t for _, _, t in events), start=0))
-    blocks = [numbered[i : i + BLOCK_SIZE] for i in range(0, len(numbered), BLOCK_SIZE)]
-    stats.total_blocks = len(blocks)
-    translated: dict[int, list[str]] = dict(checkpoint.blocks)
+    if stats.total_blocks and stats.failed_blocks / stats.total_blocks > FAILED_BLOCK_ABORT_RATE:
+        raise TranslationAborted(
+            f"翻译失败块已达 {stats.failed_blocks}/{stats.total_blocks}，"
+            "超过熔断阈值，任务中止（已完成块已暂存，修复模型配置后可续传）"
+        )
 
-    for bi, block in enumerate(blocks):
-        if bi in translated:
-            continue
-        if cancelled is not None and cancelled():
-            raise TranslationAborted("任务被用户取消（已完成块已暂存，可续传）")
-        context: list[tuple[str, str]] = []
-        if bi > 0 and (bi - 1) in translated:
-            prev_src = [t for _, t in blocks[bi - 1][-_CONTEXT_LINES:]]
-            prev_dst = translated[bi - 1][-_CONTEXT_LINES:]
-            context = list(zip(prev_src, prev_dst, strict=False))
-        user = _block_user_prompt(block, context)
+    remaining = deque(bi for bi in range(stats.total_blocks) if bi not in translated)
+    running: dict[asyncio.Task[tuple[int, list[str], bool]], int] = {}
+    rate_limit_attempts: dict[int, int] = {}
+    stable_successes = 0
+    cooldown_until = 0.0
 
-        result: list[str] | None = None
-        for attempt in range(_BLOCK_RETRIES + 1):
-            try:
-                raw = await chat(system, user)
-                result = _validate_block(raw, block, target_language)
-                break
-            except (ValueError, json.JSONDecodeError) as exc:
-                logger.warning(
-                    "字幕翻译第 %d 块校验失败（第 %d 次尝试）：%s", bi + 1, attempt + 1, exc
+    def schedule() -> None:
+        if time.monotonic() < cooldown_until:
+            return
+        while len(running) < target_concurrency and remaining:
+            bi = remaining.popleft()
+            block = blocks[bi]
+            previous_source = (
+                [text for _, text in blocks[bi - 1][-_CONTEXT_LINES:]] if bi > 0 else []
+            )
+            context: list[tuple[str, str]] = []
+            if bi > 0 and (bi - 1) in translated:
+                context = list(
+                    zip(
+                        previous_source,
+                        translated[bi - 1][-_CONTEXT_LINES:],
+                        strict=False,
+                    )
                 )
-        if result is None:
-            # 失败块保留原文——出错的块保留原文也比整任务失败强（§3.2）
-            result = [t for _, t in block]
-            stats.failed_blocks += 1
-            stats.kept_original += len(block)
-            if stats.failed_blocks / stats.total_blocks > FAILED_BLOCK_ABORT_RATE:
+            user = _block_user_prompt(block, context, previous_source)
+            task = asyncio.create_task(
+                _translate_block(
+                    chat,
+                    system,
+                    user,
+                    block,
+                    bi,
+                    target_language,
+                    secondary_language,
+                ),
+                name=f"subtitle-translate-block-{bi + 1}",
+            )
+            running[task] = bi
+
+    schedule()
+    notify(tuple(sorted(bi + 1 for bi in running.values())))
+    try:
+        while running or remaining:
+            if cancelled is not None and cancelled():
+                raise TranslationAborted("任务被用户取消（已完成块已暂存，可续传）")
+
+            if not running:
+                # 限流后没有在途调用时，小步等待以便及时响应用户停止。
+                while time.monotonic() < cooldown_until:
+                    if cancelled is not None and cancelled():
+                        raise TranslationAborted("任务被用户取消（已完成块已暂存，可续传）")
+                    delay = max(0.0, cooldown_until - time.monotonic())
+                    if delay <= 0:
+                        break
+                    await asyncio.sleep(min(1.0, delay))
+                schedule()
+                notify(tuple(sorted(bi + 1 for bi in running.values())))
+                continue
+
+            cooldown_left = max(0.0, cooldown_until - time.monotonic())
+            done, _pending = await asyncio.wait(
+                running,
+                return_when=asyncio.FIRST_COMPLETED,
+                timeout=cooldown_left or None,
+            )
+            if not done:
+                schedule()
+                notify(tuple(sorted(bi + 1 for bi in running.values())))
+                continue
+            # 同一批完成的调用中即使有一个抛错，也要先把其他成功结果写入断点，
+            # 避免上游瞬时错误让已经付费完成的块白白丢失。
+            ordered_done = sorted(done, key=lambda task: running[task])
+            finished_blocks = {task: running.pop(task) for task in ordered_done}
+            # 同一事件循环 tick 内完成的块按原顺序落断点，文件始终由这个
+            # 协调器单写，避免多个模型回调同时覆盖 checkpoint。
+            results: list[tuple[int, list[str], bool]] = []
+            rate_limited: list[int] = []
+            retry_delay = 0.0
+            first_error: BaseException | None = None
+            for task in ordered_done:
+                try:
+                    results.append(task.result())
+                except ChatRateLimited as exc:
+                    bi = finished_blocks[task]
+                    attempt = rate_limit_attempts.get(bi, 0) + 1
+                    rate_limit_attempts[bi] = attempt
+                    if attempt > _RATE_LIMIT_MAX_RETRIES:
+                        if first_error is None:
+                            first_error = TranslationAborted(
+                                "模型服务持续限流，任务已暂停（已完成块已保存，稍后重新发起可继续）"
+                            )
+                        continue
+                    rate_limited.append(bi)
+                    suggested = (
+                        exc.retry_after
+                        if exc.retry_after is not None
+                        else float(2 ** min(attempt, 5))
+                    )
+                    retry_delay = max(
+                        retry_delay,
+                        min(_RATE_LIMIT_MAX_DELAY, max(_RATE_LIMIT_MIN_DELAY, suggested)),
+                    )
+                except BaseException as exc:  # noqa: BLE001 -- 写完同批成功断点再原样抛出
+                    if first_error is None:
+                        first_error = exc
+            for bi, result, block_failed in results:
+                rate_limit_attempts.pop(bi, None)
+                translated[bi] = result
+                checkpoint.blocks[bi] = result
+                if block_failed:
+                    checkpoint.failed_blocks.add(bi)
+                    stats.failed_blocks += 1
+                    stats.kept_original += len(blocks[bi])
+                checkpoint.save()
+                notify(tuple(sorted(index + 1 for index in running.values())))
+
+            if rate_limited:
+                # 限流块放回队首，同一波 429 只降一次并发；已在途调用不取消，
+                # 以免供应商其实已经开始计费却丢掉返回结果。
+                for bi in reversed(rate_limited):
+                    remaining.appendleft(bi)
+                previous_concurrency = target_concurrency
+                target_concurrency = max(1, target_concurrency // 2)
+                stable_successes = 0
+                cooldown_until = max(cooldown_until, time.monotonic() + retry_delay)
+                wait_seconds = max(1, int(retry_delay + 0.999))
+                logger.warning(
+                    "字幕翻译触发模型限流：并发 %d → %d，%d 秒后重试 %d 个块",
+                    previous_concurrency,
+                    target_concurrency,
+                    wait_seconds,
+                    len(rate_limited),
+                )
+                if phase is not None:
+                    phase(
+                        "translating",
+                        f"模型请求较忙，已降至 {target_concurrency} 路，{wait_seconds} 秒后继续",
+                    )
+            else:
+                stable_successes += len(results)
+                if (
+                    target_concurrency < TRANSLATION_CONCURRENCY
+                    and stable_successes >= _CONCURRENCY_RECOVERY_SUCCESSES
+                    and time.monotonic() >= cooldown_until
+                ):
+                    target_concurrency += 1
+                    stable_successes = 0
+                    logger.info("模型调用已稳定，字幕翻译并发恢复至 %d", target_concurrency)
+                    if phase is not None:
+                        phase(
+                            "translating",
+                            f"模型响应已恢复，正在使用 {target_concurrency} 路并行翻译",
+                        )
+                elif phase is not None and results and time.monotonic() >= cooldown_until:
+                    phase(
+                        "translating",
+                        f"正在使用 {target_concurrency} 路并行翻译对白",
+                    )
+            notify(tuple(sorted(index + 1 for index in running.values())))
+            if first_error is not None:
+                raise first_error
+            if (
+                stats.total_blocks
+                and stats.failed_blocks / stats.total_blocks > FAILED_BLOCK_ABORT_RATE
+            ):
                 raise TranslationAborted(
                     f"翻译失败块已达 {stats.failed_blocks}/{stats.total_blocks}，"
                     "超过熔断阈值，任务中止（已完成块已暂存，修复模型配置后可续传）"
                 )
-        translated[bi] = result
-        checkpoint.blocks[bi] = result
-        checkpoint.save()
-        if progress is not None:
-            progress(len(translated), stats.total_blocks)
+            schedule()
+            notify(tuple(sorted(bi + 1 for bi in running.values())))
+    finally:
+        for task in running:
+            task.cancel()
+        if running:
+            await asyncio.gather(*running, return_exceptions=True)
 
     texts = [t for bi in range(len(blocks)) for t in translated[bi]]
     out = [(s, e, texts[i]) for i, (s, e, _) in enumerate(events)]
@@ -342,6 +681,7 @@ async def compress_overruns(
     indices: list[int],
     ctx: FilmContext,
     target_language: str,
+    secondary_language: str | None = None,
 ) -> tuple[list[SubEvent], int]:
     """对超读速事件做限字数压缩重写；失败保留原译文。返回 (事件, 成功数)。
 
@@ -351,7 +691,7 @@ async def compress_overruns(
     todo = []
     for i in indices:
         start, end, text = events[i]
-        limit = max(4, int((end - start) / 1000 * 9))
+        limit = max(4, int((end - start) / 1000 * reading_speed_limit(target_language)))
         if len(text.replace("\n", "").replace(" ", "")) > limit:
             todo.append((i, text.replace("\n", " "), limit))
     if not todo:
@@ -359,7 +699,7 @@ async def compress_overruns(
 
     out = list(events)
     compressed = 0
-    system = system_prompt(ctx, {}, target_language)
+    system = system_prompt(ctx, {}, target_language, secondary_language)
     for batch_start in range(0, len(todo), _COMPRESS_BATCH):
         batch = todo[batch_start : batch_start + _COMPRESS_BATCH]
         payload = json.dumps(
@@ -380,7 +720,16 @@ async def compress_overruns(
         for i, original, _limit in batch:
             text = by_index.get(i, "").strip()
             # 压缩结果必须真的更短且仍是目标语言,否则不采纳
-            if text and len(text) < len(original) and looks_translated(text, target_language):
+            bilingual_valid = (
+                secondary_language is None
+                or len([line for line in text.splitlines() if line.strip()]) == 2
+            )
+            if (
+                text
+                and len(text) < len(original)
+                and bilingual_valid
+                and looks_translated(text, target_language)
+            ):
                 start, end, _ = out[i]
                 out[i] = (start, end, text)
                 compressed += 1

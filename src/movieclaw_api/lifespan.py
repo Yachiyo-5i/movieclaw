@@ -16,6 +16,10 @@ from movieclaw_api.services.agent_runs import (
 from movieclaw_api.services.image_proxy import close_image_proxy
 from movieclaw_api.services.media_discover import close_media_service
 from movieclaw_api.services.site_access import get_site_access, init_site_access
+from movieclaw_api.services.task_supervisor import (
+    close_task_supervisor,
+    init_task_supervisor,
+)
 from movieclaw_api.settings import init_setting_store
 from movieclaw_db.crypto import init_secret_box
 from movieclaw_db.engine import dispose_db, get_database, init_db
@@ -97,6 +101,9 @@ def build_lifespan(settings: Settings):
         await _reset_stale_verifying()
         # 存量明文凭据一次性加密（幂等，须在 init_secret_box 之后）
         await _encrypt_plaintext_credentials()
+        # 分钟级业务任务不能挂在 HTTP BackgroundTasks 上，否则热重载会等待
+        # 整个任务自然结束。主管与当前事件循环同生共死，停机时统一协作取消。
+        init_task_supervisor()
         # Agent 运行注册表必须与当前事件循环同生共死：它持有后台 task 和
         # asyncio.Condition，不能跨 FastAPI 生命周期复用。
         init_agent_run_registry()
@@ -180,6 +187,14 @@ def build_lifespan(settings: Settings):
         from movieclaw_jellyfin.udp import start_discovery
 
         await start_discovery(settings.jellyfin_public_port)
+        # 用户已经确认并开始的字幕任务属于可恢复工作：进程崩溃或更新重启时
+        # 持久化意图仍在，启动完成前自动重新入队并从逐块断点继续。明确停止、
+        # 正常完成或业务失败会先清除意图，因此不会在重启后反向复活。
+        from movieclaw_api.services.subtitle_gen.tasks import (
+            resume_interrupted_generations,
+        )
+
+        resume_interrupted_generations()
         logger.info("应用启动完成，数据库就绪")
         try:
             yield
@@ -200,6 +215,9 @@ def build_lifespan(settings: Settings):
             from movieclaw_api.services.im_channel import close_im_channels
 
             await close_im_channels()
+            # 字幕翻译等长任务依赖 LLM、数据库与本地缓存，必须在这些下游资源
+            # 释放前先取消；翻译块和任务意图都已写入 data/，下次启动自动续传。
+            await close_task_supervisor()
             # 先停止 Agent，避免它在下游 HTTP 客户端和数据库开始释放后继续工作。
             await close_agent_run_registry()
             if settings.scheduler_enabled:

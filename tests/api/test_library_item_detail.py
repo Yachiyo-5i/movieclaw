@@ -21,6 +21,7 @@ import movieclaw_api.services.library.items as items_mod
 import movieclaw_api.services.library.scan as scan_mod
 import movieclaw_api.services.media_discover as discover_mod
 from movieclaw_api.api.routes.libraries import (
+    _file_view,
     delete_library_file,
     delete_library_item,
     get_item_artwork,
@@ -175,6 +176,27 @@ async def db(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 # ffprobe 解析
 # ---------------------------------------------------------------------------
+
+
+def test_file_view_parses_generated_subtitle_names() -> None:
+    """详情页应把产物类型与语言拆开，不能把整段文件名误当字幕标题。"""
+    row = LibraryFile(
+        id=88,
+        library_id=1,
+        media_item_id=1,
+        file_path="/media/Movie.mkv",
+        source="scanned",
+        subtitle_streams=[],
+    )
+
+    view = _file_view(
+        row,
+        ["Movie.ai-bilingual-chs-eng.chi.srt", "Movie.pgs-ocr.eng.srt"],
+    )
+
+    bilingual, ocr = view.subtitle_streams
+    assert bilingual.language == "chi" and bilingual.title == "ai-bilingual-chs-eng"
+    assert ocr.language == "eng" and ocr.title == "pgs-ocr"
 
 
 def test_parse_probe_extracts_audio_and_subtitle_streams() -> None:
@@ -707,9 +729,9 @@ async def test_library_refresh_is_full_and_reports_progress(db, tmp_path, monkey
         return await real_scrape(
             media_item_id,
             force=force,
-            on_phase=lambda phase: (seen_phases.append(phase), on_phase(phase))[1]
-            if on_phase
-            else None,
+            on_phase=lambda phase: (
+                (seen_phases.append(phase), on_phase(phase))[1] if on_phase else None
+            ),
         )
 
     monkeypatch.setattr(media_scrape, "scrape_media_item", _spy)
@@ -976,11 +998,7 @@ async def test_delete_single_file_keeps_other_version(db, tmp_path) -> None:
             .one()
         )
         target = (
-            (
-                await session.execute(
-                    select(LibraryFile).where(LibraryFile.file_path == str(video))
-                )
-            )
+            (await session.execute(select(LibraryFile).where(LibraryFile.file_path == str(video))))
             .scalars()
             .one()
         )
@@ -1414,8 +1432,14 @@ async def test_reidentify_preview_then_claim_applies_and_clears_orphan(db, tmp_p
         assert row.identity_source == IdentitySource.MANUAL
         # 旧条目已被腾空，孤儿清理的名单里应当有它（后台任务，这里只验语义前提）
         remaining = (
-            await session.execute(select(LibraryFile).where(LibraryFile.media_item_id == wrong_id))
-        ).scalars().all()
+            (
+                await session.execute(
+                    select(LibraryFile).where(LibraryFile.media_item_id == wrong_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
         assert not remaining
 
 

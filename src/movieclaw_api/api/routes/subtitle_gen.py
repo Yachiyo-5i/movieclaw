@@ -7,19 +7,24 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, BackgroundTasks, Depends
+import time
+
+from fastapi import APIRouter, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from movieclaw_api.schemas.response import ApiResponse
 from movieclaw_api.schemas.subtitle_gen import (
     CalibratePayload,
     CalibrateResultView,
+    GenPreviewBlockerView,
     GenPreviewView,
     GenProgressView,
     GenQualityView,
     GenResultView,
     GenStartPayload,
     GenStartView,
+    PgsConversionView,
+    PgsOcrLanguageOptionView,
     SourceCandidateView,
 )
 from movieclaw_api.services.subtitle_gen import tasks as gen_tasks
@@ -38,16 +43,54 @@ def _preview_view(pv: gen_tasks.Preview) -> GenPreviewView:
                 format=c.candidate.format,
                 excluded=c.excluded,
                 reasons=c.reasons,
+                selectable=gen_tasks.candidate_selectable(c),
+                requires_ocr=c.exclusion_code == "pgs",
             )
             for c in pv.candidates
         ],
-        chosen_key=(
-            f"{pv.chosen.candidate.kind}:{pv.chosen.candidate.key}" if pv.chosen else None
-        ),
+        chosen_key=(f"{pv.chosen.candidate.kind}:{pv.chosen.candidate.key}" if pv.chosen else None),
+        selected_source_key=pv.selected_source_key,
         event_count=pv.event_count,
         estimated_tokens=pv.estimated_tokens,
         already_generated=pv.already_generated,
         warnings=pv.warnings,
+        pgs_conversion=(
+            PgsConversionView(
+                candidate_key=(
+                    f"{pv.pgs_conversion.candidate.candidate.kind}:"
+                    f"{pv.pgs_conversion.candidate.candidate.key}"
+                ),
+                language=pv.pgs_conversion.candidate.candidate.language,
+                available=pv.pgs_conversion.capability.available,
+                engine=pv.pgs_conversion.capability.engine,
+                platform=pv.pgs_conversion.capability.platform,
+                architecture=pv.pgs_conversion.capability.architecture,
+                cached=pv.pgs_conversion.capability.cached,
+                message=pv.pgs_conversion.capability.message,
+                suggestions=list(pv.pgs_conversion.capability.suggestions),
+                ocr_language=pv.pgs_conversion.language.code,
+                ocr_language_label=pv.pgs_conversion.language.label,
+                language_confirmation_required=(pv.pgs_conversion.language.confirmation_required),
+                language_reason=pv.pgs_conversion.language.reason,
+                language_options=[
+                    PgsOcrLanguageOptionView(code=code, label=label)
+                    for code, label in pv.pgs_conversion.language_options
+                ],
+            )
+            if pv.pgs_conversion
+            else None
+        ),
+        blocker=(
+            GenPreviewBlockerView(
+                code=pv.blocker.code,
+                title=pv.blocker.title,
+                message=pv.blocker.message,
+                suggestions=pv.blocker.suggestions,
+            )
+            if pv.blocker
+            else None
+        ),
+        output_filename=pv.output_filename,
     )
 
 
@@ -84,9 +127,17 @@ def _result_view(result: gen_tasks.GenResult | None) -> GenResultView | None:
 async def gen_preview(
     file_id: int,
     target_language: str = "chs",
+    secondary_language: str | None = None,
+    source_candidate_key: str | None = None,
     session: AsyncSession = Depends(get_session),
 ) -> ApiResponse[GenPreviewView]:
-    pv = await gen_tasks.preview(session, file_id, target_language)
+    pv = await gen_tasks.preview(
+        session,
+        file_id,
+        target_language,
+        secondary_language=secondary_language,
+        source_candidate_key=source_candidate_key,
+    )
     return ApiResponse(data=_preview_view(pv))
 
 
@@ -105,12 +156,26 @@ async def gen_preview(
 async def gen_start(
     file_id: int,
     payload: GenStartPayload,
-    background_tasks: BackgroundTasks,
     session: AsyncSession = Depends(get_session),
 ) -> ApiResponse[GenStartView]:
-    pv = await gen_tasks.start_generation(session, file_id, payload.target_language)
-    background_tasks.add_task(
-        gen_tasks.run_generation, file_id, payload.target_language
+    pv = await gen_tasks.start_generation(
+        session,
+        file_id,
+        payload.target_language,
+        secondary_language=payload.secondary_language,
+        source_candidate_key=payload.source_candidate_key,
+        convert_pgs=payload.convert_pgs,
+        pgs_candidate_key=payload.pgs_candidate_key,
+        pgs_ocr_language=payload.pgs_ocr_language,
+    )
+    gen_tasks.queue_generation(
+        file_id,
+        payload.target_language,
+        convert_pgs=payload.convert_pgs,
+        pgs_candidate_key=payload.pgs_candidate_key,
+        pgs_ocr_language=payload.pgs_ocr_language,
+        secondary_language=payload.secondary_language,
+        source_candidate_key=pv.selected_source_key,
     )
     return ApiResponse(data=GenStartView(preview=_preview_view(pv)))
 
@@ -131,6 +196,15 @@ async def gen_status(file_id: int) -> ApiResponse[GenProgressView]:
                 message=state.message,
                 done_blocks=state.done_blocks,
                 total_blocks=state.total_blocks,
+                done_events=state.done_events,
+                total_events=state.total_events,
+                active_blocks=list(state.active_blocks),
+                parallelism=state.parallelism,
+                uses_ocr=state.uses_ocr,
+                target_language=state.target_language,
+                secondary_language=state.secondary_language,
+                source_candidate_key=state.source_candidate_key,
+                elapsed_seconds=max(0, int(time.monotonic() - state.started_at)),
             )
         )
     return ApiResponse(
@@ -167,9 +241,7 @@ async def subtitle_calibrate(
 ) -> ApiResponse[CalibrateResultView]:
     """独立于 AI 翻译的零成本工具（subtitle-ai-translate.md §5.4）：用户
     手工下载的不同步字幕就地修正，校准后覆盖写回并即时刷新台账。"""
-    result = await gen_tasks.calibrate_external_subtitle(
-        session, file_id, payload.filename
-    )
+    result = await gen_tasks.calibrate_external_subtitle(session, file_id, payload.filename)
     return ApiResponse(
         data=CalibrateResultView(
             ok=result.ok,

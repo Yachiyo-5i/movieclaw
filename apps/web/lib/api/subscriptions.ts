@@ -127,6 +127,10 @@ export interface RuleSetSpec {
   size_max_mb?: number | null;
   exclude_hr?: boolean;
   hr_unknown_policy?: "lenient" | "strict";
+  /** 要求的字幕语言（BCP 47，任一命中即过；"zh" 含简/繁/未标简繁）；空=不限 */
+  subtitle_languages_require?: string[];
+  /** 要求的音轨语言（cmn=国语、yue=粤语…）；空=不限 */
+  audio_languages_require?: string[];
 }
 
 export interface RuleSet {

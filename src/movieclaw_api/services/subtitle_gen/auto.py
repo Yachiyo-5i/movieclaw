@@ -66,7 +66,15 @@ def queue_after_scan(library_id: int) -> None:
     """扫描收尾的挂钩（同步、绝不抛）：开关开启才起后台批次。"""
     if library_id in _running_libraries:
         return
-    asyncio.get_running_loop().create_task(_run_batch(library_id))
+    # 必须在 create_task 前同步占位；若等协程首次运行、读完设置后才登记，
+    # 同一事件循环连续两次扫描收尾会同时创建两个批次并重复消费额度。
+    loop = asyncio.get_running_loop()
+    _running_libraries.add(library_id)
+    try:
+        loop.create_task(_run_batch(library_id))
+    except Exception:
+        _running_libraries.discard(library_id)
+        raise
 
 
 async def _run_batch(library_id: int) -> None:
@@ -80,7 +88,6 @@ async def _run_batch(library_id: int) -> None:
             return
         target = normalize_language(setting.target_language)
 
-        _running_libraries.add(library_id)
         db = get_database()
         async with db.session() as session:
             rows = list(

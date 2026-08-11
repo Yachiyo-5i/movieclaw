@@ -24,9 +24,10 @@ SRT_GBK = (
     "1\n00:00:01,000 --> 00:00:02,500\n简体中文字幕测试\n\n"
     "2\n00:00:03,000 --> 00:00:04,000\n第二行\n\n"
 )
-# 合成编号：video=0、audio=1、内封字幕=2、外挂=3（jellyfin-subtitle.md §4.1）
-EXTERNAL_INDEX = 3
-EMBEDDED_INDEX = 2
+# Jellyfin 官方合成编号：外挂=0、video=1、audio=2、内封字幕=3（§4.1）
+EXTERNAL_INDEX = 0
+AUDIO_INDEX = 2
+EMBEDDED_INDEX = 3
 
 
 @pytest.fixture
@@ -91,12 +92,14 @@ def test_ai_subtitle_display_title_carries_marker() -> None:
     stream = _external_subtitle_stream(
         {"filename": "M.chs.ai.srt", "format": "srt", "language": "chi", "title": "ai"},
         3,
+        Path("/media"),
     )
     assert stream["DisplayTitle"] == "Chinese - ai - SUBRIP - External"
     # 语言解析不出时 title 顶格，不重复出现
     stream = _external_subtitle_stream(
         {"filename": "M.简中特效.srt", "format": "srt", "language": None, "title": "简中特效"},
         3,
+        Path("/media"),
     )
     assert stream["DisplayTitle"] == "简中特效 - SUBRIP - External"
 
@@ -108,15 +111,19 @@ def test_playback_info_external_subtitle_stream(sclient: TestClient, subtitle_en
     source = body["MediaSources"][0]
 
     subs = [s for s in source["MediaStreams"] if s["Type"] == "Subtitle"]
-    assert [s["Index"] for s in subs] == [EMBEDDED_INDEX, EXTERNAL_INDEX]
+    assert [(s["Index"], s["IsExternal"]) for s in subs] == [
+        (EXTERNAL_INDEX, True),
+        (EMBEDDED_INDEX, False),
+    ]
 
-    external = subs[1]
+    external = subs[0]
     assert external["IsExternal"] is True
     assert external["Codec"] == "subrip"
     assert external["Language"] == "chi"
     assert external["IsDefault"] is True
     assert external["SupportsExternalStream"] is True
     assert external["IsTextSubtitleStream"] is True
+    assert external["Path"] == str(Path(source["Path"]).with_name(SIDECAR_NAME))
     assert external["DisplayTitle"] == "Chinese - Default - SUBRIP - External"
     # 投递字段（仅 PlaybackInfo 场景，无条件输出）
     assert external["DeliveryMethod"] == "External"
@@ -126,7 +133,7 @@ def test_playback_info_external_subtitle_stream(sclient: TestClient, subtitle_en
         f"?ApiKey={token}"
     )
     # 内封字幕流不带投递字段（DirectPlay 播放器自解，对齐真 Jellyfin）
-    assert "DeliveryMethod" not in subs[0]
+    assert "DeliveryMethod" not in subs[1]
     # 默认轨：无记忆时选择策略生效——外挂优先
     assert source["DefaultSubtitleStreamIndex"] == EXTERNAL_INDEX
 
@@ -181,6 +188,36 @@ def test_subtitle_stream_ticksless_route_and_format_override(
     assert resp.headers["content-type"].startswith("text/vtt")
 
 
+@pytest.mark.parametrize(
+    ("requested_format", "content_type", "expected_prefix"),
+    [
+        ("subrip", "application/x-subrip", b"1\n"),
+        ("webvtt", "text/vtt", b"WEBVTT"),
+    ],
+)
+def test_subtitle_stream_accepts_jellyfin_codec_aliases(
+    sclient: TestClient,
+    subtitle_env: dict,
+    requested_format: str,
+    content_type: str,
+    expected_prefix: bytes,
+) -> None:
+    """VidHub 会按 MediaStream.Codec 构造无 ticks 的字幕地址。"""
+    token = jf_login(sclient)
+    guid = item_guid(subtitle_env["movie"])
+    ms_id = _playback_info(sclient, token, guid)["MediaSources"][0]["Id"]
+
+    resp = sclient.get(
+        f"/Videos/{guid}/{ms_id}/Subtitles/{EXTERNAL_INDEX}/Stream.{requested_format}",
+        params={"ApiKey": token},
+    )
+
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith(content_type)
+    assert resp.content.startswith(expected_prefix)
+    assert "简体中文字幕测试" in resp.content.decode("utf-8")
+
+
 def test_subtitle_stream_embedded_index_404(sclient: TestClient, subtitle_env: dict) -> None:
     """内封轨 v1 不做服务端抽取：404 空 body。"""
     token = jf_login(sclient)
@@ -218,14 +255,14 @@ def test_track_memory_roundtrip(sclient: TestClient, subtitle_env: dict) -> None
             "ItemId": guid,
             "MediaSourceId": ms_id,
             "PositionTicks": 60 * 10_000_000,
-            "AudioStreamIndex": 1,
+            "AudioStreamIndex": AUDIO_INDEX,
             "SubtitleStreamIndex": EMBEDDED_INDEX,
         },
     )
     assert resp.status_code == 204
     source = _playback_info(sclient, token, guid)["MediaSources"][0]
     assert source["DefaultSubtitleStreamIndex"] == EMBEDDED_INDEX  # 记忆优先于外挂策略
-    assert source["DefaultAudioStreamIndex"] == 1
+    assert source["DefaultAudioStreamIndex"] == AUDIO_INDEX
 
     # 明确关闭字幕（-1 是协议有效值）：重进仍关
     resp = sclient.post(

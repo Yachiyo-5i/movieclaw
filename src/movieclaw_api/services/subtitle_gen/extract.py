@@ -8,10 +8,12 @@ subprocess 风格（线程池执行、超时保护、失败中文日志），不
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import functools
 import logging
 import shutil
 import subprocess
+import uuid
 from pathlib import Path
 
 from movieclaw_api.services.subtitle_gen.source import SourceCandidate
@@ -103,8 +105,10 @@ def decode_subtitle_bytes(raw: bytes, origin: str) -> str:
 _decode_text = decode_subtitle_bytes
 
 
-def parse_events(text: str, origin: str) -> list[SubEvent]:
-    """字幕文本 → 事件序列（pysubs2 解析，跳过空文本行，按开始时间排序）。"""
+def parse_events(
+    text: str, origin: str, *, preserve_linebreaks: bool = False
+) -> list[SubEvent]:
+    """字幕文本 → 事件序列；预览可保留对白换行，翻译链路默认压为单行。"""
     import pysubs2
 
     try:
@@ -113,7 +117,9 @@ def parse_events(text: str, origin: str) -> list[SubEvent]:
         raise SourceLoadError(f"参考字幕解析失败：{origin}（{exc}）") from exc
     events: list[SubEvent] = []
     for line in subs:
-        plain = line.plaintext.replace("\n", " ").strip()
+        plain = line.plaintext.strip()
+        if not preserve_linebreaks:
+            plain = plain.replace("\n", " ")
         if plain:
             events.append((int(line.start), int(line.end), plain))
     events.sort(key=lambda e: e[0])
@@ -142,6 +148,14 @@ def _extract_embedded_sync(video: Path, stream_index: int, out_path: Path) -> No
             "或为该影片放置外挂字幕后重试（官方 Docker 镜像已内置 ffmpeg）"
         )
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    # ffmpeg 只能写临时文件：失败/超时可能留下非空残片，若直接写最终路径，
+    # 下一次会被上面的 mtime 缓存判定误认成成功产物。临时文件保留 .srt
+    # 后缀，确保 ffmpeg 能按扩展名选择 muxer。
+    tmp_path = out_path.with_name(
+        f".{out_path.stem}.{uuid.uuid4().hex}.part{out_path.suffix}"
+    )
+    with contextlib.suppress(OSError):
+        tmp_path.unlink(missing_ok=True)
     try:
         proc = subprocess.run(
             [
@@ -149,36 +163,57 @@ def _extract_embedded_sync(video: Path, stream_index: int, out_path: Path) -> No
                 "-i", str(video),
                 "-map", f"0:s:{stream_index}",
                 "-c:s", "srt",
-                str(out_path),
+                str(tmp_path),
             ],
             capture_output=True,
             timeout=_EXTRACT_TIMEOUT,
         )
     except subprocess.TimeoutExpired as exc:
+        with contextlib.suppress(OSError):
+            tmp_path.unlink(missing_ok=True)
         raise SourceLoadError(f"内封字幕抽取超时（{_EXTRACT_TIMEOUT:.0f} 秒）：{video}") from exc
-    if proc.returncode != 0 or not out_path.is_file() or out_path.stat().st_size == 0:
+    if proc.returncode != 0 or not tmp_path.is_file() or tmp_path.stat().st_size == 0:
         stderr = proc.stderr.decode(errors="replace")[:200]
+        with contextlib.suppress(OSError):
+            tmp_path.unlink(missing_ok=True)
         raise SourceLoadError(f"内封字幕抽取失败：{video} 轨 {stream_index}（{stderr}）")
+    try:
+        tmp_path.replace(out_path)
+    except OSError as exc:
+        with contextlib.suppress(OSError):
+            tmp_path.unlink(missing_ok=True)
+        raise SourceLoadError(f"内封字幕缓存写入失败：{out_path}（{exc}）") from exc
 
 
 async def load_candidate_events(
-    file: LibraryFile, candidate: SourceCandidate
+    file: LibraryFile,
+    candidate: SourceCandidate,
+    *,
+    preserve_linebreaks: bool = False,
 ) -> list[SubEvent]:
-    """加载一个候选的事件序列（外挂读文件 / 内封先抽取）。"""
+    """加载候选事件；预览保留换行，字幕生成继续使用单行文本。"""
     if candidate.kind == "external":
         path = Path(file.file_path).parent / candidate.key
         try:
             raw = await asyncio.to_thread(path.read_bytes)
         except OSError as exc:
             raise SourceLoadError(f"外挂字幕无法读取：{path}（{exc}）") from exc
-        return parse_events(_decode_text(raw, str(path)), str(path))
+        return parse_events(
+            _decode_text(raw, str(path)),
+            str(path),
+            preserve_linebreaks=preserve_linebreaks,
+        )
 
     out_path = cache_dir() / f"{file.id}.embedded{candidate.key}.srt"
     await asyncio.to_thread(
         _extract_embedded_sync, Path(file.file_path), int(candidate.key), out_path
     )
     raw = await asyncio.to_thread(out_path.read_bytes)
-    return parse_events(_decode_text(raw, str(out_path)), str(out_path))
+    return parse_events(
+        _decode_text(raw, str(out_path)),
+        str(out_path),
+        preserve_linebreaks=preserve_linebreaks,
+    )
 
 
 # 听障字幕的音效标记（§2.4：sdh 可用但翻译前清理）

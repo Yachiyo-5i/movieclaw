@@ -1166,7 +1166,7 @@ def _resolution_text(f: LibraryFile) -> str:
     return ""
 
 
-def _video_stream(f: LibraryFile) -> dict[str, Any]:
+def _video_stream(f: LibraryFile, index: int) -> dict[str, Any]:
     video_range, range_type = _video_range(f)
     codec = (f.video_codec or "").lower()
     title_parts = [
@@ -1176,7 +1176,7 @@ def _video_stream(f: LibraryFile) -> dict[str, Any]:
     ]
     stream: dict[str, Any] = {
         "Type": "Video",
-        "Index": 0,
+        "Index": index,
         "IsDefault": True,
         "IsForced": False,
         "IsExternal": False,
@@ -1268,7 +1268,7 @@ def _subtitle_stream(raw: dict, index: int) -> dict[str, Any]:
 _EXTERNAL_SUB_CODEC = {"srt": "subrip", "vtt": "webvtt", "ass": "ass", "ssa": "ssa"}
 
 
-def _external_subtitle_stream(entry: dict, index: int) -> dict[str, Any]:
+def _external_subtitle_stream(entry: dict, index: int, media_dir: Path) -> dict[str, Any]:
     """台账外挂字幕元素 → MediaStream（jellyfin-subtitle.md §4.2）。
 
     DisplayTitle 照内封拼接规则加 " - External" 尾缀；language 解析不出时
@@ -1291,6 +1291,7 @@ def _external_subtitle_stream(entry: dict, index: int) -> dict[str, Any]:
         codec.upper() if codec else None,
         "External",
     ]
+    filename = entry.get("filename")
     stream: dict[str, Any] = {
         "Type": "Subtitle",
         "Index": index,
@@ -1300,9 +1301,12 @@ def _external_subtitle_stream(entry: dict, index: int) -> dict[str, Any]:
         "IsExternal": True,
         "SupportsExternalStream": True,
         "IsTextSubtitleStream": True,
-        "Path": entry.get("filename"),
         "DisplayTitle": " - ".join(p for p in parts if p),
     }
+    # 真 Jellyfin 在详情 MediaStream.Path 下发服务端绝对路径。客户端不应
+    # 直接访问它，但 VidHub 会据此识别外挂流，不能只给 basename。
+    if filename:
+        stream["Path"] = str(media_dir / filename)
     if codec:
         stream["Codec"] = codec
     if lang:
@@ -1314,21 +1318,24 @@ def _external_subtitle_stream(entry: dict, index: int) -> dict[str, Any]:
 
 def media_streams_dto(f: LibraryFile) -> list[dict[str, Any]]:
     """合成流编号是 Jellyfin 方言、唯一产地在本层（jellyfin-subtitle.md §4.1）：
-    video=0、audio 1..n、内封字幕接续、**外挂字幕接在最后**（台账数组序）。
-    有意偏离 Jellyfin master 的"外挂在前"排法：外挂在后时增删 sidecar 不
-    漂移内封编号；客户端只认下发的 Index 值，两种排法协议等价。
+    **外挂字幕置前**（台账数组序），再接 video、audio、内封字幕。此顺序
+    对齐 Jellyfin master；VidHub 会按官方布局识别外挂流，不能假设只要
+    Index 在单次响应内自洽就协议等价。
     编号↔中性轨引用的换算（subtitle_track_for_index 等）必须与本函数同源。
     """
-    streams: list[dict[str, Any]] = [_video_stream(f)]
-    index = 1
+    streams: list[dict[str, Any]] = []
+    index = 0
+    media_dir = Path(f.file_path).parent
+    for entry in f.external_subtitles or []:
+        streams.append(_external_subtitle_stream(entry, index, media_dir))
+        index += 1
+    streams.append(_video_stream(f, index))
+    index += 1
     for raw in f.audio_streams or []:
         streams.append(_audio_stream(raw, index))
         index += 1
     for raw in f.subtitle_streams or []:
         streams.append(_subtitle_stream(raw, index))
-        index += 1
-    for entry in f.external_subtitles or []:
-        streams.append(_external_subtitle_stream(entry, index))
         index += 1
     return streams
 
@@ -1340,15 +1347,14 @@ def subtitle_track_for_index(f: LibraryFile, index: int) -> str | None:
     """合成 Index → 字幕的中性轨引用；不在字幕区间返回 None。"""
     from movieclaw_playback.subtitles import embedded_track, external_track
 
-    base = 1 + len(f.audio_streams or [])
-    n_embedded = len(f.subtitle_streams or [])
-    if base <= index < base + n_embedded:
-        return embedded_track(index - base)
     externals = f.external_subtitles or []
-    j = index - base - n_embedded
-    if 0 <= j < len(externals):
-        filename = externals[j].get("filename")
+    if 0 <= index < len(externals):
+        filename = externals[index].get("filename")
         return external_track(filename) if filename else None
+    embedded_base = len(externals) + 1 + len(f.audio_streams or [])
+    n_embedded = len(f.subtitle_streams or [])
+    if embedded_base <= index < embedded_base + n_embedded:
+        return embedded_track(index - embedded_base)
     return None
 
 
@@ -1356,16 +1362,17 @@ def index_for_subtitle_track(f: LibraryFile, track: str) -> int | None:
     """中性轨引用 → 合成 Index；引用悬空（轨已不在）返回 None。"""
     from movieclaw_playback.subtitles import parse_embedded_track, parse_external_track
 
-    base = 1 + len(f.audio_streams or [])
+    externals = f.external_subtitles or []
+    embedded_base = len(externals) + 1 + len(f.audio_streams or [])
     n_embedded = len(f.subtitle_streams or [])
     k = parse_embedded_track(track)
     if k is not None:
-        return base + k if k < n_embedded else None
+        return embedded_base + k if k < n_embedded else None
     filename = parse_external_track(track)
     if filename is not None:
-        for j, entry in enumerate(f.external_subtitles or []):
+        for j, entry in enumerate(externals):
             if entry.get("filename") == filename:
-                return base + n_embedded + j
+                return j
     return None
 
 
@@ -1373,8 +1380,9 @@ def audio_track_for_index(f: LibraryFile, index: int) -> str | None:
     """合成 Index → 音轨的中性轨引用；不在音轨区间返回 None。"""
     from movieclaw_playback.subtitles import embedded_track
 
-    if 1 <= index <= len(f.audio_streams or []):
-        return embedded_track(index - 1)
+    audio_base = len(f.external_subtitles or []) + 1
+    if audio_base <= index < audio_base + len(f.audio_streams or []):
+        return embedded_track(index - audio_base)
     return None
 
 

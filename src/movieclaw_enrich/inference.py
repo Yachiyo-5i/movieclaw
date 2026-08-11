@@ -333,6 +333,19 @@ def extract_with_model(title: str, subtitle: str = "") -> dict[str, object]:
         if content != "other":  # other 是残差项，不算"观测到特殊题材"
             result["content_type"] = content
 
+    # 字幕/音轨声明两轴（模型 v2+ 才有这两类标签；R9 等旧模型的 labels.json
+    # 不含它们，能力位为 False，调用方回落正则通道）。语义与政策全部在
+    # lang_decl 微解析器：模型只圈"哪段在谈字幕/音轨"，简繁映射、否定裁决、
+    # 泛称政策都是可单测的纯代码
+    if any(label == "B-SUBTITLE" for label in meta["labels"]):
+        from movieclaw_enrich.lang_decl import parse_declarations
+
+        decl = parse_declarations(
+            by_field.get("SUBTITLE", []), by_field.get("AUDIO", [])
+        )
+        result.update(decl)
+        result["subtitle_decl_supported"] = True
+
     # 候选别名：副标题里"像片名但模型没抽出"的分段——漏抽/字段混淆的保险层，
     # 只供 TMDB 匹配降级查询，不作片名展示（误报由匹配环节自然淘汰）
     known_titles = list(result.get("titles_zh", [])) + list(result.get("titles_en", []))

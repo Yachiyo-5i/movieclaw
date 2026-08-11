@@ -163,9 +163,14 @@ def extract_remux(text: str) -> dict[str, object]:
     return {"remux": True} if _REMUX_RE.search(text.upper()) else {}
 
 
-# 全集标记：写法固定（COMPLETE / 全集 / 全话），属封闭词表归本通道；
-# 带数字的"全12集"由模型通道抽 EPISODE_TOTAL，二者互补
-_COMPLETE_MARKER_RE = re.compile(r"(?<![A-Za-z])COMPLETE(?![A-Za-z])|全[集话話]", re.I)
+# 全集标记：写法固定（COMPLETE / Fin / 全集 / 全话），属封闭词表归本通道；
+# 带数字的"全12集"由模型通道抽 EPISODE_TOTAL，二者互补。
+# Fin 是动漫 BDRip 命名的完结标记（"TV 01-12 Fin"），必须大小写敏感——
+# 全大写 FIN 是芬兰国家代码（"1080p.FIN.Blu-ray"），全小写 fin 见于西语词内。
+# "End/完"刻意不收——它们标记"本集是大结局"（单集种子），不代表这是全集包
+_COMPLETE_MARKER_RE = re.compile(
+    r"(?<![A-Za-z])(?:COMPLETE|(?-i:Fin))(?![A-Za-z])|全[集话話]", re.I
+)
 
 
 def extract_complete_marker(text: str) -> dict[str, object]:

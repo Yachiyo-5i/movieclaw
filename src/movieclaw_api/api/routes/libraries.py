@@ -57,6 +57,8 @@ from movieclaw_api.schemas.library import (
     ScanProgressView,
     ScanResultView,
     SeasonEpisodesView,
+    SubtitleCueView,
+    SubtitlePreviewView,
     SubtitleStreamView,
     TransferMoveView,
     TransferPayload,
@@ -108,6 +110,15 @@ from movieclaw_api.services.library.scan import (
     request_stop_scan,
     scan_library,
     scan_progress,
+)
+from movieclaw_api.services.library.subtitle_preview import (
+    SubtitlePreviewError,
+    SubtitleTrackNotFound,
+    load_subtitle_preview,
+)
+from movieclaw_api.services.library.subtitles import (
+    match_subtitle_filename,
+    parse_subtitle_tokens,
 )
 from movieclaw_api.services.library.transfer import (
     assert_transferable,
@@ -693,9 +704,7 @@ def _assert_not_busy(library_name: str, library_id: int) -> None:
             f"「{library_name}」正在整理文件名，暂不能编辑或删除；请等待整理完成"
         )
     if is_transferring(library_id):
-        raise ConflictException(
-            f"「{library_name}」正在转移条目，暂不能编辑或删除；请等待转移完成"
-        )
+        raise ConflictException(f"「{library_name}」正在转移条目，暂不能编辑或删除；请等待转移完成")
 
 
 @router.put(
@@ -1232,12 +1241,15 @@ def _file_view(row: LibraryFile, external_subs: list[str]) -> LibraryFileView:
     ]
     stem = PurePath(row.file_path).stem
     for name in external_subs:
-        # 外挂字幕的语言线索在"视频同名."之后的中缀里（如 chs&eng）
-        tag = PurePath(name).stem[len(stem) :].lstrip(".") or None
+        extra = match_subtitle_filename(stem, name)
+        parsed = parse_subtitle_tokens(extra or "")
         subtitles.append(
             SubtitleStreamView(
                 codec=PurePath(name).suffix.lstrip(".").lower() or None,
-                title=tag,
+                language=parsed["language"],
+                title=parsed["title"],
+                forced=parsed["forced"],
+                default=parsed["default"],
                 external=True,
                 file_name=name,
             )
@@ -1361,9 +1373,7 @@ async def get_library_item(
         seasons = sorted({s for s in meta_seasons if s > 0} | owned_seasons)
 
     assert item.id is not None
-    file_views = [
-        _file_view(row, bundle.external_subtitles.get(row.id or -1, [])) for row in rows
-    ]
+    file_views = [_file_view(row, bundle.external_subtitles.get(row.id or -1, [])) for row in rows]
     entry_dirs = bundle.entry_dirs
     if not principal.is_admin:
         # 成员不暴露落盘路径：文件行只留文件名与规格，条目目录整个不给
@@ -1455,6 +1465,51 @@ async def get_file_thumb(
     if thumb is None:
         raise NotFoundException("该文件没有本地缩略图")
     return FileResponse(thumb, headers={"Cache-Control": "private, max-age=3600"})
+
+
+@router.get(
+    "/files/{file_id}/subtitles/preview",
+    response_model=ApiResponse[SubtitlePreviewView],
+    summary="预览一条外挂或文本内封字幕的时间轴内容",
+    operation_id="lib.files.subtitles.preview",
+    openapi_extra={"x-cli-hidden": True},
+)
+async def preview_file_subtitle(
+    file_id: int,
+    track: str = Query(description="中性轨引用：embedded:<序号> / external:<文件名>"),
+    principal: Principal = Depends(require_login),
+    session: AsyncSession = Depends(get_session),
+) -> ApiResponse[SubtitlePreviewView]:
+    """用户主动点击字幕徽章时才读取文件本体。
+
+    轨引用必须命中该台账行：外挂文件名不能越过台账白名单，内封流序号
+    不能越界；成员仍按文件所属库执行可见性判定。文本内封轨首次预览会
+    调用 ffmpeg 抽取，结果沿用字幕生成缓存，后续打开无需重复通读视频。
+    """
+
+    row = await session.get(LibraryFile, file_id)
+    if row is None:
+        raise NotFoundException("台账文件不存在")
+    await assert_library_visible(session, principal, row.library_id)
+    try:
+        preview = await load_subtitle_preview(row, track)
+    except SubtitleTrackNotFound as exc:
+        raise NotFoundException(str(exc)) from exc
+    except SubtitlePreviewError as exc:
+        raise BadRequestException(str(exc)) from exc
+
+    cues = [
+        SubtitleCueView(start_ms=start, end_ms=end, text=text)
+        for start, end, text in preview.events
+    ]
+    return ok(
+        SubtitlePreviewView(
+            track=track,
+            format=preview.format,
+            event_count=len(cues),
+            cues=cues,
+        )
+    )
 
 
 @router.get(
@@ -1629,9 +1684,7 @@ async def preview_reidentify_item(
                     same_as_current=group.outcome.media_item_id == media_item_id,
                     reason=group.outcome.reason,
                     code=group.outcome.code,
-                    candidates=[
-                        UnidentifiedCandidateView(**c) for c in group.outcome.candidates
-                    ],
+                    candidates=[UnidentifiedCandidateView(**c) for c in group.outcome.candidates],
                 ),
                 file_ids=group.file_ids,
                 file_count=group.file_count,
