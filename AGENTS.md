@@ -23,7 +23,16 @@
   `data/` 目录，部署时挂载该目录即可持久化
 - 新站点接入用声明式 YAML，模板见
   `src/movieclaw_tracker/sites/configs/_template.yaml`
-- 合并前必须通过：`pytest`、`ruff check .`、`pnpm web:lint`、`pnpm web:typecheck`
+- 验证分级（2026-08-11 用户决策：小改动不必每轮全量，省时间）：
+  - **每次改动**：`ruff check .`（秒级）+ 与改动相关的测试目录（如改了
+    `movieclaw_jellyfin` 就跑 `pytest tests/jellyfin/`）——目录与模块
+    基本同名对应；
+  - **动了 `apps/web` 才跑**：`pnpm web:lint`、`pnpm web:typecheck`；
+  - **全量 `pytest` 不要求本地跑**：合并门禁由 CI 承担（每个 PR 自动跑
+    `pytest -m "not integration"`，见 `.github/workflows/ci.yml`），发版
+    以发版 PR 的 CI 全绿为准（`.claude/skills/release/SKILL.md` 已有该
+    判据）。改动横跨多个模块、或动了 scan/catalog 这类被广泛依赖的热点
+    时，酌情扩大本地测试面——省的是重复劳动，不是验证本身
 
 ### 1. 编码前思考
 
