@@ -975,9 +975,9 @@ async def test_auto_clear_missing_skips_unreadable_dirs(db, tmp_path, monkeypatc
     season = root / "测试剧集 (2024)" / "Season 01"
     original_walk = scan_mod._walk_videos
 
-    def flaky_walk(walk_root, unreadable=None):
+    def flaky_walk(walk_root, unreadable=None, dir_files=None):
         """整个季目录列不动：底下两集本轮都遍历不到。"""
-        for entry, is_disc in original_walk(walk_root, unreadable):
+        for entry, is_disc in original_walk(walk_root, unreadable, dir_files):
             if not str(entry).startswith(str(season)):
                 yield entry, is_disc
         if unreadable is not None:
