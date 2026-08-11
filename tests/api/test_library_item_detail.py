@@ -30,10 +30,6 @@ from movieclaw_api.api.routes.libraries import (
 from movieclaw_api.core.config import get_settings
 from movieclaw_api.exceptions import NotFoundException
 from movieclaw_api.services.auth import Principal
-
-# 直调路由函数时替代 require_login 依赖注入的超管主体（成员管理引入
-# principal 参数后，直调必须显式传，否则 session 会错位进 principal）
-_ADMIN = Principal(kind="admin", name="tester")
 from movieclaw_api.services.library.nfo import read_entry_metadata, read_tmdb_id
 from movieclaw_api.services.library.resolve import ResolveOutcome
 from movieclaw_api.services.library.scan import scan_library
@@ -45,6 +41,10 @@ from movieclaw_db.models.library_file import IdentitySource
 from movieclaw_db.repositories.library_repo import LibraryRepository
 
 _KEY = "0123456789abcdef0123456789abcdef"
+
+# 直调路由函数时替代 require_login 依赖注入的超管主体（成员管理引入
+# principal 参数后，直调必须显式传，否则 session 会错位进 principal）
+_ADMIN = Principal(kind="admin", name="tester")
 
 _ROUTES = {
     "/3/tv/200": {
