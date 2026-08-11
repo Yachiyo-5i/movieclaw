@@ -66,3 +66,15 @@ class GenStartView(BaseModel):
     """已入队的确认回执（含预估，前端展示）。"""
 
     preview: GenPreviewView
+
+
+class CalibratePayload(BaseModel):
+    filename: str  # 台账里的外挂字幕文件名
+
+
+class CalibrateResultView(BaseModel):
+    ok: bool
+    message: str
+    scale: float | None
+    offset_ms: int | None
+    score: float | None

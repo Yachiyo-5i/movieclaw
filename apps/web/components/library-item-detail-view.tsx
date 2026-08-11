@@ -45,6 +45,7 @@ import {
   refreshItemMetadata,
   transferLibraryItem,
 } from "@/lib/api/libraries";
+import { SubtitleGenPanel } from "@/components/subtitle-gen-panel";
 import { useBackdrop } from "@/lib/backdrop";
 import { getDiscoveryReturnPath } from "@/lib/discovery-return-path";
 import { formatBytes } from "@/lib/format";
@@ -783,6 +784,7 @@ function MovieVersionSpecs({ files }: { files: LibraryItemFile[] }) {
       </div>
       <div className="rounded-2xl border border-white/[0.07] bg-[rgba(14,16,22,0.45)] p-6 backdrop-blur-xl">
         <SpecRows file={active} />
+        <SubtitleGenPanel file={active} />
       </div>
     </section>
   );
@@ -1078,6 +1080,8 @@ function SeasonEpisodesSection({
                       </div>
                       <div className="mt-3.5">
                         <SpecRows file={file} />
+          <SubtitleGenPanel file={file} />
+                        <SubtitleGenPanel file={file} />
                       </div>
                     </div>
                   ))}
@@ -1288,6 +1292,7 @@ function FileRow({
       {expanded && !isMovie && (
         <div className="border-t border-white/[0.04] bg-white/[0.02] px-5 py-4">
           <SpecRows file={file} />
+          <SubtitleGenPanel file={file} />
         </div>
       )}
     </div>

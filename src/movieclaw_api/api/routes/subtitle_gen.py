@@ -12,6 +12,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from movieclaw_api.schemas.response import ApiResponse
 from movieclaw_api.schemas.subtitle_gen import (
+    CalibratePayload,
+    CalibrateResultView,
     GenPreviewView,
     GenProgressView,
     GenQualityView,
@@ -148,4 +150,32 @@ async def gen_stop(file_id: int) -> ApiResponse[dict]:
     return ApiResponse(
         data={"stopped": stopped},
         message="已请求停止（在下一块边界生效）" if stopped else "该文件没有进行中的任务",
+    )
+
+
+@router.post(
+    "/{file_id}/subtitles/calibrate",
+    response_model=ApiResponse[CalibrateResultView],
+    summary="一键校准外挂字幕时间轴（音轨互相关；strm 退字幕对字幕）",
+    operation_id="lib.subgen.calibrate",
+)
+async def subtitle_calibrate(
+    file_id: int,
+    payload: CalibratePayload,
+    session: AsyncSession = Depends(get_session),
+) -> ApiResponse[CalibrateResultView]:
+    """独立于 AI 翻译的零成本工具（subtitle-ai-translate.md §5.4）：用户
+    手工下载的不同步字幕就地修正，校准后覆盖写回并即时刷新台账。"""
+    result = await gen_tasks.calibrate_external_subtitle(
+        session, file_id, payload.filename
+    )
+    return ApiResponse(
+        data=CalibrateResultView(
+            ok=result.ok,
+            message=result.message,
+            scale=result.scale,
+            offset_ms=result.offset_ms,
+            score=result.score,
+        ),
+        message=result.message,
     )

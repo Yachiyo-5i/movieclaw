@@ -694,6 +694,15 @@ async def _scan(
         if backfill_existing_specs:
             await _probe_backfill(session, library_id, summary, state)
 
+    # AI 字幕自动生成挂钩（G2，subtitle-ai-translate.md §6）：开关默认关，
+    # fire-and-forget 后台批次，绝不阻塞/影响扫描收尾
+    try:
+        from movieclaw_api.services.subtitle_gen.auto import queue_after_scan
+
+        queue_after_scan(library_id)
+    except Exception:  # noqa: BLE001 -- 自动生成不可用不能拖垮扫描
+        logger.exception("自动字幕生成挂钩失败（不影响扫描结论）")
+
     if min_remaining is not None:
         summary.recheck_delay_seconds = max(5.0, min(min_remaining + 1.0, NEW_FILE_QUIET_SECONDS))
     if summary.marked_missing:

@@ -308,3 +308,76 @@ def test_subtitle_gen_never_imports_playback_layers() -> None:
                     f"生产端文件 {py.name} import 了播放层 {name}"
                     "（subtitle-ai-translate.md §7 分层守护）"
                 )
+
+
+# ---------------------------------------------------------------------------
+# L2 全局校准（§5.2：已知偏移/加速可被恢复）
+# ---------------------------------------------------------------------------
+
+
+def _talk_pattern(n: int = 120, period_ms: int = 9000, dur_ms: int = 2200):
+    """不均匀的说话模式（带抖动,避免周期性自相关歧义）。"""
+    rng = np.random.default_rng(3)
+    out = []
+    t = 1000
+    for _ in range(n):
+        out.append((t, t + dur_ms + int(rng.integers(-500, 500))))
+        t += period_ms + int(rng.integers(-2500, 2500))
+    return out
+
+
+def test_calibration_recovers_pure_offset() -> None:
+    reference = _talk_pattern()
+    shifted = [(s - 3000, e - 3000) for s, e in reference]  # 字幕早了 3 秒
+    cal = sync.estimate_calibration(reference, shifted)
+    assert cal is not None
+    assert cal.scale == 1.0
+    assert abs(cal.offset_ms - 3000) <= 50  # 栅格粒度内
+    assert cal.score > 0.5
+
+
+def test_calibration_recovers_pal_speedup() -> None:
+    reference = _talk_pattern()
+    a, b = 25 / 23.976, -2000
+    # 参考 t' = a*s + b → 字幕 s = (t' - b)/a
+    subtitle = [(int((s - b) / a), int((e - b) / a)) for s, e in reference]
+    cal = sync.estimate_calibration(reference, subtitle)
+    assert cal is not None
+    assert abs(cal.scale - a) < 1e-6  # 假设集里选中了 25/23.976
+    assert abs(cal.offset_ms - b) <= 60
+
+
+def test_calibration_apply_roundtrip() -> None:
+    cal = sync.Calibration(scale=1.0, offset_ms=-1500, score=1.0)
+    events = [(2000, 3000, "a"), (500, 900, "b")]
+    out = sync.apply_calibration(events, cal)
+    assert out[0] == (500, 1500, "a")
+    assert out[1] == (0, 0, "b")  # 负值截 0,end 不早于 start
+
+
+def test_calibration_none_on_empty() -> None:
+    assert sync.estimate_calibration([], [(0, 1000)]) is None
+
+
+# ---------------------------------------------------------------------------
+# G2 自动生成护栏（额度/幂等判定）
+# ---------------------------------------------------------------------------
+
+
+def test_auto_quota_and_skip_logic() -> None:
+    from movieclaw_api.services.subtitle_gen import auto
+
+    auto._quota_day = None
+    auto._quota_used = 0
+    assert auto._quota_take(2) and auto._quota_take(2)
+    assert not auto._quota_take(2)  # 第三次熔断
+
+    row = _file(
+        [{"codec": "subrip", "language": "eng"}],
+        [{"filename": "Movie.chs.ai.srt", "format": "srt", "language": "chi"}],
+    )
+    assert auto._has_target_subtitle(row, "chi")  # 已有中文（AI 产物）→ 跳过
+    assert auto._has_reference(row, "chs")
+    bare = _file([{"codec": "hdmv_pgs_subtitle", "language": "eng"}], [])
+    assert not auto._has_target_subtitle(bare, "chi")
+    assert not auto._has_reference(bare, "chs")  # 只有图形轨 → 无参考

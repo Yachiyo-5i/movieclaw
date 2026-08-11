@@ -509,3 +509,24 @@ async def get_jellyfin_compat() -> JellyfinCompatSetting:
         setting.server_id = secrets.token_hex(16)
         await store.set(setting)
     return setting
+
+
+@register_setting(namespace="subtitle.gen", title="AI 字幕生成")
+class SubtitleGenSetting(SettingSchema):
+    """AI 字幕生成配置（docs/design/subtitle-ai-translate.md §6）。
+
+    ``auto_generate`` **默认关**：批量入库=批量 LLM 消费（真金白银），
+    必须用户显式授权；开启后由 ``daily_limit`` 每日额度熔断兜底。
+    ``library_ids`` 空列表 = 对全部库生效（库级粒度，不动库表结构）。
+    """
+
+    auto_generate: bool = Field(default=False, description="入库后自动生成缺失的目标语言字幕")
+    library_ids: list[int] = Field(
+        default_factory=list, description="自动生成生效的库 id 列表；空=全部库"
+    )
+    target_language: str = Field(default="chs", description="目标语言 token（文件名用）")
+    daily_limit: int = Field(default=5, description="每日自动生成任务上限（额度熔断）")
+
+
+async def get_subtitle_gen_setting() -> SubtitleGenSetting:
+    return await get_setting_store().get(SubtitleGenSetting)

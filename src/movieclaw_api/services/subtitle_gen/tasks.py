@@ -322,3 +322,188 @@ async def _build_chat(session: AsyncSession) -> translate.ChatFn:
         return response.content or ""
 
     return chat
+
+
+# ---------------------------------------------------------------------------
+# 一键校准已有外挂字幕（§5.4：独立工具，不依赖 LLM、零调用成本）
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class CalibrateResult:
+    ok: bool
+    message: str
+    scale: float | None = None
+    offset_ms: int | None = None
+    score: float | None = None
+
+
+#: 校准结论可信度下限：相关峰太低说明参考与字幕根本对不上（如错片字幕）
+_CALIBRATE_MIN_SCORE = 0.15
+#: 变化小于该量级视为"本就同步"，不动文件
+_NOOP_OFFSET_MS = 200
+
+
+async def _audio_reference_intervals(
+    row: LibraryFile, events: list[extract.SubEvent]
+) -> list[tuple[int, int]] | None:
+    """全片语音区间（校准参考）：分段抽 PCM 拼接;无 ffmpeg/无音轨返回 None。
+
+    校准与检测不同,需要整片视野才能解出全局 (scale, offset)——按 10 分钟
+    一段流式抽取拼接区间表,内存里从不持有整片 PCM。
+    """
+    runtime = row.duration_seconds or (max(e[1] for e in events) // 1000 if events else 0)
+    if runtime <= 0:
+        return None
+    segment = 600
+    intervals: list[tuple[int, int]] = []
+    for start in range(0, runtime, segment):
+        pcm = await asyncio.to_thread(
+            sync._extract_pcm_sync,
+            Path(row.file_path),
+            float(start),
+            float(min(segment, runtime - start)),
+        )
+        if pcm is None:
+            return None if start == 0 else intervals  # 首段就失败=不可用
+        intervals.extend(
+            (s + start * 1000, e + start * 1000) for s, e in sync.speech_intervals(pcm)
+        )
+    return intervals
+
+
+async def _subtitle_reference_intervals(
+    row: LibraryFile, exclude_filename: str
+) -> tuple[list[tuple[int, int]] | None, str | None]:
+    """字幕对字幕兜底（L2'）：本文件另一条字幕的时间结构做参考。
+
+    参考优先内封轨（配套概率最高）,其次其他外挂;返回 (区间表, 参考描述)。
+    """
+    ranked = source.rank_candidates(row, original_language=None, target_language="__none__")
+    for cand in ranked:
+        if cand.excluded and "forced" in cand.excluded:
+            continue  # forced 轨时间结构残缺,不做参考;其余排除原因不影响对齐
+        if cand.candidate.kind == "external" and cand.candidate.key == exclude_filename:
+            continue
+        try:
+            events = await extract.load_candidate_events(row, cand.candidate)
+        except extract.SourceLoadError:
+            continue
+        if len(events) >= 50:
+            return [(s, e) for s, e, _ in events], _cand_desc(cand.candidate)
+    return None, None
+
+
+async def calibrate_external_subtitle(
+    session: AsyncSession, file_id: int, filename: str
+) -> CalibrateResult:
+    """校准一条外挂字幕并覆盖写回（UTF-8）;台账即时刷新。
+
+    参考优先音轨（真相源）,无音频（strm/无 ffmpeg）退字幕对字幕;两者都
+    不可用如实报错。校准量小于噪声阈值时不动文件（"本就同步"）。
+    """
+    row = await _load_row(session, file_id)
+    entry = next(
+        (e for e in row.external_subtitles or [] if e.get("filename") == filename),
+        None,
+    )
+    if entry is None:
+        raise NotFoundException(f"台账中没有这条外挂字幕：{filename}")
+    cand = source.SourceCandidate(
+        kind="external",
+        key=filename,
+        language=entry.get("language"),
+        forced=bool(entry.get("forced")),
+        sdh=bool(entry.get("sdh")),
+        format=str(entry.get("format") or "").lower(),
+    )
+    events = await extract.load_candidate_events(row, cand)
+    if len(events) < 20:
+        return CalibrateResult(ok=False, message="字幕事件太少，无法可靠校准")
+
+    reference = await _audio_reference_intervals(row, events)
+    ref_desc = "影片音轨"
+    if not reference:
+        reference, ref_desc = await _subtitle_reference_intervals(row, filename)
+        if not reference:
+            return CalibrateResult(
+                ok=False,
+                message="没有可用的校准参考：本机无 ffmpeg 或无音轨（strm 云端文件），"
+                "且该文件没有其他字幕轨可做时间结构对齐",
+            )
+
+    calibration = sync.estimate_calibration(
+        reference, [(s, e) for s, e, _ in events]
+    )
+    if calibration is None or calibration.score < _CALIBRATE_MIN_SCORE:
+        return CalibrateResult(
+            ok=False,
+            message=f"校准置信度不足（参考：{ref_desc}）——字幕可能与该影片不匹配",
+            score=calibration.score if calibration else None,
+        )
+    if (
+        calibration.scale == 1.0
+        and abs(calibration.offset_ms) <= _NOOP_OFFSET_MS
+    ):
+        return CalibrateResult(
+            ok=True,
+            message=f"字幕本就同步（参考：{ref_desc}），未做修改",
+            scale=1.0,
+            offset_ms=calibration.offset_ms,
+            score=calibration.score,
+        )
+
+    corrected = sync.apply_calibration(events, calibration)
+    path = Path(row.file_path).parent / filename
+    suffix = path.suffix.lstrip(".").lower()
+    try:
+        if suffix == "srt":
+            await asyncio.to_thread(translate.write_srt, corrected, path)
+        else:
+            # 非 srt（ass/ssa/vtt）：pysubs2 原格式平移缩放后写回,样式保留
+            await asyncio.to_thread(
+                _shift_subtitle_file, path, calibration
+            )
+    except OSError as exc:
+        return CalibrateResult(
+            ok=False, message=f"校准结果写入失败（库目录是否只读？）：{exc}"
+        )
+
+    async with get_database().session() as refresh_session:
+        fresh = await _load_row(refresh_session, file_id)
+        fresh.external_subtitles = await asyncio.to_thread(
+            discover_external_subtitles, Path(fresh.file_path)
+        )
+        fresh.updated_at = utcnow()
+        await refresh_session.commit()
+
+    logger.info(
+        "外挂字幕校准完成：%s scale=%.6f offset=%dms score=%.2f 参考=%s",
+        path, calibration.scale, calibration.offset_ms, calibration.score, ref_desc,
+    )
+    return CalibrateResult(
+        ok=True,
+        message=(
+            f"校准完成（参考：{ref_desc}）：缩放 {calibration.scale:.4f}、"
+            f"平移 {calibration.offset_ms / 1000:+.2f} 秒，已覆盖写回"
+        ),
+        scale=calibration.scale,
+        offset_ms=calibration.offset_ms,
+        score=calibration.score,
+    )
+
+
+def _shift_subtitle_file(path: Path, calibration: sync.Calibration) -> None:
+    """（线程池）非 srt 字幕的原格式校准写回（保留 ass 样式）。"""
+    import pysubs2
+
+    raw = path.read_bytes()
+    text = extract.decode_subtitle_bytes(raw, str(path))
+    subs = pysubs2.SSAFile.from_string(text)
+    for line in subs:
+        line.start = max(0, int(line.start * calibration.scale) + calibration.offset_ms)
+        line.end = max(line.start, int(line.end * calibration.scale) + calibration.offset_ms)
+    fmt = {"ssa": "ssa", "ass": "ass", "vtt": "vtt"}.get(path.suffix.lstrip(".").lower(), "srt")
+    tmp = path.with_suffix(path.suffix + ".part")
+    tmp.write_text(subs.to_string(fmt), encoding="utf-8")
+    tmp.replace(path)

@@ -18,6 +18,7 @@ import logging
 import os
 import shutil
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -208,3 +209,88 @@ async def sample_sync_score(
     if not scores:
         return None
     return sum(scores) / len(scores)
+
+
+# ---------------------------------------------------------------------------
+# L2 全局校准：FFT 互相关 + 帧率假设集（subtitle-ai-translate.md §5.2）
+# ---------------------------------------------------------------------------
+
+#: 帧率换算假设集：1（纯偏移）、PAL 加速/减速、24↔25 等常见转换比
+SCALE_HYPOTHESES = (1.0, 25 / 23.976, 23.976 / 25, 24 / 25, 25 / 24, 24 / 23.976, 23.976 / 24)
+_RASTER_MS = 10  # 栅格粒度（ffsubsync 同款量级）
+_MAX_SHIFT_S = 120  # 搜索窗：±2 分钟覆盖片头广告/logo 的现实差异
+
+
+def _rasterize(intervals: list[tuple[int, int]], total_ms: int) -> np.ndarray:
+    """区间表 → 10ms 栅格 0/1 信号。"""
+    n = total_ms // _RASTER_MS + 1
+    signal = np.zeros(n, dtype=np.float32)
+    for s, e in intervals:
+        a = max(0, s // _RASTER_MS)
+        b = min(n, e // _RASTER_MS + 1)
+        if b > a:
+            signal[a:b] = 1.0
+    return signal
+
+
+def _best_offset(reference: np.ndarray, candidate: np.ndarray) -> tuple[int, float]:
+    """FFT 互相关求 candidate 相对 reference 的最优平移（毫秒）与相关分。
+
+    去均值后做相关：全 1 段不该白得分；限幅在 ±_MAX_SHIFT_S 内取峰。
+    """
+    n = max(len(reference), len(candidate))
+    size = 1 << (2 * n - 1).bit_length()
+    ref = reference - reference.mean()
+    cand = candidate - candidate.mean()
+    fr = np.fft.rfft(ref, size)
+    fc = np.fft.rfft(cand, size)
+    corr = np.fft.irfft(fr * np.conj(fc), size)
+    # corr[k] = sum ref[i+k]*cand[i]（k>=0：cand 需右移 k 格）；负位移在尾部
+    max_shift = _MAX_SHIFT_S * 1000 // _RASTER_MS
+    lags = np.concatenate([np.arange(0, max_shift), np.arange(-max_shift, 0)])
+    values = np.concatenate([corr[:max_shift], corr[-max_shift:]])
+    peak = int(np.argmax(values))
+    denom = float(np.sqrt((ref**2).sum() * (cand**2).sum())) or 1.0
+    return int(lags[peak]) * _RASTER_MS, float(values[peak] / denom)
+
+
+@dataclass(frozen=True)
+class Calibration:
+    """全局校准结论：t' = scale * t + offset_ms。"""
+
+    scale: float
+    offset_ms: int
+    score: float  # 归一化相关峰（0..1，越高越可信）
+
+
+def estimate_calibration(
+    reference: list[tuple[int, int]], subtitle: list[tuple[int, int]]
+) -> Calibration | None:
+    """字幕区间相对参考区间（语音区间或另一条已对齐字幕）的全局校准。
+
+    帧率假设集逐个尝试：把字幕区间按假设 scale 缩放后与参考做互相关，
+    取相关峰最大的 (scale, offset)。参考/字幕任一为空返回 None。
+    """
+    if not reference or not subtitle:
+        return None
+    total = max(max(e for _, e in reference), max(e for _, e in subtitle)) + 1000
+    ref_signal = _rasterize(reference, total)
+    best: Calibration | None = None
+    for scale in SCALE_HYPOTHESES:
+        scaled = [(int(s * scale), int(e * scale)) for s, e in subtitle]
+        offset, score = _best_offset(ref_signal, _rasterize(scaled, total))
+        if best is None or score > best.score:
+            best = Calibration(scale=scale, offset_ms=offset, score=score)
+    return best
+
+
+def apply_calibration(
+    events: list[tuple[int, int, str]], calibration: Calibration
+) -> list[tuple[int, int, str]]:
+    """套用校准到事件序列（起止同变换，负值截 0）。"""
+    out = []
+    for s, e, text in events:
+        ns = max(0, int(s * calibration.scale) + calibration.offset_ms)
+        ne = max(ns, int(e * calibration.scale) + calibration.offset_ms)
+        out.append((ns, ne, text))
+    return out
