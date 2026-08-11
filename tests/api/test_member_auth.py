@@ -477,6 +477,9 @@ _MEMBER_ALLOWLIST = {
     ("GET", "/api/v1/libraries"),
     ("GET", "/api/v1/libraries/search"),
     ("GET", "/api/v1/libraries/files/{file_id}/thumb"),
+    # 字幕预览是媒体详情的浏览面；接口自身按文件所属库校验成员可见性，
+    # 且轨引用只能命中该文件已登记的内封/外挂字幕，不能读取任意路径。
+    ("GET", "/api/v1/libraries/files/{file_id}/subtitles/preview"),
     ("GET", "/api/v1/libraries/{library_id}"),
     ("GET", "/api/v1/libraries/{library_id}/cover"),
     ("GET", "/api/v1/libraries/{library_id}/item-ids"),
