@@ -10,6 +10,7 @@ from datetime import UTC, datetime
 
 import httpx
 import pytest
+from aiolimiter import AsyncLimiter
 
 from movieclaw_cache import StoredEntry
 from movieclaw_media.douban import DoubanClient, DoubanError
@@ -79,7 +80,7 @@ async def test_detail_is_cached_and_invalid_detail_is_negative_cached() -> None:
     assert len(bad_hits) == 1
 
 
-async def test_transient_failure_is_not_cached() -> None:
+async def test_transient_failure_is_not_cached(monkeypatch) -> None:
     """瞬时故障（HTTP 500）抛错但不落盘，恢复后下一次请求即可成功。"""
     store = MemoryStore()
     responses = [httpx.Response(500), httpx.Response(200, json={"id": "1", "title": "x"})]
@@ -88,6 +89,8 @@ async def test_transient_failure_is_not_cached() -> None:
         return responses.pop(0)
 
     client = DoubanClient(transport=httpx.MockTransport(handler), store=store)
+    # 此处只验证失败不入缓存；放宽漏桶容量，避免两次假请求之间真实等待 1 秒。
+    monkeypatch.setattr(client, "_limiter", AsyncLimiter(2, 1))
     with pytest.raises(DoubanError, match="访问豆瓣详情失败"):
         await client.detail("1")
     assert await client.detail("1") == {"id": "1", "title": "x"}

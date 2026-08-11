@@ -15,6 +15,7 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 from fastapi.testclient import TestClient
 
+import movieclaw_api.services.auth as auth_service
 from movieclaw_api.core.config import get_settings
 from movieclaw_api.services.auth import reset_auth_state
 from movieclaw_api.settings.store import reset_setting_store
@@ -22,6 +23,15 @@ from movieclaw_db.crypto import reset_secret_box
 
 _AUTH = "/api/v1/auth"
 _ADMIN = {"username": "admin", "password": "s3cret-pass"}
+
+
+@pytest.mark.real_password_hash
+def test_production_password_hash_roundtrip() -> None:
+    """生产推荐参数至少保留一条真实 hash/verify 烟测，防止测试快路径遮住接线错误。"""
+    encoded = auth_service.hash_password(_ADMIN["password"])
+
+    assert encoded.startswith("$argon2id$")
+    assert auth_service.verify_password(_ADMIN["password"], encoded) is True
 
 
 @pytest.fixture

@@ -6,9 +6,13 @@ git 历史。本地开发时复制 .env.example 为 .env 并填写即可，CI �
 """
 from __future__ import annotations
 
+import asyncio
 import os
+import shutil
+import sqlite3
 import subprocess
 import tempfile
+import threading
 from pathlib import Path
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -87,6 +91,125 @@ _load_env_file(_ENV_FILE)
 
 
 import pytest  # noqa: E402  须在环境变量装配之后导入
+from pwdlib import PasswordHash  # noqa: E402
+from pwdlib.hashers.argon2 import Argon2Hasher  # noqa: E402
+
+# 业务测试只需要验证 Argon2id 的格式与认证语义，不应反复承担生产环境抵抗暴力
+# 破解所需的 CPU/内存成本。生产参数另有 real_password_hash 专项测试守护。
+_TEST_PASSWORD_HASH = PasswordHash(
+    (Argon2Hasher(time_cost=1, memory_cost=8, parallelism=1),)
+)
+
+
+class _SQLiteMigrationTemplate:
+    """pytest 会话内复用一份已迁移到 head 的空 SQLite。
+
+    业务测试需要独立数据库，但不需要各自验证 64 个 Alembic revision。首个空库
+    仍完整执行真实迁移并成为模板；之后的空库直接复制模板。若目标库已有内容、
+    没有版本号或版本落后，则仍执行真实迁移，迁移兼容场景不会被快路径掩盖。
+
+    run_migrations 可能从 TestClient/uvicorn 的后台事件循环调用，因此模板初始化和
+    复制用线程锁串行化，不能使用绑定单一事件循环的 asyncio.Lock。
+    """
+
+    def __init__(self, migration_module) -> None:  # type: ignore[no-untyped-def]
+        self._module = migration_module
+        self.original = migration_module.run_migrations
+        self._temp_dir = tempfile.TemporaryDirectory(prefix="movieclaw-test-db-template-")
+        self._template = Path(self._temp_dir.name) / "migrated.db"
+        self._head_revision: str | None = None
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def _sqlite_path(database_url: str) -> Path | None:
+        """只加速文件型 SQLite；其他数据库与内存库保持生产迁移路径。"""
+        from sqlalchemy.engine import make_url
+
+        url = make_url(database_url)
+        if url.get_backend_name() != "sqlite" or not url.database or url.database == ":memory:":
+            return None
+        return Path(url.database).resolve()
+
+    @staticmethod
+    def _revision(path: Path) -> str | None:
+        if not path.is_file() or path.stat().st_size == 0:
+            return None
+        try:
+            with sqlite3.connect(path) as connection:
+                row = connection.execute("SELECT version_num FROM alembic_version").fetchone()
+        except (OSError, sqlite3.DatabaseError):
+            return None
+        return str(row[0]) if row else None
+
+    def _prepare_sync(self, target: Path) -> None:
+        with self._lock:
+            current_revision = self._revision(target)
+            if self._head_revision is not None and current_revision == self._head_revision:
+                return
+
+            fresh = not target.exists() or target.stat().st_size == 0
+            if fresh and self._head_revision is not None:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(self._template, target)
+                return
+
+            # 首个空库以及任何已有/旧版库都走真实 Alembic。直接调用同步内核，
+            # 因为当前方法本身已经由 asyncio.to_thread 放在线程池中。
+            self._module._upgrade_to_head()
+            if fresh and self._head_revision is None:
+                revision = self._revision(target)
+                if revision is not None:
+                    shutil.copyfile(target, self._template)
+                    self._head_revision = revision
+
+    async def run(self) -> None:
+        from movieclaw_api.core.config import get_settings
+
+        target = self._sqlite_path(get_settings().database_url)
+        if target is None:
+            await self.original()
+            return
+        await asyncio.to_thread(self._prepare_sync, target)
+
+    def close(self) -> None:
+        self._temp_dir.cleanup()
+
+
+_migration_template: _SQLiteMigrationTemplate | None = None
+
+
+def pytest_sessionstart(session: pytest.Session) -> None:
+    """在收集测试模块前替换迁移入口，让 from-import 也取得快路径。"""
+    global _migration_template
+    del session
+
+    from movieclaw_db import migrations
+
+    _migration_template = _SQLiteMigrationTemplate(migrations)
+    migrations.run_migrations = _migration_template.run
+
+
+def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
+    """恢复生产入口并清理会话级 SQLite 模板。"""
+    global _migration_template
+    del session, exitstatus
+
+    if _migration_template is None:
+        return
+    _migration_template._module.run_migrations = _migration_template.original
+    _migration_template.close()
+    _migration_template = None
+
+
+@pytest.fixture(autouse=True)
+def _fast_password_hash(request, monkeypatch):  # type: ignore[no-untyped-def]
+    """普通测试使用低成本 Argon2id，保留协议语义并缩短重复建号/登录耗时。"""
+    if request.node.get_closest_marker("real_password_hash"):
+        return
+
+    from movieclaw_api.services import auth
+
+    monkeypatch.setattr(auth, "_password_hash", _TEST_PASSWORD_HASH)
 
 
 @pytest.fixture(autouse=True)

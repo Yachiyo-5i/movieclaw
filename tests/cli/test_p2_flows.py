@@ -332,7 +332,9 @@ def test_organize_without_yes_exits_5(run_cli) -> None:
     assert [c["path"] for c in calls] == ["/api/v1/libraries/1/organize/preview"]
 
 
-def test_organize_with_yes_executes_and_waits(run_cli) -> None:
+def test_organize_with_yes_executes_and_waits(run_cli, monkeypatch) -> None:
+    # 本用例验证轮询次数与终态判断，不验证真实时间流逝；跳过生产退避可省 5 秒。
+    monkeypatch.setattr("time.sleep", lambda _seconds: None)
     calls: list[dict] = []
     code, _out, err = run_cli(["lib", "organize", "1", "--yes"], _organize_transport(calls))
     assert code == 0, err
