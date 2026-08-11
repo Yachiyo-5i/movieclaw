@@ -911,6 +911,13 @@ id），调同一套领域服务——**不**让自家前端去消费 Jellyfin �
 **query 键大小写不敏感**语义补进了 §1 同款归一化中间件（v1.1 调研只覆盖
 了路径，实为同一差异的两半——教训记档）。
 
+**补遗（2026-08-11，issue #124）**：新版 Infuse 添加媒体库时的探测链路比
+v1.1 调研更长，还会请求 `/Plugins`、`/Library/VirtualFolders`、
+`/UserViews/GroupingOptions`、`/DisplayPreferences/{id}`（GET+POST）——
+这些接口经前端端口返回 Next.js 404 HTML 会让 Infuse 在"验证媒体库"一步
+失败。已补齐后端敷衍/映射实现与前端 `Plugins`/`Library`/`DisplayPreferences`
+命名空间转发（`Library` 只注册 PascalCase：控制台自身有 `/library` 页面）。
+
 **已知差距**（有意留下的小缺口，不影响 Infuse 主链路）：
 - `GET /Search/Hints` 未实现（P2 兜底项，主流播放器搜索走 /Items?searchTerm）；
 - `imageTypeLimit`/`enableImageTypes`/`enableTotalRecordCount` 接受但忽略

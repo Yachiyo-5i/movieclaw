@@ -53,10 +53,18 @@ const nextConfig: NextConfig = {
       "PlayingItems",
       "Branding",
       "QuickConnect",
+      "Plugins",
+      "DisplayPreferences",
       "emby",
     ];
     const jellyfinRewrites = [
-      ...new Set(jellyfinNamespaces.flatMap((ns) => [ns, ns.toLowerCase()])),
+      ...new Set([
+        ...jellyfinNamespaces.flatMap((ns) => [ns, ns.toLowerCase()]),
+        // Library 只注册大写形态（issue #124，Infuse 请求 /Library/VirtualFolders）：
+        // 控制台自身有 /library 页面（app/(app)/library），小写转发会与之混淆；
+        // Jellyfin 客户端实际发的就是 PascalCase，Next 路由匹配大小写敏感、互不干扰。
+        "Library",
+      ]),
     ].map((ns) => ({
       source: `/${ns}/:path*`,
       destination: `${proxyTarget}/${ns}/:path*`,

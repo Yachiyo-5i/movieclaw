@@ -42,6 +42,7 @@ from movieclaw_jellyfin.ids import (
     EntityKind,
     decode_guid,
     is_empty_guid,
+    library_guid,
 )
 from movieclaw_jellyfin.routes.common import (
     dto_context,
@@ -165,6 +166,48 @@ async def user_views(
         for lib in libraries
     ]
     return JSONResponse(query_result(dtos, len(dtos)))
+
+
+@router.get("/UserViews/GroupingOptions")
+async def user_views_grouping_options(
+    scope: ViewerScope = Depends(viewer_scope),
+) -> JSONResponse:
+    """可分组视图清单（issue #124，Infuse 添加媒体库时请求）。
+
+    对齐 SpecialViewOptionDto：电影/剧集库天然可分组，直接映射可见库。
+    """
+    async with get_database().session() as session:
+        libraries = await list_libraries(session, visible_ids=scope.visible)
+    return JSONResponse(
+        [{"Name": lib.name, "Id": library_guid(lib.id)} for lib in libraries]
+    )
+
+
+@router.get("/Library/VirtualFolders")
+async def library_virtual_folders(
+    scope: ViewerScope = Depends(viewer_scope),
+) -> JSONResponse:
+    """媒体库 → VirtualFolderInfo 映射（issue #124，Infuse 添加媒体库时请求）。
+
+    真 Jellyfin 此接口仅管理员可用；这里放开给已认证设备（Infuse 普通链路
+    也会请求），但服务器文件系统路径只对主账号设备下发，成员设备置空。
+    """
+    async with get_database().session() as session:
+        libraries = await list_libraries(session, visible_ids=scope.visible)
+    return JSONResponse(
+        [
+            {
+                "Name": lib.name,
+                "Locations": (
+                    list(lib.root_paths or []) if scope.member_id == 0 else []
+                ),
+                "CollectionType": "movies" if lib.kind == "movie" else "tvshows",
+                "ItemId": library_guid(lib.id),
+                "RefreshStatus": "Idle",
+            }
+            for lib in libraries
+        ]
+    )
 
 
 # ---------------------------------------------------------------------------

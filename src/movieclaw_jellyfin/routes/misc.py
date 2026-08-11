@@ -27,6 +27,53 @@ async def quickconnect_enabled() -> JSONResponse:
     return JSONResponse(False)
 
 
+@router.get("/Plugins", dependencies=[Depends(require_device)])
+async def plugins() -> JSONResponse:
+    # Infuse 验证媒体库时会拉取插件清单（issue #124）；无插件体系，空数组即可
+    return JSONResponse([])
+
+
+@router.get(
+    "/DisplayPreferences/{display_preferences_id}",
+    dependencies=[Depends(require_device)],
+)
+async def display_preferences(
+    display_preferences_id: str, client: str = "emby"
+) -> JSONResponse:
+    """默认 DisplayPreferencesDto（issue #124）。
+
+    Infuse 添加媒体库最后一步会请求 /DisplayPreferences/usersettings；
+    不落库、恒返回默认值——展示偏好由客户端本地维护即可。
+    字段与类型对齐 Jellyfin 10.10 的 DisplayPreferencesDto（可空字段省略）。
+    """
+    return JSONResponse(
+        {
+            "Id": display_preferences_id,
+            "SortBy": "SortName",
+            "RememberIndexing": False,
+            "PrimaryImageHeight": 250,
+            "PrimaryImageWidth": 250,
+            "CustomPrefs": {},
+            "ScrollDirection": "Horizontal",
+            "ShowBackdrop": True,
+            "RememberSorting": False,
+            "SortOrder": "Ascending",
+            "ShowSidebar": False,
+            "Client": client,
+        }
+    )
+
+
+@router.post(
+    "/DisplayPreferences/{display_preferences_id}",
+    status_code=204,
+    dependencies=[Depends(require_device)],
+)
+async def update_display_preferences(display_preferences_id: str) -> Response:
+    # 客户端回写展示偏好：接受但不存储（与 GET 的恒默认值语义一致）
+    return Response(status_code=204)
+
+
 @router.get("/Sessions", dependencies=[Depends(require_device)])
 async def sessions() -> JSONResponse:
     return JSONResponse([])

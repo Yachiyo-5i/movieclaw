@@ -198,6 +198,28 @@ def test_member_library_visibility_enforced_on_all_paths(
     )
 
 
+def test_member_virtual_folders_scoped_and_paths_hidden(
+    client: TestClient, seeded: dict
+) -> None:
+    """成员设备的 VirtualFolders/GroupingOptions 只见白名单库，且不下发路径。"""
+    _create_member(client, tv_lib_id=seeded["tv_lib"])
+    member_token = _member_login(client)
+    headers = {"X-Emby-Token": member_token}
+
+    folders = client.get("/Library/VirtualFolders", headers=headers).json()
+    assert [f["Name"] for f in folders] == ["剧集"]
+    assert folders[0]["Locations"] == []
+
+    grouping = client.get("/UserViews/GroupingOptions", headers=headers).json()
+    assert [g["Name"] for g in grouping] == ["剧集"]
+
+    admin_folders = client.get(
+        "/Library/VirtualFolders", headers={"X-Emby-Token": jf_login(client)}
+    ).json()
+    assert {f["Name"] for f in admin_folders} == {"电影", "剧集"}
+    assert all(f["Locations"] for f in admin_folders)
+
+
 def test_member_playstate_isolated_from_admin(client: TestClient, seeded: dict) -> None:
     """成员标记已看只写自己的行：超管同一集的 UserData 不受影响。"""
     _create_member(client, tv_lib_id=seeded["tv_lib"])

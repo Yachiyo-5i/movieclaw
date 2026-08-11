@@ -152,6 +152,60 @@ def test_startup_helpers(client: TestClient) -> None:
     }
 
 
+def test_infuse_library_probe_endpoints(client: TestClient, seeded: dict) -> None:
+    """Infuse 添加媒体库的完整探测链路（issue #124）。
+
+    未认证必须是 Jellyfin 形态的 401（而非前端 404 HTML），认证后逐个
+    返回兼容响应——缺任何一个 Infuse 都会在"验证媒体库"一步失败。
+    """
+    for path in (
+        "/Plugins",
+        "/Library/VirtualFolders",
+        "/UserViews/GroupingOptions",
+        "/DisplayPreferences/usersettings",
+    ):
+        resp = client.get(path)
+        assert resp.status_code == 401, path
+        assert resp.content == b"", path
+
+    token = jf_login(client)
+    auth = {"ApiKey": token}
+
+    assert client.get("/Plugins", params=auth).json() == []
+
+    folders = client.get("/Library/VirtualFolders", params=auth).json()
+    by_name = {f["Name"]: f for f in folders}
+    assert set(by_name) == {"电影", "剧集"}
+    assert by_name["电影"]["CollectionType"] == "movies"
+    assert by_name["剧集"]["CollectionType"] == "tvshows"
+    assert by_name["电影"]["ItemId"] == library_guid(seeded["movie_lib"])
+    assert by_name["电影"]["Locations"]  # 主账号设备下发库根路径
+    assert by_name["电影"]["RefreshStatus"] == "Idle"
+
+    grouping = client.get("/UserViews/GroupingOptions", params=auth).json()
+    assert {g["Name"] for g in grouping} == {"电影", "剧集"}
+    assert all(g["Id"] for g in grouping)
+
+    # 大小写归一化覆盖新命名空间；PascalCase 的 Client 参数也要能取到
+    prefs = client.get(
+        "/displaypreferences/usersettings",
+        params={"userId": "ignored", "Client": "emby", **auth},
+    ).json()
+    assert prefs["Id"] == "usersettings"
+    assert prefs["SortBy"] == "SortName"
+    assert prefs["SortOrder"] == "Ascending"
+    assert prefs["Client"] == "emby"
+    assert prefs["CustomPrefs"] == {}
+    assert prefs["ShowBackdrop"] is True
+    assert isinstance(prefs["PrimaryImageHeight"], int)
+
+    post = client.post("/DisplayPreferences/usersettings", params=auth, json={})
+    assert post.status_code == 204
+
+    # /emby 前缀别名同样可达
+    assert client.get("/emby/Plugins", params=auth).json() == []
+
+
 def test_case_insensitive_paths_and_emby_alias(client: TestClient) -> None:
     assert client.get("/system/info/public").status_code == 200
     assert client.get("/SYSTEM/INFO/PUBLIC").status_code == 200
