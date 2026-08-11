@@ -263,10 +263,8 @@ async def translate_events(
     stats.glossary = glossary
     system = system_prompt(ctx, glossary, target_language)
 
-    blocks = [
-        list(enumerate((t for _, _, t in events), start=0))[i : i + BLOCK_SIZE]
-        for i in range(0, len(events), BLOCK_SIZE)
-    ]
+    numbered = list(enumerate((t for _, _, t in events), start=0))
+    blocks = [numbered[i : i + BLOCK_SIZE] for i in range(0, len(numbered), BLOCK_SIZE)]
     stats.total_blocks = len(blocks)
     translated: dict[int, list[str]] = dict(checkpoint.blocks)
 

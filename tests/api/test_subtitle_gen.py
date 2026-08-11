@@ -381,3 +381,45 @@ def test_auto_quota_and_skip_logic() -> None:
     bare = _file([{"codec": "hdmv_pgs_subtitle", "language": "eng"}], [])
     assert not auto._has_target_subtitle(bare, "chi")
     assert not auto._has_reference(bare, "chs")  # 只有图形轨 → 无参考
+
+
+# ---------------------------------------------------------------------------
+# 自查改进项（终检轮）：抽取缓存 / 语言 token 校验 / 校准文件名防护
+# ---------------------------------------------------------------------------
+
+
+def test_extract_cache_skips_when_fresh(tmp_path: Path, monkeypatch) -> None:
+    """抽取产物比视频新且非空 → 直接复用（预检/发起/执行三连不重复通读容器）。"""
+    video = tmp_path / "Movie.mkv"
+    video.write_bytes(b"fake")
+    out = tmp_path / "cached.srt"
+    out.write_text("1\n00:00:01,000 --> 00:00:02,000\nx\n")
+    import os
+
+    os.utime(out, ns=(video.stat().st_mtime_ns + 10**9,) * 2)
+    monkeypatch.setattr(extract, "ffmpeg_available", lambda: False)  # 命中缓存就不该走到这
+    extract._extract_embedded_sync(video, 0, out)  # 不抛 = 缓存生效
+
+    # 视频比产物新（洗版替换）→ 缓存失效,走抽取路径（此处 ffmpeg 缺失即抛）
+    os.utime(video, ns=(out.stat().st_mtime_ns + 10**9,) * 2)
+    with pytest.raises(extract.SourceLoadError):
+        extract._extract_embedded_sync(video, 0, out)
+
+
+def test_language_token_validation() -> None:
+    from movieclaw_api.exceptions import BadRequestException
+    from movieclaw_api.services.subtitle_gen.tasks import ensure_language_token
+
+    assert ensure_language_token(" CHS ") == "chs"
+    for bad in ("../../etc", "a", "含中文", "x" * 20, "a/b"):
+        with pytest.raises(BadRequestException):
+            ensure_language_token(bad)
+
+
+async def test_calibrate_rejects_path_traversal_filename() -> None:
+    from movieclaw_api.exceptions import BadRequestException
+    from movieclaw_api.services.subtitle_gen.tasks import calibrate_external_subtitle
+
+    for bad in ("../x.srt", "a/b.srt", ".hidden.srt"):
+        with pytest.raises(BadRequestException):
+            await calibrate_external_subtitle(None, 1, bad)  # 文件名先于一切校验

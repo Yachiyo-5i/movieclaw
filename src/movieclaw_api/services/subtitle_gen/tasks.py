@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re as _re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -103,9 +104,24 @@ async def _film_context(
     return ctx, (meta.original_language if meta else None)
 
 
+# 目标语言 token 直接进 sidecar 文件名：只收短小写字母数字（防路径注入，
+# 也保证产物文件名能被台账命名解析正常消化）
+_LANGUAGE_TOKEN = _re.compile(r"^[a-z0-9-]{2,16}$")
+
+
+def ensure_language_token(target_language: str) -> str:
+    token = target_language.strip().lower()
+    if not _LANGUAGE_TOKEN.fullmatch(token):
+        raise BadRequestException(
+            f"目标语言 token 不合法：{target_language!r}"
+            "（只允许 2-16 位小写字母/数字/连字符，如 chs）"
+        )
+    return token
+
+
 def _sidecar_path(row: LibraryFile, target_language: str) -> Path:
     video = Path(row.file_path)
-    return video.parent / f"{video.stem}.{target_language}.ai.srt"
+    return video.parent / f"{video.stem}.{ensure_language_token(target_language)}.ai.srt"
 
 
 @dataclass
@@ -122,6 +138,7 @@ class Preview:
 
 async def preview(session: AsyncSession, file_id: int, target_language: str) -> Preview:
     """选源 + 加载最优候选做成本估算（不动 LLM）。"""
+    target_language = ensure_language_token(target_language)
     row = await _load_row(session, file_id)
     _, original_language = await _film_context(session, row)
     ranked = source.rank_candidates(
@@ -402,13 +419,22 @@ async def calibrate_external_subtitle(
     参考优先音轨（真相源）,无音频（strm/无 ffmpeg）退字幕对字幕;两者都
     不可用如实报错。校准量小于噪声阈值时不动文件（"本就同步"）。
     """
+    if "/" in filename or "\\" in filename or filename.startswith("."):
+        raise BadRequestException(f"字幕文件名不合法：{filename!r}")
     row = await _load_row(session, file_id)
     entry = next(
         (e for e in row.external_subtitles or [] if e.get("filename") == filename),
         None,
     )
     if entry is None:
-        raise NotFoundException(f"台账中没有这条外挂字幕：{filename}")
+        # 台账兜底：旧行（NULL，未重扫）或刚放入的文件——控制台详情页展示
+        # 的是磁盘现场清单，按现场重新发现一次，别让用户先扫库再校准
+        discovered = await asyncio.to_thread(
+            discover_external_subtitles, Path(row.file_path)
+        )
+        entry = next((e for e in discovered if e.get("filename") == filename), None)
+        if entry is None:
+            raise NotFoundException(f"没有找到这条外挂字幕文件：{filename}")
     cand = source.SourceCandidate(
         kind="external",
         key=filename,

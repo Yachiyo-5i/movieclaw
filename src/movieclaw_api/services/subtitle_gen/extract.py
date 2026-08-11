@@ -121,7 +121,21 @@ def parse_events(text: str, origin: str) -> list[SubEvent]:
 
 
 def _extract_embedded_sync(video: Path, stream_index: int, out_path: Path) -> None:
-    """（线程池）ffmpeg 抽取内封文本轨为 srt；0:s:<k> 与台账数组下标同源。"""
+    """（线程池）ffmpeg 抽取内封文本轨为 srt；0:s:<k> 与台账数组下标同源。
+
+    带新鲜度缓存：预检/发起/执行三步都会加载参考源，抽取要通读整个容器
+    （大文件分钟级）——产物比视频新且非空时直接复用，只有视频本体变了
+    才重抽。
+    """
+    try:
+        if (
+            out_path.is_file()
+            and out_path.stat().st_size > 0
+            and out_path.stat().st_mtime_ns > video.stat().st_mtime_ns
+        ):
+            return
+    except OSError:
+        pass  # stat 失败按未缓存处理，走正常抽取
     if not ffmpeg_available():
         raise SourceLoadError(
             "系统中未找到 ffmpeg，无法抽取内封字幕轨——请安装 ffmpeg，"
