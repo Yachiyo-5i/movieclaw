@@ -288,7 +288,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
       /* data-topbar：主区要不要为全局顶栏空出那 52px，取决于这一行有没有被
          页面自己的 PageNav 认领（对应 globals.css 的 .app-shell[data-topbar] 规则）。 */
       <div
-        className="app-shell relative z-10 h-[calc(100dvh-var(--keyboard-inset))] w-full"
+        className="app-shell viewport-app-height relative z-10 w-full"
         data-topbar={showMobileTopBar}
       >
         {showMobileTopBar && (
@@ -313,7 +313,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
         body.cmdk-open .app-shell）：面板打开时整个外壳轻微缩放后退，浮层则漂在其上。
         高度同样减 --keyboard-inset：iPad 竖屏走的就是这一支布局，弹起软键盘时
         一样要把外壳收缩到键盘之上（桌面端该值恒为 0）。 */
-      <div className="app-shell relative z-10 flex h-[calc(100dvh-var(--keyboard-inset))] w-full gap-3.5 p-3.5">
+      <div className="app-shell viewport-app-height relative z-10 flex w-full gap-3.5 p-3.5">
         {/* —— 左栏：浮起的玻璃侧栏卡片 ——
           宽度随折叠态动画（仅工作台可折叠；设置模式的分区菜单始终全宽）。 */}
         <aside
