@@ -67,11 +67,22 @@ class QualityReport:
     cps_overrun: int = 0  # 超 9 字/秒的事件数
     overlong: int = 0  # 折行后仍超两行容量（>32 字）的事件数
     kept_original: int = 0  # 翻译失败保留原文的事件数
+    compressed: int = 0  # 超读速二次压缩成功的事件数（"浓缩优先"闭环）
     glossary_usage: dict[str, int] = field(default_factory=dict)  # 译名 → 出现次数
 
     @property
     def cps_overrun_rate(self) -> float:
         return self.cps_overrun / self.event_count if self.event_count else 0.0
+
+
+def overrun_indices(events: list[SubEvent], limit: float = CPS_LIMIT) -> list[int]:
+    """超读速事件的下标表（二次压缩的输入）。"""
+    out: list[int] = []
+    for i, (start, end, text) in enumerate(events):
+        duration_s = max((end - start) / 1000, 0.001)
+        if _visible_len(text) / duration_s > limit:
+            out.append(i)
+    return out
 
 
 def finalize_events(

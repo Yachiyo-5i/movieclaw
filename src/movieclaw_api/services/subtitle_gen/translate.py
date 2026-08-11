@@ -322,3 +322,66 @@ def write_srt(events: list[SubEvent], path: Path) -> None:
     tmp = path.with_suffix(path.suffix + ".part")
     tmp.write_text(subs.to_string("srt"), encoding="utf-8")
     tmp.replace(path)
+
+
+# ---------------------------------------------------------------------------
+# CPS 超标条目的二次压缩（§3.3"浓缩优先"的闭环，终检轮补）
+# ---------------------------------------------------------------------------
+
+_COMPRESS_BATCH = 30
+_COMPRESS_PROMPT = (
+    "下列译文在字幕显示时长内读不完，请在**不丢核心语义**的前提下压缩改写：\n"
+    "每条给出目标字数上限，删冗余语气词、化长句为短句；禁增删条目、禁截断句意。\n"
+    '只输出 JSON 数组，元素形如 {{"i": 序号, "t": "压缩后译文"}}：\n{payload}'
+)
+
+
+async def compress_overruns(
+    chat: ChatFn,
+    events: list[SubEvent],
+    indices: list[int],
+    ctx: FilmContext,
+    target_language: str,
+) -> tuple[list[SubEvent], int]:
+    """对超读速事件做限字数压缩重写；失败保留原译文。返回 (事件, 成功数)。
+
+    上限字数按事件时长 × 9 字/秒（Netflix 简中成人标准）计算；单条低于
+    4 字不再压（短句压无可压）。
+    """
+    todo = []
+    for i in indices:
+        start, end, text = events[i]
+        limit = max(4, int((end - start) / 1000 * 9))
+        if len(text.replace("\n", "").replace(" ", "")) > limit:
+            todo.append((i, text.replace("\n", " "), limit))
+    if not todo:
+        return events, 0
+
+    out = list(events)
+    compressed = 0
+    system = system_prompt(ctx, {}, target_language)
+    for batch_start in range(0, len(todo), _COMPRESS_BATCH):
+        batch = todo[batch_start : batch_start + _COMPRESS_BATCH]
+        payload = json.dumps(
+            [{"i": i, "t": t, "max_chars": limit} for i, t, limit in batch],
+            ensure_ascii=False,
+        )
+        try:
+            raw = await chat(system, _COMPRESS_PROMPT.format(payload=payload))
+            parsed = _parse_json_block(raw)
+            by_index = {
+                int(item["i"]): str(item["t"]).strip()
+                for item in parsed
+                if isinstance(item, dict) and "i" in item and "t" in item
+            }
+        except Exception as exc:  # noqa: BLE001 -- 压缩是增益项,失败保留原译文
+            logger.warning("超读速条目压缩失败（保留原译文）：%s", exc)
+            continue
+        for i, original, _limit in batch:
+            text = by_index.get(i, "").strip()
+            # 压缩结果必须真的更短且仍是目标语言,否则不采纳
+            if text and len(text) < len(original) and looks_translated(text, target_language):
+                start, end, _ = out[i]
+                out[i] = (start, end, text)
+                compressed += 1
+    return out, compressed

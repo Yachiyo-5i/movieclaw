@@ -32,7 +32,14 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : "请求失败，请稍后再试";
 }
 
-export function SubtitleGenPanel({ file }: { file: LibraryItemFile }) {
+export function SubtitleGenPanel({
+  file,
+  onChanged,
+}: {
+  file: LibraryItemFile;
+  /** 产物落盘后回调（详情页借此重拉字幕清单，新字幕立刻可见） */
+  onChanged?: () => void;
+}) {
   const { isAdmin } = usePermissions();
   const [preview, setPreview] = useState<SubgenPreview | null>(null);
   const [progress, setProgress] = useState<SubgenProgress | null>(null);
@@ -53,13 +60,16 @@ export function SubtitleGenPanel({ file }: { file: LibraryItemFile }) {
       const status = await subgenStatus(file.id);
       setProgress(status);
       if (!status.running) {
+        const wasRunning = pollRef.current !== null;
         stopPolling();
         if (status.last_result) setNotice(status.last_result.message);
+        // 只有"这次会话里看着它跑完"才刷新——挂载时的首次探测不算
+        if (wasRunning && status.last_result?.ok) onChanged?.();
       }
     } catch {
       // 轮询失败不打断页面；下一轮重试
     }
-  }, [file.id, stopPolling]);
+  }, [file.id, stopPolling, onChanged]);
 
   const startPolling = useCallback(() => {
     stopPolling();
@@ -125,13 +135,14 @@ export function SubtitleGenPanel({ file }: { file: LibraryItemFile }) {
       try {
         const result = await calibrateSubtitle(file.id, filename);
         setNotice(result.message);
+        if (result.ok) onChanged?.();
       } catch (error) {
         setNotice(errorMessage(error));
       } finally {
         setBusy(false);
       }
     },
-    [file.id],
+    [file.id, onChanged],
   );
 
   if (!isAdmin || file.missing) return null;

@@ -45,6 +45,7 @@ export interface SubgenQuality {
   cps_overrun: number;
   overlong: number;
   kept_original: number;
+  compressed: number;
   glossary_usage: Record<string, number>;
 }
 

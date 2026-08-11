@@ -423,3 +423,32 @@ async def test_calibrate_rejects_path_traversal_filename() -> None:
     for bad in ("../x.srt", "a/b.srt", ".hidden.srt"):
         with pytest.raises(BadRequestException):
             await calibrate_external_subtitle(None, 1, bad)  # 文件名先于一切校验
+
+
+async def test_compress_overruns_refine_pass() -> None:
+    """超读速二次压缩（§3.3 浓缩优先闭环）：只回炉超标条,失败/变长不采纳。"""
+
+    async def chat(system: str, user: str) -> str:
+        batch = json.loads(user[user.index("[") :])
+        out = []
+        for item in batch:
+            if item["i"] == 0:
+                out.append({"i": 0, "t": "压缩后的短句"})
+            else:
+                out.append({"i": item["i"], "t": item["t"] + "反而更长了"})  # 不该被采纳
+        return json.dumps(out, ensure_ascii=False)
+
+    events = [
+        (0, 1000, "这一条在一秒之内绝对读不完所以必然超标"),  # i=0 待压缩
+        (2000, 3000, "这条也超标但模型给了更长的结果不能采纳啊"),  # i=1
+        (4000, 10000, "正常条"),  # 不超标,不该进请求
+    ]
+    from movieclaw_api.services.subtitle_gen.validate import overrun_indices
+
+    indices = overrun_indices(events)
+    assert indices == [0, 1]
+    out, compressed = await translate.compress_overruns(chat, events, indices, CTX, "chs")
+    assert compressed == 1
+    assert out[0] == (0, 1000, "压缩后的短句")
+    assert out[1][2].startswith("这条也超标")  # 原译文保留
+    assert out[2] == events[2]

@@ -61,6 +61,7 @@ def _result_view(result: gen_tasks.GenResult | None) -> GenResultView | None:
             cps_overrun=result.report.cps_overrun,
             overlong=result.report.overlong,
             kept_original=result.report.kept_original,
+            compressed=result.report.compressed,
             glossary_usage=result.report.glossary_usage,
         )
     return GenResultView(

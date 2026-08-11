@@ -34,6 +34,7 @@ class GenQualityView(BaseModel):
     cps_overrun: int
     overlong: int
     kept_original: int
+    compressed: int
     glossary_usage: dict[str, int]
 
 

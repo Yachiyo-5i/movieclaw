@@ -278,10 +278,23 @@ async def _run(file_id: int, target_language: str, state: GenState) -> GenResult
         cancelled=lambda: _tasks.stop_requested(file_id),
     )
 
+    final_events, report = validate.finalize_events(out_events, stats.glossary)
+    # 超读速二次压缩（§3.3"浓缩优先"的闭环）：只回炉超标子集（通常 <10%），
+    # 压缩失败保留原译文——这是增益项，绝不因它废任务
+    compressed = 0
+    overruns = validate.overrun_indices(final_events)
+    if overruns:
+        state.message = f"正在压缩 {len(overruns)} 条超读速译文"
+        refined, compressed = await translate.compress_overruns(
+            chat, final_events, overruns, ctx, target_language
+        )
+        if compressed:
+            final_events, report = validate.finalize_events(refined, stats.glossary)
+    report.kept_original = stats.kept_original
+    report.compressed = compressed
+
     state.phase = "writing"
     state.message = "正在写出字幕文件"
-    final_events, report = validate.finalize_events(out_events, stats.glossary)
-    report.kept_original = stats.kept_original
     sidecar = _sidecar_path(row, target_language)
     try:
         await asyncio.to_thread(translate.write_srt, final_events, sidecar)
@@ -306,8 +319,10 @@ async def _run(file_id: int, target_language: str, state: GenState) -> GenResult
     message = f"已生成 {sidecar.name}（参考：{source_desc}，{report.event_count} 条对白"
     if stats.failed_blocks:
         message += f"，{stats.failed_blocks} 块翻译失败保留原文"
+    if report.compressed:
+        message += f"，压缩改写 {report.compressed} 条超读速译文"
     if report.cps_overrun:
-        message += f"，{report.cps_overrun} 条超读速"
+        message += f"，仍有 {report.cps_overrun} 条超读速"
     message += "）"
     logger.info("字幕生成完成：%s", message)
     return GenResult(
@@ -361,28 +376,36 @@ _CALIBRATE_MIN_SCORE = 0.15
 _NOOP_OFFSET_MS = 200
 
 
+#: 校准参考的抽样窗：沿时间轴均布 6 窗 × 2 分钟。稀疏参考不影响互相关
+#: 峰位置（匹配发生在有信号处,错位处只加常数底噪）,却把 2 小时片的
+#: 音频解码从整片降到 12 分钟——校准在 HTTP 请求内即可完成,不必转后台
+_CALIBRATE_WINDOWS = 6
+_CALIBRATE_WINDOW_S = 120
+
+
 async def _audio_reference_intervals(
     row: LibraryFile, events: list[extract.SubEvent]
 ) -> list[tuple[int, int]] | None:
-    """全片语音区间（校准参考）：分段抽 PCM 拼接;无 ffmpeg/无音轨返回 None。
-
-    校准与检测不同,需要整片视野才能解出全局 (scale, offset)——按 10 分钟
-    一段流式抽取拼接区间表,内存里从不持有整片 PCM。
-    """
+    """抽样语音区间（校准参考,映射回全片时间坐标）;无 ffmpeg/无音轨返回 None。"""
     runtime = row.duration_seconds or (max(e[1] for e in events) // 1000 if events else 0)
     if runtime <= 0:
         return None
-    segment = 600
+    if runtime <= _CALIBRATE_WINDOWS * _CALIBRATE_WINDOW_S:
+        starts = [0]
+        window = float(runtime)
+    else:
+        # 均布起点,避开首尾 5%（片头 logo/片尾字幕常无对白）
+        usable = runtime * 0.9
+        step = usable / _CALIBRATE_WINDOWS
+        starts = [int(runtime * 0.05 + i * step) for i in range(_CALIBRATE_WINDOWS)]
+        window = float(_CALIBRATE_WINDOW_S)
     intervals: list[tuple[int, int]] = []
-    for start in range(0, runtime, segment):
+    for start in starts:
         pcm = await asyncio.to_thread(
-            sync._extract_pcm_sync,
-            Path(row.file_path),
-            float(start),
-            float(min(segment, runtime - start)),
+            sync._extract_pcm_sync, Path(row.file_path), float(start), window
         )
         if pcm is None:
-            return None if start == 0 else intervals  # 首段就失败=不可用
+            return intervals if intervals else None  # 首窗就失败=不可用
         intervals.extend(
             (s + start * 1000, e + start * 1000) for s, e in sync.speech_intervals(pcm)
         )
