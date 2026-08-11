@@ -28,7 +28,7 @@ export function LibrarySearchResults({
 }: {
   keyword: string;
   /** 切到「影视」垂直（空态时的出口：库里没有 → 去找来） */
-  onSwitchToMedia: () => void;
+  onSwitchToMedia?: () => void;
 }) {
   // null = 加载中；[] = 无结果；error 非空 = 请求失败
   const [groups, setGroups] = useState<LibrarySearchGroup[] | null>(null);
@@ -71,13 +71,15 @@ export function LibrarySearchResults({
             <p className="text-on-image mt-1.5 text-sub text-[rgba(243,245,249,0.7)]">
               {error ?? "已入库条目按标题和原名匹配；库里还没有的片子，去影视条目里找。"}
             </p>
-            <button
-              type="button"
-              onClick={onSwitchToMedia}
-              className="btn-accent mt-5 rounded-full px-4 py-1.5 text-sub font-semibold"
-            >
-              搜索影视条目
-            </button>
+            {onSwitchToMedia && (
+              <button
+                type="button"
+                onClick={onSwitchToMedia}
+                className="btn-accent mt-5 rounded-full px-4 py-1.5 text-sub font-semibold"
+              >
+                搜索影视条目
+              </button>
+            )}
           </div>
         )}
         {groups !== null && groups.length > 0 && (

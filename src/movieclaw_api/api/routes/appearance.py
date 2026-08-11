@@ -6,7 +6,7 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, File, UploadFile
 from fastapi.responses import FileResponse, Response
 
-from movieclaw_api.api.deps import require_login
+from movieclaw_api.api.deps import optional_login, require_login
 from movieclaw_api.core.config import get_settings
 from movieclaw_api.exceptions import BadRequestException, NotFoundException
 from movieclaw_api.schemas.appearance import (
@@ -16,6 +16,7 @@ from movieclaw_api.schemas.appearance import (
 )
 from movieclaw_api.schemas.response import ApiResponse, ok
 from movieclaw_api.services import appearance as appearance_media
+from movieclaw_api.services.auth import Principal
 
 logger = logging.getLogger("movieclaw_api.appearance")
 
@@ -33,13 +34,20 @@ def _item_url(path: Path) -> str:
     return f"{prefix}/appearance/backdrops/{path.stem}?v={version}"
 
 
-def _view() -> AppearanceView:
-    """汇总图库与生效标记，构造完整的外观视图。"""
+def _member_scope(principal: Principal | None) -> int | None:
+    """把请求主体收敛为存储作用域；匿名和管理员都使用既有全局目录。"""
+    if principal is not None and principal.kind == "member":
+        return principal.member_id
+    return None
+
+
+def _view(member_id: int | None = None) -> AppearanceView:
+    """汇总指定主体的图库与生效标记，构造完整外观视图。"""
     items = [
         BackdropItem(id=path.stem, url=_item_url(path))
-        for path in appearance_media.list_backdrops()
+        for path in appearance_media.list_backdrops(member_id)
     ]
-    active_id = appearance_media.get_active_id()
+    active_id = appearance_media.get_active_id(member_id)
     active_url = next((item.url for item in items if item.id == active_id), None)
     return AppearanceView(
         active_id=active_id if active_url else None,
@@ -48,27 +56,31 @@ def _view() -> AppearanceView:
     )
 
 
-# 读取接口保持公开：登录页也要加载背景图撑起液态玻璃质感，
-# 且它们只暴露用户自选的壁纸，不含任何敏感信息。写接口必须登录。
+# 读取接口保持公开：登录页使用管理员全局背景；登录成员则按会话读取自己的
+# 图库。写接口必须登录，并由 Principal 自动限定到自己的存储作用域。
 @router.get(
     "",
     response_model=ApiResponse[AppearanceView],
     summary="读取外观设置（背景图库与当前生效图）",
     operation_id="appearance.show",
 )
-async def get_appearance() -> ApiResponse[AppearanceView]:
+async def get_appearance(
+    principal: Principal | None = Depends(optional_login),
+) -> ApiResponse[AppearanceView]:
     """前端启动时调用：拿到图库列表与生效图地址；生效图为空则用内置默认背景。"""
-    return ok(_view())
+    return ok(_view(_member_scope(principal)))
 
 
 @router.post(
     "/backdrops",
     response_model=ApiResponse[AppearanceView],
     summary="上传一张新背景图（加入图库并设为生效）",
-    dependencies=[Depends(require_login)],
     operation_id="appearance.backdrops.upload",
 )
-async def upload_backdrop(file: UploadFile = File(...)) -> ApiResponse[AppearanceView]:
+async def upload_backdrop(
+    file: UploadFile = File(...),
+    principal: Principal = Depends(require_login),
+) -> ApiResponse[AppearanceView]:
     """接收一张图片存入图库并立即启用；已有的图全部保留，供随时切换。
 
     校验：只接受常见位图格式（拒绝可内嵌脚本的 SVG）、大小与图库张数有上限。
@@ -83,45 +95,54 @@ async def upload_backdrop(file: UploadFile = File(...)) -> ApiResponse[Appearanc
     if len(data) > appearance_media.MAX_BACKDROP_BYTES:
         limit_mb = appearance_media.MAX_BACKDROP_BYTES // (1024 * 1024)
         raise BadRequestException(f"图片过大，请控制在 {limit_mb}MB 以内")
-    if len(appearance_media.list_backdrops()) >= appearance_media.MAX_BACKDROP_COUNT:
+    member_id = _member_scope(principal)
+    if len(appearance_media.list_backdrops(member_id)) >= appearance_media.MAX_BACKDROP_COUNT:
         raise BadRequestException(
             f"背景图最多保留 {appearance_media.MAX_BACKDROP_COUNT} 张，请先删除不用的旧图"
         )
 
     # 已在上面校验过 content_type 属于受支持集合，此处必定命中
-    appearance_media.save_backdrop(data, file.content_type)  # type: ignore[arg-type]
-    return ok(_view())
+    appearance_media.save_backdrop(
+        data,
+        file.content_type,  # type: ignore[arg-type]
+        member_id,
+    )
+    return ok(_view(member_id))
 
 
 @router.put(
     "/active",
     response_model=ApiResponse[AppearanceView],
     summary="切换当前生效的背景图",
-    dependencies=[Depends(require_login)],
     operation_id="appearance.active.set",
 )
 async def set_active_backdrop(
     payload: ActiveBackdropUpdate,
+    principal: Principal = Depends(require_login),
 ) -> ApiResponse[AppearanceView]:
     """点选图库中的某张图启用；``backdrop_id`` 传空则切回内置默认背景（不删图）。"""
-    if not appearance_media.set_active(payload.backdrop_id):
+    member_id = _member_scope(principal)
+    if not appearance_media.set_active(payload.backdrop_id, member_id):
         raise NotFoundException("背景图不存在或已被删除，请刷新后重试")
-    return ok(_view())
+    return ok(_view(member_id))
 
 
 @router.delete(
     "/backdrops/{backdrop_id}",
     response_model=ApiResponse[AppearanceView],
     summary="从图库删除一张背景图",
-    dependencies=[Depends(require_login)],
     operation_id="appearance.backdrops.delete",
     openapi_extra={"x-cli-dangerous": "confirm"},
 )
-async def delete_backdrop(backdrop_id: str) -> ApiResponse[AppearanceView]:
+async def delete_backdrop(
+    backdrop_id: str,
+    principal: Principal = Depends(require_login),
+) -> ApiResponse[AppearanceView]:
     """删除指定背景图；若删的是当前生效图，自动回退到内置默认背景。"""
-    if not appearance_media.remove_backdrop(backdrop_id):
+    member_id = _member_scope(principal)
+    if not appearance_media.remove_backdrop(backdrop_id, member_id):
         raise NotFoundException("背景图不存在或已被删除")
-    return ok(_view())
+    return ok(_view(member_id))
 
 
 @router.get(
@@ -130,17 +151,20 @@ async def delete_backdrop(backdrop_id: str) -> ApiResponse[AppearanceView]:
     response_class=Response,
     operation_id="appearance.backdrops.download",
 )
-async def read_backdrop(backdrop_id: str) -> FileResponse:
+async def read_backdrop(
+    backdrop_id: str,
+    principal: Principal | None = Depends(optional_login),
+) -> FileResponse:
     """直接返回图片文件本身，供 <img> 与 WebGL 着色器加载。
 
     地址由 ``GET /appearance`` 返回（带版本号）；图不存在时返回 404。
     """
-    path = appearance_media.find_backdrop(backdrop_id)
+    path = appearance_media.find_backdrop(backdrop_id, _member_scope(principal))
     if path is None:
         raise NotFoundException("背景图不存在或已被删除")
     return FileResponse(
         path,
         media_type=appearance_media.content_type_for(path),
-        # URL 带版本号做缓存键，这里可放心让浏览器长期缓存，换图时 URL 会变。
-        headers={"Cache-Control": "public, max-age=31536000"},
+        # 成员背景必须经过会话作用域判定，不能进入共享代理缓存。
+        headers={"Cache-Control": "private, max-age=31536000"},
     )

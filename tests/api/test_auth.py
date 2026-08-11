@@ -161,10 +161,26 @@ def test_login_throttled_after_repeated_failures(client: TestClient) -> None:
     assert locked.status_code == 429
 
 
+# 超管会话视图的固定部分：role 恒为 admin，能力开关恒全开
+_ADMIN_VIEW_EXTRAS = {
+    "role": "admin",
+    "capabilities": {
+        "allow_subscribe": True,
+        "allow_search": True,
+        "allow_direct_download": True,
+    },
+}
+
+
 def test_nickname_defaults_to_username_and_editable(client: TestClient) -> None:
     """建号时昵称默认取用户名；可在个人信息里修改，用户名保持不变。"""
     created = _bootstrap(client).json()["data"]
-    assert created == {"username": "admin", "nickname": "admin", "avatar_url": None}
+    assert created == {
+        "username": "admin",
+        "nickname": "admin",
+        "avatar_url": None,
+        **_ADMIN_VIEW_EXTRAS,
+    }
 
     resp = client.put(f"{_AUTH}/profile", json={"nickname": "呀哈喽"})
     assert resp.status_code == 200
@@ -172,6 +188,7 @@ def test_nickname_defaults_to_username_and_editable(client: TestClient) -> None:
         "username": "admin",
         "nickname": "呀哈喽",
         "avatar_url": None,
+        **_ADMIN_VIEW_EXTRAS,
     }
 
     # /auth/me 与后续登录都返回新昵称；登录仍用用户名
@@ -182,6 +199,7 @@ def test_nickname_defaults_to_username_and_editable(client: TestClient) -> None:
         "username": "admin",
         "nickname": "呀哈喽",
         "avatar_url": None,
+        **_ADMIN_VIEW_EXTRAS,
     }
 
 
@@ -210,6 +228,31 @@ def test_change_password_kicks_other_sessions(client: TestClient) -> None:
         f"{_AUTH}/login", json={"username": "admin", "password": "new-pass-456"}
     )
     assert new_login.status_code == 200
+
+
+def test_throttle_lock_survives_bucket_flood() -> None:
+    """限速桶淘汰不能变成解锁通道：海量随机用户名注水后，
+    被锁定账号的桶必须原地存活（无差别 LRU 会被 128 个新桶挤掉）。"""
+    from movieclaw_api.exceptions import AppException
+    from movieclaw_api.services import auth as auth_service
+
+    auth_service.reset_auth_state()
+    try:
+        target = auth_service._throttle_for("admin")
+        for _ in range(auth_service.LoginThrottle.THRESHOLD):
+            target.record_failure()
+        with pytest.raises(AppException):
+            target.ensure_allowed()  # 已锁定
+
+        for i in range(auth_service._MAX_THROTTLE_BUCKETS * 2):
+            auth_service._throttle_for(f"flood-{i}")
+
+        # 注水后同名桶还是那一个，锁定仍然生效
+        assert auth_service._throttle_for("admin") is target
+        with pytest.raises(AppException):
+            auth_service._throttle_for("admin").ensure_allowed()
+    finally:
+        auth_service.reset_auth_state()
 
 
 # ---------------------------------------------------------------------------
@@ -267,6 +310,7 @@ def test_every_route_denies_anonymous_access(client: TestClient) -> None:
             .replace("{account_id}", "test-bot")
             .replace("{channel}", "weixin")
             .replace("{endpoint_id}", "test-endpoint")
+            .replace("{member_id}", "1")
         )
         assert "{" not in url, f"守护测试不认识路径参数，请补充哑值：{path}"
         for method in methods:

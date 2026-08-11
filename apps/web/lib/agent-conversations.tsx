@@ -42,6 +42,7 @@ import {
 } from "@/lib/api/agent";
 import { HttpError } from "@/lib/http";
 import { nanoid } from "nanoid";
+import { usePermissions } from "@/lib/permissions";
 
 /** 一次工具调用及其执行回执（tool_call_start 创建、tool_call_delta 逐片
  * 追加参数、tool_call 定稿参数、tool_result 补全回执）。 */
@@ -449,6 +450,7 @@ function applyAgentEvent(turn: AgentTurn, event: AgentEvent): AgentTurn {
 }
 
 export function AgentConversationsProvider({ children }: { children: React.ReactNode }) {
+  const { isAdmin } = usePermissions();
   const [conversations, setConversations] = useState<AgentConversation[]>([]);
   // runId → 当前 SSE 读取器；仅用于页面卸载时关闭连接，不负责取消后台运行。
   const controllers = useRef(new Map<string, AbortController>());
@@ -471,6 +473,7 @@ export function AgentConversationsProvider({ children }: { children: React.React
   // 挂载时拉取首页会话列表；本地已有的会话（正在流式）以本地为准。
   useEffect(() => {
     let cancelled = false;
+    if (!isAdmin) return;
     void listAgentSessions({ limit: PAGE_SIZE })
       .then((items) => {
         if (cancelled) return;
@@ -501,7 +504,7 @@ export function AgentConversationsProvider({ children }: { children: React.React
       activeControllers.clear();
       if (activeFlushTimer.current !== null) window.clearTimeout(activeFlushTimer.current);
     };
-  }, []);
+  }, [isAdmin]);
 
   /** 取下一页会话摘要追加到列表尾部（侧栏滚动触底时调用）。
    *

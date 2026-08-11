@@ -3,7 +3,8 @@ from __future__ import annotations
 from fastapi import APIRouter, BackgroundTasks, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from movieclaw_api.exceptions import BadRequestException
+from movieclaw_api.api.deps import require_login
+from movieclaw_api.exceptions import BadRequestException, ForbiddenException
 from movieclaw_api.schemas.downloader import (
     DownloaderPayload,
     DownloaderStatusUpdate,
@@ -15,10 +16,12 @@ from movieclaw_api.schemas.downloader import (
     ManualDownloadTargetView,
 )
 from movieclaw_api.schemas.response import ApiResponse, ok
+from movieclaw_api.services.auth import Principal
 from movieclaw_api.services.downloader_config import (
     DownloaderConfigService,
     verify_downloader,
 )
+from movieclaw_api.services.library.access import assert_library_visible
 from movieclaw_api.services.library.config import LibraryConfigService
 from movieclaw_api.services.torrent_submit import (
     anchor_manual_download,
@@ -29,6 +32,11 @@ from movieclaw_api.services.torrent_submit import (
 from movieclaw_db.engine import get_session
 
 router = APIRouter(prefix="/downloaders", tags=["downloaders"])
+
+# 一键下载单独一个路由器（docs/design/member-management.md §3.2）：配置面
+# 整组保持管理员专属，仅 /submit 按 allow_direct_download 能力放行成员——
+# 不为一条路由把整组配置面降级为逐路由防守。挂载见 api/router.py。
+submit_router = APIRouter(prefix="/downloaders", tags=["downloaders"])
 
 
 def _mappings_to_rows(payload: DownloaderPayload) -> list[dict[str, str]] | None:
@@ -108,7 +116,7 @@ async def resolve_download_target(
     )
 
 
-@router.post(
+@submit_router.post(
     "/submit",
     response_model=ApiResponse[DownloadSubmitView],
     summary="把一条搜索结果种子提交到下载器（缺省默认下载器，可指定分流）",
@@ -116,6 +124,7 @@ async def resolve_download_target(
 )
 async def submit_download(
     payload: DownloadSubmitPayload,
+    principal: Principal = Depends(require_login),
     session: AsyncSession = Depends(get_session),
 ) -> ApiResponse[DownloadSubmitView]:
     """手动下载：带站点登录态取回 .torrent → 提交给默认下载器。
@@ -127,6 +136,20 @@ async def submit_download(
     提交幂等：种子已在下载器中不视为错误，data.already_exists=true。
     """
     from movieclaw_api.services.library.routing import resolve_save_path
+
+    if not principal.is_admin:
+        # 成员版强制自动路由（§2.2）：手选目录/指定下载器都是管理员的事——
+        # 前端成员弹窗不提供这两项，这里是绕过前端也拦得住的服务端强制
+        if payload.save_path is not None:
+            raise ForbiddenException("成员的一键下载不能手选保存目录，将按目标库自动选择")
+        if payload.downloader_id is not None:
+            raise ForbiddenException("成员的一键下载不能指定下载器，将使用默认下载器")
+        # 智能入库按收藏范围路由，可能选中成员不可见的库并回显库名/路由理由，
+        # 与成员的库可见性隔离冲突；成员端也不提供该入口，服务端一并拦住
+        if payload.auto_route:
+            raise ForbiddenException("成员的一键下载不支持智能入库，请选择可见的媒体库")
+        if payload.library_id is not None:
+            await assert_library_visible(session, principal, payload.library_id)
 
     library = None
     derived_path = None
@@ -141,7 +164,9 @@ async def submit_download(
         from movieclaw_api.services.media_library import MediaLibraryService
         from movieclaw_media.models import MediaKind
 
-        assert payload.media_kind is not None and payload.tmdb_id is not None and payload.title
+        if payload.media_kind is None or payload.tmdb_id is None or not payload.title:
+            # schema 校验已保证；此处显式再守一道，避免校验演进后带残缺身份建档
+            raise BadRequestException("智能入库必须提供媒体类型、TMDB ID 和标题")
         manual_item = await MediaLibraryService(session, get_tmdb_client()).ensure_media_item(
             MediaKind(payload.media_kind), payload.tmdb_id, extra_aliases=[payload.title]
         )
@@ -199,8 +224,12 @@ async def submit_download(
         downloader_id=row.id,
         downloader_name=row.name,
         # 回显下载器视角的实际保存目录（有路径映射时与本地视角不同），
-        # 跨容器部署配错映射能在提交结果里第一时间看出来
-        save_path=translate_save_path(derived_path or row.save_path, row.path_mappings),
+        # 跨容器部署配错映射能在提交结果里第一时间看出来。成员不暴露路径。
+        save_path=(
+            None
+            if not principal.is_admin
+            else translate_save_path(derived_path or row.save_path, row.path_mappings)
+        ),
     )
     if result.already_exists:
         message = "该种子已在下载器中，未重复添加"

@@ -5,7 +5,7 @@ import logging
 from fastapi import APIRouter, BackgroundTasks, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from movieclaw_api.api.deps import require_login, require_sync_token
+from movieclaw_api.api.deps import require_admin, require_sync_token
 from movieclaw_api.core.config import get_settings
 from movieclaw_api.exceptions import NotFoundException
 from movieclaw_api.schemas.extension import (
@@ -151,7 +151,7 @@ async def push_cookies(
     "/token",
     response_model=ApiResponse[SyncTokenView],
     summary="查看当前同步令牌",
-    dependencies=[Depends(require_login)],
+    dependencies=[Depends(require_admin)],
     operation_id="extension.token.show",
 )
 async def get_token() -> ApiResponse[SyncTokenView]:
@@ -170,7 +170,7 @@ async def get_token() -> ApiResponse[SyncTokenView]:
     "/token",
     response_model=ApiResponse[SyncTokenView],
     summary="生成 / 重新生成同步令牌",
-    dependencies=[Depends(require_login)],
+    dependencies=[Depends(require_admin)],
     operation_id="extension.token.create",
 )
 async def create_token() -> ApiResponse[SyncTokenView]:
@@ -186,7 +186,7 @@ async def create_token() -> ApiResponse[SyncTokenView]:
     "/token",
     response_model=ApiResponse[SyncTokenView],
     summary="关闭同步（撤销令牌）",
-    dependencies=[Depends(require_login)],
+    dependencies=[Depends(require_admin)],
     operation_id="extension.token.revoke",
     openapi_extra={"x-cli-dangerous": "confirm"},
 )

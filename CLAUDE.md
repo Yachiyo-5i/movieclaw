@@ -23,7 +23,9 @@
   `data/` 目录，部署时挂载该目录即可持久化
 - 新站点接入用声明式 YAML，模板见
   `src/movieclaw_tracker/sites/configs/_template.yaml`
-- 合并前必须通过：`pytest`、`ruff check .`、`pnpm web:lint`、`pnpm web:typecheck`
+- 测试门禁由 CI 与发版流程承担（每个 PR 自动跑 `pytest -m "not integration"`，
+  发版以发版 PR 的 CI 全绿为准，见 `.claude/skills/release/SKILL.md`），
+  本地不要求跑全量测试
 
 ### 1. 编码前思考
 

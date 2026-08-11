@@ -112,6 +112,11 @@ lib scan start
 lib scan stop
 lib search
 lib show
+lib subgen calibrate
+lib subgen preview
+lib subgen start
+lib subgen status
+lib subgen stop
 lib transfer status
 lib unidentified clear
 lib unidentified list
@@ -123,6 +128,14 @@ llm provider show
 llm provider verify
 logs days
 logs read
+members avatar download
+members create
+members delete
+members list
+members password reset
+members show
+members status set
+members update
 net set
 net show
 net test

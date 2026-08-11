@@ -44,7 +44,7 @@ export function MediaSearchResults({
   /** 快照提示条的「重新搜索」：切回实时搜索（丢掉 snapshot 参数）；不传则不渲染该按钮 */
   onResearch?: () => void;
   /** 切到「站点资源」垂直（空态/出错时的逃生入口） */
-  onSwitchToTorrent: () => void;
+  onSwitchToTorrent?: () => void;
 }) {
   // 每个来源各自三态：null = 加载中；[] = 无结果；error 非空 = 该分区失败
   const [douban, setDouban] = useState<MediaSearchItem[] | null>(null);
@@ -236,19 +236,21 @@ function MediaSearchEmpty({
 }: {
   title: string;
   hint: string;
-  onSwitchToTorrent: () => void;
+  onSwitchToTorrent?: () => void;
 }) {
   return (
     <div className="flex flex-col items-center pt-24 text-center">
       <p className="text-on-image text-body-lg font-semibold text-white">{title}</p>
       <p className="text-on-image mt-1.5 text-sub text-[rgba(243,245,249,0.7)]">{hint}</p>
-      <button
-        type="button"
-        onClick={onSwitchToTorrent}
-        className="btn-accent mt-5 rounded-full px-4 py-1.5 text-sub font-semibold"
-      >
-        搜索站点资源
-      </button>
+      {onSwitchToTorrent && (
+        <button
+          type="button"
+          onClick={onSwitchToTorrent}
+          className="btn-accent mt-5 rounded-full px-4 py-1.5 text-sub font-semibold"
+        >
+          搜索站点资源
+        </button>
+      )}
     </div>
   );
 }

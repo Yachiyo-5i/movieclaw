@@ -6,21 +6,26 @@ import type { Route } from "next";
 
 import { AuthError, AuthField, AuthScreen } from "@/components/auth-screen";
 import { getBootstrapStatus, getSession, login } from "@/lib/api/auth";
+import { clearBackdropCache } from "@/lib/backdrop-cache";
 import { usePageTitle } from "@/lib/use-page-title";
 import { HttpError } from "@/lib/http";
+import { accessiblePathFor } from "@/lib/permissions";
+import type { SessionView } from "@/lib/api/auth";
 
 /**
  * 登录成功 / 已登录后要跳回的目标地址：取自 ?next= 参数（会话过期时由 http.ts 写入）。
  * 只接受站内相对路径（以单个 / 开头），拒绝 //host、http(s):// 等外站地址，防开放重定向；
  * 缺失或非法时回落到首页。
  */
-function resolveNext(): string {
+function resolveNext(session?: SessionView): string {
   if (typeof window === "undefined") return "/";
   const raw = new URLSearchParams(window.location.search).get("next");
-  if (!raw) return "/";
+  if (!raw) return session ? accessiblePathFor(session, "/") : "/";
   const next = decodeURIComponent(raw);
-  if (next.startsWith("/") && !next.startsWith("//")) return next;
-  return "/";
+  if (next.startsWith("/") && !next.startsWith("//")) {
+    return session ? accessiblePathFor(session, next) : next;
+  }
+  return session ? accessiblePathFor(session, "/") : "/";
 }
 
 /**
@@ -48,8 +53,8 @@ export default function LoginPage() {
           router.replace("/setup");
           return;
         }
-        await getSession(); // 已登录则不抛错
-        if (!cancelled) router.replace(resolveNext() as Route);
+        const session = await getSession(); // 已登录则不抛错
+        if (!cancelled) router.replace(resolveNext(session) as Route);
       } catch {
         // 未登录（401）或后端暂不可达：留在登录页即可
       }
@@ -65,10 +70,11 @@ export default function LoginPage() {
     setError(null);
     setBusy(true);
     try {
-      await login(username.trim(), password, remember);
+      const session = await login(username.trim(), password, remember);
       // 整页跳转而非路由跳转：让 AppShell 及全部数据在已登录态下重新初始化。
       // 回到 next 指向的页面（会话过期前所在处），默认首页。
-      window.location.href = resolveNext();
+      clearBackdropCache();
+      window.location.href = resolveNext(session);
     } catch (err) {
       setError(err instanceof HttpError ? err.message : "网络异常，请稍后重试");
       setBusy(false);
@@ -76,7 +82,7 @@ export default function LoginPage() {
   };
 
   return (
-    <AuthScreen title="登录" subtitle="使用超级管理员账号进入控制台。">
+    <AuthScreen title="登录" subtitle="使用你的 MovieClaw 账号进入。">
       <form onSubmit={submit} className="space-y-4">
         <AuthField
           label="用户名"

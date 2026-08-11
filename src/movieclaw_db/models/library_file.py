@@ -158,6 +158,16 @@ class LibraryFile(TimestampMixin, table=True):
         sa_column=Column(_NullableJson, nullable=True),
         description="内封字幕轨列表 JSON；NULL=未探测",
     )
+    # 外挂字幕台账（docs/design/jellyfin-subtitle.md §2.3）。与内封
+    # subtitle_streams 平行分列：两者数据来源与失效键完全不同（内封=视频
+    # 本体 ffprobe，外挂=同目录 sidecar 文件集），分列各自刷新互不牵连。
+    # 三态：NULL=未发现过（旧行，重扫回填），[]=发现过但没有。
+    # 元素结构见 library/subtitles.py 的 discover_external_subtitles
+    external_subtitles: list | None = Field(
+        default=None,
+        sa_column=Column(_NullableJson, nullable=True),
+        description="外挂字幕清单 JSON；NULL=未发现过",
+    )
 
     # -- 发布信息（来自文件名解析，enrich 复用）------------------------------
     media_source: str | None = Field(default=None, description="片源：WEB-DL/Blu-ray/…")

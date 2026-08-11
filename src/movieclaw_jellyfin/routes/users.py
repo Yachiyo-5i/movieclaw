@@ -9,18 +9,24 @@ from fastapi.responses import JSONResponse
 from sqlalchemy import select
 
 from movieclaw_api.services import auth as auth_service
+from movieclaw_api.services.library.access import member_visible_ids
 from movieclaw_api.settings.schemas import get_jellyfin_compat
 from movieclaw_db.engine import get_database
 from movieclaw_db.models import JellyfinDevice
 from movieclaw_db.models.base import utcnow
+from movieclaw_db.models.member import Member
+from movieclaw_db.repositories.member_repo import MemberRepository
 from movieclaw_jellyfin.errors import (
     JellyfinError,
     bad_request_text,
     not_found_message,
 )
 from movieclaw_jellyfin.identity import session_info_dto, user_dto
-from movieclaw_jellyfin.ids import normalize_guid, user_guid
-from movieclaw_jellyfin.security import read_authorization, require_device
+from movieclaw_jellyfin.ids import (
+    normalize_guid,
+    user_guid_for,
+)
+from movieclaw_jellyfin.security import RequestIdentity, read_authorization, require_device
 
 router = APIRouter()
 
@@ -46,10 +52,12 @@ async def authenticate_by_name(request: Request) -> JSONResponse:
         raise bad_request_text()
 
     try:
-        await auth_service.authenticate(username, str(password))
+        identity = await auth_service.authenticate(username, str(password))
     except Exception:
         # 密码错/账号不存在 → 401 text/plain "Error processing request."
         raise JellyfinError(401, text="Error processing request.") from None
+    member = identity if isinstance(identity, Member) else None
+    member_id = member.id if member is not None else 0
 
     setting = await get_jellyfin_compat()
     token = secrets.token_hex(16)
@@ -65,6 +73,9 @@ async def authenticate_by_name(request: Request) -> JSONResponse:
             session.add(device)
         else:
             device.token = token
+        # 设备绑定登录身份：换人登录同一设备 → 行覆盖 + 身份改写，
+        # 之后该设备的 Policy、观看状态、可见库全部按新身份投影
+        device.member_id = member_id
         device.client = auth.client
         device.device_name = auth.device
         device.version = auth.version
@@ -72,10 +83,17 @@ async def authenticate_by_name(request: Request) -> JSONResponse:
         device.updated_at = utcnow()
         await session.commit()
 
-    account = await auth_service.get_admin_account()
+    if member is not None:
+        async with get_database().session() as session:
+            visible = await member_visible_ids(session, member_id)
+        user_payload = await user_dto(setting.server_id, member, visible)
+        user_name = member.username
+    else:
+        user_payload = await user_dto(setting.server_id)
+        user_name = (await auth_service.get_admin_account()).username
     return JSONResponse(
         {
-            "User": await user_dto(setting.server_id),
+            "User": user_payload,
             "SessionInfo": session_info_dto(
                 setting.server_id,
                 secrets.token_hex(16),
@@ -83,7 +101,8 @@ async def authenticate_by_name(request: Request) -> JSONResponse:
                 device_id=auth.device_id,
                 device_name=auth.device,
                 version=auth.version,
-                user_name=account.username,
+                user_name=user_name,
+                member_id=member_id,
             ),
             "AccessToken": token,
             "ServerId": setting.server_id,
@@ -91,25 +110,58 @@ async def authenticate_by_name(request: Request) -> JSONResponse:
     )
 
 
+async def _member_user_dto(server_id: str, member: Member) -> dict:
+    async with get_database().session() as session:
+        visible = await member_visible_ids(session, member.id)
+    return await user_dto(server_id, member, visible)
+
+
+async def _identity_user_dto(server_id: str, member_id: int) -> dict:
+    """按设备登录身份装配用户 DTO；成员行已不存在（竞态）按 404 处理。"""
+    if member_id == 0:
+        return await user_dto(server_id)
+    async with get_database().session() as session:
+        member = await MemberRepository(session).get(member_id)
+    if member is None:
+        raise not_found_message("User not found")
+    return await _member_user_dto(server_id, member)
+
+
 @router.get("/Users/Public")
 async def users_public() -> JSONResponse:
+    """登录页用户列表：超管 + 启用中的成员（电视端出现多个头像）。"""
     setting = await get_jellyfin_compat()
-    return JSONResponse([await user_dto(setting.server_id)])
+    dtos = [await user_dto(setting.server_id)]
+    async with get_database().session() as session:
+        members = [
+            m for m in await MemberRepository(session).list_all() if m.status == "active"
+        ]
+    for member in members:
+        dtos.append(await _member_user_dto(setting.server_id, member))
+    return JSONResponse(dtos)
 
 
-@router.get("/Users/Me", dependencies=[Depends(require_device)])
-async def users_me() -> JSONResponse:
+@router.get("/Users/Me")
+async def users_me(identity: RequestIdentity = Depends(require_device)) -> JSONResponse:
     setting = await get_jellyfin_compat()
-    return JSONResponse(await user_dto(setting.server_id))
+    return JSONResponse(
+        await _identity_user_dto(setting.server_id, identity.device.member_id)
+    )
 
 
-@router.get("/Users/{user_id}", dependencies=[Depends(require_device)])
-async def users_by_id(user_id: str) -> JSONResponse:
+@router.get("/Users/{user_id}")
+async def users_by_id(
+    user_id: str, identity: RequestIdentity = Depends(require_device)
+) -> JSONResponse:
     normalized = normalize_guid(user_id)
     if normalized is None:
         # 路由段解析失败是参数错误（400），绝不能 401——会触发客户端登录循环
         raise bad_request_text()
-    if normalized != user_guid():
+    # 只允许取自己的用户对象：GUID 必须与设备登录身份一致（协议里管理员可查
+    # 他人，我们的超管即唯一管理员，同样按本人语义即可满足客户端需求）
+    if normalized != user_guid_for(identity.device.member_id):
         raise not_found_message("User not found")
     setting = await get_jellyfin_compat()
-    return JSONResponse(await user_dto(setting.server_id))
+    return JSONResponse(
+        await _identity_user_dto(setting.server_id, identity.device.member_id)
+    )

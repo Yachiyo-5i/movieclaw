@@ -33,12 +33,32 @@ function mediaQueryList(query: string): MediaQueryList {
   return mql;
 }
 
+/**
+ * 订阅媒体查询变化。旧版 WebKit 只有已废弃的 addListener/removeListener；
+ * 若在启动阶段无条件调用 addEventListener，异常会让整个 AppShell 卸载，页面只剩背景图。
+ */
+export function subscribeMediaQueryChange(
+  mql: MediaQueryList,
+  onChange: () => void,
+): () => void {
+  if (typeof mql.addEventListener === "function") {
+    mql.addEventListener("change", onChange);
+    return () => mql.removeEventListener("change", onChange);
+  }
+  if (typeof mql.addListener === "function") {
+    mql.addListener(onChange);
+    return () => mql.removeListener(onChange);
+  }
+  // 极旧 WebView 连旧订阅接口也没有时，保留首次断点判断；旋转后不热切版式，
+  // 但工作台仍可使用，刷新后会按新宽度重新计算。
+  return () => {};
+}
+
 export function useMediaQuery(query: string): boolean {
   const subscribe = useCallback(
     (onChange: () => void) => {
       const mql = mediaQueryList(query);
-      mql.addEventListener("change", onChange);
-      return () => mql.removeEventListener("change", onChange);
+      return subscribeMediaQueryChange(mql, onChange);
     },
     [query],
   );

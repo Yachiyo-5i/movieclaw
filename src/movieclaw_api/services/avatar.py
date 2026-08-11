@@ -1,11 +1,12 @@
-"""管理员头像的文件存储服务。
+"""头像的文件存储服务（超管 + 成员）。
 
-存储模型：单槽位文件
---------------------
-系统只有一个超级管理员，头像因此是「单槽位」：文件固定存在
-``media_dir/avatar.<ext>``，上传新头像即替换旧文件（扩展名可能变化，
-先删旧再写新）。不入库、不建图库——与背景图库（appearance.py）相比，
-头像没有"保留多张随时切换"的需求，一个文件最简单也最够用。
+存储模型：按主体分槽位的单文件
+------------------------------
+每个主体一个槽位：超管固定 ``media_dir/avatar.<ext>``（升级前的既有文件
+原地沿用），成员为 ``media_dir/avatar-member-<id>.<ext>``。上传新头像即
+替换本槽位旧文件（扩展名可能变化，先删旧再写新）。不入库、不建图库——
+与背景图库（appearance.py）相比，头像没有"保留多张随时切换"的需求，
+一个文件最简单也最够用。
 
 与背景图一致的取舍：
 - 只接受常见位图格式，刻意不收 SVG（可内嵌脚本，存在 XSS 风险）；
@@ -34,6 +35,11 @@ _EXT_CONTENT_TYPE: dict[str, str] = {ext: ct for ct, ext in _CONTENT_TYPE_EXT.it
 
 _AVATAR_STEM = "avatar"
 
+
+def member_stem(member_id: int) -> str:
+    """成员头像的槽位名。超管沿用默认槽位 ``avatar``（升级前文件原地生效）。"""
+    return f"avatar-member-{member_id}"
+
 # 头像体积上限。前端上传前会把长边压到 512px 的 JPEG（通常几十 KB），
 # 这里留足冗余并作为防滥用的硬上限——直接调 API 传超大图会被挡下。
 MAX_AVATAR_BYTES = 5 * 1024 * 1024
@@ -53,39 +59,46 @@ def content_type_for(path: Path) -> str:
     return _EXT_CONTENT_TYPE.get(path.suffix.lower(), "application/octet-stream")
 
 
-def find_avatar() -> Path | None:
-    """定位当前头像文件；尚未上传过头像时返回 None。"""
+def find_avatar(stem: str = _AVATAR_STEM) -> Path | None:
+    """定位该槽位当前的头像文件；尚未上传过头像时返回 None。"""
     media = _media_dir()
     if not media.is_dir():
         return None
-    for path in sorted(media.glob(f"{_AVATAR_STEM}.*")):
+    for path in sorted(media.glob(f"{stem}.*")):
         if path.is_file() and path.suffix.lower() in _EXT_CONTENT_TYPE:
             return path
     return None
 
 
-def avatar_version() -> int | None:
+def avatar_version(stem: str = _AVATAR_STEM) -> int | None:
     """头像的版本号（文件 mtime 纳秒值），无头像时返回 None。
 
     版本号拼进对外 URL：内容变化 → URL 变化，浏览器按 URL 命中缓存，
     借此在替换头像后强制所有展示处加载新图。
     """
-    path = find_avatar()
+    path = find_avatar(stem)
     return path.stat().st_mtime_ns if path else None
 
 
-def save_avatar(data: bytes, content_type: str) -> Path:
-    """保存（替换）头像，返回落盘路径。
+def save_avatar(data: bytes, content_type: str, stem: str = _AVATAR_STEM) -> Path:
+    """保存（替换）该槽位的头像，返回落盘路径。
 
     调用方须先用 ``is_supported_content_type`` 与 ``MAX_AVATAR_BYTES`` 校验。
     新旧头像扩展名可能不同（如 PNG 换 JPEG），先删旧文件再写新文件。
     """
     media = _media_dir()
     media.mkdir(parents=True, exist_ok=True)
-    old = find_avatar()
+    old = find_avatar(stem)
     if old is not None:
         old.unlink(missing_ok=True)
-    target = media / f"{_AVATAR_STEM}{_CONTENT_TYPE_EXT[content_type]}"
+    target = media / f"{stem}{_CONTENT_TYPE_EXT[content_type]}"
     target.write_bytes(data)
-    logger.info("已保存管理员头像：%s（%d 字节）", target, len(data))
+    logger.info("已保存头像：%s（%d 字节）", target, len(data))
     return target
+
+
+def delete_avatar(stem: str) -> None:
+    """删除该槽位的头像文件（删除成员时清理个人数据用）；不存在时静默。"""
+    old = find_avatar(stem)
+    if old is not None:
+        old.unlink(missing_ok=True)
