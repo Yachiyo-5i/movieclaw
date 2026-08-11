@@ -78,6 +78,7 @@ from movieclaw_db.models.library_file import IdentitySource, UnidentifiedCode
 from movieclaw_db.models.scheduled_task import TriggerType
 from movieclaw_db.repositories.library_file_repo import LibraryFileRepository
 from movieclaw_enrich import enrich
+from movieclaw_enrich.structure import title_candidates
 from movieclaw_media.models import MediaKind
 from movieclaw_scheduler.registry import register_task
 
@@ -1913,6 +1914,14 @@ def guess_evidence(
         title = (attrs.titles_zh[0] if attrs.titles_zh else None) or (
             attrs.titles_en[0] if attrs.titles_en else None
         )
+        # 短中文片名（实测《两生花》）在 NER 换代后可能整段漏抽。仅当这个
+        # 干净分段也确实出现在文件自身名称里时，才把结构候选当查询词；这样
+        # 「大陆/欧美」等纯分组目录不会凭空变成作品名。最终仍须通过 TMDB
+        # 标题门槛与年份/时长证据验证，不会降低自动挂载标准。
+        if title is None:
+            fallback_titles = title_candidates(text, [])
+            if fallback_titles and normalize_title(fallback_titles[0]) in normalize_title(own):
+                title = fallback_titles[0]
         # "Title (Year)"惯例（Emby/TMM 整理过的目录名）：先剥掉 [tmdbid=N]
         # 这类方括号标记组再匹配，允许年份后还挂着画质等尾巴。500 库实测：
         # 惯例名是**高置信来源**——NER 面向脏乱种子名训练，对整理过的干净

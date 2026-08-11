@@ -144,6 +144,23 @@ def enrich(title: str, subtitle: str = "", category: str | None = None) -> Torre
             )
             fields["subtitle_languages"] = []
             fields["subtitle_carriers"] = []
+
+        # v2 把字幕语言扩展为完整集合，但简体中文这一维已有一套经过线上病例
+        # 打磨的高精度规则。模型在极短拉丁标签（CHS / ZHS / zh-Hans）上会
+        # 偶发漏圈，也可能把「简体中文配音」误圈到字幕轴。发布切换期用旧规则
+        # 对 zh-Hans 做双向校准：其它语言仍完全采用模型结果，不会退回 v13 的
+        # 单一语言能力；待下一轮模型吃回这些错例后再审计是否移除。
+        legacy_simplified = extract_subtitle_languages(merged_text).get(
+            "subtitle_languages", []
+        )
+        languages = list(fields.get("subtitle_languages", []))
+        legacy_has_simplified = "zh-Hans" in legacy_simplified
+        model_has_simplified = "zh-Hans" in languages
+        if legacy_has_simplified and not model_has_simplified:
+            languages.append("zh-Hans")
+        elif model_has_simplified and not legacy_has_simplified:
+            languages.remove("zh-Hans")
+        fields["subtitle_languages"] = languages
     else:
         # 旧模型（无 SUBTITLE/AUDIO 标签）回落正则通道：行为与 v13 一致，仅 zh-Hans。
         # 字幕的明确否定需要跨主标题/副标题生效（标题带 CHS、描述写「无字幕」），

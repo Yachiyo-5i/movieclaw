@@ -1982,8 +1982,8 @@ async def test_unidentified_code_classifies_failures(db, tmp_path, monkeypatch) 
     test_ambiguous_scan_records_candidates_and_groups）。
     """
     root = tmp_path / "media" / "tv"
-    (root / "zzqx 乱码目录").mkdir(parents=True)
-    (root / "zzqx 乱码目录" / "zzqx.mkv").write_bytes(b"x")  # 解析不出片名
+    (root / "---").mkdir(parents=True)
+    (root / "---" / "---.mkv").write_bytes(b"x")  # 纯分隔符，确定解析不出片名
     (root / "查无此剧 (2019)").mkdir(parents=True)
     (root / "查无此剧 (2019)" / "查无此剧.S01E01.mkv").write_bytes(b"y")  # 搜不到
     async with db.session() as session:
@@ -1997,10 +1997,10 @@ async def test_unidentified_code_classifies_failures(db, tmp_path, monkeypatch) 
             Path(r.file_path).name: r
             for r in (await session.execute(select(LibraryFile))).scalars().all()
         }
-    assert by_name["zzqx.mkv"].unidentified_code == "unparsable"
+    assert by_name["---.mkv"].unidentified_code == "unparsable"
     assert by_name["查无此剧.S01E01.mkv"].unidentified_code == "no_match"
     # 原因整句不再以「请…」收尾——该做什么由清单上的按钮表达
-    assert not (by_name["zzqx.mkv"].unidentified_reason or "").endswith("请人工认领")
+    assert not (by_name["---.mkv"].unidentified_reason or "").endswith("请人工认领")
 
     # TMDB 不可达：与「确实找不到」必须分开，前者重扫可自愈
     async def boom(*args, **kwargs):

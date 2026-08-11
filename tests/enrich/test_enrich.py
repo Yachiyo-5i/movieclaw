@@ -211,7 +211,8 @@ class TestChinesePT:
             "Obsession.2025.2160p.UHD.BluRay.x265-UBits",
             f"痴迷 美版压制 {marker}",
         )
-        assert a.subtitle_languages == ["zh-Hans"]
+        # v15 起返回完整语言集合；这里的契约只要求明确包含简体中文字幕。
+        assert "zh-Hans" in a.subtitle_languages
 
     @pytest.mark.parametrize(
         "marker",
@@ -245,7 +246,9 @@ class TestChinesePT:
     )
     def test_ambiguous_or_traditional_subtitle_markers_are_not_simplified(self, marker):
         a = enrich("Obsession.2025.1080p.WEB-DL.x265-GROUP", f"痴迷 {marker}")
-        assert a.subtitle_languages == []
+        # 繁中、泛称中字、英文字幕在 v15 都会如实输出，不能再断言整个集合为空；
+        # 这组病例真正守护的是「不得误判成简体中文字幕」。
+        assert "zh-Hans" not in a.subtitle_languages
 
     def test_no_subtitle_in_description_overrides_title_marker(self):
         a = enrich("Obsession.2025.1080p.WEB-DL.CHS.x265-GROUP", "痴迷 无字幕")
