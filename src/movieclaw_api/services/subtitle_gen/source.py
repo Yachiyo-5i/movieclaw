@@ -1,0 +1,173 @@
+"""参考字幕选源：规则打分，不用 AI（subtitle-ai-translate.md §2）。
+
+决定参考质量的因素全部是结构化事实——排除项（forced/目标语言/图形轨）、
+语言优先级（原语言 > 英语 > 其他）、完整度（加载后评估）、形态平分决胜
+（内封优先，v2.1 评审修正：内封多为发行方官方字幕）。打分明细随任务
+日志输出，用户要能看懂"为什么选了这条"。
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+from movieclaw_api.services.library.subtitles import LANGUAGE_TOKENS
+from movieclaw_db.models import LibraryFile
+
+# 内封文本字幕 codec（可抽取为 srt 做翻译源）；图形轨（PGS/VobSub）排除
+_TEXT_CODECS = {"srt", "subrip", "ass", "ssa", "vtt", "webvtt", "mov_text", "text"}
+
+
+def normalize_language(raw: str | None) -> str | None:
+    """任意语言写法 → ISO 639-2/B 三字码（复用 A 层 token 表）；认不出原样返回。"""
+    if not raw:
+        return None
+    return LANGUAGE_TOKENS.get(raw.lower(), raw.lower())
+
+
+@dataclass(frozen=True)
+class SourceCandidate:
+    """一个可做翻译参考的字幕轨（内封或外挂）。"""
+
+    kind: str  # "embedded" | "external"
+    key: str  # embedded: 字幕轨数组下标的字符串；external: 台账文件名
+    language: str | None  # ISO 639-2/B
+    forced: bool
+    sdh: bool
+    format: str | None  # 外挂扩展名 / 内封 codec（小写）
+
+
+@dataclass
+class RankedCandidate:
+    candidate: SourceCandidate
+    excluded: str | None = None  # 非空 = 被排除的中文原因
+    reasons: list[str] = field(default_factory=list)  # 打分明细（任务日志）
+    rank_key: tuple = ()  # 越大越优
+
+
+def _language_rank(lang: str | None, original: str | None) -> int:
+    """原语言=2（第一手台词），英语=1（通用中间语言），其余=0。"""
+    if lang is None:
+        return 0
+    if original is not None and lang == original:
+        return 2
+    return 1 if lang == "eng" else 0
+
+
+def rank_candidates(
+    file: LibraryFile,
+    *,
+    original_language: str | None,
+    target_language: str,
+) -> list[RankedCandidate]:
+    """元数据级排序（完整度/同步度在加载后另行评估，tasks 按序逐个尝试）。
+
+    排序键（越大越优）：语言优先级 → 非 sdh（听障标记要清理，同分让路）
+    → 内封优先（v2.1：多为发行方官方字幕，方差小；形态只做平分决胜）。
+    """
+    original = normalize_language(original_language)
+    target = normalize_language(target_language)
+    ranked: list[RankedCandidate] = []
+
+    for k, raw in enumerate(file.subtitle_streams or []):
+        codec = str(raw.get("codec") or "").lower()
+        cand = SourceCandidate(
+            kind="embedded",
+            key=str(k),
+            language=normalize_language(raw.get("language")),
+            forced=bool(raw.get("forced")),
+            sdh=False,
+            format=codec,
+        )
+        ranked.append(_rank_one(cand, original, target, is_text=codec in _TEXT_CODECS))
+
+    for entry in file.external_subtitles or []:
+        filename = entry.get("filename")
+        if not filename:
+            continue
+        cand = SourceCandidate(
+            kind="external",
+            key=str(filename),
+            language=normalize_language(entry.get("language")),
+            forced=bool(entry.get("forced")),
+            sdh=bool(entry.get("sdh")),
+            format=str(entry.get("format") or "").lower(),
+        )
+        # 外挂台账只收文本格式（SUBTITLE_EXTS 保证），恒可用
+        ranked.append(_rank_one(cand, original, target, is_text=True))
+
+    # 稳定排序：rank_key 降序，同分保持进入顺序（内封在前=决胜时内封优先）
+    order = {c.candidate.key + c.candidate.kind: i for i, c in enumerate(ranked)}
+    ranked.sort(
+        key=lambda c: (
+            [-x for x in c.rank_key],
+            order[c.candidate.key + c.candidate.kind],
+        )
+    )
+    return ranked
+
+
+def _rank_one(
+    cand: SourceCandidate, original: str | None, target: str | None, *, is_text: bool
+) -> RankedCandidate:
+    r = RankedCandidate(candidate=cand)
+    if not is_text:
+        r.excluded = f"图形字幕轨（{cand.format}）无法做翻译源（OCR 不做）"
+        return r
+    if cand.forced:
+        r.excluded = "forced 轨是外语片段部分字幕，对白严重缺失，不能当翻译源"
+        return r
+    if target is not None and cand.language == target:
+        r.excluded = "已是目标语言，无需翻译"
+        return r
+
+    lang_rank = _language_rank(cand.language, original)
+    lang_label = cand.language or "未知语言"
+    if lang_rank == 2:
+        r.reasons.append(f"语言 {lang_label} = 影片原语言（第一手台词，最优）")
+    elif lang_rank == 1:
+        r.reasons.append(f"语言 {lang_label} = 英语（通用中间语言，次优）")
+    else:
+        r.reasons.append(f"语言 {lang_label}（非原语言/英语，二次转译误差叠加）")
+    if cand.sdh:
+        r.reasons.append("听障字幕（翻译前清理音效标记，同分让路）")
+    embedded = cand.kind == "embedded"
+    if embedded:
+        r.reasons.append("内封轨（多为发行方官方字幕，平分决胜优先）")
+    r.rank_key = (lang_rank, 0 if cand.sdh else 1, 1 if embedded else 0)
+    return r
+
+
+@dataclass(frozen=True)
+class Assessment:
+    """候选加载后的完整度评估（§2.3：条数 + 覆盖时长比）。"""
+
+    event_count: int
+    coverage: float  # 首末事件跨度 / 影片时长；无时长数据 = 1.0（不惩罚）
+    ok: bool
+    reason: str
+
+
+# 完整度阈值：条数低于此值多半是残缺轨/纯标题轨；覆盖率低于此值疑似片段
+_MIN_EVENTS = 50
+_MIN_COVERAGE = 0.5
+
+
+def assess_events(
+    events: list[tuple[int, int, str]], runtime_seconds: int | None
+) -> Assessment:
+    """events 为 (start_ms, end_ms, text) 序列（加载层产物）。"""
+    count = len(events)
+    if count == 0:
+        return Assessment(0, 0.0, False, "解析后没有任何对白事件")
+    if runtime_seconds and runtime_seconds > 0:
+        span_ms = max(e[1] for e in events) - min(e[0] for e in events)
+        coverage = min(1.0, span_ms / (runtime_seconds * 1000))
+    else:
+        coverage = 1.0
+    if count < _MIN_EVENTS:
+        return Assessment(count, coverage, False, f"对白仅 {count} 条，疑似残缺轨")
+    if coverage < _MIN_COVERAGE:
+        return Assessment(
+            count, coverage, False, f"时间覆盖率仅 {coverage:.0%}，疑似片段字幕"
+        )
+    return Assessment(count, coverage, True, f"{count} 条对白，覆盖率 {coverage:.0%}")

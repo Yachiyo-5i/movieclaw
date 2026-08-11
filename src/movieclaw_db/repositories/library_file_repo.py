@@ -221,6 +221,7 @@ class LibraryFileRepository:
         existing.bit_rate = row.bit_rate
         existing.audio_streams = row.audio_streams
         existing.subtitle_streams = row.subtitle_streams
+        existing.external_subtitles = row.external_subtitles
         existing.media_source = row.media_source
         existing.release_group = row.release_group
         existing.source = row.source

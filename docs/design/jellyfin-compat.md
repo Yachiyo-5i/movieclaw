@@ -922,4 +922,6 @@ id），调同一套领域服务——**不**让自家前端去消费 Jellyfin �
 
 1. **外挂字幕台账**：library_file 目前只有内封 `subtitle_streams`；同目录
    `.srt/.ass` 的发现、命名解析（语言后缀）、台账落位是独立小设计（§6.5
-   字幕接口随台账一起实施），补一节到 library.md 或单开短文档。
+   字幕接口随台账一起实施），已单开文档：
+   [jellyfin-subtitle.md](jellyfin-subtitle.md)（接口范围经真 Jellyfin
+   源码逐条比对定稿，含技术选型与分期）。

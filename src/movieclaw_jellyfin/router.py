@@ -76,6 +76,11 @@ _KNOWN_QUERY_KEYS = [
     "static",
     "container",
     "mediaSourceId",
+    # 字幕接口的 route 段同名覆盖参数（jellyfin-subtitle.md §4.4；
+    # mediaSourceId/format 已在列）——漏登记 PascalCase 客户端就取不到
+    "itemId",
+    "index",
+    "startPositionTicks",
     "ApiKey",
     "api_key",
     "playSessionId",

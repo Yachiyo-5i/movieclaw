@@ -144,3 +144,47 @@ async def set_favorite(
     row.is_favorite = favorite
     row.updated_at = utcnow()
     return row
+
+
+def apply_track_selection(
+    row: PlaybackState,
+    *,
+    audio_track: str | None = None,
+    subtitle_track: str | None = None,
+) -> None:
+    """在已取得的状态行上记忆轨选择（docs/design/jellyfin-subtitle.md §3.3）。
+
+    与 record_playback_start/progress 同一会话内使用（它们已经
+    get-or-create 了该单元的行，这里绝不能再建第二行——会撞唯一键）。
+    参数值是中性轨引用（movieclaw_playback.subtitles 的
+    embedded:<k> / external:<文件名> / 字幕特有 "off"）。None = 本次上报
+    没带该轨，**保持原值不动**——播放器的心跳可能只报进度不报轨。
+    """
+    changed = False
+    if audio_track is not None and row.audio_track != audio_track:
+        row.audio_track = audio_track
+        changed = True
+    if subtitle_track is not None and row.subtitle_track != subtitle_track:
+        row.subtitle_track = subtitle_track
+        changed = True
+    if changed:
+        row.updated_at = utcnow()
+
+
+async def get_remembered_tracks(
+    session: AsyncSession, unit: Unit, *, member_id: int
+) -> tuple[str | None, str | None]:
+    """读取记忆的 (音轨, 字幕轨) 中性引用；无记录返回 (None, None)。"""
+    row = (
+        await session.execute(
+            select(PlaybackState).where(
+                PlaybackState.member_id == member_id,
+                PlaybackState.media_item_id == unit[0],
+                PlaybackState.season_number == unit[1],
+                PlaybackState.episode_number == unit[2],
+            )
+        )
+    ).scalar_one_or_none()
+    if row is None:
+        return None, None
+    return row.audio_track, row.subtitle_track

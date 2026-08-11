@@ -45,6 +45,7 @@ import {
   refreshItemMetadata,
   transferLibraryItem,
 } from "@/lib/api/libraries";
+import { SubtitleGenPanel } from "@/components/subtitle-gen-panel";
 import { useBackdrop } from "@/lib/backdrop";
 import { getDiscoveryReturnPath } from "@/lib/discovery-return-path";
 import { formatBytes } from "@/lib/format";
@@ -363,7 +364,7 @@ export function LibraryItemDetailView({
 
       <div className="mt-9 space-y-8 px-12 max-md:mt-6 max-md:space-y-6 max-md:px-4">
         {/* —— 片源规格：电影多版本合并切换（剧集走下方分集区逐集展示）—— */}
-        {isMovie && detail.files.length > 0 && <MovieVersionSpecs files={detail.files} />}
+        {isMovie && detail.files.length > 0 && <MovieVersionSpecs files={detail.files} onChanged={reload} />}
 
         {/* —— 剧情简介（本地 NFO 优先，TMDB 兜底）—— */}
         {meta?.plot && (
@@ -390,6 +391,7 @@ export function LibraryItemDetailView({
             libraryId={libraryId}
             detail={detail}
             onDeleteFile={canManageLibraries ? setDeleteFileTarget : undefined}
+            onChanged={reload}
           />
         )}
 
@@ -419,6 +421,7 @@ export function LibraryItemDetailView({
               isMovie={isMovie}
               title={isMovie ? "文件" : "其他文件"}
               onDeleteFile={canManageLibraries ? setDeleteFileTarget : undefined}
+              onChanged={reload}
             />
           );
         })()}
@@ -735,7 +738,13 @@ function QualityBadges({ files }: { files: LibraryItemFile[] }) {
  * 电影片源规格：多版本（1080p 与 2160p 并存）合并成切换器，选中版本
  * 展开视频 / 音轨 / 字幕三组真实规格（探测自文件本体，不来自种子名）。
  */
-function MovieVersionSpecs({ files }: { files: LibraryItemFile[] }) {
+function MovieVersionSpecs({
+  files,
+  onChanged,
+}: {
+  files: LibraryItemFile[];
+  onChanged?: () => void;
+}) {
   // 在位版本优先、分辨率高在前
   const versions = useMemo(
     () =>
@@ -783,6 +792,7 @@ function MovieVersionSpecs({ files }: { files: LibraryItemFile[] }) {
       </div>
       <div className="rounded-2xl border border-white/[0.07] bg-[rgba(14,16,22,0.45)] p-6 backdrop-blur-xl">
         <SpecRows file={active} />
+        <SubtitleGenPanel file={active} onChanged={onChanged} />
       </div>
     </section>
   );
@@ -899,10 +909,12 @@ function SeasonEpisodesSection({
   libraryId,
   detail,
   onDeleteFile,
+  onChanged,
 }: {
   libraryId: number;
   detail: LibraryItemDetail;
   onDeleteFile?: (file: LibraryItemFile) => void;
+  onChanged?: () => void;
 }) {
   const seasons = detail.seasons;
   // 季选择器列的是「元数据的季 ∪ 库里实有的季」，本地没有的季也在里面（看得到
@@ -1078,6 +1090,7 @@ function SeasonEpisodesSection({
                       </div>
                       <div className="mt-3.5">
                         <SpecRows file={file} />
+                        <SubtitleGenPanel file={file} onChanged={onChanged} />
                       </div>
                     </div>
                   ))}
@@ -1158,11 +1171,13 @@ function FileSection({
   isMovie,
   title,
   onDeleteFile,
+  onChanged,
 }: {
   files: LibraryItemFile[];
   isMovie: boolean;
   title: string;
   onDeleteFile?: (file: LibraryItemFile) => void;
+  onChanged?: () => void;
 }) {
   // 剧集按季分组；电影全部落在 0 组
   const groups = useMemo(() => {
@@ -1195,6 +1210,7 @@ function FileSection({
                 file={file}
                 isMovie={isMovie}
                 onDelete={onDeleteFile ? () => onDeleteFile(file) : undefined}
+                onChanged={onChanged}
               />
             ))}
           </div>
@@ -1211,10 +1227,12 @@ function FileRow({
   file,
   isMovie,
   onDelete,
+  onChanged,
 }: {
   file: LibraryItemFile;
   isMovie: boolean;
   onDelete?: () => void;
+  onChanged?: () => void;
 }) {
   // 剧集行可展开看逐集完整规格（电影已有片源规格区，这里保持单行紧凑）
   const [expanded, setExpanded] = useState(false);
@@ -1288,6 +1306,7 @@ function FileRow({
       {expanded && !isMovie && (
         <div className="border-t border-white/[0.04] bg-white/[0.02] px-5 py-4">
           <SpecRows file={file} />
+          <SubtitleGenPanel file={file} onChanged={onChanged} />
         </div>
       )}
     </div>
