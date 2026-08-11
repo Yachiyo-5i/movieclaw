@@ -7,8 +7,8 @@
 仅新增独立表，不影响既有下载任务与监听台账，向前兼容。
 
 Revision ID: e2b4c6d8f901
-Revises: d1e4b8f30527
-Create Date: 2026-08-10 14:00:00.000000
+Revises: d0e6f2b84a17
+Create Date: 2026-08-11 09:00:00.000000
 
 """
 
@@ -22,7 +22,7 @@ from alembic import op
 
 # revision identifiers, used by Alembic.
 revision: str = "e2b4c6d8f901"
-down_revision: str | None = "d1e4b8f30527"
+down_revision: str | None = "d0e6f2b84a17"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
