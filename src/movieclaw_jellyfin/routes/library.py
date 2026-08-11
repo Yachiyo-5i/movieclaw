@@ -169,17 +169,24 @@ async def user_views(
 
 
 @router.get("/UserViews/GroupingOptions")
+@router.get("/Users/{user_id}/GroupingOptions")
 async def user_views_grouping_options(
+    user_id: str | None = None,
     scope: ViewerScope = Depends(viewer_scope),
 ) -> JSONResponse:
     """可分组视图清单（issue #124，Infuse 添加媒体库时请求）。
 
-    对齐 SpecialViewOptionDto：电影/剧集库天然可分组，直接映射可见库。
+    对齐 UserViewsController.GetGroupingOptions：movies/tvshows 库天然可
+    分组（IsEligibleForGrouping），映射可见库、按名称排序；legacy 路由
+    /Users/{userId}/GroupingOptions 一并注册。
     """
     async with get_database().session() as session:
         libraries = await list_libraries(session, visible_ids=scope.visible)
     return JSONResponse(
-        [{"Name": lib.name, "Id": library_guid(lib.id)} for lib in libraries]
+        [
+            {"Name": lib.name, "Id": library_guid(lib.id)}
+            for lib in sorted(libraries, key=lambda lib: lib.name)
+        ]
     )
 
 

@@ -183,19 +183,24 @@ def test_infuse_library_probe_endpoints(client: TestClient, seeded: dict) -> Non
     assert by_name["电影"]["RefreshStatus"] == "Idle"
 
     grouping = client.get("/UserViews/GroupingOptions", params=auth).json()
-    assert {g["Name"] for g in grouping} == {"电影", "剧集"}
+    assert [g["Name"] for g in grouping] == ["剧集", "电影"]  # 按名称排序
     assert all(g["Id"] for g in grouping)
+    # legacy 路由（UserViewsController.GetGroupingOptionsLegacy）
+    legacy = client.get("/Users/any-user/GroupingOptions", params=auth).json()
+    assert legacy == grouping
 
     # 大小写归一化覆盖新命名空间；PascalCase 的 Client 参数也要能取到
     prefs = client.get(
         "/displaypreferences/usersettings",
         params={"userId": "ignored", "Client": "emby", **auth},
     ).json()
-    assert prefs["Id"] == "usersettings"
+    # Id 是真 Jellyfin 的派生规则金样：GetMD5('usersettings') 按 .NET Guid 字节序
+    assert prefs["Id"] == "3ce5b65d-e116-d731-65d1-efc4a30ec35c"
     assert prefs["SortBy"] == "SortName"
     assert prefs["SortOrder"] == "Ascending"
     assert prefs["Client"] == "emby"
-    assert prefs["CustomPrefs"] == {}
+    assert prefs["CustomPrefs"]["chromecastVersion"] == "stable"
+    assert prefs["CustomPrefs"]["skipForwardLength"] == "30000"
     assert prefs["ShowBackdrop"] is True
     assert isinstance(prefs["PrimaryImageHeight"], int)
 
