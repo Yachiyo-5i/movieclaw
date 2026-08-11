@@ -29,6 +29,7 @@ from movieclaw_api.api.routes.libraries import (
 )
 from movieclaw_api.core.config import get_settings
 from movieclaw_api.exceptions import NotFoundException
+from movieclaw_api.services.auth import Principal
 from movieclaw_api.services.library.nfo import read_entry_metadata, read_tmdb_id
 from movieclaw_api.services.library.resolve import ResolveOutcome
 from movieclaw_api.services.library.scan import scan_library
@@ -38,6 +39,8 @@ from movieclaw_db.migrations import run_migrations
 from movieclaw_db.models import LibraryFile, MediaItem
 from movieclaw_db.models.library_file import IdentitySource
 from movieclaw_db.repositories.library_repo import LibraryRepository
+
+_ADMIN = Principal(kind="admin", name="tester")
 
 _KEY = "0123456789abcdef0123456789abcdef"
 
@@ -393,7 +396,7 @@ async def test_item_detail_assembles_local_scrape(db, tmp_path, monkeypatch) -> 
             .scalars()
             .one()
         )
-        resp = await get_library_item(library.id, item.id, session)
+        resp = await get_library_item(library.id, item.id, _ADMIN, session)
         view = resp.data
 
     assert view.title == "某电影" and view.kind == "movie" and view.tmdb_id == 300
@@ -427,7 +430,7 @@ async def test_item_detail_assembles_local_scrape(db, tmp_path, monkeypatch) -> 
         row = (await session.execute(select(LibraryFile))).scalars().one()
         assert row.audio_streams and row.audio_streams[0]["codec"] == "eac3"
         assert row.subtitle_streams and row.subtitle_streams[0]["codec"] == "subrip"
-        resp2 = await get_library_item(library.id, item.id, session)
+        resp2 = await get_library_item(library.id, item.id, _ADMIN, session)
         file2 = resp2.data.files[0]
         assert file2.audio_streams is not None and file2.audio_streams[0].codec == "eac3"
         assert file2.audio_streams[0].channels == 6
@@ -485,7 +488,7 @@ async def test_strm_rows_never_count_as_probe_pending(db, tmp_path) -> None:
         assert [v.probe_pending_count for v in wall] == [0]
         item_id = (await session.execute(select(MediaItem))).scalars().one().id
         # 详情页可正常打开（不再有任何补探副作用）
-        await get_library_item(library.id, item_id, session)
+        await get_library_item(library.id, item_id, _ADMIN, session)
 
 
 async def test_item_detail_selfsufficient_after_scan(db, tmp_path) -> None:
@@ -512,7 +515,7 @@ async def test_item_detail_selfsufficient_after_scan(db, tmp_path) -> None:
             .scalars()
             .one()
         )
-        resp = await get_library_item(library.id, item.id, session)
+        resp = await get_library_item(library.id, item.id, _ADMIN, session)
         view = resp.data
 
     # NFO 身份高置信（identity_source=nfo）→ 最小 NFO 被升级为完整版并回读
@@ -536,7 +539,7 @@ async def test_item_detail_selfsufficient_after_scan(db, tmp_path) -> None:
             .scalars()
             .one()
         )
-        resp = await get_library_item(library.id, item.id, session)
+        resp = await get_library_item(library.id, item.id, _ADMIN, session)
         view = resp.data
 
     assert view.local_meta is not None and view.local_meta.source == "db"
@@ -579,7 +582,7 @@ async def test_item_detail_fills_missing_actor_thumbs_from_archive(db, tmp_path)
             .scalars()
             .one()
         )
-        resp = await get_library_item(library.id, item.id, session)
+        resp = await get_library_item(library.id, item.id, _ADMIN, session)
         view = resp.data
 
     assert view.local_meta is not None and view.local_meta.source == "nfo"
@@ -622,7 +625,7 @@ async def test_item_detail_fills_person_ids_even_when_thumbs_complete(db, tmp_pa
             .scalars()
             .one()
         )
-        resp = await get_library_item(library.id, item.id, session)
+        resp = await get_library_item(library.id, item.id, _ADMIN, session)
         view = resp.data
 
     assert view.local_meta is not None and view.local_meta.source == "nfo"
@@ -778,7 +781,7 @@ async def test_item_detail_reports_scraping_state(db, tmp_path) -> None:
             .scalars()
             .one()
         ).id
-        resp = await get_library_item(library.id, item_id, session)
+        resp = await get_library_item(library.id, item_id, _ADMIN, session)
         assert resp.data.scraping is False
         assert resp.data.scraping_phase is None
 
@@ -786,7 +789,7 @@ async def test_item_detail_reports_scraping_state(db, tmp_path) -> None:
         # 阶段文案与整库刷新同一套，两处状态语言因此一致
         media_scrape._scraping[item_id] = "下载图片"
         try:
-            resp = await get_library_item(library.id, item_id, session)
+            resp = await get_library_item(library.id, item_id, _ADMIN, session)
             assert resp.data.scraping is True
             assert resp.data.scraping_phase == "下载图片"
         finally:
@@ -887,7 +890,7 @@ async def test_delete_item_removes_whole_entry_dir(db, tmp_path) -> None:
         assert (await session.execute(select(LibraryFile))).scalars().all() == []
         resp404 = None
         try:
-            await get_library_item(library.id, item.id, session)
+            await get_library_item(library.id, item.id, _ADMIN, session)
         except NotFoundException as exc:
             resp404 = exc
         assert resp404 is not None
@@ -986,7 +989,7 @@ async def test_delete_single_file_keeps_other_version(db, tmp_path) -> None:
     assert other.exists() and entry.exists()  # 另一版本与条目目录不动
     assert (entry / "movie.nfo").exists() and (entry / "poster.jpg").exists()
     async with db.session() as session:
-        detail = (await get_library_item(library.id, item.id, session)).data
+        detail = (await get_library_item(library.id, item.id, _ADMIN, session)).data
         assert detail.file_count == 1
         assert detail.files[0].file_path == str(other)
 
@@ -1167,7 +1170,7 @@ async def test_tv_episodes_merge_local_and_tmdb(db, tmp_path) -> None:
             .scalars()
             .one()
         )
-        detail = (await get_library_item(library.id, item.id, session)).data
+        detail = (await get_library_item(library.id, item.id, _ADMIN, session)).data
         assert detail.seasons == [1]
 
         resp = await list_item_episodes(library.id, item.id, 1, session)
@@ -1183,7 +1186,7 @@ async def test_tv_episodes_merge_local_and_tmdb(db, tmp_path) -> None:
 
     # 本地缩略图接口按台账行回吐文件
     async with db.session() as session:
-        thumb_resp = await get_file_thumb(ep1.file_ids[0], session)
+        thumb_resp = await get_file_thumb(ep1.file_ids[0], _ADMIN, session)
         assert str(thumb_resp.path).endswith("-thumb.jpg")
 
 
@@ -1465,7 +1468,7 @@ async def test_actor_thumb_missing_only_when_tmdb_has_no_profile(db, tmp_path) -
                 .scalars()
                 .one()
             )
-            resp = await get_library_item(library.id, item.id, session)
+            resp = await get_library_item(library.id, item.id, _ADMIN, session)
         return resp.data.local_meta
 
     # 1) NFO 路径（我们自己写出的完整 NFO：有图的写 <thumb>，没图的不写）
