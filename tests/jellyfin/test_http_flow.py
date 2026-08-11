@@ -181,6 +181,10 @@ def test_infuse_library_probe_endpoints(client: TestClient, seeded: dict) -> Non
     assert by_name["电影"]["ItemId"] == library_guid(seeded["movie_lib"])
     assert by_name["电影"]["Locations"]  # 主账号设备下发库根路径
     assert by_name["电影"]["RefreshStatus"] == "Idle"
+    assert "RefreshProgress" not in by_name["电影"]  # 仅 Active 时输出
+    options = by_name["电影"]["LibraryOptions"]
+    assert [p["Path"] for p in options["PathInfos"]] == by_name["电影"]["Locations"]
+    assert options["Enabled"] is True
 
     grouping = client.get("/UserViews/GroupingOptions", params=auth).json()
     assert [g["Name"] for g in grouping] == ["剧集", "电影"]  # 按名称排序

@@ -190,31 +190,81 @@ async def user_views_grouping_options(
     )
 
 
+def _refresh_status(library_id: int) -> tuple[str, float | None]:
+    """把本库的扫描/元数据刷新任务线映射到 Jellyfin 的三态语义（LibraryManager.cs）。
+
+    真实现：有进度值 → Active，在队列里 → Queued，其余 → Idle；RefreshProgress
+    是 0~100 的百分数，非 Active 时为 null（省略输出）。我们两条任务线
+    （scan 扫描 + media_scrape 整库元数据刷新）任一在跑即 Active——分母未知的
+    遍历阶段报 0.0（客户端画不确定态转圈）；元数据刷新"已启动但状态尚未就绪"
+    的间隙映射为 Queued。
+    """
+    from movieclaw_api.services import media_scrape
+    from movieclaw_api.services.library.scan import scan_progress
+
+    for state in (
+        scan_progress(library_id),
+        media_scrape.library_refresh_state(library_id),
+    ):
+        if state is not None:
+            if state.total > 0:
+                return "Active", round(state.processed / state.total * 100, 1)
+            return "Active", 0.0
+    if media_scrape.is_library_refreshing(library_id):
+        return "Queued", None
+    return "Idle", None
+
+
 @router.get("/Library/VirtualFolders")
 async def library_virtual_folders(
     scope: ViewerScope = Depends(viewer_scope),
 ) -> JSONResponse:
     """媒体库 → VirtualFolderInfo 映射（issue #124，Infuse 添加媒体库时请求）。
 
-    真 Jellyfin 此接口仅管理员可用；这里放开给已认证设备（Infuse 普通链路
-    也会请求），但服务器文件系统路径只对主账号设备下发，成员设备置空。
+    真 Jellyfin 此接口仅管理员可用（RequiresElevation）；这里放开给已认证
+    设备（Infuse 普通链路也会请求），但成员设备只见白名单库、服务器文件
+    系统路径只对主账号设备下发。LibraryOptions 按真实现的实体默认值给一份
+    静态子集——客户端只读，我们不开放库管理写端点。
     """
     async with get_database().session() as session:
         libraries = await list_libraries(session, visible_ids=scope.visible)
-    return JSONResponse(
-        [
+    infos = []
+    for lib in libraries:
+        roots = [str(p) for p in (lib.root_paths or [])] if scope.member_id == 0 else []
+        status, progress = _refresh_status(lib.id)
+        infos.append(
             {
                 "Name": lib.name,
-                "Locations": (
-                    list(lib.root_paths or []) if scope.member_id == 0 else []
-                ),
+                "Locations": roots,
                 "CollectionType": "movies" if lib.kind == "movie" else "tvshows",
                 "ItemId": library_guid(lib.id),
-                "RefreshStatus": "Idle",
+                "RefreshStatus": status,
+                "LibraryOptions": {
+                    "Enabled": True,
+                    "EnablePhotos": False,
+                    "EnableRealtimeMonitor": True,
+                    "EnableChapterImageExtraction": False,
+                    "ExtractChapterImagesDuringLibraryScan": False,
+                    "EnableTrickplayImageExtraction": False,
+                    "ExtractTrickplayImagesDuringLibraryScan": False,
+                    "PathInfos": [{"Path": p} for p in roots],
+                    "SaveLocalMetadata": False,
+                    "EnableAutomaticSeriesGrouping": False,
+                    "EnableEmbeddedTitles": False,
+                    "EnableEmbeddedExtrasTitles": False,
+                    "EnableEmbeddedEpisodeInfos": False,
+                    "AutomaticRefreshIntervalDays": 0,
+                    "SeasonZeroDisplayName": "Specials",
+                    "DisabledLocalMetadataReaders": [],
+                    "DisabledSubtitleFetchers": [],
+                    "SubtitleFetcherOrder": [],
+                },
             }
-            for lib in libraries
-        ]
-    )
+        )
+        # 对齐真实现：RefreshProgress 仅 Active 时输出（可空 double 的 null 省略约定）
+        if progress is not None:
+            infos[-1]["RefreshProgress"] = progress
+    return JSONResponse(infos)
 
 
 # ---------------------------------------------------------------------------

@@ -36,24 +36,20 @@ async def plugins() -> JSONResponse:
 def _display_preferences_guid(raw: str) -> str:
     """DisplayPreferencesDto.Id：对齐真 Jellyfin 的派生规则（10.10 源码）。
 
-    DisplayPreferencesController 先 Guid.TryParse，失败则取
-    ``GetMD5``（UTF-16LE 编码取 MD5，再按 .NET Guid(byte[]) 的
-    小端字节序构造），输出为带连字符的 "D" 格式。
+    DisplayPreferencesController 先 Guid.TryParse，失败则取 ``GetMD5``：
+    字符串按 **UTF-16LE**（C# Encoding.Unicode）编码取 MD5，再经
+    .NET Guid(byte[]) 的小端重排——Python 里等价于 ``uuid.UUID(bytes_le=)``；
+    输出用 Guid 默认 "D" 格式（带连字符，与条目 Id 的 "N" 格式不同）。
     金样：'usersettings' → 3ce5b65d-e116-d731-65d1-efc4a30ec35c。
     """
     import hashlib
+    import uuid
 
-    from movieclaw_jellyfin.ids import normalize_guid
-
-    normalized = normalize_guid(raw)
-    if normalized is None:
-        digest = hashlib.md5(raw.encode("utf-16-le")).digest()
-        # .NET Guid(byte[])：前 4/2/2 字节按小端翻转，后 8 字节原样
-        normalized = (digest[3::-1] + digest[5:3:-1] + digest[7:5:-1] + digest[8:]).hex()
-    return (
-        f"{normalized[:8]}-{normalized[8:12]}-{normalized[12:16]}"
-        f"-{normalized[16:20]}-{normalized[20:]}"
-    )
+    try:
+        return str(uuid.UUID(raw))
+    except ValueError:
+        digest = hashlib.md5(raw.encode("utf-16-le")).digest()  # noqa: S324
+        return str(uuid.UUID(bytes_le=digest))
 
 
 @router.get(

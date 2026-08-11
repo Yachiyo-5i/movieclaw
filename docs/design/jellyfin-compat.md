@@ -915,15 +915,24 @@ id），调同一套领域服务——**不**让自家前端去消费 Jellyfin �
 v1.1 调研更长，还会请求 `/Plugins`、`/Library/VirtualFolders`、
 `/UserViews/GroupingOptions`、`/DisplayPreferences/{id}`（GET+POST）——
 这些接口经前端端口返回 Next.js 404 HTML 会让 Infuse 在"验证媒体库"一步
-失败。已补齐后端敷衍/映射实现与前端 `Plugins`/`Library`/`DisplayPreferences`
-命名空间转发（`Library` 只注册 PascalCase：控制台自身有 `/library` 页面）。
+失败。已补齐后端敷衍/映射实现与前端 `Plugins`/`DisplayPreferences` 命名空间
+转发。**Library 命名空间不能整段通配**：Next 的 rewrite source 匹配大小写
+不敏感、且 afterFiles rewrites 先于动态路由求值，`/Library/:path*` 会劫持
+控制台自己的 `/library/[id]` 页面——只按字面注册 VirtualFolders/
+MediaFolders/PhysicalPaths/Refresh 四个 API 子路径。
 实现已对照 v10.10.7 源码逐条复核：DisplayPreferencesDto 的 Id 按
-`GetMD5`（UTF-16LE + .NET Guid 小端字节序）派生（金样 `usersettings` →
-`3ce5b65d-…`），CustomPrefs 对齐新建实体默认值；GroupingOptions 按名称
-排序并注册 legacy `/Users/{userId}/GroupingOptions`。有意放宽的偏离：
-真 Jellyfin 的 /Plugins 与 /Library/VirtualFolders 是仅管理员
-（RequiresElevation）接口，这里放开给已认证设备但成员只见白名单库、
-不下发文件系统路径；VirtualFolderInfo 省略 LibraryOptions。
+`GetMD5`（**UTF-16LE**，即 C# Encoding.Unicode + .NET Guid 小端字节序）
+派生（金样 `usersettings` → `3ce5b65d-…`），CustomPrefs 对齐新建实体
+默认值；GroupingOptions 按名称排序并注册 legacy
+`/Users/{userId}/GroupingOptions`；VirtualFolderInfo 带 LibraryOptions
+静态子集，RefreshStatus 接扫描/元数据刷新任务线（Active+百分比/Queued/
+Idle）。有意放宽的偏离：真 Jellyfin 的 /Plugins 与 /Library/VirtualFolders
+是仅管理员（RequiresElevation）接口，这里放开给已认证设备但成员只见
+白名单库、不下发文件系统路径。
+考古备注：2026-08-04 曾在 `jellyfin-compat` 分支按真实 Infuse 逐轮实测
+修过同一问题（a50127f，含上述 rewrite 劫持教训与任务线映射），但该分支
+尾部 5 个提交从未合并进 main，v0.8.0 因此不含此修复——本次已吸收其成果
+（并修正其 GetMD5 误用 UTF-8 的编码差异），另补齐了它没覆盖的 /Plugins。
 
 **已知差距**（有意留下的小缺口，不影响 Infuse 主链路）：
 - `GET /Search/Hints` 未实现（P2 兜底项，主流播放器搜索走 /Items?searchTerm）；
