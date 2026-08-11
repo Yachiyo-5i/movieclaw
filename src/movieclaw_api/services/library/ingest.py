@@ -122,6 +122,7 @@ from movieclaw_db.models import (
     IngestStatus,
     Library,
     LibraryFile,
+    ManualDownloadIntent,
     MediaItem,
     NoticeSeverity,
     utcnow,
@@ -625,8 +626,15 @@ async def _ingest_entry(
     # 与 dest_library 同理：conclude 读的是当下的 item——定出身份前失败/跳过的
     # 条目落账无作品归属，摘要行的作品去重自然不会把它算进任何一部
     item: MediaItem | None = None
+    # 手动下载的 hash 锚只服务于这次在途导入：一旦文件已成功整理，和台账
+    # 一起提交删除。这样同一 torrent 将来删除后重下、或用户调整规则后重投，
+    # 不会被已完成任务的旧库选择永久劫持；失败/PENDING 时则保留供重试认领。
+    manual_intent: ManualDownloadIntent | None = None
 
     async def conclude(status: IngestStatus, message: str, imported: int = 0) -> None:
+        if status is IngestStatus.IMPORTED and manual_intent is not None:
+            await session.delete(manual_intent)
+            logger.info("手动下载身份锚已随成功入库消费：hash=%s", manual_intent.info_hash)
         await _save_record(
             session,
             dest_library,
@@ -678,10 +686,15 @@ async def _ingest_entry(
             return
     if forced_item is not None:
         item, pinned_library_id = forced_item, None
-        claimed = False
+        identity_source: str | None = None
     else:
         item, pinned_library_id = await _wanted_identity(session, matched_hashes or [])
-        claimed = item is not None
+        identity_source = "subscription" if item is not None else None
+        if item is None:
+            item, pinned_library_id, manual_intent = await _manual_download_identity(
+                session, matched_hashes or []
+            )
+            identity_source = "manual" if item is not None else None
         if item is None:
             try:
                 item = await _identify(session, kind, watch_root, main, spec)
@@ -698,14 +711,17 @@ async def _ingest_entry(
         return
 
     # auto 规则：识别后决定目标库（docs/design/library-routing.md 2.3）。
-    # 订阅认领的内容沿用创建时定格的库——粘性 + 尊重用户在订阅上的手选，
-    # 不重新路由；识别链身份才走收藏范围路由（route 内含默认库兜底）
+    # 订阅/手动下载的已确认身份均沿用提交时定格的库——粘性 + 不让规则
+    # 后续变化改写已在下载任务的归属；名称识别的身份才重新走收藏范围路由。
     route_note: str | None = None
     if staging is None and dest_library is None:
-        if claimed and pinned_library_id is not None:
+        if identity_source is not None and pinned_library_id is not None:
             dest_library = await session.get(Library, pinned_library_id)
             if dest_library is not None:
-                route_note = f"入库到订阅指定的「{dest_library.name}」"
+                if identity_source == "subscription":
+                    route_note = f"入库到订阅指定的「{dest_library.name}」"
+                else:
+                    route_note = f"入库到手动下载时确认的「{dest_library.name}」"
         if dest_library is None:
             from movieclaw_api.services.library.routing import route_for_item
 
@@ -894,6 +910,33 @@ async def _wanted_identity(session, info_hashes: list[str]) -> tuple[MediaItem |
     item, library_id = row
     logger.info("条目按 info_hash 认领了订阅身份：《%s》", item.title)
     return item, library_id
+
+
+async def _manual_download_identity(
+    session, info_hashes: list[str]
+) -> tuple[MediaItem | None, int | None, ManualDownloadIntent | None]:
+    """按 info_hash 反查手动下载在提交时确认的身份与目标库。
+
+    监听目录常被多个库复用，文件名不足以重新识别时，这颗锚把「搜索结果
+    已确认的 TMDB 身份 → 收藏范围选库 → 实际投递目录」完整接到完成后的
+    整理流程。订阅工单优先级更高，调用方只会在它未命中时走这里。
+    """
+    if not info_hashes:
+        return None, None, None
+    result = await session.execute(
+        select(MediaItem, ManualDownloadIntent)
+        .join(
+            ManualDownloadIntent,
+            MediaItem.id == ManualDownloadIntent.media_item_id,  # type: ignore[arg-type]
+        )
+        .where(ManualDownloadIntent.info_hash.in_(info_hashes))  # type: ignore[union-attr]
+    )
+    row = result.first()
+    if row is None:
+        return None, None, None
+    item, intent = row
+    logger.info("条目按 info_hash 认领了手动下载身份：《%s》", item.title)
+    return item, intent.library_id, intent
 
 
 class IdentifyUnavailable(Exception):

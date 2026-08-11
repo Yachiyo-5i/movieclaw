@@ -307,6 +307,13 @@ def test_direct_download_member_restrictions(client: TestClient) -> None:
     )
     assert picked_downloader.status_code == 403
     assert "下载器" in picked_downloader.json()["message"]
+    # 智能入库按收藏范围路由，可能选中成员不可见的库并回显库名——同样拒绝
+    auto_routed = client.post(
+        "/api/v1/downloaders/submit",
+        json={**payload, "auto_route": True, "media_kind": "movie", "tmdb_id": 1, "title": "片"},
+    )
+    assert auto_routed.status_code == 403
+    assert "智能入库" in auto_routed.json()["message"]
 
 
 def test_ui_preferences_isolated_per_member(client: TestClient) -> None:

@@ -28,6 +28,7 @@ from movieclaw_db.models import (
     IngestStatus,
     Library,
     LibraryFile,
+    ManualDownloadIntent,
     MediaItem,
 )
 from movieclaw_db.repositories.library_repo import LibraryRepository
@@ -379,7 +380,70 @@ async def test_downloader_signal_is_authoritative(db, tmp_path, monkeypatch):
     library = await _get_library(db, library_id)
     await ingest_mod._sweep_dir(_fixed_rule(watch, library_id=library_id), library)
     assert (root / "某电影 (2020)" / "某电影 (2020).mkv").read_bytes() == b"video"
+
+
+@pytest.mark.asyncio
+async def test_manual_download_identity_claim_via_info_hash(db, tmp_path, monkeypatch):
+    """手动下载投到共享监听目录后，按提交时锚定的身份和库入库。"""
+    from movieclaw_downloader import TorrentBrief
+
+    default_root, target_root, watch = tmp_path / "default", tmp_path / "target", tmp_path / "watch"
+    watch.mkdir()
+    default_library_id = await _make_library(db, kind=MediaKind.MOVIE, root=default_root)
+    target_root.mkdir()
+    async with db.session() as session:
+        target = await LibraryRepository(session).create(
+            name="手动下载目标库",
+            kind=MediaKind.MOVIE.value,
+            root_paths=[str(target_root)],
+        )
+        assert target.id is not None
+        target_library_id = target.id
+    item = await _make_item(db, kind=MediaKind.MOVIE, title="手动确认影片", year=2024)
+    monkeypatch.setattr(ingest_mod, "probe_media", lambda p: _FAKE_SPEC)
+
+    # 名称识别链必然失败，只有手动提交时保存的 hash 身份锚能让导入成功。
+    async def identify_none(session, kind, watch_root, main, spec):
+        return None
+
+    monkeypatch.setattr(ingest_mod, "_identify", identify_none)
+    async with db.session() as session:
+        assert item.id is not None
+        session.add(
+            ManualDownloadIntent(
+                info_hash="manualhash",
+                media_item_id=item.id,
+                library_id=target_library_id,
+                site_id="mteam",
+            )
+        )
+        await session.commit()
+
+    brief = TorrentBrief(
+        name="Cryptic.Manual.Release",
+        content_name="Cryptic.Manual.Release",
+        completed=True,
+        info_hash="manualhash",
+    )
+
+    async def briefs():
+        return [brief]
+
+    monkeypatch.setattr(ingest_mod, "_downloader_briefs", briefs)
+    entry = watch / "Cryptic.Manual.Release"
+    entry.mkdir()
+    (entry / "video.mkv").write_bytes(b"video")
+
+    # auto 监听规则没有指定库；若没有手动身份锚，会走到 identify_none → pending。
+    rule = ImportWatch(source_path=str(watch), strategy="hardlink", library_id=None, kind="movie")
+    await ingest_mod._sweep_dir(rule, None)
+
+    assert (target_root / "手动确认影片 (2024)" / "手动确认影片 (2024).mkv").exists()
+    assert not (default_root / "手动确认影片 (2024)").exists()
+    assert default_library_id != target_library_id
     assert str(entry) not in ingest_mod._deferred
+    async with db.session() as session:
+        assert (await session.execute(select(ManualDownloadIntent))).scalar_one_or_none() is None
 
 
 @pytest.mark.asyncio

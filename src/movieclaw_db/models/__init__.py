@@ -21,6 +21,7 @@ from movieclaw_db.models.jellyfin_device import JellyfinDevice
 from movieclaw_db.models.library import Library
 from movieclaw_db.models.library_file import FileSource, LibraryFile
 from movieclaw_db.models.llm_provider import LlmProvider
+from movieclaw_db.models.manual_download_intent import ManualDownloadIntent
 from movieclaw_db.models.media_item import MediaItem, MediaSeason
 from movieclaw_db.models.media_metadata import MediaEpisode, MediaMetadata
 from movieclaw_db.models.member import Member, MemberLibraryAccess, MemberSiteAccess
@@ -79,6 +80,7 @@ __all__ = [
     "Library",
     "LibraryFile",
     "LlmProvider",
+    "ManualDownloadIntent",
     "MediaEpisode",
     "MediaItemPerson",
     "MediaItem",
