@@ -186,12 +186,19 @@ def test_infuse_library_probe_endpoints(client: TestClient, seeded: dict) -> Non
     assert [p["Path"] for p in options["PathInfos"]] == by_name["电影"]["Locations"]
     assert options["Enabled"] is True
 
+    # GroupingOptions 是裸数组（不套 QueryResult），元素仅 Name+Id，按名称排序
     grouping = client.get("/UserViews/GroupingOptions", params=auth).json()
-    assert [g["Name"] for g in grouping] == ["剧集", "电影"]  # 按名称排序
-    assert all(g["Id"] for g in grouping)
+    assert isinstance(grouping, list)
+    assert [g["Name"] for g in grouping] == ["剧集", "电影"]
+    assert {g["Name"]: g for g in grouping}["电影"]["Id"] == library_guid(
+        seeded["movie_lib"]
+    )
+    assert all(set(g) == {"Name", "Id"} for g in grouping)
     # legacy 路由（UserViewsController.GetGroupingOptionsLegacy）
-    legacy = client.get("/Users/any-user/GroupingOptions", params=auth).json()
+    legacy = client.get(f"/Users/{'0' * 32}/GroupingOptions", params=auth).json()
     assert legacy == grouping
+    # 大小写归一化可达（library 命名空间进归一化中间件）
+    assert client.get("/library/virtualfolders", params=auth).status_code == 200
 
     # 大小写归一化覆盖新命名空间；PascalCase 的 Client 参数也要能取到
     prefs = client.get(
@@ -208,11 +215,54 @@ def test_infuse_library_probe_endpoints(client: TestClient, seeded: dict) -> Non
     assert prefs["ShowBackdrop"] is True
     assert isinstance(prefs["PrimaryImageHeight"], int)
 
-    post = client.post("/DisplayPreferences/usersettings", params=auth, json={})
+    post = client.post(
+        "/DisplayPreferences/usersettings", params=auth, json={"SortBy": "SortName"}
+    )
     assert post.status_code == 204
 
     # /emby 前缀别名同样可达
     assert client.get("/emby/Plugins", params=auth).json() == []
+    assert (
+        client.get("/emby/DisplayPreferences/usersettings", params=auth).status_code
+        == 200
+    )
+
+
+def test_virtual_folders_refresh_status(
+    client: TestClient, seeded: dict, monkeypatch
+) -> None:
+    """扫描/元数据刷新任务线映射到 Active(+百分比)/Queued 三态（救回自 a50127f）。"""
+    from types import SimpleNamespace
+
+    from movieclaw_api.services import media_scrape
+    from movieclaw_api.services.library import scan as scan_module
+
+    token = jf_login(client)
+    auth = {"ApiKey": token}
+    movie_lib = seeded["movie_lib"]
+
+    def by_name(body: list) -> dict:
+        return {v["Name"]: v for v in body}
+
+    # 电影库在扫描（3/10）→ Active 30.0；剧集库无任务 → Idle
+    monkeypatch.setattr(
+        scan_module,
+        "scan_progress",
+        lambda lid: SimpleNamespace(processed=3, total=10) if lid == movie_lib else None,
+    )
+    body = by_name(client.get("/Library/VirtualFolders", params=auth).json())
+    assert body["电影"]["RefreshStatus"] == "Active"
+    assert body["电影"]["RefreshProgress"] == 30.0
+    assert body["剧集"]["RefreshStatus"] == "Idle"
+
+    # 元数据刷新已启动但状态未就绪 → Queued
+    monkeypatch.setattr(scan_module, "scan_progress", lambda lid: None)
+    monkeypatch.setattr(
+        media_scrape, "is_library_refreshing", lambda lid: lid == movie_lib
+    )
+    body = by_name(client.get("/Library/VirtualFolders", params=auth).json())
+    assert body["电影"]["RefreshStatus"] == "Queued"
+    assert "RefreshProgress" not in body["电影"]
 
 
 def test_case_insensitive_paths_and_emby_alias(client: TestClient) -> None:
