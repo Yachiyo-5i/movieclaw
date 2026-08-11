@@ -565,6 +565,50 @@ def test_auto_route_submits_to_watch_and_anchors_info_hash(client, monkeypatch) 
     assert intent.library_id == library["id"]
 
 
+def test_anchor_sweeps_stale_orphan_intents(client) -> None:
+    """锚定新下载时顺带清理超窗孤儿锚；窗口内的在途锚不受影响。
+
+    任务下载中途被用户从下载器删除时没有入库时刻消费锚，靠这次机会
+    兜底回收，表不会无限累积。
+    """
+    from datetime import timedelta
+
+    from movieclaw_api.services.torrent_submit import _INTENT_STALE_AFTER, anchor_manual_download
+    from movieclaw_db.models import utcnow
+
+    async def run() -> set[str]:
+        async with get_database().session() as session:
+            item = MediaItem(
+                kind="movie", tmdb_id=1, title="片", original_title="Pian", year=2020, aliases=[]
+            )
+            lib = Library(name="库", kind="movie", root_paths=["/media/movies"])
+            session.add_all([item, lib])
+            await session.commit()
+            await session.refresh(item)
+            await session.refresh(lib)
+            assert item.id is not None and lib.id is not None
+            stale = ManualDownloadIntent(
+                info_hash="b" * 40, media_item_id=item.id, library_id=lib.id
+            )
+            stale.created_at = utcnow() - _INTENT_STALE_AFTER - timedelta(days=1)
+            fresh = ManualDownloadIntent(
+                info_hash="c" * 40, media_item_id=item.id, library_id=lib.id
+            )
+            session.add_all([stale, fresh])
+            await session.commit()
+            await anchor_manual_download(
+                session,
+                info_hash="d" * 40,
+                media_item_id=item.id,
+                library_id=lib.id,
+                site_id="mteam",
+            )
+            rows = (await session.execute(select(ManualDownloadIntent))).scalars().all()
+            return {row.info_hash for row in rows}
+
+    assert asyncio.run(run()) == {"c" * 40, "d" * 40}
+
+
 def test_submit_with_disabled_default_downloader(client) -> None:
     did = _add_default_downloader(client)
     client.patch(f"/api/v1/downloaders/{did}/status", json={"enabled": False})

@@ -20,7 +20,10 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from datetime import timedelta
+from typing import TYPE_CHECKING
 
+from sqlalchemy import delete
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
@@ -35,7 +38,14 @@ from movieclaw_downloader.models import DownloaderConfig, DownloadRequest, Submi
 from movieclaw_enrich import enrich
 from movieclaw_media.models import MediaKind
 
+if TYPE_CHECKING:
+    from movieclaw_api.services.library.resolve import ResolveCandidate
+
 logger = logging.getLogger("movieclaw_api.torrent_submit")
+
+# 身份锚的兜底存活窗口：正常下载远短于此；超窗仍未被入库消费的锚基本是
+# 任务已从下载器删除的孤儿行，锚定新下载时顺带清理，避免无限累积
+_INTENT_STALE_AFTER = timedelta(days=90)
 
 
 @dataclass(frozen=True)
@@ -48,7 +58,7 @@ class ManualTargetResolution:
     """
 
     tmdb_id: int | None
-    candidates: list
+    candidates: list[ResolveCandidate]
 
 
 async def resolve_manual_target(
@@ -273,6 +283,13 @@ async def anchor_manual_download(
     if not info_hash:
         logger.warning("手动下载未返回 infohash，监听导入将无法复用已确认身份")
         return
+    # 顺带清理超窗孤儿锚（任务下载中途被从下载器删除时，没有入库时刻来
+    # 消费它）。跟随本次锚定同一事务提交，失败回滚也只是留到下次再清。
+    await session.execute(
+        delete(ManualDownloadIntent)
+        .where(ManualDownloadIntent.created_at < utcnow() - _INTENT_STALE_AFTER)  # type: ignore[arg-type]
+        .execution_options(synchronize_session=False)
+    )
     normalized = info_hash.lower()
     existing = (
         await session.execute(
