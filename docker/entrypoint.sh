@@ -5,10 +5,10 @@
 # 进程模型：
 #   - 后端监听容器内 8000（不对外），前端监听 3000（对外唯一端口）
 #   - /api/v1 请求由 Next 服务器反代到后端（构建时固化的 rewrite 规则）
-#   - 任意一个进程退出，整个容器退出（交给 Docker 的 restart 策略拉起），
-#     避免出现"半死"状态：前端活着但后端已挂
-#   - 例外一：后端以约定码 42 退出表示「设置页请求的重启」，原地拉起新的
-#     后端进程（前端不中断）
+#   - 后端健康后才启动前端；运行中任意进程退出、或完整健康链路持续失败时，
+#     整个容器退出（交给 Docker 的 restart 策略拉起），避免出现"半死"状态
+#   - 例外一：后端以约定码 42 退出表示「设置页请求的重启」，重新拉起前后端；
+#     只有后端与反代链路均健康后才恢复前端，避免向空后端持续反代
 #   - 例外二：后端以约定码 43 退出表示「应用内更新/回退后的全量重启」，
 #     前后端一起重启，并重新解析代码来源（可能切到新的 overlay 版本）
 #
@@ -40,6 +40,22 @@ STATE_DIR="$UPDATES_DIR/state"
 # 同一版本连续失败 MAX 次即标记 bad 并回落
 STARTUP_GRACE_SECONDS="${MOVIECLAW_STARTUP_GRACE_SECONDS:-60}"
 MAX_STARTUP_FAILURES=2
+# 启动和运行期健康监督的边界：后端在完成 FastAPI lifespan 前不会监听 8000，
+# 因此前端必须等待它真正可请求后才能启动。启动超时设得比 overlay 的短失败窗口
+# 长得多，兼顾首次迁移/慢盘；超时仍未就绪则属于确定的启动失败，不能无限等待。
+API_STARTUP_TIMEOUT_SECONDS="${MOVIECLAW_API_STARTUP_TIMEOUT_SECONDS:-300}"
+# 设置页请求重启时应用已运行过，后端应很快恢复；单独使用较短的等待窗口，
+# 失败后直接走完整启动/回退，避免前端长时间处于无后端可用的状态。
+API_RESTART_TIMEOUT_SECONDS="${MOVIECLAW_API_RESTART_TIMEOUT_SECONDS:-60}"
+WEB_STARTUP_TIMEOUT_SECONDS="${MOVIECLAW_WEB_STARTUP_TIMEOUT_SECONDS:-60}"
+HEALTHCHECK_INTERVAL_SECONDS="${MOVIECLAW_HEALTHCHECK_INTERVAL_SECONDS:-10}"
+HEALTHCHECK_FAILURE_THRESHOLD="${MOVIECLAW_HEALTHCHECK_FAILURE_THRESHOLD:-6}"
+SHUTDOWN_GRACE_SECONDS="${MOVIECLAW_SHUTDOWN_GRACE_SECONDS:-20}"
+API_HEALTH_URL="http://127.0.0.1:8000/api/v1/health"
+WEB_HEALTH_URL="http://127.0.0.1:3000/api/v1/health"
+# 看门狗以此约定码退出；主循环会把它转换成容器失败退出，不能与后端的 42/43
+# 重启约定混用。
+HEALTH_WATCHDOG_EXIT_CODE=75
 
 PYTHON_BIN="${MOVIECLAW_PYTHON_BIN:-/venv/bin/python}"
 if [ ! -x "$PYTHON_BIN" ]; then
@@ -178,6 +194,97 @@ cd "$APP_ROOT"
 
 # 容器内后端端口显式钉死为 8000：它是 Next 反代目标（构建时固化），
 # 不受部署者环境变量干扰；容器对外端口请改 compose 的 ports 映射。
+API_PID=""
+WEB_PID=""
+WATCHDOG_PID=""
+SHUTTING_DOWN=0
+# 启动门禁的失败信息由函数写入全局变量。Shell 函数的 return 值只表达成功/失败，
+# 用变量保留子进程真实退出码，才能继续支持 42/43 与 overlay 的失败计数。
+START_FAILURE_CODE=1
+START_FAILURE_UPTIME=0
+START_FAILURE_IS_TIMEOUT=0
+WAIT_FAILURE_CODE=1
+WAIT_TIMED_OUT=0
+
+process_is_running() {
+    local pid="${1:-}"
+    [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+}
+
+# HTTP 成功才是"就绪"，不能只探测 TCP 端口：FastAPI 的 lifespan 未完成时后端
+# 尚不可接请求；前端则必须验证 rewrite 已能穿透到后端。
+probe_health() {
+    "$PYTHON_BIN" -c '
+import sys
+from urllib.request import urlopen
+
+try:
+    with urlopen(sys.argv[1], timeout=2) as response:
+        raise SystemExit(0 if 200 <= response.status < 300 else 1)
+except Exception:
+    raise SystemExit(1)
+' "$1" >/dev/null 2>&1
+}
+
+# 在等待健康接口时同步观察进程是否提前退出，避免后端 import/迁移报错后还白等
+# 到超时。WAIT_FAILURE_CODE 保存真实退出码；正常退出却未就绪也按失败码 1 处理。
+wait_for_health() {
+    local name="$1"
+    local pid="$2"
+    local url="$3"
+    local timeout="$4"
+    # 前端反代就绪依赖后端持续存活。后端自身就绪时无需传入依赖进程；前端
+    # 就绪时传入 API_PID，避免 API 恰在两阶段之间退出后，前端继续监听并对
+    # 空的 8000 反代到超时。
+    local dependency_name="${5:-}"
+    local dependency_pid="${6:-}"
+    local started now exit_code
+    started="$(date +%s)"
+    WAIT_FAILURE_CODE=1
+    WAIT_TIMED_OUT=0
+
+    while true; do
+        if [ -n "$dependency_pid" ] && ! process_is_running "$dependency_pid"; then
+            if wait "$dependency_pid" 2>/dev/null; then
+                exit_code=0
+            else
+                exit_code=$?
+            fi
+            WAIT_FAILURE_CODE="$exit_code"
+            if [ "$WAIT_FAILURE_CODE" -eq 0 ]; then
+                WAIT_FAILURE_CODE=1
+            fi
+            echo "[entrypoint] $dependency_name 在${name}就绪前退出（exit=${exit_code}）。" >&2
+            return 1
+        fi
+        if ! process_is_running "$pid"; then
+            if wait "$pid" 2>/dev/null; then
+                exit_code=0
+            else
+                exit_code=$?
+            fi
+            WAIT_FAILURE_CODE="$exit_code"
+            if [ "$WAIT_FAILURE_CODE" -eq 0 ]; then
+                WAIT_FAILURE_CODE=1
+            fi
+            echo "[entrypoint] $name 在就绪前退出（exit=${exit_code}）。" >&2
+            return 1
+        fi
+        if probe_health "$url"; then
+            echo "[entrypoint] $name 已就绪：$url"
+            return 0
+        fi
+        now="$(date +%s)"
+        if [ "$(( now - started ))" -ge "$timeout" ]; then
+            WAIT_FAILURE_CODE=124
+            WAIT_TIMED_OUT=1
+            echo "[entrypoint] 等待 $name 就绪超过 ${timeout}s（${url}），停止本次启动。" >&2
+            return 1
+        fi
+        sleep 1
+    done
+}
+
 start_api() {
     echo "[entrypoint] 启动后端 (FastAPI, 127.0.0.1:8000)……来源：$ACTIVE_SOURCE${ACTIVE_VERSION:+ v$ACTIVE_VERSION}"
     API_START_TS="$(date +%s)"
@@ -192,29 +299,111 @@ start_web() {
     WEB_PID=$!
 }
 
+# 运行期看门狗验证完整的「Next → rewrite → FastAPI」链路。Docker HEALTHCHECK
+# 只能标记 unhealthy，restart policy 不会因该状态自动重启；由入口脚本主动失败
+# 退出，Docker 才能可靠地拉起一个全新的进程组。
+start_health_watchdog() {
+    (
+        local failures=0
+        while true; do
+            sleep "$HEALTHCHECK_INTERVAL_SECONDS"
+            if probe_health "$WEB_HEALTH_URL"; then
+                failures=0
+                continue
+            fi
+            failures=$(( failures + 1 ))
+            echo "[entrypoint] 完整健康链路检查失败（$failures/${HEALTHCHECK_FAILURE_THRESHOLD}）：$WEB_HEALTH_URL" >&2
+            if [ "$failures" -ge "$HEALTHCHECK_FAILURE_THRESHOLD" ]; then
+                echo "[entrypoint] 完整健康链路连续失败，停止容器以触发 Docker 重启。" >&2
+                exit "$HEALTH_WATCHDOG_EXIT_CODE"
+            fi
+        done
+    ) &
+    WATCHDOG_PID=$!
+}
+
+stop_health_watchdog() {
+    if process_is_running "$WATCHDOG_PID"; then
+        kill "$WATCHDOG_PID" 2>/dev/null || true
+    fi
+    if [ -n "$WATCHDOG_PID" ]; then
+        wait "$WATCHDOG_PID" 2>/dev/null || true
+    fi
+    WATCHDOG_PID=""
+}
+
+# 先让服务自行收尾，超出宽限期才强杀。入口脚本不能无限 wait：进程卡死时，
+# 无限等待会再次制造"容器仍在、服务已失效"的半死状态。
+terminate_managed_processes() {
+    local deadline now pid
+    stop_health_watchdog
+    for pid in "$API_PID" "$WEB_PID"; do
+        if process_is_running "$pid"; then
+            kill "$pid" 2>/dev/null || true
+        fi
+    done
+    deadline=$(( $(date +%s) + SHUTDOWN_GRACE_SECONDS ))
+    while process_is_running "$API_PID" || process_is_running "$WEB_PID"; do
+        now="$(date +%s)"
+        if [ "$now" -ge "$deadline" ]; then
+            break
+        fi
+        sleep 1
+    done
+    for pid in "$API_PID" "$WEB_PID"; do
+        if process_is_running "$pid"; then
+            echo "[entrypoint] 进程 $pid 未在 ${SHUTDOWN_GRACE_SECONDS}s 内退出，强制终止。" >&2
+            kill -KILL "$pid" 2>/dev/null || true
+        fi
+        if [ -n "$pid" ]; then
+            wait "$pid" 2>/dev/null || true
+        fi
+    done
+    API_PID=""
+    WEB_PID=""
+}
+
+# 按顺序启动后端、直接健康检查、前端、完整链路健康检查。参数只在运行期 42
+# 重启时使用较短的后端等待窗口；代码来源仍保持当前已解析版本，不会误切 overlay。
+# 任一阶段失败时，前端都不会在后端不可用的状态下对外提供反代。
+start_current_code() {
+    local api_timeout="${1:-$API_STARTUP_TIMEOUT_SECONDS}"
+    start_api
+    if ! wait_for_health "后端" "$API_PID" "$API_HEALTH_URL" "$api_timeout"; then
+        START_FAILURE_CODE="$WAIT_FAILURE_CODE"
+        START_FAILURE_UPTIME=$(( $(date +%s) - API_START_TS ))
+        START_FAILURE_IS_TIMEOUT="$WAIT_TIMED_OUT"
+        return 1
+    fi
+    start_web
+    if ! wait_for_health "前端反代" "$WEB_PID" "$WEB_HEALTH_URL" "$WEB_STARTUP_TIMEOUT_SECONDS" \
+        "后端" "$API_PID"; then
+        START_FAILURE_CODE="$WAIT_FAILURE_CODE"
+        START_FAILURE_UPTIME=$(( $(date +%s) - WEB_START_TS ))
+        START_FAILURE_IS_TIMEOUT="$WAIT_TIMED_OUT"
+        return 1
+    fi
+    start_health_watchdog
+    return 0
+}
+
 start_all() {
     resolve_code
-    start_api
-    start_web
+    start_current_code "$API_STARTUP_TIMEOUT_SECONDS"
 }
 
-kill_remaining() {
-    kill "$API_PID" "$WEB_PID" 2>/dev/null || true
-    wait "$API_PID" 2>/dev/null || true
-    wait "$WEB_PID" 2>/dev/null || true
-}
-
-# overlay 启动失败兜底：短时间内退出计一次失败，连续 MAX 次标记 bad。
+# overlay 启动失败兜底：短时间内退出或就绪超时计一次失败，连续 MAX 次标记 bad。
 # 返回 0 表示「已处理，调用方应重启全部进程再试」；返回 1 表示按真故障处理。
 # 只对 overlay 生效——基线是镜像烧入的，起不来属于环境问题，必须外显。
 handle_startup_failure() {
     local uptime="$1"
+    local forced_timeout="${2:-0}"
     if [ "$ACTIVE_SOURCE" != "overlay" ]; then
         return 1
     fi
     local marker
     marker="$(sanitize "$ACTIVE_VERSION")"
-    if [ "$uptime" -ge "$STARTUP_GRACE_SECONDS" ]; then
+    if [ "$uptime" -ge "$STARTUP_GRACE_SECONDS" ] && [ "$forced_timeout" -ne 1 ]; then
         # 稳定运行过一段时间后才挂：不是坏更新，清掉启动失败计数，按真故障处理
         rm -f "$STATE_DIR/failures-$marker"
         return 1
@@ -243,19 +432,36 @@ handle_startup_failure() {
     return 0
 }
 
-# 收到停止信号时把两个子进程都带走，确保容器干净退出。
+# 收到停止信号时把三个子进程都带走，确保容器干净退出。
 # SHUTTING_DOWN 标志让主循环把「停机导致的进程退出」与故障区分开——
 # 否则 overlay 启动后 60 秒内 docker stop 会被误计为一次「启动失败」，
 # 连续两次正常停容器就可能把好版本错标成坏版本。
 # trap 必须先于 start_all 安装：启动窗口内到达的 TERM 不能被 PID 1 默认忽略。
-SHUTTING_DOWN=0
 shutdown() {
     SHUTTING_DOWN=1
-    kill "${API_PID:-}" "${WEB_PID:-}" 2>/dev/null || true
+    kill "${API_PID:-}" "${WEB_PID:-}" "${WATCHDOG_PID:-}" 2>/dev/null || true
 }
 trap shutdown TERM INT
 
-start_all
+# 统一处理首次启动、全量重启与 overlay 回退时的就绪失败。42/43 只有在服务
+# 已就绪后才是合法重启请求；启动阶段出现它们说明该版本无法完成启动，必须和
+# 其他失败一样计入 overlay 回退，不能无限重试。就绪超时同样强制计为启动失败。
+boot_until_running() {
+    while true; do
+        if start_all; then
+            return 0
+        fi
+        if [ "$SHUTTING_DOWN" -eq 1 ]; then
+            return 1
+        fi
+        echo "[entrypoint] 启动阶段失败（exit=${START_FAILURE_CODE}），正在收尾。" >&2
+        terminate_managed_processes
+        if handle_startup_failure "$START_FAILURE_UPTIME" "$START_FAILURE_IS_TIMEOUT"; then
+            continue
+        fi
+        return 1
+    done
+}
 
 # 启动失败计数的衰减：进程稳定运行超过宽限期后清零该版本的计数。
 # 否则计数在 data 卷上跨周跨月累计，两次相隔很久的孤立故障会把好版本
@@ -269,63 +475,154 @@ clear_failures_if_seasoned() {
 }
 
 # 主循环：处理重启约定码（42 后端 / 43 全量）、overlay 启动失败兜底、
-# 真故障与停机（整容器退出，交给 Docker 的 restart 策略与 healthcheck，
-# 不在容器内静默兜养）。
+# 进程退出和健康看门狗故障。所有真故障最终让容器退出，交给 Docker restart
+# 策略恢复；入口脚本不在容器内无限重试基线版本。
 # EXIT_CODE 预置为 143（SIGTERM 的约定码）：TERM 落在首次 wait 之前时主循环
 # 会在顶部直接 break，此时若变量未定义，set -u 会让脚本在结尾崩掉、跳过收尾
-EXIT_CODE=143
-while true; do
-    if [ "$SHUTTING_DOWN" -eq 1 ]; then
-        break # 停机信号在分支处理期间到达：不再进入 wait（新进程由结尾的 shutdown 收拾）
+identify_exited_process() {
+    EXITED_PID=""
+    if ! process_is_running "$API_PID"; then
+        EXITED_PID="$API_PID"
+    elif ! process_is_running "$WEB_PID"; then
+        EXITED_PID="$WEB_PID"
+    elif ! process_is_running "$WATCHDOG_PID"; then
+        EXITED_PID="$WATCHDOG_PID"
     fi
-    # bash ≤5.2 的 wait -n 会忽略「调用前已被收割」的进程（打印 no such job
-    # 后继续等另一个），特定竞态下会漏掉一侧进程的死亡。先同步探测再兜底：
-    # 「&& … || …」写法让非零退出码不触发顶部的 set -e（否则脚本在此直接终止）
-    if ! kill -0 "$API_PID" 2>/dev/null; then
-        wait "$API_PID" && EXIT_CODE=0 || EXIT_CODE=$?
-    elif ! kill -0 "$WEB_PID" 2>/dev/null; then
-        wait "$WEB_PID" && EXIT_CODE=0 || EXIT_CODE=$?
+    [ -n "$EXITED_PID" ]
+}
+
+collect_exit_code() {
+    local pid="$1"
+    if wait "$pid" 2>/dev/null; then
+        EXIT_CODE=0
     else
-        wait -n "$API_PID" "$WEB_PID" && EXIT_CODE=0 || EXIT_CODE=$?
+        EXIT_CODE=$?
     fi
+}
+
+# 镜像内的 Bash 5.2 用 wait -n -p 同时取得退出码与准确 PID，避免两个子进程
+# 近同时退出时把错误退出码套到 API 的 42/43 语义上。开发机的旧 Bash 则以
+# 一秒轮询降级；它只用于测试环境，不影响发布镜像的精确归属。
+wait_for_managed_process_exit() {
+    if identify_exited_process; then
+        collect_exit_code "$EXITED_PID"
+        return
+    fi
+    if [ "${BASH_VERSINFO[0]}" -gt 5 ] \
+        || { [ "${BASH_VERSINFO[0]}" -eq 5 ] && [ "${BASH_VERSINFO[1]}" -ge 1 ]; }; then
+        EXITED_PID=""
+        wait -n -p EXITED_PID "$API_PID" "$WEB_PID" "$WATCHDOG_PID" && EXIT_CODE=0 || EXIT_CODE=$?
+        # 被信号打断时 -p 可能未写入 PID；交给后续逻辑按停机处理，绝不猜测。
+        return
+    fi
+    if [ "${BASH_VERSINFO[0]}" -gt 4 ] \
+        || { [ "${BASH_VERSINFO[0]}" -eq 4 ] && [ "${BASH_VERSINFO[1]}" -ge 3 ]; }; then
+        wait -n "$API_PID" "$WEB_PID" "$WATCHDOG_PID" && EXIT_CODE=0 || EXIT_CODE=$?
+        identify_exited_process || true
+        return
+    fi
+    while process_is_running "$API_PID" && process_is_running "$WEB_PID" \
+        && process_is_running "$WATCHDOG_PID"; do
+        if [ "$SHUTTING_DOWN" -eq 1 ]; then
+            EXITED_PID=""
+            return
+        fi
+        sleep 1
+    done
+    if identify_exited_process; then
+        collect_exit_code "$EXITED_PID"
+    fi
+}
+
+EXIT_CODE=143
+if ! boot_until_running; then
+    if [ "$SHUTTING_DOWN" -eq 1 ]; then
+        EXIT_CODE=143
+    else
+        EXIT_CODE="$START_FAILURE_CODE"
+    fi
+fi
+while true; do
+    if [ "$SHUTTING_DOWN" -eq 1 ] || [ -z "$API_PID" ]; then
+        break
+    fi
+    wait_for_managed_process_exit
     NOW="$(date +%s)"
     clear_failures_if_seasoned
     if [ "$SHUTTING_DOWN" -eq 1 ]; then
         break # 停机信号已到：无论进程处于什么状态都直接走停机流程
     fi
-    if kill -0 "$API_PID" 2>/dev/null && kill -0 "$WEB_PID" 2>/dev/null; then
+    if [ -z "$EXITED_PID" ] && kill -0 "$API_PID" 2>/dev/null && kill -0 "$WEB_PID" 2>/dev/null; then
         break # 两个进程都活着 = wait 被停止信号打断（docker stop）：走停机流程
     fi
-    if ! kill -0 "$API_PID" 2>/dev/null; then
+    if [ "$EXITED_PID" = "$API_PID" ]; then
         # 后端退出：先看重启约定码
         if [ "$EXIT_CODE" -eq 42 ]; then
-            echo "[entrypoint] 后端请求重启（exit=42），正在拉起新的后端进程……"
-            start_api
-            continue
+            echo "[entrypoint] 后端请求重启（exit=42），停止前端并等待完整链路恢复……"
+            # 前端若保持运行会把用户请求转发到已退出的 8000，持续制造
+            # ECONNREFUSED；先收掉旧前端，后端与反代均就绪后再重新开放。
+            terminate_managed_processes
+            if start_current_code "$API_RESTART_TIMEOUT_SECONDS"; then
+                continue
+            fi
+            echo "[entrypoint] 后端重启后未能就绪，改为完整重启。" >&2
+            terminate_managed_processes
+            if boot_until_running; then
+                continue
+            fi
+            EXIT_CODE="$START_FAILURE_CODE"
+            break
         fi
         if [ "$EXIT_CODE" -eq 43 ]; then
             echo "[entrypoint] 应用请求全量重启（exit=43），重新解析代码来源并重启前后端……"
-            kill "$WEB_PID" 2>/dev/null || true
-            wait "$WEB_PID" 2>/dev/null || true
-            start_all
-            continue
+            terminate_managed_processes
+            if boot_until_running; then
+                continue
+            fi
+            EXIT_CODE="$START_FAILURE_CODE"
+            break
         fi
         if handle_startup_failure "$(( NOW - API_START_TS ))"; then
-            kill_remaining
-            start_all
-            continue
+            terminate_managed_processes
+            if boot_until_running; then
+                continue
+            fi
+            EXIT_CODE="$START_FAILURE_CODE"
+            break
         fi
         break # 后端真故障：结束容器
     fi
-    # 前端退出
-    if handle_startup_failure "$(( NOW - WEB_START_TS ))"; then
-        kill_remaining
-        start_all
-        continue
+    if [ "$EXITED_PID" = "$WEB_PID" ]; then
+        if handle_startup_failure "$(( NOW - WEB_START_TS ))"; then
+            terminate_managed_processes
+            if boot_until_running; then
+                continue
+            fi
+            EXIT_CODE="$START_FAILURE_CODE"
+            break
+        fi
+        break # 前端真故障：结束容器
     fi
-    break # 前端真故障：结束容器
+    if [ "$EXITED_PID" = "$WATCHDOG_PID" ]; then
+        if [ "$EXIT_CODE" -eq "$HEALTH_WATCHDOG_EXIT_CODE" ]; then
+            echo "[entrypoint] 完整健康链路持续失败，停止容器以触发 Docker 重启。" >&2
+            EXIT_CODE=1
+        else
+            echo "[entrypoint] 健康看门狗意外退出（exit=${EXIT_CODE}），停止容器。" >&2
+            if [ "$EXIT_CODE" -eq 0 ]; then
+                EXIT_CODE=1
+            fi
+        fi
+        break
+    fi
+    # wait -n 被信号打断且没有退出 PID；走统一停机收尾。
+    if [ "$SHUTTING_DOWN" -eq 1 ]; then
+        break
+    fi
+    echo "[entrypoint] 无法确定退出的子进程，停止容器。" >&2
+    EXIT_CODE=1
+    break
 done
-echo "[entrypoint] 有进程退出（exit=$EXIT_CODE），停止容器……"
-shutdown
-wait || true
+echo "[entrypoint] 有进程退出（exit=${EXIT_CODE}），停止容器……"
+terminate_managed_processes
 exit "$EXIT_CODE"
