@@ -18,6 +18,15 @@ from movieclaw_db.models.downloader_client import ClientType, DownloaderClient
 from movieclaw_db.models.import_watch import ImportWatch
 from movieclaw_db.models.ingest_entry import IngestEntry, IngestStatus
 from movieclaw_db.models.jellyfin_device import JellyfinDevice
+from movieclaw_db.models.job import (
+    ACTIVE_JOB_STATUSES,
+    TERMINAL_JOB_STATUSES,
+    Job,
+    JobEvent,
+    JobLock,
+    JobResource,
+    JobStatus,
+)
 from movieclaw_db.models.library import Library
 from movieclaw_db.models.library_file import FileSource, LibraryFile
 from movieclaw_db.models.llm_provider import LlmProvider
@@ -77,6 +86,13 @@ __all__ = [
     "IngestEntry",
     "IngestStatus",
     "JellyfinDevice",
+    "Job",
+    "JobEvent",
+    "JobLock",
+    "JobResource",
+    "JobStatus",
+    "ACTIVE_JOB_STATUSES",
+    "TERMINAL_JOB_STATUSES",
     "Library",
     "LibraryFile",
     "LlmProvider",

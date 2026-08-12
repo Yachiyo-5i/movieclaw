@@ -36,9 +36,7 @@ def client(tmp_path, monkeypatch):
 
 def _create(client, *, name: str, kind: str, root: str) -> dict:
     """建库辅助：POST /libraries 并返回创建的库视图（断言 200）。"""
-    r = client.post(
-        "/api/v1/libraries", json={"name": name, "kind": kind, "root_paths": [root]}
-    )
+    r = client.post("/api/v1/libraries", json={"name": name, "kind": kind, "root_paths": [root]})
     assert r.status_code == 200
     return r.json()["data"]
 
@@ -180,15 +178,15 @@ def test_update_name_and_paths(client) -> None:
 
 
 def test_update_root_scan_receives_previous_roots(client, monkeypatch) -> None:
-    """改根的后台扫描必须带上修改前根列表，不能从历史台账反推。"""
+    """改根的持久扫描作业必须带上修改前根列表，不能从历史台账反推。"""
     from movieclaw_api.api.routes import libraries as library_routes
 
-    calls: list[tuple[int, dict]] = []
+    calls: list[tuple[int, str, dict]] = []
 
-    async def fake_scan(library_id: int, **kwargs) -> None:  # noqa: ANN003
-        calls.append((library_id, kwargs))
+    async def fake_enqueue(_session, library_id: int, library_name: str, **kwargs) -> None:  # noqa: ANN003
+        calls.append((library_id, library_name, kwargs))
 
-    monkeypatch.setattr(library_routes, "scan_library", fake_scan)
+    monkeypatch.setattr(library_routes, "enqueue_scan_job", fake_enqueue)
     library_id = _create(client, name="电影库", kind="movie", root="/media/movies")["id"]
     calls.clear()  # 建库本身也会排一次普通扫描
 
@@ -205,7 +203,9 @@ def test_update_root_scan_receives_previous_roots(client, monkeypatch) -> None:
     assert calls == [
         (
             library_id,
+            "电影库",
             {
+                "origin": "web",
                 "reconcile_root_change": True,
                 "previous_root_paths": ["/media/movies"],
             },
@@ -237,9 +237,7 @@ def test_reorder_changes_list_order_and_new_library_goes_last(client) -> None:
     ids = [x["id"] for x in client.get("/api/v1/libraries").json()["data"]]
     assert ids == [a["id"], b["id"], c["id"]]  # 未排过序时保持创建顺序
 
-    r = client.put(
-        "/api/v1/libraries/order", json={"ordered_ids": [c["id"], a["id"], b["id"]]}
-    )
+    r = client.put("/api/v1/libraries/order", json={"ordered_ids": [c["id"], a["id"], b["id"]]})
     assert r.status_code == 200
     ids = [x["id"] for x in client.get("/api/v1/libraries").json()["data"]]
     assert ids == [c["id"], a["id"], b["id"]]

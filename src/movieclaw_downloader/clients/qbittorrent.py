@@ -199,12 +199,21 @@ class QBittorrentDownloader(BaseDownloader):
             # 目录/文件名（种子在客户端里被改名后 name 会失真，末段不会）
             content = str(getattr(torrent, "content_path", "") or "").rstrip("/\\")
             content_name = content.replace("\\", "/").rsplit("/", 1)[-1] if content else ""
+            progress = float(torrent.progress)
+            completed = progress >= 1.0
+            # qBittorrent 用 8640000（100 天）表示“无法估算”。
+            eta = int(getattr(torrent, "eta", 0) or 0)
             briefs.append(
                 TorrentBrief(
                     name=torrent.name,
                     content_name=content_name or torrent.name,
-                    completed=float(torrent.progress) >= 1.0,
+                    completed=completed,
                     info_hash=str(torrent.hash).lower(),
+                    progress=progress,
+                    size_bytes=int(getattr(torrent, "size", 0) or 0) or None,
+                    dlspeed_bytes=int(getattr(torrent, "dlspeed", 0) or 0),
+                    eta_seconds=eta if 0 < eta < 8640000 else None,
+                    state=_normalize_state(str(getattr(torrent, "state", "")), completed=completed),
                 )
             )
         return briefs

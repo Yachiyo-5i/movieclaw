@@ -53,6 +53,59 @@ export interface ConfiguredDownloader {
   updated_at: string;
 }
 
+export type DownloadTaskState =
+  | "downloading"
+  | "stalled"
+  | "paused"
+  | "completed"
+  | "error"
+  | "missing"
+  | "unknown";
+
+export interface DownloadTaskSubscription {
+  id: number;
+  media_item_id: number;
+  media_title: string;
+  media_kind: string;
+  poster_url: string | null;
+  units: { season_number: number; episode_number: number }[];
+}
+
+/** 下载器实时任务；订阅/手动来源由后端按 infohash 关联，不复制下载状态。 */
+export interface DownloadTask {
+  id: string;
+  info_hash: string;
+  name: string | null;
+  downloader_id: number | null;
+  downloader_name: string | null;
+  downloader_type: DownloaderClientType | null;
+  progress: number | null;
+  size_bytes: number | null;
+  dlspeed_bytes: number | null;
+  eta_seconds: number | null;
+  state: DownloadTaskState;
+  source: "subscription" | "manual" | "external";
+  media_item_id: number | null;
+  media_title: string | null;
+  media_kind: string | null;
+  poster_url: string | null;
+  subscriptions: DownloadTaskSubscription[];
+}
+
+export interface DownloadTaskSource {
+  id: number;
+  name: string;
+  client_type: DownloaderClientType;
+  status: "active" | "disabled" | "unavailable" | "error";
+  message: string | null;
+  task_count: number;
+}
+
+export interface DownloadTaskSnapshot {
+  items: DownloadTask[];
+  sources: DownloadTaskSource[];
+}
+
 /** 新增/更新下载器的请求体（见 schemas.downloader.DownloaderPayload）。 */
 export interface DownloaderPayload {
   name: string;
@@ -68,6 +121,11 @@ export interface DownloaderPayload {
 /** 列出所有已配置的下载器及连接状态。 */
 export function listDownloaders(init?: RequestInit): Promise<ConfiguredDownloader[]> {
   return unwrap(request<ApiEnvelope<ConfiguredDownloader[]>>("/downloaders", init));
+}
+
+/** 任务中心快照：所有下载器的活跃任务、仍待入库任务与来源健康状态。 */
+export function listDownloadTasks(init?: RequestInit): Promise<DownloadTaskSnapshot> {
+  return unwrap(request<ApiEnvelope<DownloadTaskSnapshot>>("/downloaders/tasks", init));
 }
 
 /** 获取单个下载器详情（用于轮询连接测试进度）。 */

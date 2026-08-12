@@ -49,6 +49,7 @@ DOMAIN_HELP = {
     "dl": "下载器与一键下载",
     "extension": "浏览器插件 Cookie 同步",
     "health": "服务健康检查",
+    "jobs": "后台任务",
     "lib": "媒体库",
     "llm": "AI 模型供应商",
     "logs": "系统日志",
@@ -192,6 +193,7 @@ def iter_operations(spec: dict[str, Any]) -> list[dict[str, Any]]:
                     "stream": op.get("x-cli-stream"),
                     "dangerous": op.get("x-cli-dangerous"),
                     "long_task": op.get("x-cli-long-task"),
+                    "job": op.get("x-cli-job"),
                 }
             )
     return ops
@@ -358,6 +360,77 @@ def wait_long_task(
         raise click.exceptions.Abort() from None
 
 
+def _value_at_path(value: Any, path: str) -> Any:
+    """按点分路径读取响应字段；不存在返回 None。"""
+    for token in path.split("."):
+        if not isinstance(value, dict):
+            return None
+        value = value.get(token)
+    return value
+
+
+def wait_persistent_job(
+    api: Api,
+    start_data: Any,
+    metadata: dict[str, Any],
+    wait_timeout: float,
+) -> None:
+    """等待统一 Job 终态；本地停止等待不会取消服务端任务。"""
+    job_id = _value_at_path(start_data, metadata.get("id_path", "id"))
+    if not isinstance(job_id, str) or not job_id:
+        raise CliError(
+            "服务端已接收任务，但响应中没有可追踪的任务 ID",
+            exit_code=ExitCode.BUSINESS,
+            hint="请用 mclaw jobs list --active-only 查找刚创建的任务",
+        )
+    started = time.monotonic()
+    revision = 0
+    last_line = ""
+    terminal = {"succeeded", "failed", "cancelled", "blocked"}
+    try:
+        while True:
+            remaining = wait_timeout - (time.monotonic() - started)
+            if remaining <= 0:
+                raise CliError(
+                    f"等待超时（{wait_timeout:.0f} 秒），任务仍在后台执行",
+                    exit_code=ExitCode.TASK_FAILED,
+                    hint=f"稍后执行 mclaw jobs show {job_id}，或调大 --wait-timeout",
+                )
+            payload = api.request(
+                "GET",
+                f"/jobs/{job_id}/wait",
+                params={"after_revision": revision, "wait_seconds": min(25.0, remaining)},
+            )
+            job = (payload or {}).get("job") or {}
+            revision = max(revision, int(job.get("revision") or 0))
+            status = str(job.get("status") or "")
+            progress = job.get("progress") or {}
+            line = str(progress.get("message") or status or "等待执行")
+            percent = progress.get("percent")
+            if percent is not None:
+                line = f"{line}（{percent:g}%）"
+            if line != last_line:
+                print(f"{job_id} · {line}", file=sys.stderr)
+                last_line = line
+            if status not in terminal:
+                continue
+            if status == "succeeded":
+                print(f"任务已完成：{job_id}", file=sys.stderr)
+                return
+            error = job.get("error") or {}
+            message = error.get("message") or progress.get("message") or f"任务状态：{status}"
+            hint = f"执行 mclaw jobs show {job_id} 查看详情"
+            if any(action.get("type") == "handoff_agent" for action in error.get("actions") or []):
+                hint += "；也可以交给 MovieClaw Agent 处理"
+            raise CliError(str(message), exit_code=ExitCode.TASK_FAILED, hint=hint)
+    except KeyboardInterrupt:
+        print(
+            f"已停止等待，任务 {job_id} 仍在后台执行；需要取消时运行 mclaw jobs cancel {job_id}",
+            file=sys.stderr,
+        )
+        raise click.exceptions.Abort() from None
+
+
 def _make_command(op: dict[str, Any], ops_by_id: dict[str, dict[str, Any]]) -> click.Command:
     path_params = [p for p in op["params"] if p["in"] == "path"]
     query_params = [p for p in op["params"] if p["in"] == "query"]
@@ -398,7 +471,9 @@ def _make_command(op: dict[str, Any], ops_by_id: dict[str, dict[str, Any]]) -> c
             if api.last_message and not settings.quiet:
                 print(api.last_message, file=sys.stderr)
             emit(data, output=settings.output, quiet=settings.quiet)
-            if op["long_task"] and wait:
+            if op["job"] and wait:
+                wait_persistent_job(api, data, op["job"], wait_timeout)
+            elif op["long_task"] and wait:
                 wait_long_task(op, ops_by_id, api, kwargs, wait_timeout)
         finally:
             api.close()
@@ -459,13 +534,17 @@ def _make_command(op: dict[str, Any], ops_by_id: dict[str, dict[str, Any]]) -> c
         cli_params.append(
             click.Option(["--output-file"], required=True, help="下载内容保存到的本地路径")
         )
-    if op["long_task"]:
+    if op["long_task"] or op["job"]:
         cli_params.append(
             click.Option(
                 ["--wait/--no-wait"],
-                default=True,
+                default=not bool(op["job"]),
                 show_default=True,
-                help="等待任务完成（轮询进度到终态）；--no-wait 启动后立即返回",
+                help=(
+                    "等待持久化任务完成；默认立即返回任务 ID"
+                    if op["job"]
+                    else "等待任务完成（轮询进度到终态）；--no-wait 启动后立即返回"
+                ),
             )
         )
         cli_params.append(

@@ -20,10 +20,11 @@ from movieclaw_api.api.routes.libraries import (
 from movieclaw_api.core.config import get_settings
 from movieclaw_api.exceptions import BadRequestException
 from movieclaw_api.schemas.library import TransferPayload
+from movieclaw_api.services import jobs
 from movieclaw_api.services.library import transfer as transfer_svc
 from movieclaw_db.engine import dispose_db, get_database, init_db
 from movieclaw_db.migrations import run_migrations
-from movieclaw_db.models import FileSource, LibraryFile, MediaItem, RuleSet, Subscription
+from movieclaw_db.models import FileSource, JobStatus, LibraryFile, MediaItem, RuleSet, Subscription
 from movieclaw_db.repositories.library_repo import LibraryRepository
 
 
@@ -33,7 +34,9 @@ async def db(tmp_path, monkeypatch):
     get_settings.cache_clear()
     init_db(get_settings().database_url, echo=False)
     await run_migrations()
+    await jobs.init_job_dispatcher(max_parallel=1)
     yield get_database()
+    await jobs.close_job_dispatcher()
     await dispose_db()
     get_settings.cache_clear()
 
@@ -53,14 +56,16 @@ def _no_media_server_notify(monkeypatch):
 async def _drain_transfer(source_id: int, target_id: int) -> transfer_svc.TransferSummary:
     """等后台转移任务跑完并取回结论（最多等 5 秒，正常是毫秒级）。"""
     for _ in range(500):
-        if not transfer_svc.is_transferring(source_id) and not transfer_svc.is_transferring(
-            target_id
-        ):
-            break
+        async with get_database().session() as session:
+            latest = await jobs.latest_job_for_resource(
+                session, "library", source_id, job_type="library.transfer"
+            )
+        if latest is not None and latest.status is JobStatus.SUCCEEDED:
+            result = dict(latest.result or {})
+            result.pop("message", None)
+            return transfer_svc.TransferSummary(**result)
         await asyncio.sleep(0.01)
-    last = transfer_svc.last_transfer(source_id)
-    assert last is not None, "转移任务没有留下结论"
-    return last[1]
+    raise AssertionError("转移作业没有在时限内留下结论")
 
 
 def _make_series(root, name: str, episodes: int = 2):

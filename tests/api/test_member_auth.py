@@ -536,6 +536,7 @@ _PATH_DUMMIES = {
     "{channel}": "weixin",
     "{endpoint_id}": "test-endpoint",
     "{member_id}": "1",
+    "{job_id}": "job_test",
 }
 
 

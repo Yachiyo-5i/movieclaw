@@ -11,6 +11,9 @@ from movieclaw_api.schemas.downloader import (
     DownloaderView,
     DownloadSubmitPayload,
     DownloadSubmitView,
+    DownloadTaskListView,
+    DownloadTaskSourceView,
+    DownloadTaskView,
     ManualDownloadCandidateView,
     ManualDownloadTargetPayload,
     ManualDownloadTargetView,
@@ -79,9 +82,7 @@ async def resolve_download_target(
     if resolution.tmdb_id is not None:
         candidate_ids.add(resolution.tmdb_id)
     tmdb_id = (
-        payload.selected_tmdb_id
-        if payload.selected_tmdb_id is not None
-        else resolution.tmdb_id
+        payload.selected_tmdb_id if payload.selected_tmdb_id is not None else resolution.tmdb_id
     )
     if payload.selected_tmdb_id is not None and payload.selected_tmdb_id not in candidate_ids:
         raise BadRequestException("确认的 TMDB 条目不在本次识别候选中，请重新识别后再选择")
@@ -254,6 +255,28 @@ async def list_downloaders(
     service = DownloaderConfigService(session)
     rows = await service.list_all()
     return ok([DownloaderView.from_model(r) for r in rows])
+
+
+@router.get(
+    "/tasks",
+    response_model=ApiResponse[DownloadTaskListView],
+    summary="汇总所有下载器的活跃任务及订阅关联",
+    operation_id="dl.tasks",
+    openapi_extra={"x-cli-hidden": True},
+)
+async def list_download_tasks(
+    session: AsyncSession = Depends(get_session),
+) -> ApiResponse[DownloadTaskListView]:
+    """任务中心实时快照；单台下载器故障会降级为来源状态，不拖垮整页。"""
+    from movieclaw_api.services.download_tasks import download_task_snapshot
+
+    snapshot = await download_task_snapshot(session)
+    return ok(
+        DownloadTaskListView(
+            items=[DownloadTaskView(**item) for item in snapshot["items"]],
+            sources=[DownloadTaskSourceView(**source) for source in snapshot["sources"]],
+        )
+    )
 
 
 @router.get(

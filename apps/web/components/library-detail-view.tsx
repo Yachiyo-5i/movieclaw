@@ -67,6 +67,7 @@ import { cachedImageUrl, imageUrl } from "@/lib/image-proxy";
 import { keepIfEqual, reconcileList } from "@/lib/poll-reconcile";
 import { usePermissions } from "@/lib/permissions";
 import { useVisiblePolling } from "@/lib/use-visible-polling";
+import { useJobs } from "@/lib/jobs";
 import {
   subscriptionProgressNote,
   subscriptionStatusMeta,
@@ -99,6 +100,7 @@ const WALL_PAGE_SIZE = 60;
 
 export function LibraryDetailView({ libraryId }: { libraryId: number }) {
   const { canManageLibraries } = usePermissions();
+  const { activeJobs } = useJobs();
   const confirm = useConfirm();
   const [libraries, setLibraries] = useState<MediaLibrary[] | null>(null);
   const [items, setItems] = useState<LibraryItem[]>([]);
@@ -316,6 +318,30 @@ export function LibraryDetailView({ libraryId }: { libraryId: number }) {
     () => new Map((metaRefresh?.active ?? []).map((a) => [a.media_item_id, a.phase])),
     [metaRefresh],
   );
+  // 统一 Job 资源索引让 CLI / Agent 发起的任务也能直接点亮海报格，不依赖
+  // 详情组件是否已经挂载。一个任务关联剧集条目时只显示一枚聚合状态。
+  const jobPhaseById = useMemo(() => {
+    const mapped = new Map<number, string>();
+    for (const job of activeJobs) {
+      const resource = job.resources.find((item) => item.resource_type === "media_item");
+      if (!resource) continue;
+      const mediaId = Number(resource.resource_id);
+      if (!Number.isFinite(mediaId) || mapped.has(mediaId)) continue;
+      const prefix = job.status === "blocked" ? "需要处理" : "后台任务";
+      mapped.set(mediaId, `${prefix} · ${job.progress.message}`);
+    }
+    return mapped;
+  }, [activeJobs]);
+  const libraryJobs = useMemo(
+    () =>
+      activeJobs.filter((job) =>
+        job.resources.some(
+          (resource) =>
+            resource.resource_type === "library" && resource.resource_id === String(libraryId),
+        ),
+      ),
+    [activeJobs, libraryId],
+  );
 
   // 扫描的补探阶段：把「还有文件没读出规格」的条目排到墙前面并点亮——
   // 头部胶囊只有一个总数（22/25），用户看不出具体是哪几部还在处理。
@@ -532,6 +558,7 @@ export function LibraryDetailView({ libraryId }: { libraryId: number }) {
           unidentified.length > 0 ||
           review.length > 0 ||
           importing > 0 ||
+          libraryJobs.length > 0 ||
           refreshingMeta ||
           busy) && (
           <div className="mt-2.5 flex flex-wrap items-center gap-2">
@@ -549,6 +576,12 @@ export function LibraryDetailView({ libraryId }: { libraryId: number }) {
               <span className="flex items-center gap-1.5 rounded-full border border-[#7dd3fc]/35 bg-[#7dd3fc]/[0.12] px-3 py-1 text-sub font-semibold text-[#7dd3fc]">
                 <span className="size-1.5 animate-pulse rounded-full bg-[#7dd3fc]" />
                 已发现 {importing} 个新文件 · 写入完成后自动入库
+              </span>
+            )}
+            {libraryJobs.length > 0 && (
+              <span className="flex items-center gap-1.5 rounded-full border border-[#7dd3fc]/35 bg-[#7dd3fc]/[0.12] px-3 py-1 text-sub font-semibold text-[#7dd3fc]">
+                <span className="size-1.5 animate-pulse rounded-full bg-[#7dd3fc]" />
+                {libraryJobs.length} 个后台任务正在处理库内影片
               </span>
             )}
             {missing.length > 0 && (
@@ -672,6 +705,7 @@ export function LibraryDetailView({ libraryId }: { libraryId: number }) {
                     libraryId={libraryId}
                     workingLabel={
                       refreshPhaseById.get(item.media_item_id) ??
+                      jobPhaseById.get(item.media_item_id) ??
                       (probing && item.probe_pending_count > 0 ? "正在读取规格" : undefined)
                     }
                   />

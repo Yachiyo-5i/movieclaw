@@ -40,9 +40,7 @@ class LibraryPayload(BaseModel):
 class LibraryReorderPayload(BaseModel):
     """媒体库重排的请求体：必须一次给全所有库的 id（漏/多/重复都拒绝）。"""
 
-    ordered_ids: list[int] = Field(
-        description="全部媒体库 id 的目标顺序（越靠前展示越靠前）"
-    )
+    ordered_ids: list[int] = Field(description="全部媒体库 id 的目标顺序（越靠前展示越靠前）")
 
 
 class LibraryStats(BaseModel):
@@ -563,6 +561,8 @@ class TransferStartView(BaseModel):
 
     started: bool
     message: str
+    job_id: str = Field(description="持久化后台作业 ID，可在任务中心继续观察")
+    created: bool = Field(default=True, description="false 表示复用了仍在进行的同一作业")
 
 
 class TransferStatusView(BaseModel):
@@ -763,9 +763,7 @@ class ReidentifyPreviewView(BaseModel):
     pinned_identity: bool = Field(
         default=False, description="身份被目录名 tmdbid 标记或 NFO 钉死——改了还会被扫描改回去"
     )
-    unreachable: bool = Field(
-        default=False, description="有文件因 TMDB 不通而无结论，此刻不宜拍板"
-    )
+    unreachable: bool = Field(default=False, description="有文件因 TMDB 不通而无结论，此刻不宜拍板")
     search_seed: str = Field(default="", description="「自己搜」的预填词（解析出的片名）")
 
 
@@ -837,6 +835,8 @@ class ScanResultView(BaseModel):
 
     started: bool
     message: str
+    job_id: str = Field(description="持久化后台作业 id，可用于等待、取消和查看时间线")
+    created: bool = Field(description="本次是否新建作业；false 表示复用同库进行中的扫描")
 
 
 class OrganizeSidecarView(BaseModel):
@@ -882,3 +882,5 @@ class OrganizeStartView(BaseModel):
 
     started: bool
     message: str
+    job_id: str = Field(description="持久化后台作业 ID，可在任务中心继续观察")
+    created: bool = Field(default=True, description="false 表示复用了仍在进行的同一作业")

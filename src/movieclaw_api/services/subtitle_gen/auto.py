@@ -56,9 +56,7 @@ def _has_target_subtitle(row: LibraryFile, target: str | None) -> bool:
 
 
 def _has_reference(row: LibraryFile, target_language: str) -> bool:
-    ranked = source.rank_candidates(
-        row, original_language=None, target_language=target_language
-    )
+    ranked = source.rank_candidates(row, original_language=None, target_language=target_language)
     return any(not c.excluded for c in ranked)
 
 
@@ -127,16 +125,21 @@ async def _run_batch(library_id: int) -> None:
                 )
                 return
             _attempted.add(row.id)
-            # 串行执行：一个翻译任务是分钟级 LLM 消费,绝不并发洪峰
+            # 自动入口与 Web / CLI / Agent 共用持久化 Job。这里只负责按额度
+            # 创建任务，执行并发、恢复、取消与状态展示统一交给 dispatcher。
             async with db.session() as session:
                 try:
-                    await tasks.start_generation(
-                        session, row.id, setting.target_language
+                    await tasks.enqueue_generation_job(
+                        session,
+                        row.id,
+                        setting.target_language,
+                        origin="scheduler",
+                        actor_kind="scheduler",
+                        actor_name="入库后自动生成字幕",
                     )
                 except Exception as exc:  # noqa: BLE001 -- 单文件不可行不断批次
                     logger.info("自动字幕生成跳过 %s：%s", row.file_path, exc)
                     continue
-            await tasks.run_generation(row.id, setting.target_language)
     except Exception:  # noqa: BLE001 -- 自动批次绝不影响扫描主流程
         logger.exception("自动字幕生成批次失败：库 #%s", library_id)
     finally:

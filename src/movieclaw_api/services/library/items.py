@@ -23,10 +23,11 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import logging
 import os
 import shutil
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -37,6 +38,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
 from movieclaw_api.schemas.library import LibraryItemView, derive_air_status
+from movieclaw_api.services.library.bluray import (
+    enrich_spec_with_clpi,
+    read_clpi_languages,
+    streams_have_clpi_metadata,
+)
 from movieclaw_api.services.library.layout import STRM_EXT, entry_dir_of
 from movieclaw_api.services.library.nfo import (
     EntryMetadata,
@@ -880,38 +886,80 @@ async def backfill_streams(
     files: list[LibraryFile],
     *,
     limit: int | None = None,
-    on_probed: Callable[[], bool] | None = None,
+    on_processed: Callable[[], bool | Awaitable[bool]] | None = None,
+    on_checkpoint: Callable[[], None | Awaitable[None]] | None = None,
 ) -> int:
-    """给没探测过音轨/字幕轨的在位台账行按需补探并回填，返回实际探了几个。
+    """补齐没探过的流，并为存量 BDMV 回填 CLPI 语言；返回实际 ffprobe 数。
 
-    这是「ffprobe 后装」的唯一救赎路径——扫描对已识别且在位的行整体秒过，
-    不会回头重探。**只由扫描的补探阶段调用**（有进度与停止按钮的后台任务，
-    慢没关系，半途而废才是问题），用 ``on_probed`` 汇报进度——回调返回
-    False 即收尾（用户点了停止）。详情页曾经也会限量触发补探，已移除：
-    浏览不碰媒体文件本体（云盘挂载上 ffprobe 读文件就是流量与延迟），
-    未探测的行由前端提示用户重新扫描补齐。
+    这是「ffprobe 后装」和「旧 BDMV 尚未读取 CLPI」的统一补救路径——扫描对
+    已识别且在位的行整体秒过，不会在主循环回头重探。**只由扫描的补探阶段
+    调用**（有进度与停止按钮的后台任务，慢没关系，半途而废才是问题），用
+    ``on_processed`` 汇报进度——无论最终是否需要 ffprobe，每检查完一个
+    候选都回调一次，返回 False 即收尾（用户点了停止）。详情页曾经也会
+    限量触发补探，已移除：浏览不碰媒体文件本体（云盘挂载上 ffprobe 读文件
+    就是流量与延迟），未探测的行由前端提示用户重新扫描补齐。
 
-    探测失败的行保持 NULL、下次再试：失败常常是暂时的（挂载还没就绪）。
-    代价是永远探不出的坏文件每轮都会被重试一次，坏文件多的库要留意。
+    探测失败的行保持原值、下次再试：失败常常是暂时的（挂载还没就绪）。
+    BDMV 已有流但缺 CLPI 版本戳时先读对应 CLPI；只有 CLPI 有效才重探 m2ts，
+    随后用 PID 合并，避免缺失元数据导致无意义的大文件读取。
     """
     from movieclaw_api.services.library.scan import disc_main_stream
 
     probed = 0
-    since_commit = 0
+    since_checkpoint = 0
+
+    async def keep_going() -> bool:
+        nonlocal since_checkpoint
+        since_checkpoint += 1
+        # 先提交领域数据再让进度回调写 Job：SQLite 同一时刻只允许一个写
+        # 事务，顺序反过来会让两个会话互等。即使本批全是无需探测的候选，
+        # 也结束读事务后再保存观察进度。
+        if since_checkpoint >= _PROBE_COMMIT_EVERY:
+            await session.commit()
+            since_checkpoint = 0
+            if on_checkpoint is not None:
+                checkpoint_result = on_checkpoint()
+                if inspect.isawaitable(checkpoint_result):
+                    await checkpoint_result
+        if on_processed is None:
+            return True
+        result = on_processed()
+        return bool(await result) if inspect.isawaitable(result) else result
+
     for row in files:
         if limit is not None and probed >= limit:
             break
-        if row.audio_streams is not None or row.missing_since is not None:
+        needs_clpi = row.container == "bluray" and not streams_have_clpi_metadata(
+            row.audio_streams, row.subtitle_streams
+        )
+        if (row.audio_streams is not None and not needs_clpi) or row.missing_since is not None:
+            if not await keep_going():
+                break
             continue
         if row.file_path.lower().endswith(STRM_EXT):
+            if not await keep_going():
+                break
             continue  # strm 占位文件没有媒体流，探了必失败，别每轮白试
         path = Path(row.file_path)
         target = disc_main_stream(path) if row.container in ("bluray", "dvd") else path
         if target is None or not await asyncio.to_thread(target.exists):
+            if not await keep_going():
+                break
             continue
+        languages = None
+        if row.container == "bluray":
+            languages = await asyncio.to_thread(read_clpi_languages, target)
+            # 已有 ffprobe 流的存量行只缺 CLPI 回填；CLPI 不存在/损坏时不值得
+            # 再读一遍大 m2ts。audio_streams=NULL 的行仍按原逻辑补普通规格。
+            if row.audio_streams is not None and languages is None:
+                if not await keep_going():
+                    break
+                continue
         probed += 1
         spec = await asyncio.to_thread(probe_media, target)
         if spec is not None:
+            if languages is not None:
+                spec = enrich_spec_with_clpi(spec, languages)
             row.audio_streams = list(spec.audio_streams)
             row.subtitle_streams = list(spec.subtitle_streams)
             # 顺手回填缺失的视频规格（同一次探测的免费产出，不覆盖已有值）
@@ -926,16 +974,16 @@ async def backfill_streams(
                 with contextlib.suppress(OSError):
                     row.file_mtime_ns = Path(row.file_path).stat().st_mtime_ns
             row.updated_at = utcnow()
-            since_commit += 1
-        # 分批提交而不是攒到最后：整库补探可能要几个小时，中途断电/重启
-        # 时已经探完的那部分不该白探
-        if since_commit >= _PROBE_COMMIT_EVERY:
-            await session.commit()
-            since_commit = 0
-        if on_probed is not None and not on_probed():
+        if not await keep_going():
             break
-    if since_commit:
-        await session.commit()
+    # 分批提交而不是攒到最后：整库补探可能要几个小时，中途断电/重启
+    # 时已经探完的那部分不该白探。这里无论有无写入都 commit，确保随后
+    # 的 Job 进度回调不与本会话的读事务交叠。
+    await session.commit()
+    if on_checkpoint is not None and since_checkpoint:
+        checkpoint_result = on_checkpoint()
+        if inspect.isawaitable(checkpoint_result):
+            await checkpoint_result
     return probed
 
 

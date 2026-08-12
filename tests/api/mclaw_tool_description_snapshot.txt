@@ -9,6 +9,7 @@ movieclaw 的官方命令行工具。对本产品的一切操作——搜索资�
 - dl       下载器接入、默认下载器与路径映射
 - extension 浏览器插件 Cookie 同步令牌
 - health   服务健康检查（一般用 status 即可）
+- jobs   后台任务
 - lib      媒体库：库管理、scan 扫描、organize 整理、items 条目、unidentified 待识别认领、missing 缺失重下、review 身份复核
 - llm      AI 模型供应商配置
 - net      网络与代理（show/set/test）

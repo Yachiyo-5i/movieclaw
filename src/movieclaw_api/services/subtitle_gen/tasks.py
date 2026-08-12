@@ -1,28 +1,28 @@
-"""生成任务编排：选源 → 同步质检 → 翻译 → 机检 → 落盘 → 台账刷新
-（subtitle-ai-translate.md §3.6/§6）。
+"""字幕生成领域管线：选源 → 同步质检 → 翻译 → 机检 → 落盘 → 台账刷新。
 
-任务按 library_file id 单飞（TaskState 三件套），不同文件可排队；实际执行
-由进程级锁全局串行，手动入口与自动批次共用同一成本闸门。产物落视频同目录
-sidecar，写完直接刷新台账（不等 watchdog，任务结束即可见）。
+任务状态、去重、取消和恢复全部由持久化 Job 负责。本模块只保留同步预检与
+可恢复的领域执行体，不维护第二套进程内状态。相同文件由 Job 资源锁单飞，
+不同文件可并行执行；每个文件内部的模型调用另有自适应并发与限流退避。
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
+import contextlib
 import logging
 import re as _re
 import time
-from dataclasses import dataclass, field
+from collections.abc import Callable
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
 from movieclaw_api.exceptions import AppException, BadRequestException, NotFoundException
+from movieclaw_api.services import jobs
 from movieclaw_api.services.library.subtitles import discover_external_subtitles
 from movieclaw_api.services.subtitle_gen import extract, pgs, source, sync, translate, validate
-from movieclaw_api.services.task_state import TaskState
 from movieclaw_db.engine import get_database
 from movieclaw_db.models import LibraryFile, MediaItem, MediaMetadata, utcnow
 
@@ -31,119 +31,106 @@ logger = logging.getLogger("movieclaw_api.subtitle_gen")
 #: 每千字符对白的估算 token 量（原文+译文+提示词开销的经验粗估，
 #: 只用于发起前的确认展示，不参与任何限额判断）
 _TOKENS_PER_KCHAR = 2600
-_JOB_INTENT_VERSION = 1
 
 
-@dataclass(frozen=True)
-class GenerationIntent:
-    """用户已确认且在进程意外退出后仍应继续的字幕任务。"""
+@dataclass
+class SubtitleLlmUsage:
+    """字幕任务的模型用量聚合器；并发回调只做无 await 的原子快照更新。"""
 
-    file_id: int
-    target_language: str
-    convert_pgs: bool = False
-    pgs_candidate_key: str | None = None
-    pgs_ocr_language: str | None = None
-    secondary_language: str | None = None
-    source_candidate_key: str | None = None
+    request_count: int = 0
+    failed_request_count: int = 0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+    cache_read_tokens: int = 0
+    total_duration_ms: int = 0
+    max_duration_ms: int = 0
+    thinking_response_count: int = 0
+    by_purpose: dict[str, dict[str, int]] = field(default_factory=dict)
+    finish_reasons: dict[str, int] = field(default_factory=dict)
+    last_call: dict[str, object] = field(default_factory=dict)
 
-
-def _intent_path(intent: GenerationIntent) -> Path:
-    output_key = subtitle_output_key(intent.target_language, intent.secondary_language)
-    return extract.cache_dir() / f"{intent.file_id}.{output_key}.job.json"
-
-
-def _persist_intent(intent: GenerationIntent) -> None:
-    """原子写入任务意图；断电最多留下 .part，不会产生半份有效任务。"""
-    target_language, secondary_language = ensure_output_languages(
-        intent.target_language, intent.secondary_language
-    )
-    path = _intent_path(intent)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".part")
-    temporary.write_text(
-        json.dumps(
-            {
-                "version": _JOB_INTENT_VERSION,
-                "file_id": intent.file_id,
-                "target_language": target_language,
-                "convert_pgs": intent.convert_pgs,
-                "pgs_candidate_key": intent.pgs_candidate_key,
-                "pgs_ocr_language": intent.pgs_ocr_language,
-                "secondary_language": secondary_language,
-                "source_candidate_key": intent.source_candidate_key,
-            },
-            ensure_ascii=False,
-        ),
-        encoding="utf-8",
-    )
-    temporary.replace(path)
-
-
-def _discard_intent(intent: GenerationIntent) -> None:
-    try:
-        _intent_path(intent).unlink(missing_ok=True)
-    except OSError as exc:
-        logger.warning("清理字幕任务意图失败：file=%s %s", intent.file_id, exc)
-
-
-def _discard_file_intents(file_id: int) -> None:
-    """明确停止时清掉该文件的全部目标语言意图，防止重启后反向复活。"""
-    for path in extract.cache_dir().glob(f"{file_id}.*.job.json"):
-        try:
-            path.unlink(missing_ok=True)
-        except OSError as exc:
-            logger.warning("清理字幕任务意图失败：file=%s %s", file_id, exc)
-
-
-def _load_intent(path: Path) -> GenerationIntent | None:
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        if data.get("version") != _JOB_INTENT_VERSION:
-            raise ValueError("版本不受支持")
-        file_id = int(data["file_id"])
-        if file_id <= 0:
-            raise ValueError("文件 ID 无效")
-        target_language = ensure_language_token(str(data["target_language"]))
-        convert_pgs = data.get("convert_pgs") is True
-        candidate_key = data.get("pgs_candidate_key")
-        ocr_language = data.get("pgs_ocr_language")
-        secondary_language = data.get("secondary_language")
-        source_candidate_key = data.get("source_candidate_key")
-        if candidate_key is not None and not isinstance(candidate_key, str):
-            raise ValueError("PGS 轨道标识无效")
-        if ocr_language is not None and not isinstance(ocr_language, str):
-            raise ValueError("OCR 语言无效")
-        if secondary_language is not None and not isinstance(secondary_language, str):
-            raise ValueError("第二字幕语言无效")
-        if source_candidate_key is not None and not isinstance(source_candidate_key, str):
-            raise ValueError("参考字幕标识无效")
-        target_language, secondary_language = ensure_output_languages(
-            target_language, secondary_language
+    def record_success(
+        self,
+        call: translate.ChatCall,
+        *,
+        duration_ms: int,
+        prompt_tokens: int,
+        completion_tokens: int,
+        total_tokens: int,
+        cache_read_tokens: int,
+        finish_reason: str | None,
+        has_thinking: bool,
+    ) -> None:
+        self.request_count += 1
+        self.prompt_tokens += prompt_tokens
+        self.completion_tokens += completion_tokens
+        self.total_tokens += total_tokens
+        self.cache_read_tokens += cache_read_tokens
+        self.total_duration_ms += duration_ms
+        self.max_duration_ms = max(self.max_duration_ms, duration_ms)
+        if has_thinking:
+            self.thinking_response_count += 1
+        reason = finish_reason or "unknown"
+        self.finish_reasons[reason] = self.finish_reasons.get(reason, 0) + 1
+        bucket = self.by_purpose.setdefault(
+            call.purpose,
+            {"requests": 0, "prompt_tokens": 0, "completion_tokens": 0, "duration_ms": 0},
         )
-        return GenerationIntent(
-            file_id=file_id,
-            target_language=target_language,
-            convert_pgs=convert_pgs,
-            pgs_candidate_key=candidate_key,
-            pgs_ocr_language=ocr_language,
-            secondary_language=secondary_language,
-            source_candidate_key=source_candidate_key,
+        bucket["requests"] += 1
+        bucket["prompt_tokens"] += prompt_tokens
+        bucket["completion_tokens"] += completion_tokens
+        bucket["duration_ms"] += duration_ms
+        self.last_call = {
+            "purpose": call.purpose,
+            "block_index": call.block_index,
+            "attempt": call.attempt,
+            "duration_ms": duration_ms,
+            "finish_reason": reason,
+        }
+
+    def record_failure(
+        self, call: translate.ChatCall, *, duration_ms: int, error_code: str
+    ) -> None:
+        self.request_count += 1
+        self.failed_request_count += 1
+        self.total_duration_ms += duration_ms
+        self.max_duration_ms = max(self.max_duration_ms, duration_ms)
+        bucket = self.by_purpose.setdefault(
+            call.purpose,
+            {"requests": 0, "prompt_tokens": 0, "completion_tokens": 0, "duration_ms": 0},
         )
-    except (
-        BadRequestException,
-        KeyError,
-        OSError,
-        TypeError,
-        ValueError,
-        json.JSONDecodeError,
-    ) as exc:
-        logger.warning("跳过损坏的字幕任务意图：%s（%s）", path, exc)
-        return None
+        bucket["requests"] += 1
+        bucket["duration_ms"] += duration_ms
+        self.last_call = {
+            "purpose": call.purpose,
+            "block_index": call.block_index,
+            "attempt": call.attempt,
+            "duration_ms": duration_ms,
+            "error_code": error_code,
+        }
+
+    def snapshot(self) -> dict[str, object]:
+        """返回全新字典，避免 Job 轮询比较被后续原地更新污染。"""
+        return {
+            "request_count": self.request_count,
+            "failed_request_count": self.failed_request_count,
+            "prompt_tokens": self.prompt_tokens,
+            "completion_tokens": self.completion_tokens,
+            "total_tokens": self.total_tokens,
+            "cache_read_tokens": self.cache_read_tokens,
+            "total_duration_ms": self.total_duration_ms,
+            "max_duration_ms": self.max_duration_ms,
+            "thinking_response_count": self.thinking_response_count,
+            "by_purpose": {key: dict(value) for key, value in self.by_purpose.items()},
+            "finish_reasons": dict(self.finish_reasons),
+            "last_call": dict(self.last_call),
+        }
 
 
 @dataclass
 class GenState:
-    """进行中任务的实时状态（进度面板数据源）。"""
+    """单次领域执行的内存快照；Job 处理器定期把它持久化为公共进度。"""
 
     # 阶段值由前端映射成稳定的五步进度，message 则描述阶段内的即时动作。
     phase: str = "preparing"
@@ -154,16 +141,20 @@ class GenState:
     total_events: int = 0
     active_blocks: tuple[int, ...] = ()
     parallelism: int = 0
+    oldest_active_seconds: int = 0
+    last_completed_seconds_ago: int | None = None
+    validation_retries: int = 0
+    rate_limit_count: int = 0
     uses_ocr: bool = False
     target_language: str = "chs"
     secondary_language: str | None = None
     source_candidate_key: str | None = None
-    started_at: float = field(default_factory=time.monotonic)
+    llm_usage: SubtitleLlmUsage = field(default_factory=SubtitleLlmUsage)
 
 
 @dataclass
 class GenResult:
-    """最近一次任务结论。"""
+    """字幕领域执行结论；成功后被写入 Job.result。"""
 
     ok: bool
     message: str
@@ -172,52 +163,6 @@ class GenResult:
     sync_score: float | None = None
     source_desc: str | None = None
     finished_at: object = None
-
-
-_tasks: TaskState[GenState] = TaskState()
-# 翻译调用会消耗真实 LLM 配额；不同文件可以同时排队，但执行体必须全局串行。
-# TaskState 只负责“同文件单飞”，不能替代这把进程级串行闸门。
-_generation_lock = asyncio.Lock()
-
-
-def gen_state(file_id: int) -> GenState | None:
-    return _tasks.state_of(file_id)
-
-
-def last_result(file_id: int) -> GenResult | None:
-    result = _tasks.last(file_id)
-    return result if isinstance(result, GenResult) else None
-
-
-def request_stop(file_id: int) -> bool:
-    stopped = _tasks.request_stop(file_id)
-    if stopped:
-        # 用户明确停止与服务重启不同：立即撤销持久化意图，即使进程随后崩溃，
-        # 下次启动也不能擅自把用户刚停掉的任务重新拉起。
-        _discard_file_intents(file_id)
-    return stopped
-
-
-def is_generation_running(file_id: int) -> bool:
-    """该台账行是否正有字幕生成任务在执行。"""
-    return _tasks.running(file_id)
-
-
-def discard_removed_file_job_state(file_id: int) -> None:
-    """台账行已提交删除后，清理它遗留的字幕续传状态。
-
-    调用方先以 ``is_generation_running`` 确认没有在跑的任务，且只能在删除
-    台账事务提交成功后调用。这样服务重启时不会续传一个已经不存在的文件，
-    同时避免提交失败却提前丢掉用户已确认的任务意图。
-    """
-    _discard_file_intents(file_id)
-    for path in extract.cache_dir().glob(f"{file_id}.*.checkpoint.json"):
-        try:
-            path.unlink(missing_ok=True)
-        except OSError as exc:
-            logger.warning("清理字幕翻译断点失败：file=%s %s", file_id, exc)
-    # 防止 SQLite 以后复用这个 id 时，详情页读到被删除行遗留的“最近结果”。
-    _tasks.discard(file_id)
 
 
 async def _load_row(session: AsyncSession, file_id: int) -> LibraryFile:
@@ -377,6 +322,50 @@ def candidate_key(candidate: source.RankedCandidate) -> str:
 def candidate_selectable(candidate: source.RankedCandidate) -> bool:
     """文本字幕可直接选择，PGS 可选择后进入 OCR；其他排除项不可选。"""
     return candidate.exclusion_code in {None, "pgs"}
+
+
+async def _source_fingerprint(row: LibraryFile, selected_source_key: str) -> dict[str, int]:
+    """记录预检实际读取的源文件身份，防止长时间排队后翻译另一份内容。"""
+    kind, separator, key = selected_source_key.partition(":")
+    if not separator or kind not in {"embedded", "external"}:
+        raise BadRequestException("参考字幕标识不合法，请重新预检")
+    if kind == "external":
+        known = {str(item.get("filename")) for item in row.external_subtitles or []}
+        if key not in known:
+            raise BadRequestException("所选参考字幕已不存在，请重新扫描后再试")
+        path = Path(row.file_path).parent / key
+    else:
+        path = Path(row.file_path)
+    try:
+        stat = await asyncio.to_thread(path.stat)
+    except OSError as exc:
+        raise BadRequestException("参考字幕暂时无法读取，请检查文件后重试") from exc
+    return {"size_bytes": stat.st_size, "file_mtime_ns": stat.st_mtime_ns}
+
+
+async def _verify_source_fingerprint(
+    file_id: int,
+    selected_source_key: str,
+    expected: dict[str, object],
+) -> None:
+    """执行前复验源文件；不允许重试任务静默改用已变化的片源或字幕。"""
+    db = get_database()
+    async with db.session() as session:
+        row = await _load_row(session, file_id)
+    try:
+        actual = await _source_fingerprint(row, selected_source_key)
+    except AppException as exc:
+        raise jobs.JobFailed(
+            exc.message,
+            code="SUBTITLE_SOURCE_UNAVAILABLE",
+            actions=[{"type": "handoff_agent", "label": "交给 Agent"}],
+        ) from exc
+    if actual != expected:
+        raise jobs.JobFailed(
+            "参考字幕或影片在排队期间发生了变化，请重新预检后再生成",
+            code="SUBTITLE_SOURCE_CHANGED",
+            actions=[{"type": "handoff_agent", "label": "交给 Agent"}],
+        )
 
 
 def _select_reference(
@@ -592,7 +581,6 @@ async def preview(
     *,
     secondary_language: str | None = None,
     source_candidate_key: str | None = None,
-    pgs_candidate_key: str | None = None,
     pgs_ocr_language: str | None = None,
 ) -> Preview:
     """选源 + 加载最优候选做成本估算（不动 LLM）。"""
@@ -607,8 +595,7 @@ async def preview(
     ranked = source.rank_candidates(
         row, original_language=original_language, target_language=source_target
     )
-    requested_source_key = source_candidate_key or pgs_candidate_key
-    selected = _select_reference(ranked, requested_source_key)
+    selected = _select_reference(ranked, source_candidate_key)
     selected_candidates = [selected] if selected is not None else []
     warnings: list[str] = []
     chosen, events = await _pick_loadable(row, selected_candidates, warnings)
@@ -687,7 +674,7 @@ def _cand_desc(c: source.SourceCandidate) -> str:
     return f"{kind} {c.key}（{c.language or '未知语言'}/{c.format}）"
 
 
-async def start_generation(
+async def _prepare_generation(
     session: AsyncSession,
     file_id: int,
     target_language: str,
@@ -695,10 +682,9 @@ async def start_generation(
     secondary_language: str | None = None,
     source_candidate_key: str | None = None,
     convert_pgs: bool = False,
-    pgs_candidate_key: str | None = None,
     pgs_ocr_language: str | None = None,
-) -> Preview:
-    """校验可行性并登记任务；调用方随后交给任务主管执行。"""
+) -> tuple[Preview, GenState]:
+    """完成所有同步预检并生成首个进度快照，随后由 Job 原子入队。"""
     target_language, secondary_language = ensure_output_languages(
         target_language, secondary_language
     )
@@ -708,11 +694,10 @@ async def start_generation(
         target_language,
         secondary_language=secondary_language,
         source_candidate_key=source_candidate_key,
-        pgs_candidate_key=pgs_candidate_key,
         pgs_ocr_language=pgs_ocr_language,
     )
     if pv.chosen is None:
-        if pgs_candidate_key and pv.pgs_conversion is None:
+        if source_candidate_key and pv.pgs_conversion is None:
             raise BadRequestException("用户确认的 PGS 轨道已变化，请重新预检后再试")
         language_ready = bool(
             pv.pgs_conversion
@@ -750,182 +735,289 @@ async def start_generation(
 
     # 入队前只组装一次 LLM 路由，不发送网络请求。这样缺少模型配置时由当前
     # POST 直接返回可读错误，不会让页面先看到“任务已开始”，随后又收到一条
-    # 后台“未知错误”。排队后配置仍可能被删除，run_generation 另有兜底。
+    # 后台“未知错误”。排队后配置仍可能被删除，Job 处理器会转为 blocked。
     from movieclaw_api.services.llm_config import acquire_llm_router
 
     await acquire_llm_router(session)
-    if not _tasks.try_start(file_id, initial):
-        raise BadRequestException("该文件已有字幕生成任务在进行中")
-    return pv
+    return pv, initial
 
 
-def queue_generation(
+async def enqueue_generation_job(
+    session: AsyncSession,
     file_id: int,
     target_language: str,
-    convert_pgs: bool = False,
-    pgs_candidate_key: str | None = None,
-    pgs_ocr_language: str | None = None,
+    *,
     secondary_language: str | None = None,
     source_candidate_key: str | None = None,
-) -> asyncio.Task[None]:
-    """把已登记的字幕任务交给进程级主管，立即返回且不绑定 HTTP 响应。"""
-    if _tasks.state_of(file_id) is None:
-        raise RuntimeError(f"字幕任务 #{file_id} 尚未登记，无法入队")
-    intent = GenerationIntent(
-        file_id=file_id,
-        target_language=target_language,
-        convert_pgs=convert_pgs,
-        pgs_candidate_key=pgs_candidate_key,
-        pgs_ocr_language=pgs_ocr_language,
-        secondary_language=secondary_language,
-        source_candidate_key=source_candidate_key,
-    )
-    # 先持久化用户已经确认过的任务，再交给事件循环。即使进程在下一行前崩溃，
-    # 下次启动也能恢复；正常结论和明确停止会由统一收尾删除这份意图。
-    _persist_intent(intent)
-
-    from movieclaw_api.services.task_supervisor import get_task_supervisor
-
-    try:
-        return get_task_supervisor().start(
-            run_generation(
-                file_id,
-                target_language,
-                convert_pgs,
-                pgs_candidate_key,
-                pgs_ocr_language,
-                secondary_language,
-                source_candidate_key,
-            ),
-            name=f"subtitle-generation-{file_id}",
-        )
-    except Exception:
-        # HTTP 请求尚未返回时入队失败，撤销 start_generation 占住的单飞位，
-        # 让用户可以立即重试，而不是留下一个永远不会执行的“进行中”任务。
-        _tasks.finish(file_id)
-        _discard_intent(intent)
-        raise
-
-
-def resume_interrupted_generations() -> int:
-    """启动时恢复仍有持久化意图的任务；返回成功入队数量。"""
-    resumed = 0
-    for path in sorted(extract.cache_dir().glob("*.job.json")):
-        intent = _load_intent(path)
-        if intent is None:
-            continue
-        initial = GenState(
-            phase="ocr" if intent.convert_pgs else "preparing",
-            message="正在从已保存进度自动续传",
-            uses_ocr=intent.convert_pgs,
-            target_language=intent.target_language,
-            secondary_language=intent.secondary_language,
-            source_candidate_key=intent.source_candidate_key,
-        )
-        if not _tasks.try_start(intent.file_id, initial):
-            logger.warning("跳过重复的字幕续传任务：file=%s", intent.file_id)
-            continue
-        try:
-            queue_generation(
-                intent.file_id,
-                intent.target_language,
-                intent.convert_pgs,
-                intent.pgs_candidate_key,
-                intent.pgs_ocr_language,
-                intent.secondary_language,
-                intent.source_candidate_key,
-            )
-        except Exception:  # noqa: BLE001 -- 单个损坏任务不能阻断整个应用启动
-            logger.exception("自动续传字幕任务入队失败：file=%s", intent.file_id)
-            continue
-        resumed += 1
-        logger.info(
-            "已自动续传字幕任务：file=%s target=%s",
-            intent.file_id,
-            intent.target_language,
-        )
-    if resumed:
-        logger.info("字幕任务自动续传完成：共 %d 个", resumed)
-    return resumed
-
-
-async def run_generation(
-    file_id: int,
-    target_language: str,
     convert_pgs: bool = False,
-    pgs_candidate_key: str | None = None,
     pgs_ocr_language: str | None = None,
-    secondary_language: str | None = None,
-    source_candidate_key: str | None = None,
-) -> None:
-    """后台执行体（自开会话，不向外抛异常；结论落 TaskState.last）。"""
-    state = _tasks.state_of(file_id)
-    assert state is not None  # start_generation 已登记
-    intent = GenerationIntent(
-        file_id=file_id,
-        target_language=target_language,
-        convert_pgs=convert_pgs,
-        pgs_candidate_key=pgs_candidate_key,
-        pgs_ocr_language=pgs_ocr_language,
+    actor_kind: str | None = None,
+    actor_name: str | None = None,
+    actor_id: str | None = None,
+    origin: str = "web",
+) -> tuple[Preview, jobs.CreateJobResult]:
+    """把字幕生成写成真正持久化任务；HTTP/CLI 只负责创建，不持有执行协程。"""
+    target_language, secondary_language = ensure_output_languages(
+        target_language, secondary_language
+    )
+    pv, initial = await _prepare_generation(
+        session,
+        file_id,
+        target_language,
         secondary_language=secondary_language,
         source_candidate_key=source_candidate_key,
+        convert_pgs=convert_pgs,
+        pgs_ocr_language=pgs_ocr_language,
     )
-    result: GenResult | None = None
-    interrupted_by_shutdown = False
+    row = await _load_row(session, file_id)
+    from movieclaw_api.services.llm_config import acquire_llm_router
+
+    router = await acquire_llm_router(session)
+    provider, model_id = router.resolve("default")
+    provider_ref = provider.name
+    selected_source_key = pv.selected_source_key
+    if selected_source_key is None:
+        raise BadRequestException("没有可用的参考字幕，请重新预检")
+    source_fingerprint = await _source_fingerprint(row, selected_source_key)
+    input_data = {
+        "file_id": file_id,
+        "target_language": target_language,
+        "secondary_language": secondary_language,
+        "source_candidate_key": selected_source_key,
+        "source_fingerprint": source_fingerprint,
+        "convert_pgs": convert_pgs,
+        "pgs_ocr_language": pgs_ocr_language,
+        # 固定到任务创建时实际选中的供应商/模型；不保存 API key。用户随后
+        # 改默认模型不会让一个已开始的任务中途混用另一套翻译风格。
+        "provider_ref": provider_ref,
+        "model_ref": f"{provider_ref}/{model_id}",
+        "prompt_revision": "subtitle.translate.v1",
+    }
+    resources = [
+        jobs.ResourceRef("library_file", file_id),
+        jobs.ResourceRef("library", row.library_id, "container"),
+    ]
+    if row.media_item_id is not None:
+        resources.append(jobs.ResourceRef("media_item", row.media_item_id, "container"))
+    progress = _job_progress(initial)
+    created = await jobs.create_job(
+        session,
+        job_type="subtitle.generate",
+        subject=Path(row.file_path).name,
+        definition_version=1,
+        handler_revision="subtitle.generate.v1",
+        prompt_revision="subtitle.translate.v1",
+        provider_ref=f"{provider_ref}/{model_id}",
+        input_data=input_data,
+        resources=resources,
+        dedupe_key=(
+            f"subtitle.generate:{file_id}:"
+            f"{subtitle_output_key(target_language, secondary_language)}"
+        ),
+        conflict_policy="return_existing",
+        max_attempts=2,
+        actor_kind=actor_kind,
+        actor_name=actor_name,
+        actor_id=actor_id,
+        origin=origin,
+        progress=progress,
+    )
+    return pv, created
+
+
+_PHASE_INDEX = {
+    "preparing": 1,
+    "ocr": 1,
+    "syncing": 1,
+    "glossary": 2,
+    "translating": 3,
+    "validating": 4,
+    "compressing": 4,
+    "writing": 5,
+    "refreshing": 5,
+}
+
+
+def _job_progress(state: GenState) -> dict[str, object]:
+    """把字幕领域实时状态映射到公共进度外壳，不伪造无法计算的百分比。"""
+    percent = None
+    if state.total_blocks > 0 and state.phase in {
+        "translating",
+        "validating",
+        "compressing",
+        "writing",
+        "refreshing",
+    }:
+        percent = round(min(100.0, state.done_blocks / state.total_blocks * 100), 1)
+    return {
+        "mode": "determinate" if percent is not None else "indeterminate",
+        "phase": state.phase,
+        "message": state.message,
+        "current": state.done_blocks if state.total_blocks else None,
+        "total": state.total_blocks or None,
+        "percent": percent,
+        "phase_index": _PHASE_INDEX.get(state.phase),
+        "phase_count": 5,
+        "details": {
+            "done_blocks": state.done_blocks,
+            "total_blocks": state.total_blocks,
+            "done_events": state.done_events,
+            "total_events": state.total_events,
+            "active_blocks": list(state.active_blocks),
+            "parallelism": state.parallelism,
+            "oldest_active_seconds": state.oldest_active_seconds,
+            "last_completed_seconds_ago": state.last_completed_seconds_ago,
+            "validation_retries": state.validation_retries,
+            "rate_limit_count": state.rate_limit_count,
+            "uses_ocr": state.uses_ocr,
+            "target_language": state.target_language,
+            "secondary_language": state.secondary_language,
+            "source_candidate_key": state.source_candidate_key,
+        },
+    }
+
+
+def _result_payload(result: GenResult) -> dict[str, object]:
+    return {
+        "ok": result.ok,
+        "message": result.message,
+        "filename": result.filename,
+        "report": asdict(result.report) if result.report is not None else None,
+        "sync_score": result.sync_score,
+        "source_desc": result.source_desc,
+        "finished_at": (
+            result.finished_at.isoformat()
+            if hasattr(result.finished_at, "isoformat")
+            else result.finished_at
+        ),
+    }
+
+
+@jobs.register_job_handler("subtitle.generate")
+async def _run_generation_job(
+    context: jobs.JobContext, input_data: dict[str, object]
+) -> dict[str, object]:
+    """Job 原生处理器：直接执行领域管线并持久化进度，不维护影子任务状态。"""
+    file_id = int(input_data["file_id"])
+    target_language = str(input_data.get("target_language") or "chs")
+    secondary_language = input_data.get("secondary_language")
+    source_candidate_key = input_data.get("source_candidate_key")
+    model_ref = input_data.get("model_ref")
+    convert_pgs = input_data.get("convert_pgs") is True
+    pgs_ocr_language = input_data.get("pgs_ocr_language")
+    source_fingerprint = input_data.get("source_fingerprint")
+    if source_candidate_key and isinstance(source_fingerprint, dict):
+        await _verify_source_fingerprint(
+            file_id,
+            str(source_candidate_key),
+            source_fingerprint,
+        )
+    state = GenState(
+        phase="ocr" if convert_pgs else "preparing",
+        message="正在从已保存进度继续" if input_data.get("resume") else "正在准备",
+        uses_ocr=convert_pgs,
+        target_language=target_language,
+        secondary_language=str(secondary_language) if secondary_language else None,
+        source_candidate_key=str(source_candidate_key) if source_candidate_key else None,
+    )
+    cancelled = asyncio.Event()
+    runner = asyncio.create_task(
+        _run(
+            file_id,
+            target_language,
+            state,
+            convert_pgs=convert_pgs,
+            pgs_ocr_language=str(pgs_ocr_language) if pgs_ocr_language else None,
+            secondary_language=str(secondary_language) if secondary_language else None,
+            source_candidate_key=(str(source_candidate_key) if source_candidate_key else None),
+            model_ref=str(model_ref) if model_ref else None,
+            job_id=getattr(context, "job_id", None),
+            cancelled=cancelled.is_set,
+        ),
+        name=f"subtitle-pipeline-{file_id}",
+    )
+    last_snapshot: dict[str, object] | None = None
+    last_usage: dict[str, object] | None = None
     try:
-        async with _generation_lock:
-            if _tasks.stop_requested(file_id):
-                raise translate.TranslationAborted("任务在排队期间被用户取消")
-            if convert_pgs:
-                kwargs = {
-                    "convert_pgs": True,
-                    "pgs_candidate_key": pgs_candidate_key,
-                    "pgs_ocr_language": pgs_ocr_language,
-                }
-                if secondary_language is not None:
-                    kwargs["secondary_language"] = secondary_language
-                if source_candidate_key is not None:
-                    kwargs["source_candidate_key"] = source_candidate_key
-                result = await _run(file_id, target_language, state, **kwargs)
-            else:
-                # 保持单语原调用形态，避免自动生成和既有扩展点被无关参数破坏。
-                if secondary_language is None and source_candidate_key is None:
-                    result = await _run(file_id, target_language, state)
-                else:
-                    kwargs = {}
-                    if secondary_language is not None:
-                        kwargs["secondary_language"] = secondary_language
-                    if source_candidate_key is not None:
-                        kwargs["source_candidate_key"] = source_candidate_key
-                    result = await _run(file_id, target_language, state, **kwargs)
+        while not runner.done():
+            if await context.cancel_requested():
+                cancelled.set()
+            snapshot = _job_progress(state)
+            usage = state.llm_usage.snapshot()
+            if snapshot != last_snapshot or usage != last_usage:
+                await context.update_progress(  # type: ignore[arg-type]
+                    **snapshot,
+                    usage=usage,
+                )
+                last_snapshot = snapshot
+                last_usage = usage
+            try:
+                await asyncio.wait_for(asyncio.shield(runner), timeout=0.75)
+            except TimeoutError:
+                continue
+        result = await runner
     except translate.TranslationAborted as exc:
-        logger.warning("字幕生成中止：file=%s %s", file_id, exc)
-        result = GenResult(ok=False, message=str(exc))
-    except asyncio.CancelledError:
-        # 服务重载只暂停任务，不把已花费的 LLM 成本作废：translate.Checkpoint
-        # 已逐块落在 data/，用户重新发起后会从最后完成块继续。
-        logger.info("服务关闭，字幕生成已暂停：file=%s", file_id)
-        interrupted_by_shutdown = True
-        result = GenResult(
-            ok=False,
-            message="服务重启，字幕生成已暂停；启动完成后将从已保存进度自动继续",
-        )
-        raise
+        if cancelled.is_set() or await context.cancel_requested():
+            raise jobs.JobCancelled from exc
+        raise jobs.JobFailed(
+            str(exc),
+            code="SUBTITLE_TRANSLATION_ABORTED",
+            actions=[
+                {"type": "retry_job", "label": "重试"},
+                {"type": "handoff_agent", "label": "交给 Agent"},
+            ],
+        ) from exc
     except AppException as exc:
-        # AppException 的中文 message 是服务层明确允许展示的业务错误（未配置、
-        # 文件丢失等）；保留它才能给非开发者可执行的下一步。任意未知异常仍走
-        # 下方兜底，避免把密钥、路径或上游响应泄露到页面。
-        logger.warning("字幕生成失败：file=%s %s", file_id, exc.message)
-        result = GenResult(ok=False, message=exc.message)
-    except Exception:  # noqa: BLE001 -- 后台任务兜底
-        logger.exception("字幕生成失败：file=%s", file_id)
-        result = GenResult(ok=False, message="生成失败：发生未知错误（详见后端日志）")
+        if "配置" in exc.message or "模型" in exc.message:
+            raise jobs.JobBlocked(
+                exc.message,
+                code="SUBTITLE_MODEL_UNAVAILABLE",
+                actions=[
+                    {"type": "open_settings", "label": "配置 AI 模型", "target": "llm"},
+                    {"type": "retry_job", "label": "配置后重试"},
+                    {"type": "handoff_agent", "label": "交给 Agent"},
+                ],
+            ) from exc
+        raise jobs.JobFailed(
+            exc.message,
+            code="SUBTITLE_GENERATION_FAILED",
+            actions=[{"type": "handoff_agent", "label": "交给 Agent"}],
+        ) from exc
     finally:
-        if result is not None:
-            result.finished_at = utcnow()
-        if not interrupted_by_shutdown:
-            _discard_intent(intent)
-        _tasks.finish(file_id, result=result)
+        # 进度持久化失败等异常也必须回收领域协程；否则 dispatcher 已把 Job
+        # 转入重试，旧翻译却仍在后台调用模型，造成重复费用和产物写入竞态。
+        if not runner.done():
+            runner.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await runner
+
+    snapshot = _job_progress(state)
+    usage = state.llm_usage.snapshot()
+    if snapshot != last_snapshot or usage != last_usage:
+        await context.update_progress(  # type: ignore[arg-type]
+            **snapshot,
+            usage=usage,
+        )
+    result.finished_at = utcnow()
+    if not result.ok:
+        if await context.cancel_requested():
+            raise jobs.JobCancelled
+        actions: list[dict[str, object]] = [
+            {"type": "retry_job", "label": "重试"},
+            {"type": "handoff_agent", "label": "交给 Agent"},
+        ]
+        if "配置" in result.message or "模型" in result.message:
+            raise jobs.JobBlocked(
+                result.message,
+                code="SUBTITLE_MODEL_UNAVAILABLE",
+                actions=[
+                    {"type": "open_settings", "label": "配置 AI 模型", "target": "llm"},
+                    {"type": "retry_job", "label": "配置后重试"},
+                    {"type": "handoff_agent", "label": "交给 Agent"},
+                ],
+            )
+        raise jobs.JobFailed(result.message, code="SUBTITLE_GENERATION_FAILED", actions=actions)
+    return _result_payload(result)
 
 
 async def _run(
@@ -934,10 +1026,12 @@ async def _run(
     state: GenState,
     *,
     convert_pgs: bool = False,
-    pgs_candidate_key: str | None = None,
     pgs_ocr_language: str | None = None,
     secondary_language: str | None = None,
     source_candidate_key: str | None = None,
+    model_ref: str | None = None,
+    job_id: str | None = None,
+    cancelled: Callable[[], bool],
 ) -> GenResult:
     target_language, secondary_language = ensure_output_languages(
         target_language, secondary_language
@@ -946,15 +1040,19 @@ async def _run(
     async with db.session() as session:
         row = await _load_row(session, file_id)
         ctx, original_language = await _film_context(session, row)
-        chat = await _build_chat(session)
+        chat = await _build_chat(
+            session,
+            model_ref=model_ref,
+            job_id=job_id,
+            usage=state.llm_usage,
+        )
 
     source_target = target_language if secondary_language is None else "__bilingual__"
     ranked = source.rank_candidates(
         row, original_language=original_language, target_language=source_target
     )
-    requested_source_key = source_candidate_key or pgs_candidate_key
     try:
-        selected = _select_reference(ranked, requested_source_key)
+        selected = _select_reference(ranked, source_candidate_key)
     except BadRequestException as exc:
         return GenResult(ok=False, message=exc.message)
     state.source_candidate_key = candidate_key(selected) if selected is not None else None
@@ -996,7 +1094,7 @@ async def _run(
             )
         except (OSError, extract.SourceLoadError, pgs.PgsConversionError) as exc:
             return GenResult(ok=False, message=f"图片字幕识别未完成：{exc}")
-        if _tasks.stop_requested(file_id):
+        if cancelled():
             raise translate.TranslationAborted("图片字幕识别完成，已按你的请求停止后续 AI 翻译")
         assessment = source.assess_events(events, row.duration_seconds)
         if not assessment.ok:
@@ -1053,6 +1151,7 @@ async def _run(
         state.phase = phase
         state.message = message
         state.active_blocks = ()
+        state.oldest_active_seconds = 0
 
     def _progress(progress: translate.TranslationProgress) -> None:
         state.done_blocks = progress.done_blocks
@@ -1061,6 +1160,19 @@ async def _run(
         state.total_events = progress.total_events
         state.active_blocks = progress.active_blocks
         state.parallelism = progress.concurrency
+        state.oldest_active_seconds = progress.oldest_active_seconds
+        state.last_completed_seconds_ago = progress.last_completed_seconds_ago
+        state.validation_retries = progress.validation_retries
+        state.rate_limit_count = progress.rate_limit_count
+        if state.phase == "translating" and progress.active_blocks:
+            active_count = len(progress.active_blocks)
+            if progress.done_blocks == 0:
+                state.message = f"首批 {active_count} 个字幕块正在等待模型返回"
+            else:
+                state.message = (
+                    f"已完成 {progress.done_blocks}/{progress.total_blocks} 块，"
+                    f"另有 {active_count} 块处理中"
+                )
 
     out_events, stats = await translate.translate_events(
         chat,
@@ -1071,7 +1183,7 @@ async def _run(
         secondary_language=secondary_language,
         progress=_progress,
         phase=_phase,
-        cancelled=lambda: _tasks.stop_requested(file_id),
+        cancelled=cancelled,
     )
 
     state.phase = "validating"
@@ -1174,27 +1286,143 @@ async def _refresh_subtitle_inventory(db, file_id: int) -> None:  # noqa: ANN001
         await session.commit()
 
 
-async def _build_chat(session: AsyncSession) -> translate.ChatFn:
-    """movieclaw_llm 路由 → translate 层的 chat 函数（§3.6）。"""
+def _subtitle_max_tokens(call: translate.ChatCall) -> int:
+    """按输出条数给结构化字幕留足空间，同时阻止模型无界思考。"""
+    if call.purpose == "glossary":
+        base, ceiling = 2048, 4096
+    elif call.purpose == "compress":
+        base = max(2048, 1024 + call.event_count * 100)
+        ceiling = 6144
+    else:
+        per_event = 180 if call.bilingual else 110
+        base = max(4096, 1024 + call.event_count * per_event)
+        ceiling = 12288 if call.bilingual else 8192
+    expanded = int(base * (1.5 ** max(0, call.attempt - 1)))
+    return min(ceiling, expanded)
+
+
+async def _build_chat(
+    session: AsyncSession,
+    *,
+    model_ref: str | None = None,
+    job_id: str | None = None,
+    usage: SubtitleLlmUsage | None = None,
+) -> translate.ChatFn:
+    """movieclaw_llm 路由 → 字幕专用结构化生成，并记录任务级用量。"""
     from movieclaw_api.services.llm_config import acquire_llm_router
-    from movieclaw_llm import ChatMessage, ChatRequest, LlmRateLimitError
+    from movieclaw_llm import (
+        ChatMessage,
+        ChatRequest,
+        LlmRateLimitError,
+        LlmRoutingError,
+        ModelSettings,
+    )
 
     router = await acquire_llm_router(session)
+    try:
+        provider, resolved_model = router.resolve(model_ref or "")
+    except LlmRoutingError as exc:
+        raise BadRequestException(
+            f"任务使用的 AI 模型配置已不可用：{exc}。请恢复配置后重试任务"
+        ) from exc
+    # K2.5/K2.6 官方默认为深度思考；字幕逐条映射不需要长推理。只在官方
+    # Kimi 方言上发送已确认支持的参数，不把私有字段泄漏给其他兼容端点。
+    kimi_fast_json = provider.provider_type == "kimi" and resolved_model in {
+        "kimi-k2.5",
+        "kimi-k2.6",
+    }
 
-    async def chat(system: str, user: str) -> str:
+    async def chat(system: str, user: str, call: translate.ChatCall) -> str:
+        settings = ModelSettings(
+            max_tokens=_subtitle_max_tokens(call),
+            response_format="json_object" if kimi_fast_json else None,
+            extra_body=({"thinking": {"type": "disabled"}} if kimi_fast_json else None),
+        )
+        started = time.monotonic()
         try:
             response = await router.chat(
                 ChatRequest(
+                    model=model_ref or "",
                     messages=[
                         ChatMessage(role="system", content=system),
                         ChatMessage(role="user", content=user),
-                    ]
+                    ],
+                    settings=settings,
                 )
             )
         except LlmRateLimitError as exc:
+            duration_ms = max(1, int((time.monotonic() - started) * 1000))
+            if usage is not None:
+                usage.record_failure(call, duration_ms=duration_ms, error_code="rate_limit")
+            logger.warning(
+                "字幕模型调用限流 job=%s purpose=%s block=%s attempt=%d 耗时=%dms",
+                job_id or "-",
+                call.purpose,
+                call.block_index or "-",
+                call.attempt,
+                duration_ms,
+            )
             # 翻译层只认识统一限流信号，不依赖具体供应商或 OpenAI SDK；
             # 调度器据此降低并发、按 Retry-After 退避并重试当前块。
             raise translate.ChatRateLimited(exc.retry_after) from exc
+        except LlmRoutingError as exc:
+            duration_ms = max(1, int((time.monotonic() - started) * 1000))
+            if usage is not None:
+                usage.record_failure(call, duration_ms=duration_ms, error_code="routing")
+            # Job 会固定创建时的供应商/模型；配置之后被停用或删除时不能静默
+            # 换模型，否则同一任务重试的结果不可复现。转成业务异常后，持久化
+            # 调度器会把任务置为 blocked，并给前端与 Agent 返回恢复配置的动作。
+            raise BadRequestException(
+                f"任务使用的 AI 模型配置已不可用：{exc}。请恢复配置后重试任务"
+            ) from exc
+        except Exception as exc:
+            duration_ms = max(1, int((time.monotonic() - started) * 1000))
+            if usage is not None:
+                usage.record_failure(
+                    call,
+                    duration_ms=duration_ms,
+                    error_code=type(exc).__name__,
+                )
+            logger.warning(
+                "字幕模型调用失败 job=%s purpose=%s block=%s attempt=%d 耗时=%dms：%s",
+                job_id or "-",
+                call.purpose,
+                call.block_index or "-",
+                call.attempt,
+                duration_ms,
+                exc,
+            )
+            raise
+        duration_ms = max(1, int((time.monotonic() - started) * 1000))
+        if usage is not None:
+            usage.record_success(
+                call,
+                duration_ms=duration_ms,
+                prompt_tokens=response.usage.prompt_tokens,
+                completion_tokens=response.usage.completion_tokens,
+                total_tokens=response.usage.total_tokens,
+                cache_read_tokens=response.usage.cache_read_tokens,
+                finish_reason=response.finish_reason,
+                has_thinking=bool(response.thinking),
+            )
+        logger.info(
+            "字幕模型调用完成 job=%s purpose=%s block=%s attempt=%d model=%s "
+            "耗时=%dms tokens=%d/%d thinking=%s finish=%s",
+            job_id or "-",
+            call.purpose,
+            call.block_index or "-",
+            call.attempt,
+            response.model or resolved_model,
+            duration_ms,
+            response.usage.prompt_tokens,
+            response.usage.completion_tokens,
+            bool(response.thinking),
+            response.finish_reason,
+        )
+        if response.finish_reason == "length":
+            raise ValueError("模型输出达到长度上限，正在扩大预算后重试")
+        if response.finish_reason == "tool_calls":
+            raise ValueError("字幕模型返回了意外的工具调用，正在重试结构化输出")
         return response.content or ""
 
     return chat

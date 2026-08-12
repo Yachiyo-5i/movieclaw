@@ -1,4 +1,5 @@
 import { request } from "@/lib/http";
+import type { JobView } from "@/lib/api/jobs";
 
 /** 后端统一响应信封（见 movieclaw_api.schemas.response.ApiResponse） */
 interface ApiEnvelope<T> {
@@ -23,6 +24,7 @@ export interface SubgenCandidate {
   key: string;
   language: string | null;
   format: string | null;
+  provenance: "original" | "pgs_ocr" | "ai" | "ai_bilingual";
   /** 非空 = 被排除原因（forced/目标语言/图形轨） */
   excluded: string | null;
   /** 打分明细："为什么选了这条"要能看懂 */
@@ -72,43 +74,6 @@ export interface SubgenPreview {
   output_filename: string | null;
 }
 
-export interface SubgenQuality {
-  event_count: number;
-  cps_overrun: number;
-  overlong: number;
-  kept_original: number;
-  compressed: number;
-  glossary_usage: Record<string, number>;
-}
-
-export interface SubgenResult {
-  ok: boolean;
-  message: string;
-  filename: string | null;
-  sync_score: number | null;
-  source_desc: string | null;
-  report: SubgenQuality | null;
-  finished_at: string | null;
-}
-
-export interface SubgenProgress {
-  running: boolean;
-  phase: string | null;
-  message: string | null;
-  done_blocks: number;
-  total_blocks: number;
-  done_events: number;
-  total_events: number;
-  active_blocks: number[];
-  parallelism: number;
-  uses_ocr: boolean;
-  target_language: string | null;
-  secondary_language: string | null;
-  source_candidate_key: string | null;
-  elapsed_seconds: number;
-  last_result: SubgenResult | null;
-}
-
 export interface CalibrateResult {
   ok: boolean;
   message: string;
@@ -140,21 +105,19 @@ export function subgenStart(
   targetLanguage = "chs",
   options: {
     convertPgs?: boolean;
-    pgsCandidateKey?: string | null;
     pgsOcrLanguage?: string | null;
     secondaryLanguage?: string | null;
     sourceCandidateKey?: string | null;
   } = {},
-): Promise<{ preview: SubgenPreview }> {
+): Promise<JobView> {
   const {
     convertPgs = false,
-    pgsCandidateKey = null,
     pgsOcrLanguage = null,
     secondaryLanguage = null,
     sourceCandidateKey = null,
   } = options;
   return unwrap(
-    request<ApiEnvelope<{ preview: SubgenPreview }>>(
+    request<ApiEnvelope<JobView>>(
       `/library/files/${fileId}/subtitles/generate`,
       {
         method: "POST",
@@ -164,27 +127,9 @@ export function subgenStart(
           secondary_language: secondaryLanguage,
           source_candidate_key: sourceCandidateKey,
           convert_pgs: convertPgs,
-          pgs_candidate_key: pgsCandidateKey,
           pgs_ocr_language: pgsOcrLanguage,
         }),
       },
-    ),
-  );
-}
-
-/** 任务状态：进行中带块进度，否则带最近一次结论。 */
-export function subgenStatus(fileId: number): Promise<SubgenProgress> {
-  return unwrap(
-    request<ApiEnvelope<SubgenProgress>>(`/library/files/${fileId}/subtitles/generate/status`),
-  );
-}
-
-/** 停止进行中的生成（下一块边界生效；已译块保留可续传）。 */
-export function subgenStop(fileId: number): Promise<{ stopped: boolean }> {
-  return unwrap(
-    request<ApiEnvelope<{ stopped: boolean }>>(
-      `/library/files/${fileId}/subtitles/generate/stop`,
-      { method: "POST" },
     ),
   );
 }

@@ -46,11 +46,12 @@ from __future__ import annotations
 import asyncio
 import errno
 import logging
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from sqlmodel import select
 
+from movieclaw_api.services import jobs
 from movieclaw_api.services.library.config import sanitize_folder_name
 from movieclaw_api.services.library.fsops import rename_no_replace
 from movieclaw_api.services.library.layout import SCAN_VIDEO_EXTS, entry_base_name
@@ -352,7 +353,13 @@ class _MoveError(Exception):
     """单个文件改名失败。message 是完整中文句子，直接进 errors。"""
 
 
-async def organize_library(library_id: int) -> OrganizeSummary:
+async def organize_library(
+    library_id: int,
+    *,
+    plan: OrganizePlan | None = None,
+    context: jobs.JobContext | None = None,
+    raise_unexpected: bool = False,
+) -> OrganizeSummary:
     """整理一个库（后台任务入口；自开会话，不向外抛异常）。
 
     执行时重新计算计划（不信任预览快照），逐文件"改名 → 台账随迁"收口。
@@ -372,53 +379,115 @@ async def organize_library(library_id: int) -> OrganizeSummary:
         return summary
     _organize_tasks.try_start(library_id, (0, 0))
     try:
-        return await _organize(library_id, summary)
+        return await _organize(library_id, summary, plan=plan, context=context)
+    except jobs.JobCancelled:
+        raise
     except Exception:  # noqa: BLE001 -- 后台任务兜底
         logger.exception("媒体库 #%s 整理时发生未知错误", library_id)
+        if raise_unexpected:
+            raise
         summary.errors.append("整理中断：发生未知错误（详见后端日志）")
         return summary
     finally:
         _organize_tasks.finish(library_id, result=(utcnow(), summary))
 
 
-async def _organize(library_id: int, summary: OrganizeSummary) -> OrganizeSummary:
+async def _organize(
+    library_id: int,
+    summary: OrganizeSummary,
+    *,
+    plan: OrganizePlan | None = None,
+    context: jobs.JobContext | None = None,
+) -> OrganizeSummary:
     db = get_database()
     async with db.session() as session:
         library = await session.get(Library, library_id)
         if library is None:
             summary.errors.append("媒体库不存在（可能已被删除）")
             return summary
-        plan = await build_organize_plan(session, library)
+        plan = plan or await build_organize_plan(session, library)
         summary.already_ok = plan.already_ok
         summary.skipped = len(plan.skips)
         repo = LibraryFileRepository(session)
         roots = [r.rstrip("/") for r in library.root_paths]
 
         _organize_tasks.update(library_id, (0, len(plan.renames)))
+        if context is not None:
+            await context.update_progress(
+                mode="determinate",
+                phase="organizing",
+                message=f"准备整理 {len(plan.renames)} 个文件",
+                current=0,
+                total=len(plan.renames),
+                percent=0.0 if plan.renames else 100.0,
+                details={"errors": 0},
+            )
         dirty_parents: set[Path] = set()
         for done, action in enumerate(plan.renames, start=1):
+            if context is not None:
+                await context.raise_if_cancelled()
+            row = await session.get(LibraryFile, action.file_id)
+            if row is None:
+                summary.errors.append(f"台账文件已不存在，跳过：{action.source_path}")
+                _organize_tasks.update(library_id, (done, len(plan.renames)))
+                continue
+            src = Path(action.source_path)
+            dst = Path(action.target_path)
+            relocated = row.file_path == action.target_path and dst.exists()
             try:
-                await asyncio.to_thread(
-                    _move_no_clobber, Path(action.source_path), Path(action.target_path)
-                )
+                if not relocated:
+                    if row.file_path != action.source_path:
+                        raise _MoveError(f"台账路径已被其他操作修改，跳过：{row.file_path}")
+                    if src.exists() and not dst.exists():
+                        await asyncio.to_thread(_move_no_clobber, src, dst)
+                    elif not src.exists() and dst.exists():
+                        # 服务可能停在“磁盘改名成功、台账提交前”。持久化计划
+                        # 能证明目标属于本任务，此时只补台账，不重复改名。
+                        pass
+                    elif src.exists() and dst.exists():
+                        raise _MoveError(f"源与目标同时存在，跳过以免覆盖：{src} → {dst}")
+                    else:
+                        raise _MoveError(f"源与目标都不存在，无法继续整理：{src}")
             except _MoveError as exc:
                 summary.errors.append(str(exc))
                 _organize_tasks.update(library_id, (done, len(plan.renames)))
                 continue
             # 改名成功立即随迁台账：中途失败不会留下账实不符的批量烂摊子
-            container = Path(action.target_path).suffix.lstrip(".").lower() or None
-            await repo.relocate(action.file_id, file_path=action.target_path, container=container)
+            if not relocated:
+                container = dst.suffix.lstrip(".").lower() or None
+                await repo.relocate(
+                    action.file_id, file_path=action.target_path, container=container
+                )
             summary.renamed += 1
-            dirty_parents.add(Path(action.source_path).parent)
+            dirty_parents.add(src.parent)
             for sidecar in action.sidecars:
+                sidecar_src = Path(sidecar.source_path)
+                sidecar_dst = Path(sidecar.target_path)
                 try:
-                    await asyncio.to_thread(
-                        _move_no_clobber, Path(sidecar.source_path), Path(sidecar.target_path)
-                    )
+                    if sidecar_src.exists() and not sidecar_dst.exists():
+                        await asyncio.to_thread(_move_no_clobber, sidecar_src, sidecar_dst)
+                    elif not sidecar_src.exists() and sidecar_dst.exists():
+                        pass  # 上次执行已改名，重启后直接确认完成
+                    elif sidecar_src.exists() and sidecar_dst.exists():
+                        raise _MoveError(
+                            f"源与目标同时存在，跳过以免覆盖：{sidecar_src} → {sidecar_dst}"
+                        )
+                    else:
+                        raise _MoveError(f"附属文件已不存在：{sidecar_src}")
                     summary.sidecars_renamed += 1
                 except _MoveError as exc:
                     summary.errors.append(f"附属文件改名失败：{exc}")
             _organize_tasks.update(library_id, (done, len(plan.renames)))
+            if context is not None:
+                await context.update_progress(
+                    mode="determinate",
+                    phase="organizing",
+                    message=f"已整理 {done} / {len(plan.renames)} 个文件",
+                    current=done,
+                    total=len(plan.renames),
+                    percent=(done / len(plan.renames) * 100) if plan.renames else 100.0,
+                    details={"errors": len(summary.errors)},
+                )
 
         # 只清理被本次整理搬空的目录（及其变空的祖先）：非空即停、绝不删文件，
         # 与整理无关的空目录一概不碰
@@ -436,6 +505,84 @@ async def _organize(library_id: int, summary: OrganizeSummary) -> OrganizeSummar
         len(summary.errors),
     )
     return summary
+
+
+async def enqueue_organize_job(
+    session,
+    library: Library,
+    plan: OrganizePlan,
+    *,
+    actor_kind: str | None = None,
+    actor_name: str | None = None,
+    actor_id: str | None = None,
+    origin: str = "web",
+) -> jobs.CreateJobResult:
+    """保存本次确认后的整理计划；重启时据此修复“磁盘已改、台账未改”。"""
+    assert library.id is not None
+    return await jobs.create_job(
+        session,
+        job_type="library.organize",
+        subject=library.name,
+        input_data={"library_id": library.id, "plan": asdict(plan)},
+        resources=[jobs.ResourceRef("library", library.id)],
+        dedupe_key=f"library.organize:{library.id}",
+        conflict_policy="return_existing",
+        handler_revision="library.organize.v1",
+        max_attempts=3,
+        actor_kind=actor_kind,
+        actor_name=actor_name,
+        actor_id=actor_id,
+        origin=origin,
+        progress={
+            **jobs.default_progress("等待整理媒体库文件"),
+            "total": len(plan.renames),
+            "details": {"errors": 0},
+        },
+    )
+
+
+def _plan_from_job(value: object) -> OrganizePlan:
+    """从版本化 Job 输入恢复计划；字段只接受创建端写入的稳定最小集合。"""
+    if not isinstance(value, dict):
+        raise jobs.JobFailed("整理任务定义损坏，请重新预览后发起", code="JOB_INPUT_INVALID")
+    renames = []
+    for raw in value.get("renames", []):
+        sidecars = [SidecarMove(**item) for item in raw.get("sidecars", [])]
+        renames.append(RenameAction(**{**raw, "sidecars": sidecars}))
+    return OrganizePlan(
+        library_id=int(value["library_id"]),
+        total=int(value.get("total") or 0),
+        already_ok=int(value.get("already_ok") or 0),
+        renames=renames,
+        skips=[SkipEntry(**item) for item in value.get("skips", [])],
+    )
+
+
+@jobs.register_job_handler("library.organize")
+async def _run_organize_job(
+    context: jobs.JobContext, input_data: dict[str, object]
+) -> dict[str, object]:
+    """整理 Job 处理器：逐文件物理改名并提交台账，每一步都可幂等恢复。"""
+    library_id = int(input_data["library_id"])
+    from movieclaw_api.services.library.scan import is_scanning
+    from movieclaw_api.services.library.transfer import is_transferring
+
+    if is_organizing(library_id):
+        raise jobs.JobRetry("媒体库已有整理任务在收尾", delay_seconds=5)
+    if is_scanning(library_id):
+        raise jobs.JobRetry("媒体库正在扫描，整理作业稍后自动继续", delay_seconds=10)
+    if is_transferring(library_id):
+        raise jobs.JobRetry("媒体库正在转移条目，整理作业稍后自动继续", delay_seconds=10)
+    summary = await organize_library(
+        library_id,
+        plan=_plan_from_job(input_data.get("plan")),
+        context=context,
+        raise_unexpected=True,
+    )
+    message = f"整理完成：改名 {summary.renamed} 个文件"
+    if summary.errors:
+        message += f"，{len(summary.errors)} 个问题已跳过"
+    return {"message": message, **asdict(summary)}
 
 
 def _move_no_clobber(src: Path, dst: Path) -> None:

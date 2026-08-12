@@ -22,6 +22,7 @@ from movieclaw_cli.gen.tree_builder import DOMAIN_HELP, build_tree
 from movieclaw_cli.overlay.agent_cmds import agent_attach, agent_run
 from movieclaw_cli.overlay.auth_cmds import login, logout, status
 from movieclaw_cli.overlay.groups import DefaultCommandGroup
+from movieclaw_cli.overlay.jobs_cmds import jobs_wait
 from movieclaw_cli.overlay.lib_cmds import lib_organize
 from movieclaw_cli.overlay.logs_cmds import logs_tail
 from movieclaw_cli.overlay.search_cmds import download, search
@@ -107,6 +108,10 @@ def _assemble() -> None:
     logs_group = click.Group(name="logs", help=DOMAIN_HELP.get("logs"))
     logs_group.add_command(logs_tail)
     cli.add_command(logs_group)
+
+    jobs_group = click.Group(name="jobs", help=DOMAIN_HELP.get("jobs"))
+    jobs_group.add_command(jobs_wait)
+    cli.add_command(jobs_group)
 
     server = spec_loader.guess_server_for_startup(sys.argv[1:])
     spec, from_cache = spec_loader.load_active(server)

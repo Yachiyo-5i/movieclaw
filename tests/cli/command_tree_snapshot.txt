@@ -70,6 +70,13 @@ extension token create
 extension token revoke
 extension token show
 health check
+jobs cancel
+jobs events
+jobs health
+jobs list
+jobs retry
+jobs show
+jobs wait
 lib create
 lib default set
 lib delete
@@ -115,8 +122,6 @@ lib show
 lib subgen calibrate
 lib subgen preview
 lib subgen start
-lib subgen status
-lib subgen stop
 lib transfer status
 lib unidentified clear
 lib unidentified list

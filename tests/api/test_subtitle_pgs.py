@@ -11,7 +11,6 @@ import pytest
 
 from movieclaw_api.exceptions import BadRequestException
 from movieclaw_api.services.subtitle_gen import pgs, source, tasks
-from movieclaw_api.services.task_state import TaskState
 from movieclaw_db.models import LibraryFile
 
 
@@ -392,7 +391,7 @@ def test_preview_view_exposes_language_confirmation_options() -> None:
     ]
 
 
-async def test_start_generation_requires_explicit_pgs_confirmation(monkeypatch) -> None:
+async def test_generation_preflight_requires_explicit_pgs_confirmation(monkeypatch) -> None:
     ranked = source.rank_candidates(
         _file(Path("/media/Movie.mkv")),
         original_language="eng",
@@ -413,9 +412,7 @@ async def test_start_generation_requires_explicit_pgs_confirmation(monkeypatch) 
     async def fake_preview(*_args, **_kwargs):  # noqa: ANN002, ANN003
         return preview
 
-    states: TaskState[tasks.GenState] = TaskState()
     monkeypatch.setattr(tasks, "preview", fake_preview)
-    monkeypatch.setattr(tasks, "_tasks", states)
 
     async def configured_router(_session):  # noqa: ANN001
         return object()
@@ -425,19 +422,19 @@ async def test_start_generation_requires_explicit_pgs_confirmation(monkeypatch) 
     monkeypatch.setattr(llm_config, "acquire_llm_router", configured_router)
 
     with pytest.raises(BadRequestException, match="图片字幕"):
-        await tasks.start_generation(None, 42, "chs")  # type: ignore[arg-type]
+        await tasks._prepare_generation(None, 42, "chs")  # type: ignore[arg-type]
 
-    result = await tasks.start_generation(
+    result, initial = await tasks._prepare_generation(
         None,
         42,
         "chs",
         convert_pgs=True,  # type: ignore[arg-type]
     )
     assert result is preview
-    assert states.state_of(42).phase == "ocr"
+    assert initial.phase == "ocr"
 
 
-async def test_start_generation_rejects_unconfirmed_ocr_language(monkeypatch) -> None:
+async def test_generation_preflight_rejects_unconfirmed_ocr_language(monkeypatch) -> None:
     ranked = source.rank_candidates(
         _file(Path("/media/Movie.mkv")),
         original_language="eng",
@@ -463,15 +460,12 @@ async def test_start_generation_rejects_unconfirmed_ocr_language(monkeypatch) ->
     async def fake_preview(*_args, **_kwargs):  # noqa: ANN002, ANN003
         return preview
 
-    states: TaskState[tasks.GenState] = TaskState()
     monkeypatch.setattr(tasks, "preview", fake_preview)
-    monkeypatch.setattr(tasks, "_tasks", states)
 
     with pytest.raises(BadRequestException, match="选择"):
-        await tasks.start_generation(
+        await tasks._prepare_generation(
             None,
             42,
             "chs",
             convert_pgs=True,
         )  # type: ignore[arg-type]
-    assert states.state_of(42) is None

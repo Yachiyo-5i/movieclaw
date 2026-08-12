@@ -7,26 +7,24 @@
 
 from __future__ import annotations
 
-import time
-
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Header, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from movieclaw_api.api.deps import require_admin
+from movieclaw_api.api.routes.jobs import job_view
+from movieclaw_api.schemas.jobs import JobView
 from movieclaw_api.schemas.response import ApiResponse
 from movieclaw_api.schemas.subtitle_gen import (
     CalibratePayload,
     CalibrateResultView,
     GenPreviewBlockerView,
     GenPreviewView,
-    GenProgressView,
-    GenQualityView,
-    GenResultView,
     GenStartPayload,
-    GenStartView,
     PgsConversionView,
     PgsOcrLanguageOptionView,
     SourceCandidateView,
 )
+from movieclaw_api.services.auth import Principal
 from movieclaw_api.services.subtitle_gen import tasks as gen_tasks
 from movieclaw_db.engine import get_session
 
@@ -41,6 +39,7 @@ def _preview_view(pv: gen_tasks.Preview) -> GenPreviewView:
                 key=c.candidate.key,
                 language=c.candidate.language,
                 format=c.candidate.format,
+                provenance=c.candidate.provenance,
                 excluded=c.excluded,
                 reasons=c.reasons,
                 selectable=gen_tasks.candidate_selectable(c),
@@ -94,28 +93,12 @@ def _preview_view(pv: gen_tasks.Preview) -> GenPreviewView:
     )
 
 
-def _result_view(result: gen_tasks.GenResult | None) -> GenResultView | None:
-    if result is None:
-        return None
-    report = None
-    if result.report is not None:
-        report = GenQualityView(
-            event_count=result.report.event_count,
-            cps_overrun=result.report.cps_overrun,
-            overlong=result.report.overlong,
-            kept_original=result.report.kept_original,
-            compressed=result.report.compressed,
-            glossary_usage=result.report.glossary_usage,
-        )
-    return GenResultView(
-        ok=result.ok,
-        message=result.message,
-        filename=result.filename,
-        sync_score=result.sync_score,
-        source_desc=result.source_desc,
-        report=report,
-        finished_at=result.finished_at,  # type: ignore[arg-type]
-    )
+def _request_origin(principal: Principal, client_name: str | None) -> str:
+    if principal.kind == "agent":
+        return "agent"
+    if client_name and client_name.lower() in {"web", "cli", "agent", "scheduler"}:
+        return client_name.lower()
+    return "cli" if principal.kind == "pat" else "web"
 
 
 @router.get(
@@ -143,88 +126,39 @@ async def gen_preview(
 
 @router.post(
     "/{file_id}/subtitles/generate",
-    response_model=ApiResponse[GenStartView],
+    response_model=ApiResponse[JobView],
     summary="发起 AI 字幕生成（后台执行；同文件单飞）",
     operation_id="lib.subgen.start",
     openapi_extra={
-        "x-cli-long-task": {
-            "progress_op": "lib.subgen.status",
-            "progress_field": "done_blocks",
-        },
+        "x-cli-job": {"id_path": "id", "wait_op": "jobs.wait"},
     },
+    status_code=202,
 )
 async def gen_start(
     file_id: int,
     payload: GenStartPayload,
+    response: Response,
+    principal: Principal = Depends(require_admin),
+    client_name: str | None = Header(default=None, alias="X-MovieClaw-Client"),
     session: AsyncSession = Depends(get_session),
-) -> ApiResponse[GenStartView]:
-    pv = await gen_tasks.start_generation(
+) -> ApiResponse[JobView]:
+    _preview, created = await gen_tasks.enqueue_generation_job(
         session,
         file_id,
         payload.target_language,
         secondary_language=payload.secondary_language,
         source_candidate_key=payload.source_candidate_key,
         convert_pgs=payload.convert_pgs,
-        pgs_candidate_key=payload.pgs_candidate_key,
         pgs_ocr_language=payload.pgs_ocr_language,
+        actor_kind=principal.kind,
+        actor_name=principal.name,
+        actor_id=str(principal.member_id) if principal.member_id is not None else None,
+        origin=_request_origin(principal, client_name),
     )
-    gen_tasks.queue_generation(
-        file_id,
-        payload.target_language,
-        convert_pgs=payload.convert_pgs,
-        pgs_candidate_key=payload.pgs_candidate_key,
-        pgs_ocr_language=payload.pgs_ocr_language,
-        secondary_language=payload.secondary_language,
-        source_candidate_key=pv.selected_source_key,
-    )
-    return ApiResponse(data=GenStartView(preview=_preview_view(pv)))
-
-
-@router.get(
-    "/{file_id}/subtitles/generate/status",
-    response_model=ApiResponse[GenProgressView],
-    summary="AI 字幕生成任务状态（进行中进度 / 最近一次结论）",
-    operation_id="lib.subgen.status",
-)
-async def gen_status(file_id: int) -> ApiResponse[GenProgressView]:
-    state = gen_tasks.gen_state(file_id)
-    if state is not None:
-        return ApiResponse(
-            data=GenProgressView(
-                running=True,
-                phase=state.phase,
-                message=state.message,
-                done_blocks=state.done_blocks,
-                total_blocks=state.total_blocks,
-                done_events=state.done_events,
-                total_events=state.total_events,
-                active_blocks=list(state.active_blocks),
-                parallelism=state.parallelism,
-                uses_ocr=state.uses_ocr,
-                target_language=state.target_language,
-                secondary_language=state.secondary_language,
-                source_candidate_key=state.source_candidate_key,
-                elapsed_seconds=max(0, int(time.monotonic() - state.started_at)),
-            )
-        )
+    response.headers["Location"] = f"/api/v1/jobs/{created.job.id}"
     return ApiResponse(
-        data=GenProgressView(
-            running=False, last_result=_result_view(gen_tasks.last_result(file_id))
-        )
-    )
-
-
-@router.post(
-    "/{file_id}/subtitles/generate/stop",
-    response_model=ApiResponse[dict],
-    summary="停止进行中的字幕生成（已译块保留，可续传）",
-    operation_id="lib.subgen.stop",
-)
-async def gen_stop(file_id: int) -> ApiResponse[dict]:
-    stopped = gen_tasks.request_stop(file_id)
-    return ApiResponse(
-        data={"stopped": stopped},
-        message="已请求停止（在下一块边界生效）" if stopped else "该文件没有进行中的任务",
+        data=await job_view(session, created.job),
+        message="任务已入队" if created.created else "相同任务已在进行中",
     )
 
 

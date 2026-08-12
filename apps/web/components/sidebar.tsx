@@ -17,6 +17,7 @@ import {
 import { AppUpdateEntry } from "@/components/app-update-entry";
 import { useConfirm, usePrompt, useToast } from "@/components/feedback";
 import { NoticeCenter } from "@/components/notice-center";
+import { JobCenter } from "@/components/job-center";
 import { UserMenu } from "@/components/user-menu";
 import { useAgentConversations } from "@/lib/agent-conversations";
 import { useBackdrop } from "@/lib/backdrop";
@@ -161,6 +162,7 @@ export function Sidebar({
               </button>
             );
           })}
+          <JobCenter collapsed={collapsed} active={activeNav === "tasks"} />
           {/* 待处理事项：常态零渲染，有"需要用户行动"的运行时故障才亮起 */}
           <NoticeCenter collapsed={collapsed} />
           {/* 更新入口：同样常态零渲染。刻意与待处理事项分开——"有新版可用"

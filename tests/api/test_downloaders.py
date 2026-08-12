@@ -4,8 +4,10 @@
 启用停用、更新重测。真实的 create_downloader 被替换为假下载器，
 不发真实请求，使状态流转可确定性断言。
 """
+
 from __future__ import annotations
 
+import asyncio
 import sqlite3
 
 import pytest
@@ -13,7 +15,7 @@ from fastapi.testclient import TestClient
 
 import movieclaw_api.services.downloader_config as downloader_service
 from movieclaw_api.core.config import get_settings
-from movieclaw_downloader import DownloaderConnectError, DownloaderInfo
+from movieclaw_downloader import DownloaderConnectError, DownloaderInfo, TorrentBrief
 from movieclaw_downloader.models import DownloaderConfig
 
 # 假下载器行为开关：url 含 "unreachable" 时模拟连不上
@@ -21,6 +23,7 @@ _UNREACHABLE_MARK = "unreachable"
 
 # 每次连接测试收到的 DownloaderConfig，供断言"传给适配器的密码已解密"
 _captured_configs: list[DownloaderConfig] = []
+_fake_torrents: list[TorrentBrief] = []
 
 
 class _FakeDownloader:
@@ -34,6 +37,11 @@ class _FakeDownloader:
         if _UNREACHABLE_MARK in self.config.url:
             raise DownloaderConnectError("无法连接到 qBittorrent，请检查 WebUI 地址和端口")
         return DownloaderInfo(type=self.config.type, version="v5.0.2")
+
+    async def list_torrents(self) -> list[TorrentBrief]:
+        if "task-error" in self.config.url:
+            raise DownloaderConnectError("读取下载任务失败")
+        return list(_fake_torrents)
 
     async def close(self) -> None:
         pass
@@ -49,7 +57,11 @@ def client(tmp_path, monkeypatch):
 
     # 用假适配器替换真实下载器客户端
     _captured_configs.clear()
+    _fake_torrents.clear()
     monkeypatch.setattr(downloader_service, "create_downloader", _FakeDownloader)
+    import movieclaw_api.services.download_tasks as download_tasks_service
+
+    monkeypatch.setattr(download_tasks_service, "create_downloader", _FakeDownloader)
 
     from movieclaw_api.api.deps import require_login
     from movieclaw_api.app import create_app
@@ -151,6 +163,166 @@ def test_list_returns_all(client) -> None:
     # 未填用户名密码的下载器同样能通过测试（未开鉴权场景）
     assert data[1]["username"] is None
     assert data[1]["status"] == "active"
+
+
+def test_task_center_aggregates_live_downloads_and_subscription_context(client) -> None:
+    """只返回活跃/仍待入库任务，并为订阅任务补齐媒体身份、海报与季集上下文。"""
+    from movieclaw_db.engine import get_database
+    from movieclaw_db.models import MediaItem, RuleSet, Subscription, WantedItem, WantedStatus
+
+    c, _ = client
+    downloader_id = c.post("/api/v1/downloaders", json=_PAYLOAD).json()["data"]["id"]
+    linked_hash = "a" * 40
+    external_hash = "b" * 40
+    old_seed_hash = "c" * 40
+    missing_hash = "d" * 40
+    media_identity: dict[str, int] = {}
+    _fake_torrents.extend(
+        [
+            TorrentBrief(
+                name="Subscription.Show.S01",
+                content_name="Subscription.Show.S01",
+                completed=True,
+                info_hash=linked_hash,
+                progress=1,
+                size_bytes=1024,
+                state="completed",
+            ),
+            TorrentBrief(
+                name="External.Movie",
+                content_name="External.Movie",
+                completed=False,
+                info_hash=external_hash,
+                progress=0.42,
+                dlspeed_bytes=2048,
+                state="downloading",
+            ),
+            TorrentBrief(
+                name="Old.Seed",
+                content_name="Old.Seed",
+                completed=True,
+                info_hash=old_seed_hash,
+                progress=1,
+                state="completed",
+            ),
+        ]
+    )
+
+    async def seed_subscription() -> None:
+        db = get_database()
+        async with db.session() as session:
+            rule = RuleSet(name="任务中心测试规则", is_default=True)
+            media = MediaItem(
+                kind="tv",
+                tmdb_id=98765,
+                title="聚合测试剧",
+                original_title="Task Center Show",
+                poster_path="/task-center-show.jpg",
+            )
+            session.add(rule)
+            session.add(media)
+            await session.flush()
+            assert rule.id is not None and media.id is not None
+            media_identity["id"] = media.id
+            subscription = Subscription(
+                media_item_id=media.id,
+                kind="tv",
+                selected_seasons=[1],
+                rule_set_id=rule.id,
+            )
+            session.add(subscription)
+            await session.flush()
+            assert subscription.id is not None
+            session.add_all(
+                [
+                    WantedItem(
+                        subscription_id=subscription.id,
+                        media_item_id=media.id,
+                        season_number=1,
+                        episode_number=1,
+                        status=WantedStatus.GRABBED,
+                        info_hash=linked_hash,
+                    ),
+                    WantedItem(
+                        subscription_id=subscription.id,
+                        media_item_id=media.id,
+                        season_number=1,
+                        episode_number=2,
+                        status=WantedStatus.GRABBED,
+                        info_hash=missing_hash,
+                    ),
+                ]
+            )
+            await session.commit()
+
+    asyncio.run(seed_subscription())
+
+    response = c.get("/api/v1/downloaders/tasks")
+    assert response.status_code == 200
+    payload = response.json()["data"]
+    by_hash = {item["info_hash"]: item for item in payload["items"]}
+    assert set(by_hash) == {linked_hash, external_hash, missing_hash}
+    assert by_hash[linked_hash]["source"] == "subscription"
+    assert by_hash[linked_hash]["state"] == "completed"
+    assert by_hash[linked_hash]["media_item_id"] == media_identity["id"]
+    assert by_hash[linked_hash]["media_title"] == "聚合测试剧"
+    assert by_hash[linked_hash]["poster_url"].endswith("/w342/task-center-show.jpg")
+    assert by_hash[linked_hash]["subscriptions"][0]["media_item_id"] == media_identity["id"]
+    assert (
+        by_hash[linked_hash]["subscriptions"][0]["poster_url"] == by_hash[linked_hash]["poster_url"]
+    )
+    assert by_hash[linked_hash]["subscriptions"][0]["units"] == [
+        {"season_number": 1, "episode_number": 1}
+    ]
+    assert by_hash[external_hash]["source"] == "external"
+    assert by_hash[external_hash]["progress"] == 0.42
+    assert by_hash[missing_hash]["state"] == "missing"
+    assert by_hash[missing_hash]["downloader_id"] is None
+    # 同一剧集的多个资源带回同一个稳定媒体 ID，前端据此安全合并；不按标题猜测。
+    assert by_hash[missing_hash]["media_item_id"] == by_hash[linked_hash]["media_item_id"]
+    assert payload["sources"] == [
+        {
+            "id": downloader_id,
+            "name": _PAYLOAD["name"],
+            "client_type": "qbittorrent",
+            "status": "active",
+            "message": None,
+            "task_count": 2,
+        }
+    ]
+
+
+def test_task_center_degrades_single_downloader_failure(client) -> None:
+    """一台下载器读取失败只标记来源异常，不能拖垮其余下载器任务。"""
+    c, _ = client
+    c.post("/api/v1/downloaders", json=_PAYLOAD)
+    failed = c.post(
+        "/api/v1/downloaders",
+        json={
+            "name": "故障下载器",
+            "client_type": "transmission",
+            "url": "http://task-error:9091",
+        },
+    ).json()["data"]
+    _fake_torrents.append(
+        TorrentBrief(
+            name="Still.Visible",
+            content_name="Still.Visible",
+            completed=False,
+            info_hash="e" * 40,
+            progress=0.2,
+            state="downloading",
+        )
+    )
+
+    response = c.get("/api/v1/downloaders/tasks")
+
+    assert response.status_code == 200
+    payload = response.json()["data"]
+    assert [item["name"] for item in payload["items"]] == ["Still.Visible"]
+    sources = {source["id"]: source for source in payload["sources"]}
+    assert sources[failed["id"]]["status"] == "error"
+    assert "检查下载器连接" in sources[failed["id"]]["message"]
 
 
 def test_enable_disable_toggles_usable(client) -> None:

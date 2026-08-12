@@ -95,10 +95,10 @@ def probe_media(path: str | Path) -> MediaSpec | None:
         payload = json.loads(proc.stdout)
     except json.JSONDecodeError:
         return None
-    return _parse_probe(payload)
+    return _parse_probe(payload, include_mpegts_pids=Path(path).suffix.lower() == ".m2ts")
 
 
-def _parse_probe(payload: dict) -> MediaSpec:
+def _parse_probe(payload: dict, *, include_mpegts_pids: bool = False) -> MediaSpec:
     video = next(
         (s for s in payload.get("streams", []) if s.get("codec_type") == "video"),
         None,
@@ -124,19 +124,23 @@ def _parse_probe(payload: dict) -> MediaSpec:
         duration_seconds=_to_int(fmt.get("duration")),
         bit_rate=_to_int(fmt.get("bit_rate")),
         audio_streams=[
-            _audio_stream_info(s) for s in streams if s.get("codec_type") == "audio"
+            _audio_stream_info(s, include_pid=include_mpegts_pids)
+            for s in streams
+            if s.get("codec_type") == "audio"
         ],
         subtitle_streams=[
-            _subtitle_stream_info(s) for s in streams if s.get("codec_type") == "subtitle"
+            _subtitle_stream_info(s, include_pid=include_mpegts_pids)
+            for s in streams
+            if s.get("codec_type") == "subtitle"
         ],
     )
 
 
-def _audio_stream_info(stream: dict) -> dict:
+def _audio_stream_info(stream: dict, *, include_pid: bool = False) -> dict:
     """音轨的展示要素。``profile`` 比 codec 更接近用户认知（如 DTS-HD MA、
     Dolby TrueHD + Atmos 探不出 Atmos 层，先给基础格式），缺失时前端退回 codec。"""
     tags = stream.get("tags") or {}
-    return {
+    result = {
         "codec": stream.get("codec_name"),
         "profile": stream.get("profile"),
         "channels": _to_int(stream.get("channels")),
@@ -145,19 +149,45 @@ def _audio_stream_info(stream: dict) -> dict:
         "title": tags.get("title"),
         "default": bool((stream.get("disposition") or {}).get("default")),
     }
+    pid = _stream_pid(stream.get("id")) if include_pid else None
+    if pid is not None:
+        # MPEG-TS/BDMV 用 PID 与 CLPI 关联。详情 API 显式投影公开字段，内部键
+        # 只落 JSON 台账，不改变前端契约。
+        result["pid"] = pid
+    return result
 
 
-def _subtitle_stream_info(stream: dict) -> dict:
+def _subtitle_stream_info(stream: dict, *, include_pid: bool = False) -> dict:
     """内封字幕轨的展示要素（外挂字幕文件由媒体库详情层另行发现）。"""
     tags = stream.get("tags") or {}
     disposition = stream.get("disposition") or {}
-    return {
+    result = {
         "codec": stream.get("codec_name"),
         "language": tags.get("language"),
         "title": tags.get("title"),
         "forced": bool(disposition.get("forced")),
         "default": bool(disposition.get("default")),
     }
+    pid = _stream_pid(stream.get("id")) if include_pid else None
+    if pid is not None:
+        result["pid"] = pid
+    return result
+
+
+def _stream_pid(value) -> int | None:
+    """ffprobe 的 MPEG-TS stream.id 通常是 ``0x1200``，也兼容整数/十进制。"""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    if not isinstance(value, str):
+        return None
+    try:
+        stripped = value.strip().lower()
+        parsed = int(stripped, 16 if stripped.startswith("0x") else 10)
+    except ValueError:
+        return None
+    return parsed if parsed >= 0 else None
 
 
 def _resolution_label(width: int | None, height: int | None) -> str | None:

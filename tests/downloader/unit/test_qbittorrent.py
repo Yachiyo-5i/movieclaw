@@ -45,6 +45,8 @@ class FakeQbtClient:
         self.register_on_add: tuple[str, str] | None = (TORRENT_HASH, "test.mkv")
 
     def torrents_info(self, torrent_hashes=None):
+        if torrent_hashes is None:
+            return list(self.store.values())
         found = self.store.get(torrent_hashes)
         return [found] if found else []
 
@@ -156,3 +158,26 @@ class TestConnection:
 
         with pytest.raises(DownloaderAuthError):
             await downloader.test_connection()
+
+
+class TestListTorrents:
+    async def test_list_includes_task_center_progress_snapshot(self):
+        fake = FakeQbtClient()
+        fake.store[TORRENT_HASH] = SimpleNamespace(
+            hash=TORRENT_HASH,
+            name="Task.Center.Show",
+            content_path="/downloads/Task.Center.Show",
+            progress=0.42,
+            size=4096,
+            dlspeed=1024,
+            eta=120,
+            state="downloading",
+        )
+
+        rows = await make_downloader(fake).list_torrents()
+
+        assert rows[0].content_name == "Task.Center.Show"
+        assert rows[0].progress == 0.42
+        assert rows[0].dlspeed_bytes == 1024
+        assert rows[0].eta_seconds == 120
+        assert rows[0].state == "downloading"

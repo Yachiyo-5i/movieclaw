@@ -100,6 +100,13 @@ class TorrentBrief(BaseModel):
     content_name: str
     completed: bool
     info_hash: str = ""
+    # 下列字段仍来自下载器的同一批列表结果，不会额外逐任务请求。监听导入只
+    # 消费上面的身份字段；任务中心则用这些可选快照展示进度、速度与 ETA。
+    progress: float | None = None
+    size_bytes: int | None = None
+    dlspeed_bytes: int | None = None
+    eta_seconds: int | None = None
+    state: str = "unknown"
 
 
 class TorrentStatus(BaseModel):

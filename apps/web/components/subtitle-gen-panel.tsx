@@ -5,8 +5,8 @@
  *
  * 交互分成两个明确阶段：点击后先同步预检（不调用 LLM），在弹窗里讲清
  * 参考字幕、目标语言、输出文件与预计成本；用户确认后才启动后台任务。
- * 后台状态由服务端保存，组件每 2 秒轮询，同一枚字幕徽章承担入口、进度
- * 和最近结论，离开页面再回来也能继续看到正在运行的任务。
+ * 后台状态只读取全站 Job Provider；SSE 即时更新、低频轮询兜底，Web、CLI
+ * 与 Agent 发起的任务在这里呈现完全一致。
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -22,13 +22,12 @@ import type { LibraryItemFile } from "@/lib/api/libraries";
 import {
   subgenPreview,
   subgenStart,
-  subgenStatus,
-  subgenStop,
   type SubgenCandidate,
   type SubgenPreview,
-  type SubgenProgress,
 } from "@/lib/api/subtitle-gen";
+import { cancelJob, type JobStatus, type JobView } from "@/lib/api/jobs";
 import { usePermissions } from "@/lib/permissions";
+import { useJobs } from "@/lib/jobs";
 
 const OUTPUT_LANGUAGES = [
   { token: "chs", label: "简体中文" },
@@ -136,7 +135,13 @@ function candidateLabel(candidate: SubgenCandidate): string {
       ? `轨道 ${Number(candidate.key) + 1}`
       : candidate.key;
   const conversion = candidate.requires_ocr ? " · 需先识别" : "";
-  return `${languageLabel(candidate.language)} · ${formatLabel(candidate.format)} · ${location} ${identity}${conversion}`;
+  const provenanceLabels: Record<SubgenCandidate["provenance"], string> = {
+    original: "原始字幕",
+    pgs_ocr: "图片字幕识别结果",
+    ai: "AI 字幕",
+    ai_bilingual: "AI 双语成品",
+  };
+  return `${languageLabel(candidate.language)} · ${formatLabel(candidate.format)} · ${provenanceLabels[candidate.provenance]} · ${location} ${identity}${conversion}`;
 }
 
 function candidateKey(candidate: SubgenCandidate): string {
@@ -156,12 +161,99 @@ const PROGRESS_STAGES = [
   { phases: ["writing", "refreshing"], label: "保存并更新字幕" },
 ] as const;
 
-function progressPercent(progress: SubgenProgress | null): number | null {
-  if (!progress || progress.total_blocks <= 0) return null;
-  return Math.min(100, Math.floor((progress.done_blocks / progress.total_blocks) * 100));
+interface SubtitleProgress {
+  phase: string;
+  message: string;
+  percent: number | null;
+  done_blocks: number;
+  total_blocks: number;
+  done_events: number;
+  total_events: number;
+  active_blocks: number[];
+  parallelism: number;
+  oldest_active_seconds: number;
+  last_completed_seconds_ago: number | null;
+  validation_retries: number;
+  rate_limit_count: number;
+  model_requests: number;
+  model_tokens: number;
+  uses_ocr: boolean;
+  target_language: string | null;
+  secondary_language: string | null;
+  source_candidate_key: string | null;
+  elapsed_seconds: number;
 }
 
-function progressStageIndex(progress: SubgenProgress): number {
+const RUNNING_JOB_STATUSES = new Set<JobStatus>([
+  "queued",
+  "running",
+  "retry_wait",
+  "cancelling",
+  "waiting",
+]);
+
+function detailNumber(details: Record<string, unknown>, key: string): number {
+  const value = details[key];
+  return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+
+function detailString(details: Record<string, unknown>, key: string): string | null {
+  const value = details[key];
+  return typeof value === "string" && value ? value : null;
+}
+
+function subtitleProgress(job: JobView | null): SubtitleProgress | null {
+  if (!job) return null;
+  const details = job.progress.details;
+  const activeBlocks = Array.isArray(details.active_blocks)
+    ? details.active_blocks.filter((value): value is number => typeof value === "number")
+    : [];
+  const startedAt = job.started_at ? Date.parse(job.started_at) : Number.NaN;
+  return {
+    phase: job.progress.phase,
+    message: job.progress.message,
+    percent: job.progress.percent,
+    done_blocks: detailNumber(details, "done_blocks"),
+    total_blocks: detailNumber(details, "total_blocks"),
+    done_events: detailNumber(details, "done_events"),
+    total_events: detailNumber(details, "total_events"),
+    active_blocks: activeBlocks,
+    parallelism: detailNumber(details, "parallelism"),
+    oldest_active_seconds: detailNumber(details, "oldest_active_seconds"),
+    last_completed_seconds_ago:
+      typeof details.last_completed_seconds_ago === "number"
+        ? details.last_completed_seconds_ago
+        : null,
+    validation_retries: detailNumber(details, "validation_retries"),
+    rate_limit_count: detailNumber(details, "rate_limit_count"),
+    model_requests: detailNumber(job.usage, "request_count"),
+    model_tokens: detailNumber(job.usage, "total_tokens"),
+    uses_ocr: details.uses_ocr === true,
+    target_language:
+      detailString(details, "target_language") ??
+      (typeof job.input_data.target_language === "string" ? job.input_data.target_language : null),
+    secondary_language:
+      detailString(details, "secondary_language") ??
+      (typeof job.input_data.secondary_language === "string"
+        ? job.input_data.secondary_language
+        : null),
+    source_candidate_key:
+      detailString(details, "source_candidate_key") ??
+      (typeof job.input_data.source_candidate_key === "string"
+        ? job.input_data.source_candidate_key
+        : null),
+    elapsed_seconds: Number.isFinite(startedAt)
+      ? Math.max(0, Math.floor((Date.now() - startedAt) / 1000))
+      : 0,
+  };
+}
+
+function progressPercent(progress: SubtitleProgress | null): number | null {
+  if (!progress || progress.percent === null) return null;
+  return Math.min(100, Math.floor(progress.percent));
+}
+
+function progressStageIndex(progress: SubtitleProgress): number {
   const index = PROGRESS_STAGES.findIndex((stage) =>
     (stage.phases as readonly string[]).includes(progress.phase ?? "preparing"),
   );
@@ -185,7 +277,7 @@ function sourceKeyLabel(key: string | null): string | null {
   return key.startsWith("external:") ? key.slice("external:".length) : key;
 }
 
-function runningBadgeText(progress: SubgenProgress | null): string {
+function runningBadgeText(progress: SubtitleProgress | null): string {
   const phaseLabels: Record<string, string> = {
     preparing: "准备中",
     ocr: "识别中",
@@ -207,7 +299,7 @@ function ProgressDetails({
   progress,
   compact = false,
 }: {
-  progress: SubgenProgress;
+  progress: SubtitleProgress;
   compact?: boolean;
 }) {
   const percent = progressPercent(progress);
@@ -235,12 +327,31 @@ function ProgressDetails({
         )}
         {totalEvents > 0 && <span className="tnum">对白 {doneEvents}/{totalEvents} 条</span>}
         {reference && <span className="max-w-full truncate" title={reference}>参考 {reference}</span>}
+        {progress.model_requests > 0 && (
+          <span className="tnum">
+            模型调用 {progress.model_requests} 次
+            {progress.model_tokens > 0 ? ` · ${progress.model_tokens.toLocaleString()} token` : ""}
+          </span>
+        )}
         <span className="tnum">已用时 {formatElapsed(progress.elapsed_seconds ?? 0)}</span>
       </div>
       {activeBlocks.length > 0 && (
         <p className="text-caption text-[#b9e8ff]/85">
           {progress.parallelism > 1 ? `并发上限 ${progress.parallelism} 路 · ` : ""}
           正在处理第 {activeBlocks.join("、")} 块
+          {progress.oldest_active_seconds > 0
+            ? ` · 最早一块已等待 ${formatElapsed(progress.oldest_active_seconds)}`
+            : ""}
+        </p>
+      )}
+      {(progress.rate_limit_count > 0 || progress.validation_retries > 0) && (
+        <p className="text-caption leading-5 text-[#ffd89a]">
+          {progress.rate_limit_count > 0
+            ? `模型服务繁忙 ${progress.rate_limit_count} 次，系统已自动降速重试。`
+            : ""}
+          {progress.validation_retries > 0
+            ? `有 ${progress.validation_retries} 次返回格式不完整，系统已自动纠正。`
+            : ""}
         </p>
       )}
       <ol className={compact ? "space-y-1" : "space-y-1.5"} aria-label="字幕生成阶段">
@@ -291,13 +402,13 @@ export function SubtitleGenPanel({
   const router = useRouter();
   const { start: startAgent } = useAgentConversations();
   const { isAdmin } = usePermissions();
+  const { latestFor, upsert } = useJobs();
   const [targetLanguage, setTargetLanguage] = useState<OutputLanguage>("chs");
   const [bilingual, setBilingual] = useState(false);
   const [secondaryLanguage, setSecondaryLanguage] = useState<OutputLanguage>("eng");
   const [sourceCandidateKey, setSourceCandidateKey] = useState<string | null>(null);
   const [preview, setPreview] = useState<SubgenPreview | null>(null);
   const [pgsOcrLanguage, setPgsOcrLanguage] = useState("");
-  const [progress, setProgress] = useState<SubgenProgress | null>(null);
   const [dialogOpen, setDialogOpen] = useState(false);
   const [dialogMode, setDialogMode] = useState<"preview" | "status">("preview");
   const [previewing, setPreviewing] = useState(false);
@@ -305,44 +416,33 @@ export function SubtitleGenPanel({
   const [stopping, setStopping] = useState(false);
   const [agentStarting, setAgentStarting] = useState(false);
   const [requestError, setRequestError] = useState<string | null>(null);
-  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const previewRequestRef = useRef(0);
+  const sharedJob = latestFor("library_file", file.id, "subtitle.generate");
+  const sharedJobId = sharedJob?.id;
+  const sharedJobStatus = sharedJob?.status;
+  const progress = subtitleProgress(sharedJob);
+  const running = sharedJobStatus ? RUNNING_JOB_STATUSES.has(sharedJobStatus) : false;
+  const hasTerminalIssue =
+    sharedJobStatus === "blocked" ||
+    sharedJobStatus === "failed" ||
+    sharedJobStatus === "cancelled";
+  const previousJobRef = useRef({ id: sharedJobId, status: sharedJobStatus });
 
-  const stopPolling = useCallback(() => {
-    if (pollRef.current !== null) {
-      clearInterval(pollRef.current);
-      pollRef.current = null;
-    }
-  }, []);
-
-  const poll = useCallback(async () => {
-    try {
-      const status = await subgenStatus(file.id);
-      setProgress(status);
-      if (!status.running) {
-        const wasRunning = pollRef.current !== null;
-        stopPolling();
-        // 只有“这次会话里看着它跑完”才刷新；挂载时读取历史结论不算。
-        if (wasRunning && status.last_result?.ok) onChanged?.();
-      }
-    } catch {
-      // 短暂轮询失败不把后台任务误报成失败，下一轮继续尝试。
-    }
-  }, [file.id, stopPolling, onChanged]);
-
-  const startPolling = useCallback(() => {
-    stopPolling();
-    pollRef.current = setInterval(() => void poll(), 2000);
-  }, [poll, stopPolling]);
-
-  // 进入页面时读取一次服务端状态：任务可能在别处发起后仍在运行。
+  // 只在当前页面亲眼看到同一任务从活跃态变为成功时刷新字幕台账；初次挂载
+  // 读到历史成功任务不触发多余请求。依赖只用 primitive，避免对象替换抖动。
   useEffect(() => {
-    void poll();
-    return stopPolling;
-  }, [poll, stopPolling]);
-  useEffect(() => {
-    if (progress?.running && pollRef.current === null) startPolling();
-  }, [progress?.running, startPolling]);
+    const previous = previousJobRef.current;
+    if (
+      sharedJobId &&
+      previous.id === sharedJobId &&
+      previous.status &&
+      RUNNING_JOB_STATUSES.has(previous.status) &&
+      sharedJobStatus === "succeeded"
+    ) {
+      onChanged?.();
+    }
+    previousJobRef.current = { id: sharedJobId, status: sharedJobStatus };
+  }, [onChanged, sharedJobId, sharedJobStatus]);
 
   const loadPreview = useCallback(async (
     target: string,
@@ -372,13 +472,13 @@ export function SubtitleGenPanel({
   }, [file.id]);
 
   const openAction = useCallback(() => {
-    if (progress?.running) {
+    if (running || hasTerminalIssue) {
       setDialogMode("status");
       setDialogOpen(true);
       return;
     }
     void loadPreview(targetLanguage, bilingual ? secondaryLanguage : null);
-  }, [bilingual, loadPreview, progress?.running, secondaryLanguage, targetLanguage]);
+  }, [bilingual, hasTerminalIssue, loadPreview, running, secondaryLanguage, targetLanguage]);
 
   const onStart = useCallback(async () => {
     setStarting(true);
@@ -387,32 +487,14 @@ export function SubtitleGenPanel({
       preview?.blocker?.code === "pgs_conversion_required" &&
       preview.pgs_conversion?.available === true;
     try {
-      await subgenStart(file.id, targetLanguage, {
+      const started = await subgenStart(file.id, targetLanguage, {
         convertPgs,
-        pgsCandidateKey: convertPgs ? preview?.pgs_conversion?.candidate_key : null,
         pgsOcrLanguage: convertPgs ? pgsOcrLanguage || null : null,
         secondaryLanguage: bilingual ? secondaryLanguage : null,
         sourceCandidateKey,
       });
-      setProgress({
-        running: true,
-        phase: convertPgs ? "ocr" : "preparing",
-        message: convertPgs ? "正在排队识别图片字幕" : "正在准备",
-        done_blocks: 0,
-        total_blocks: 0,
-        done_events: 0,
-        total_events: 0,
-        active_blocks: [],
-        parallelism: 0,
-        uses_ocr: convertPgs,
-        target_language: targetLanguage,
-        secondary_language: bilingual ? secondaryLanguage : null,
-        source_candidate_key: sourceCandidateKey,
-        elapsed_seconds: 0,
-        last_result: null,
-      });
+      upsert(started);
       setDialogOpen(false);
-      startPolling();
     } catch (error) {
       // 确认到真正入队之间文件可能变化，错误留在弹窗里让用户看清。
       setRequestError(errorMessage(error));
@@ -426,32 +508,22 @@ export function SubtitleGenPanel({
     preview,
     secondaryLanguage,
     sourceCandidateKey,
-    startPolling,
     targetLanguage,
+    upsert,
   ]);
 
   const onStop = useCallback(async () => {
     setStopping(true);
     setRequestError(null);
     try {
-      await subgenStop(file.id);
-      setProgress((current) =>
-        current
-          ? {
-              ...current,
-              message:
-                current.phase === "ocr"
-                  ? "已请求停止，将在当前字幕识别完成后停止"
-                  : "已请求停止，正在等待当前翻译块完成",
-            }
-          : current,
-      );
+      if (!sharedJobId) return;
+      upsert(await cancelJob(sharedJobId));
     } catch (error) {
       setRequestError(errorMessage(error));
     } finally {
       setStopping(false);
     }
-  }, [file.id]);
+  }, [sharedJobId, upsert]);
 
   const handOffToAgent = useCallback(
     async (reason: string) => {
@@ -489,8 +561,11 @@ export function SubtitleGenPanel({
 
   if (!isAdmin || file.missing) return null;
 
-  const running = progress?.running ?? false;
-  const lastResult = progress?.last_result;
+  const jobSucceeded = sharedJobStatus === "succeeded";
+  const resultMessage =
+    sharedJob?.error?.message ??
+    (typeof sharedJob?.result?.message === "string" ? sharedJob.result.message : null) ??
+    "任务已经结束。";
   const generated = file.subtitle_streams.some(
     (subtitle) => subtitle.external && isAiSubtitle(subtitle.file_name),
   );
@@ -509,15 +584,15 @@ export function SubtitleGenPanel({
   const canConvertPgs = canPreparePgs && pgsLanguageReady;
 
   let badgeClass = AI_BADGE_IDLE;
-  let badgeSuffix = generated ? "新建版本" : "生成";
+  let badgeSuffix = generated || jobSucceeded ? "新建版本" : "生成";
   if (previewing) {
     badgeSuffix = "正在检查";
   } else if (running) {
     badgeClass = AI_BADGE_RUNNING;
     badgeSuffix = runningBadgeText(progress);
-  } else if (generated) {
+  } else if (generated || jobSucceeded) {
     badgeClass = AI_BADGE_DONE;
-  } else if (lastResult && !lastResult.ok) {
+  } else if (hasTerminalIssue) {
     badgeClass = AI_BADGE_FAILED;
     badgeSuffix = "AI 未完成";
   }
@@ -527,14 +602,14 @@ export function SubtitleGenPanel({
   const badgeMain = running ? activeOutputLabel : "AI 字幕";
   const badgeLabel = `${badgeMain} · ${badgeSuffix}`;
 
-  const runningTooltip = progress?.running ? <ProgressDetails progress={progress} compact /> : null;
+  const runningTooltip = running && progress ? <ProgressDetails progress={progress} compact /> : null;
 
   const actionButton = (
     <button
       type="button"
       className={`${AI_BADGE_BASE} ${badgeClass}`}
       disabled={previewing}
-      aria-label={progress?.running ? `${badgeLabel}，${progress.message || "正在运行"}` : badgeLabel}
+      aria-label={running ? `${badgeLabel}，${progress?.message || "正在运行"}` : badgeLabel}
       onClick={openAction}
     >
       {running && <span className="size-1.5 animate-pulse rounded-full bg-current" />}
@@ -550,7 +625,7 @@ export function SubtitleGenPanel({
       {/* 生成前直接进确认弹窗，不用 tooltip 重复解释；只有后台任务运行时，
           固定状态按钮才承载进度 tooltip。打开状态弹窗后立即卸掉 tooltip，
           避免浮层残留在 Modal 上方。 */}
-      {running ? (
+      {running || hasTerminalIssue ? (
         !dialogOpen ? (
           <Tooltip content={runningTooltip} maxWidth={460}>
             {actionButton}
@@ -578,11 +653,17 @@ export function SubtitleGenPanel({
             </span>
             <div>
               <h2 className="text-title-sm font-bold text-white">
-                {dialogMode === "status" ? `正在生成${activeOutputLabel}` : "生成 AI 字幕"}
+                {dialogMode === "status"
+                  ? running
+                    ? `正在生成${activeOutputLabel}`
+                    : "AI 字幕任务"
+                  : "生成 AI 字幕"}
               </h2>
               <p className="mt-1 text-sub leading-5 text-[var(--text-muted)]">
                 {dialogMode === "status"
-                  ? "后台运行，离开页面不会中断。"
+                  ? running
+                    ? "后台运行，离开页面不会中断。"
+                    : "任务详情与处理建议。"
                   : "确认后才调用 AI，并在后台生成。"}
               </p>
             </div>
@@ -590,7 +671,7 @@ export function SubtitleGenPanel({
 
           {dialogMode === "status" ? (
             <div className="mt-6 space-y-4">
-              {progress?.running ? (
+              {running && progress ? (
                 <>
                   <div className="rounded-xl border border-[#7dd3fc]/25 bg-[#7dd3fc]/[0.07] p-4">
                     <ProgressDetails progress={progress} />
@@ -618,16 +699,16 @@ export function SubtitleGenPanel({
                 <>
                   <div
                     className={`rounded-xl border p-4 ${
-                      progress?.last_result?.ok
+                      jobSucceeded
                         ? "border-[#4ade80]/30 bg-[#4ade80]/[0.08] text-[#7cf0a4]"
                         : "border-[#ff9f9f]/30 bg-[#ff9f9f]/[0.08] text-[#ffb4b4]"
                     }`}
                   >
                     <p className="text-ui font-semibold">
-                      {progress?.last_result?.ok ? "字幕生成完成" : "字幕生成未完成"}
+                      {jobSucceeded ? "字幕生成完成" : "字幕生成未完成"}
                     </p>
                     <p className="mt-1.5 text-sub leading-5 opacity-85">
-                      {progress?.last_result?.message || "任务已经结束。"}
+                      {resultMessage}
                     </p>
                   </div>
                   {requestError && (
@@ -636,15 +717,29 @@ export function SubtitleGenPanel({
                     </p>
                   )}
                   <div className="flex justify-end gap-2.5">
-                    {lastResult && !lastResult.ok && (
-                      <button
-                        type="button"
-                        className={AGENT_BUTTON}
-                        disabled={agentStarting}
-                        onClick={() => void handOffToAgent(lastResult.message)}
-                      >
-                        {agentStarting ? "正在交给 Agent…" : "交给 Agent 处理"}
-                      </button>
+                    {!jobSucceeded && (
+                      <>
+                        <button
+                          type="button"
+                          className={CONFIRM_BUTTON}
+                          onClick={() =>
+                            void loadPreview(
+                              targetLanguage,
+                              bilingual ? secondaryLanguage : null,
+                            )
+                          }
+                        >
+                          重新预检
+                        </button>
+                        <button
+                          type="button"
+                          className={AGENT_BUTTON}
+                          disabled={agentStarting}
+                          onClick={() => void handOffToAgent(resultMessage)}
+                        >
+                          {agentStarting ? "正在交给 Agent…" : "交给 Agent 处理"}
+                        </button>
+                      </>
                     )}
                     <button type="button" className={CANCEL_BUTTON} onClick={() => setDialogOpen(false)}>
                       关闭

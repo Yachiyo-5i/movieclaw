@@ -20,14 +20,14 @@ from sqlmodel import select
 import movieclaw_api.services.library.scan as scan_mod
 import movieclaw_api.services.media_discover as discover_mod
 from movieclaw_api.core.config import get_settings
+from movieclaw_api.services import jobs
 from movieclaw_api.services.library.scan import scan_library
 from movieclaw_api.services.media_library import MediaLibraryService
 from movieclaw_api.services.subscription import SubscriptionService
-from movieclaw_api.services.subtitle_gen import tasks as subtitle_tasks
-from movieclaw_api.services.task_state import TaskState
+from movieclaw_api.services.subtitle_gen import translate
 from movieclaw_db.engine import dispose_db, get_database, init_db
 from movieclaw_db.migrations import run_migrations
-from movieclaw_db.models import LibraryFile, MediaItem, WantedItem
+from movieclaw_db.models import JobResource, JobStatus, LibraryFile, MediaItem, WantedItem
 from movieclaw_db.models.library_file import IdentitySource, UnidentifiedCode
 from movieclaw_db.repositories.library_repo import LibraryRepository
 from movieclaw_media.models import MediaKind
@@ -359,9 +359,7 @@ async def test_rescan_after_root_alias_change_relocates_same_file_ledger(db, tmp
         old = (await session.execute(select(LibraryFile))).scalar_one()
         old_id = old.id
         old_item_id = old.media_item_id
-        await LibraryRepository(session).update(
-            library.id, name="电影库", root_paths=[str(alias)]
-        )
+        await LibraryRepository(session).update(library.id, name="电影库", root_paths=[str(alias)])
 
     summary = await scan_library(
         library.id,
@@ -413,9 +411,7 @@ async def test_rescan_merges_duplicate_rows_left_by_root_alias_change(db, tmp_pa
         )
         session.add(duplicate)
         await session.commit()
-        await LibraryRepository(session).update(
-            library.id, name="电影库", root_paths=[str(alias)]
-        )
+        await LibraryRepository(session).update(library.id, name="电影库", root_paths=[str(alias)])
 
     summary = await scan_library(
         library.id,
@@ -492,9 +488,7 @@ async def test_adding_root_does_not_merge_matching_fingerprint_on_another_device
     other_file = other_entry / "某电影.2020.mkv"
     shutil.copy2(original, other_file)
     os.utime(other_file, ns=(original.stat().st_atime_ns, original.stat().st_mtime_ns))
-    (other_entry / "movie.nfo").write_text(
-        "<movie><tmdbid>300</tmdbid></movie>", encoding="utf-8"
-    )
+    (other_entry / "movie.nfo").write_text("<movie><tmdbid>300</tmdbid></movie>", encoding="utf-8")
     real_stat = Path.stat
 
     def cross_device_stat(path: Path, *args, **kwargs):  # noqa: ANN002, ANN003
@@ -599,10 +593,7 @@ async def test_rescan_relinks_when_old_root_is_unavailable(db, tmp_path) -> None
     new_file = new_entry / "某电影.2020.mkv"
     shutil.copy2(old_file, new_file)
     (new_entry / "movie.nfo").write_text("<movie><tmdbid>300</tmdbid></movie>", encoding="utf-8")
-    old_file.unlink()
-    (old_entry / "movie.nfo").unlink()
-    old_entry.rmdir()
-    old_root.rmdir()
+    shutil.rmtree(old_root)
 
     async with db.session() as session:
         old = (await session.execute(select(LibraryFile))).scalar_one()
@@ -667,7 +658,7 @@ async def test_rescan_does_not_merge_same_fingerprint_different_inode(db, tmp_pa
 async def test_reconcile_duplicate_clears_idle_subtitle_job_state(
     db, tmp_path, monkeypatch
 ) -> None:
-    """合并重复行时清理未执行的字幕续传状态，不让它在重启后指向已删行。"""
+    """合并重复行时迁移字幕历史与重试输入，并清理被删行的旧断点。"""
     root = tmp_path / "media" / "movies"
     entry = root / "某电影 (2020)"
     entry.mkdir(parents=True)
@@ -685,6 +676,8 @@ async def test_reconcile_duplicate_clears_idle_subtitle_job_state(
 
     async with db.session() as session:
         old = (await session.execute(select(LibraryFile))).scalar_one()
+        assert old.id is not None
+        old_id = old.id
         duplicate = LibraryFile(
             library_id=library.id,
             media_item_id=old.media_item_id,
@@ -695,36 +688,43 @@ async def test_reconcile_duplicate_clears_idle_subtitle_job_state(
         session.add(duplicate)
         await session.commit()
         assert duplicate.id is not None
-        await LibraryRepository(session).update(
-            library.id, name="电影库", root_paths=[str(alias)]
+        duplicate_id = duplicate.id
+        created = await jobs.create_job(
+            session,
+            job_type="subtitle.generate",
+            subject="历史字幕任务",
+            input_data={"file_id": duplicate_id, "target_language": "chs"},
+            resources=[jobs.ResourceRef("library_file", duplicate_id)],
+            dedupe_key=f"subtitle.generate:{duplicate_id}:chs",
         )
+        created.job.status = JobStatus.FAILED
+        await session.commit()
+        job_id = created.job.id
+        await LibraryRepository(session).update(library.id, name="电影库", root_paths=[str(alias)])
 
-    intent = subtitle_tasks.GenerationIntent(duplicate.id, "chs")
-    subtitle_tasks._persist_intent(intent)
-    checkpoint = subtitle_tasks.translate.Checkpoint(duplicate.id, "chs", "test")
+    checkpoint = translate.Checkpoint(duplicate_id, "chs", "test")
     checkpoint.save()
-    subtitle_tasks._tasks.finish(
-        duplicate.id,
-        result=subtitle_tasks.GenResult(ok=True, message="旧结果"),
-    )
 
     await scan_library(
         library.id,
         reconcile_root_change=True,
         previous_root_paths=[str(root)],
     )
-    assert not subtitle_tasks._intent_path(intent).exists()
     assert not checkpoint.path.exists()
-    assert subtitle_tasks.last_result(duplicate.id) is None
     async with db.session() as session:
         rows = list((await session.execute(select(LibraryFile))).scalars().all())
+        job = await jobs.get_job(session, job_id)
+        resource = (
+            await session.execute(select(JobResource).where(JobResource.job_id == job_id))
+        ).scalar_one()
     assert len(rows) == 1
+    assert rows[0].id == old_id
+    assert job is not None and job.input_data["file_id"] == old_id
+    assert resource.resource_id == str(old_id)
 
 
-async def test_reconcile_duplicate_preserves_running_subtitle_task(
-    db, tmp_path, monkeypatch
-) -> None:
-    """重复行正在生成字幕时保留它的 id，任务可继续且台账仍会收敛。"""
+async def test_reconcile_duplicate_preserves_running_subtitle_task(db, tmp_path) -> None:
+    """重复行有关联的活跃持久字幕作业时保留它的 id。"""
     root = tmp_path / "media" / "movies"
     entry = root / "某电影 (2020)"
     entry.mkdir(parents=True)
@@ -732,8 +732,6 @@ async def test_reconcile_duplicate_preserves_running_subtitle_task(
     (entry / "movie.nfo").write_text("<movie><tmdbid>300</tmdbid></movie>", encoding="utf-8")
     alias = tmp_path / "mounted-movies"
     alias.symlink_to(root, target_is_directory=True)
-    states: TaskState[subtitle_tasks.GenState] = TaskState()
-    monkeypatch.setattr(subtitle_tasks, "_tasks", states)
 
     async with db.session() as session:
         library = await LibraryRepository(session).create(
@@ -753,10 +751,16 @@ async def test_reconcile_duplicate_preserves_running_subtitle_task(
         session.add(duplicate)
         await session.commit()
         assert duplicate.id is not None
-        assert states.try_start(duplicate.id, subtitle_tasks.GenState())
-        await LibraryRepository(session).update(
-            library.id, name="电影库", root_paths=[str(alias)]
+        duplicate_id = duplicate.id
+        created = await jobs.create_job(
+            session,
+            job_type="subtitle.generate",
+            subject="运行中的字幕任务",
+            input_data={"file_id": duplicate_id, "target_language": "chs"},
+            resources=[jobs.ResourceRef("library_file", duplicate_id)],
+            dedupe_key=f"subtitle.generate:{duplicate_id}:chs",
         )
+        await LibraryRepository(session).update(library.id, name="电影库", root_paths=[str(alias)])
 
     summary = await scan_library(
         library.id,
@@ -766,15 +770,14 @@ async def test_reconcile_duplicate_preserves_running_subtitle_task(
     assert summary.errors == []
     async with db.session() as session:
         rows = list((await session.execute(select(LibraryFile))).scalars().all())
+        job = await jobs.get_job(session, created.job.id)
     assert len(rows) == 1
-    assert rows[0].id == duplicate.id
-    assert subtitle_tasks.is_generation_running(duplicate.id)
+    assert rows[0].id == duplicate_id
+    assert job is not None and job.status == JobStatus.QUEUED
 
 
-async def test_reconcile_duplicate_waits_when_both_subtitle_tasks_are_running(
-    db, tmp_path, monkeypatch
-) -> None:
-    """两条重复台账各有运行任务时，不删任一行，留待任务结束后再合并。"""
+async def test_reconcile_duplicate_waits_when_both_subtitle_tasks_are_running(db, tmp_path) -> None:
+    """两条重复台账各有活跃持久作业时，不删任一行，留待任务结束后合并。"""
     root = tmp_path / "media" / "movies"
     entry = root / "某电影 (2020)"
     entry.mkdir(parents=True)
@@ -782,8 +785,6 @@ async def test_reconcile_duplicate_waits_when_both_subtitle_tasks_are_running(
     (entry / "movie.nfo").write_text("<movie><tmdbid>300</tmdbid></movie>", encoding="utf-8")
     alias = tmp_path / "mounted-movies"
     alias.symlink_to(root, target_is_directory=True)
-    states: TaskState[subtitle_tasks.GenState] = TaskState()
-    monkeypatch.setattr(subtitle_tasks, "_tasks", states)
 
     async with db.session() as session:
         library = await LibraryRepository(session).create(
@@ -803,11 +804,16 @@ async def test_reconcile_duplicate_waits_when_both_subtitle_tasks_are_running(
         session.add(duplicate)
         await session.commit()
         assert old.id is not None and duplicate.id is not None
-        assert states.try_start(old.id, subtitle_tasks.GenState())
-        assert states.try_start(duplicate.id, subtitle_tasks.GenState())
-        await LibraryRepository(session).update(
-            library.id, name="电影库", root_paths=[str(alias)]
-        )
+        for file_id in (old.id, duplicate.id):
+            await jobs.create_job(
+                session,
+                job_type="subtitle.generate",
+                subject=f"字幕任务 {file_id}",
+                input_data={"file_id": file_id, "target_language": "chs"},
+                resources=[jobs.ResourceRef("library_file", file_id)],
+                dedupe_key=f"subtitle.generate:{file_id}:chs",
+            )
+        await LibraryRepository(session).update(library.id, name="电影库", root_paths=[str(alias)])
 
     summary = await scan_library(
         library.id,

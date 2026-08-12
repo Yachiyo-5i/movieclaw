@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -19,6 +20,7 @@ from sqlmodel import select
 import movieclaw_api.services.library.ingest as ingest_mod
 from movieclaw_api.core.config import get_settings
 from movieclaw_api.exceptions import BadRequestException
+from movieclaw_api.services import jobs
 from movieclaw_api.services.import_watch_config import ImportWatchConfigService
 from movieclaw_db.engine import dispose_db, get_database, init_db
 from movieclaw_db.migrations import run_migrations
@@ -26,6 +28,8 @@ from movieclaw_db.models import (
     ImportWatch,
     IngestEntry,
     IngestStatus,
+    Job,
+    JobStatus,
     Library,
     LibraryFile,
     ManualDownloadIntent,
@@ -61,6 +65,7 @@ async def db(tmp_path, monkeypatch):
     monkeypatch.setattr(ingest_mod, "QUIET_SECONDS", 0)
     monkeypatch.setattr(ingest_mod, "_briefs_cache", (float("-inf"), None))
     yield get_database()
+    await jobs.close_job_dispatcher()
     await dispose_db()
     get_settings.cache_clear()
 
@@ -96,6 +101,20 @@ async def _get_library(db, library_id: int) -> Library:
         return row
 
 
+async def _wait_job_status(job_id: str, status: JobStatus, timeout: float = 3.0) -> Job:
+    """等待统一调度器收口状态，避免测试依赖固定 sleep。"""
+    deadline = asyncio.get_running_loop().time() + timeout
+    while True:
+        async with get_database().session() as session:
+            row = await session.get(Job, job_id)
+            assert row is not None
+            if row.status is status:
+                return row
+        if asyncio.get_running_loop().time() >= deadline:
+            raise AssertionError(f"作业未进入 {status.value}，当前为 {row.status.value}")
+        await asyncio.sleep(0.01)
+
+
 def _stub_identify(monkeypatch, item):
     async def identify(session, kind, watch_root, main, spec):
         return item
@@ -112,7 +131,9 @@ async def _sweep_twice(db, library_id, watch, strategy="hardlink"):
     """两轮巡检：第一轮记录指纹，第二轮确认静默后处理。"""
     for _ in range(2):
         library = await _get_library(db, library_id)
-        await ingest_mod._sweep_dir(_fixed_rule(watch, strategy, library_id), library)
+        await ingest_mod._sweep_dir(
+            _fixed_rule(watch, strategy, library_id), library, execute_inline=True
+        )
 
 
 @pytest.mark.asyncio
@@ -160,11 +181,11 @@ async def test_unstable_fingerprint_defers_import(db, tmp_path, monkeypatch):
 
     library = await _get_library(db, library_id)
     rule = _fixed_rule(watch, library_id=library_id)
-    await ingest_mod._sweep_dir(rule, library)  # 记录指纹 A
+    await ingest_mod._sweep_dir(rule, library, execute_inline=True)  # 记录指纹 A
     video.write_bytes(b"part1-part2")  # 下载继续，指纹变为 B
-    await ingest_mod._sweep_dir(rule, library)  # B 首见，重新起算
+    await ingest_mod._sweep_dir(rule, library, execute_inline=True)  # B 首见，重新起算
     assert not (root / "某电影 (2020)").exists()
-    await ingest_mod._sweep_dir(rule, library)  # B 稳定 → 导入
+    await ingest_mod._sweep_dir(rule, library, execute_inline=True)  # B 稳定 → 导入
     assert (root / "某电影 (2020)" / "某电影 (2020).mkv").read_bytes() == b"part1-part2"
 
 
@@ -378,7 +399,9 @@ async def test_downloader_signal_is_authoritative(db, tmp_path, monkeypatch):
     # 下载器确认完成：无需静默等待，单轮巡检立即导入，挂起记录清除
     brief.completed = True
     library = await _get_library(db, library_id)
-    await ingest_mod._sweep_dir(_fixed_rule(watch, library_id=library_id), library)
+    await ingest_mod._sweep_dir(
+        _fixed_rule(watch, library_id=library_id), library, execute_inline=True
+    )
     assert (root / "某电影 (2020)" / "某电影 (2020).mkv").read_bytes() == b"video"
 
 
@@ -436,7 +459,7 @@ async def test_manual_download_identity_claim_via_info_hash(db, tmp_path, monkey
 
     # auto 监听规则没有指定库；若没有手动身份锚，会走到 identify_none → pending。
     rule = ImportWatch(source_path=str(watch), strategy="hardlink", library_id=None, kind="movie")
-    await ingest_mod._sweep_dir(rule, None)
+    await ingest_mod._sweep_dir(rule, None, execute_inline=True)
 
     assert (target_root / "手动确认影片 (2024)" / "手动确认影片 (2024).mkv").exists()
     assert not (default_root / "手动确认影片 (2024)").exists()
@@ -539,7 +562,9 @@ async def test_wanted_identity_claim_via_info_hash(db, tmp_path, monkeypatch):
 
     library = await _get_library(db, library_id)
     # 下载器确认完成,单轮即处理
-    await ingest_mod._sweep_dir(_fixed_rule(watch, library_id=library_id), library)
+    await ingest_mod._sweep_dir(
+        _fixed_rule(watch, library_id=library_id), library, execute_inline=True
+    )
     assert (root / "某电影 (2020)" / "某电影 (2020).mkv").read_bytes() == b"video"
 
     # 库存对账闭环：入库单元关闭了对应工单（订阅止于投递的另一半）
@@ -667,11 +692,233 @@ async def test_failed_entry_retried_by_fallback_without_new_events(db, tmp_path,
 
     monkeypatch.setattr(ingest_mod, "_watcher", _StubWatcher())
     await ingest_mod.ingest_tick()  # 第一轮：重新记录静默指纹
-    await ingest_mod.ingest_tick()  # 第二轮：静默确认 → 重试导入
+    await ingest_mod.ingest_tick()  # 第二轮：静默确认 → 创建可恢复入库 Job
+    async with db.session() as session:
+        job = (
+            await session.execute(select(Job).where(Job.job_type == "library.ingest"))
+        ).scalar_one()
+    await jobs.init_job_dispatcher(max_parallel=1)
+    deadline = asyncio.get_running_loop().time() + 3
+    while True:
+        async with db.session() as session:
+            job = await session.get(Job, job.id)
+            assert job is not None
+        if job.status == JobStatus.SUCCEEDED:
+            break
+        if asyncio.get_running_loop().time() >= deadline:
+            raise AssertionError(f"监听入库 Job 未完成，当前状态：{job.status}")
+        await asyncio.sleep(0.01)
     assert (root / "某电影 (2020)" / "某电影 (2020).mkv").read_bytes() == b"video"
     async with db.session() as session:
         record = (await session.execute(select(IngestEntry))).scalar_one()
     assert record.status == IngestStatus.IMPORTED
+
+
+@pytest.mark.asyncio
+async def test_persistent_ingest_copy_resumes_after_dispatcher_restart(db, tmp_path, monkeypatch):
+    """复制到一半更新服务：作业退回队列，隐藏副本保留并从已有字节续跑。"""
+    root, watch = tmp_path / "movies", tmp_path / "watch"
+    watch.mkdir()
+    library_id = await _make_library(db, kind=MediaKind.MOVIE, root=root)
+    await _make_rule(db, library_id=library_id, source=watch, strategy="copy")
+    item = await _make_item(db, kind=MediaKind.MOVIE, title="续传电影", year=2026)
+    _stub_identify(monkeypatch, item)
+    monkeypatch.setattr(ingest_mod, "probe_media", lambda _path: _FAKE_SPEC)
+    monkeypatch.setattr(ingest_mod, "_INGEST_COPY_CHUNK_BYTES", 8)
+
+    async def no_assets(_media_item_id: int) -> None:
+        return None
+
+    monkeypatch.setattr("movieclaw_api.services.media_scrape.ensure_assets", no_assets)
+
+    entry = watch / "续传电影 (2026)"
+    entry.mkdir()
+    source = entry / "movie.mkv"
+    source.write_bytes(bytes(range(128)))
+
+    async with db.session() as session:
+        rule = (await session.execute(select(ImportWatch))).scalar_one()
+        library = await session.get(Library, library_id)
+        assert library is not None
+    await ingest_mod._sweep_dir(rule, library)
+    await ingest_mod._sweep_dir(rule, library)
+
+    async with db.session() as session:
+        job = (
+            await session.execute(select(Job).where(Job.job_type == "library.ingest"))
+        ).scalar_one()
+        resources = await jobs.resources_for_jobs(session, [job.id])
+    assert {row.resource_type for row in resources[job.id]} >= {
+        "import_watch",
+        "ingest_path",
+        "library",
+    }
+    final = root / "续传电影 (2026)" / "续传电影 (2026).mkv"
+    partial, state_path = ingest_mod._ingest_copy_paths(final)
+    assert not final.exists()  # 巡检只入队，不在监听协程里直接搬运
+
+    loop = asyncio.get_running_loop()
+    first_chunk = asyncio.Event()
+    release_thread = threading.Event()
+    thread_finished = threading.Event()
+    offsets: list[int] = []
+    real_copy_chunk = ingest_mod._copy_ingest_chunk
+
+    def controlled_copy_chunk(source_path, partial_path, **kwargs):
+        offsets.append(partial_path.stat().st_size if partial_path.exists() else 0)
+        copied = real_copy_chunk(source_path, partial_path, **kwargs)
+        if len(offsets) == 1:
+            loop.call_soon_threadsafe(first_chunk.set)
+            release_thread.wait(timeout=2)
+            thread_finished.set()
+        return copied
+
+    monkeypatch.setattr(ingest_mod, "_copy_ingest_chunk", controlled_copy_chunk)
+    await jobs.init_job_dispatcher(max_parallel=1)
+    await asyncio.wait_for(first_chunk.wait(), timeout=2)
+    assert partial.stat().st_size == 8
+    await jobs.close_job_dispatcher()
+    paused = await _wait_job_status(job.id, JobStatus.QUEUED)
+    assert paused.attempt == 0
+    assert partial.stat().st_size == 8
+
+    release_thread.set()
+    assert await asyncio.to_thread(thread_finished.wait, 2)
+    await jobs.init_job_dispatcher(max_parallel=1)
+    completed = await _wait_job_status(job.id, JobStatus.SUCCEEDED)
+
+    assert final.read_bytes() == source.read_bytes()
+    assert offsets[0] == 0 and offsets[1] == 8
+    assert not partial.exists() and not state_path.exists()
+    assert completed.progress["percent"] == 100.0
+
+
+@pytest.mark.asyncio
+async def test_pending_ingest_claim_unblocks_same_job(db, tmp_path, monkeypatch):
+    """识别不出时 Job 待处理；人工认领后复用同一稳定 job id 完成入库。"""
+    root, watch = tmp_path / "movies", tmp_path / "watch"
+    watch.mkdir()
+    library_id = await _make_library(db, kind=MediaKind.MOVIE, root=root)
+    await _make_rule(db, library_id=library_id, source=watch)
+    item = await _make_item(db, kind=MediaKind.MOVIE, title="认领后入库", year=2026)
+    monkeypatch.setattr(ingest_mod, "probe_media", lambda _path: _FAKE_SPEC)
+
+    async def identify_none(*_args):
+        return None
+
+    async def ensure_item(_service, kind, tmdb_id):
+        assert kind is MediaKind.MOVIE and tmdb_id == item.tmdb_id
+        return item
+
+    async def no_assets(_media_item_id: int) -> None:
+        return None
+
+    monkeypatch.setattr(ingest_mod, "_identify", identify_none)
+    monkeypatch.setattr(ingest_mod.MediaLibraryService, "ensure_media_item", ensure_item)
+    monkeypatch.setattr("movieclaw_api.services.media_scrape.ensure_assets", no_assets)
+
+    entry = watch / "unknown-release"
+    entry.mkdir()
+    (entry / "movie.mkv").write_bytes(b"video")
+    async with db.session() as session:
+        rule = (await session.execute(select(ImportWatch))).scalar_one()
+        library = await session.get(Library, library_id)
+        assert library is not None
+    await ingest_mod._sweep_dir(rule, library)
+    await ingest_mod._sweep_dir(rule, library)
+
+    async with db.session() as session:
+        job = (
+            await session.execute(select(Job).where(Job.job_type == "library.ingest"))
+        ).scalar_one()
+    await jobs.init_job_dispatcher(max_parallel=1)
+    blocked = await _wait_job_status(job.id, JobStatus.BLOCKED)
+    assert blocked.error["code"] == "INGEST_IDENTITY_REQUIRED"
+
+    async with db.session() as session:
+        record = (await session.execute(select(IngestEntry))).scalar_one()
+        assert record.status == IngestStatus.PENDING
+        await ingest_mod.claim_entry(session, record.id, item.tmdb_id)
+
+    completed = await _wait_job_status(job.id, JobStatus.SUCCEEDED)
+    assert completed.id == job.id
+    assert (root / "认领后入库 (2026)" / "认领后入库 (2026).mkv").exists()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_ingest_is_not_resurrected_by_startup_sweep(db, tmp_path, monkeypatch):
+    """用户取消的同一磁盘版本不能在下次启动补扫时被静默重新创建。"""
+    root, watch = tmp_path / "movies", tmp_path / "watch"
+    watch.mkdir()
+    library_id = await _make_library(db, kind=MediaKind.MOVIE, root=root)
+    await _make_rule(db, library_id=library_id, source=watch)
+    item = await _make_item(db, kind=MediaKind.MOVIE, title="取消入库", year=2026)
+    _stub_identify(monkeypatch, item)
+    monkeypatch.setattr(ingest_mod, "probe_media", lambda _path: _FAKE_SPEC)
+    entry = watch / "取消入库 (2026)"
+    entry.mkdir()
+    (entry / "movie.mkv").write_bytes(b"video")
+
+    async with db.session() as session:
+        rule = (await session.execute(select(ImportWatch))).scalar_one()
+        library = await session.get(Library, library_id)
+        assert library is not None
+    await ingest_mod._sweep_dir(rule, library)
+    await ingest_mod._sweep_dir(rule, library)
+    async with db.session() as session:
+        job = (await session.execute(select(Job))).scalar_one()
+        await jobs.request_cancel(session, job.id, requested_by="test")
+
+    monkeypatch.setattr(ingest_mod, "_stability", {})  # 模拟新进程启动
+    await ingest_mod._sweep_dir(rule, library)
+    await ingest_mod._sweep_dir(rule, library)
+    async with db.session() as session:
+        all_jobs = list((await session.execute(select(Job))).scalars())
+    assert len(all_jobs) == 1 and all_jobs[0].status == JobStatus.CANCELLED
+
+
+@pytest.mark.asyncio
+async def test_auto_routed_ingest_adds_target_library_resource(db, tmp_path, monkeypatch):
+    """自动路由在识别后补充真实库资源，让所有库级作业共享同一互斥锁。"""
+    root, watch = tmp_path / "movies", tmp_path / "watch"
+    watch.mkdir()
+    library_id = await _make_library(db, kind=MediaKind.MOVIE, root=root)
+    item = await _make_item(db, kind=MediaKind.MOVIE, title="自动路由电影", year=2026)
+    _stub_identify(monkeypatch, item)
+    monkeypatch.setattr(ingest_mod, "probe_media", lambda _path: _FAKE_SPEC)
+
+    async def no_assets(_media_item_id: int) -> None:
+        return None
+
+    monkeypatch.setattr("movieclaw_api.services.media_scrape.ensure_assets", no_assets)
+    entry = watch / "自动路由电影 (2026)"
+    entry.mkdir()
+    (entry / "movie.mkv").write_bytes(b"video")
+    async with db.session() as session:
+        rule = ImportWatch(
+            source_path=str(watch),
+            strategy="hardlink",
+            library_id=None,
+            kind="movie",
+        )
+        session.add(rule)
+        await session.commit()
+        await session.refresh(rule)
+    await ingest_mod._sweep_dir(rule, None)
+    await ingest_mod._sweep_dir(rule, None)
+
+    async with db.session() as session:
+        job = (await session.execute(select(Job))).scalar_one()
+    await jobs.init_job_dispatcher(max_parallel=1)
+    await _wait_job_status(job.id, JobStatus.SUCCEEDED)
+    async with db.session() as session:
+        resources = await jobs.resources_for_jobs(session, [job.id])
+    assert any(
+        row.resource_type == "library"
+        and row.resource_id == str(library_id)
+        and row.relation == "target"
+        for row in resources[job.id]
+    )
     assert not ingest_mod._has_pending(str(watch))  # 重试成功后重试表清空
 
 

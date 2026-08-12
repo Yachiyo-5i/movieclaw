@@ -35,6 +35,7 @@ class SourceCandidate:
     forced: bool
     sdh: bool
     format: str | None  # 外挂扩展名 / 内封 codec（小写）
+    provenance: str = "original"  # original / pgs_ocr / ai / ai_bilingual
 
 
 @dataclass
@@ -55,6 +56,18 @@ def _language_rank(lang: str | None, original: str | None) -> int:
     return 1 if lang == "eng" else 0
 
 
+def _external_provenance(entry: dict) -> str:
+    """从规范 title/文件名识别字幕世代，避免把 AI 成品继续当默认翻译源。"""
+    marker = f"{entry.get('title') or ''}.{entry.get('filename') or ''}".lower()
+    if "ai-bilingual-" in marker:
+        return "ai_bilingual"
+    if ".ai-" in marker or marker.startswith("ai-") or ".ai." in marker:
+        return "ai"
+    if "pgs-ocr" in marker:
+        return "pgs_ocr"
+    return "original"
+
+
 def rank_candidates(
     file: LibraryFile,
     *,
@@ -64,7 +77,7 @@ def rank_candidates(
     """元数据级排序（完整度/同步度在加载后另行评估，tasks 按序逐个尝试）。
 
     排序键（越大越优）：语言优先级 → 非 sdh（听障标记要清理，同分让路）
-    → 内封优先（v2.1：多为发行方官方字幕，方差小；形态只做平分决胜）。
+    → 来源世代（发行原文 > OCR 文本 > AI 单语 > AI 双语）→ 内封优先。
     """
     original = normalize_language(original_language)
     target = normalize_language(target_language)
@@ -79,6 +92,7 @@ def rank_candidates(
             forced=bool(raw.get("forced")),
             sdh=False,
             format=codec,
+            provenance="original",
         )
         ranked.append(_rank_one(cand, original, target, is_text=codec in _TEXT_CODECS))
 
@@ -93,6 +107,7 @@ def rank_candidates(
             forced=bool(entry.get("forced")),
             sdh=bool(entry.get("sdh")),
             format=str(entry.get("format") or "").lower(),
+            provenance=_external_provenance(entry),
         )
         # 外挂台账只收文本格式（SUBTITLE_EXTS 保证），恒可用
         ranked.append(_rank_one(cand, original, target, is_text=True))
@@ -132,9 +147,29 @@ def _rank_one(
     if cand.sdh:
         r.reasons.append("听障字幕（翻译前清理音效标记，同分让路）")
     embedded = cand.kind == "embedded"
+    provenance_rank = {
+        "original": 3,
+        "pgs_ocr": 2,
+        "ai": 1,
+        "ai_bilingual": 0,
+    }.get(cand.provenance, 1)
     if embedded:
         r.reasons.append("内封轨（多为发行方官方字幕，平分决胜优先）")
-    r.rank_key = (lang_rank, 0 if cand.sdh else 1, 1 if embedded else 0)
+        provenance_rank = 4
+    elif cand.provenance == "pgs_ocr":
+        r.reasons.append("由原始图片字幕识别得到（优先于二次 AI 成品）")
+    elif cand.provenance == "ai":
+        r.reasons.append("AI 生成字幕（二次转译可能叠加误差）")
+    elif cand.provenance == "ai_bilingual":
+        r.reasons.append("AI 双语成品（默认最后使用，避免重复翻译）")
+    else:
+        r.reasons.append("普通外挂字幕（未检测到二次生成标记）")
+    r.rank_key = (
+        lang_rank,
+        0 if cand.sdh else 1,
+        provenance_rank,
+        1 if embedded else 0,
+    )
     if not is_text:
         r.exclusion_code = "pgs" if pgs.is_pgs_codec(cand.format) else "graphic"
         if r.exclusion_code == "pgs":
@@ -159,9 +194,7 @@ _MIN_EVENTS = 50
 _MIN_COVERAGE = 0.5
 
 
-def assess_events(
-    events: list[tuple[int, int, str]], runtime_seconds: int | None
-) -> Assessment:
+def assess_events(events: list[tuple[int, int, str]], runtime_seconds: int | None) -> Assessment:
     """events 为 (start_ms, end_ms, text) 序列（加载层产物）。"""
     count = len(events)
     if count == 0:
@@ -174,7 +207,5 @@ def assess_events(
     if count < _MIN_EVENTS:
         return Assessment(count, coverage, False, f"对白仅 {count} 条，疑似残缺轨")
     if coverage < _MIN_COVERAGE:
-        return Assessment(
-            count, coverage, False, f"时间覆盖率仅 {coverage:.0%}，疑似片段字幕"
-        )
+        return Assessment(count, coverage, False, f"时间覆盖率仅 {coverage:.0%}，疑似片段字幕")
     return Assessment(count, coverage, True, f"{count} 条对白，覆盖率 {coverage:.0%}")

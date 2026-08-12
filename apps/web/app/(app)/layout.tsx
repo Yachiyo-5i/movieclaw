@@ -1,6 +1,8 @@
 import { AppShell } from "@/components/app-shell";
 import { AuthGate } from "@/components/auth-gate";
 import { LlmCapabilityProvider } from "@/components/llm-gate";
+import { DownloadTasksProvider } from "@/lib/download-tasks";
+import { JobsProvider } from "@/lib/jobs";
 
 /**
  * (app) 路由组：工作台全部页面共用的外壳布局。
@@ -12,7 +14,11 @@ export default function AppLayout({ children }: { children: React.ReactNode }) {
   return (
     <AuthGate>
       <LlmCapabilityProvider>
-        <AppShell>{children}</AppShell>
+        <JobsProvider>
+          <DownloadTasksProvider>
+            <AppShell>{children}</AppShell>
+          </DownloadTasksProvider>
+        </JobsProvider>
       </LlmCapabilityProvider>
     </AuthGate>
   );

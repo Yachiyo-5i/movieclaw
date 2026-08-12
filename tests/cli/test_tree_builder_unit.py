@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 from movieclaw_cli.core.errors import CliError, ExitCode
-from movieclaw_cli.gen.tree_builder import _build_body, wait_long_task
+from movieclaw_cli.gen.tree_builder import _build_body, wait_long_task, wait_persistent_job
 
 
 def _op_with_body() -> dict:
@@ -132,3 +132,61 @@ def test_wait_concludes_after_streak_when_never_running(monkeypatch) -> None:
     api = _FakeApi([{"scan_progress": None}] * 5)
     wait_long_task(op, ops_by_id, api, {"library_id": 1}, wait_timeout=60)
     assert api.calls == 3
+
+
+def test_persistent_job_wait_uses_job_status_not_domain_progress(monkeypatch) -> None:
+    monkeypatch.setattr("time.monotonic", lambda: 0.0)
+    api = _FakeApi(
+        [
+            {
+                "changed": True,
+                "job": {
+                    "id": "job_1",
+                    "revision": 2,
+                    "status": "running",
+                    "progress": {"message": "翻译中", "percent": 50},
+                },
+            },
+            {
+                "changed": True,
+                "job": {
+                    "id": "job_1",
+                    "revision": 3,
+                    "status": "succeeded",
+                    "progress": {"message": "完成", "percent": 100},
+                },
+            },
+        ]
+    )
+
+    wait_persistent_job(api, {"id": "job_1"}, {"id_path": "id"}, 60)
+
+    assert api.calls == 2
+
+
+def test_persistent_job_wait_reports_structured_failure(monkeypatch) -> None:
+    monkeypatch.setattr("time.monotonic", lambda: 0.0)
+    api = _FakeApi(
+        [
+            {
+                "changed": True,
+                "job": {
+                    "id": "job_2",
+                    "revision": 4,
+                    "status": "failed",
+                    "progress": {"message": "未完成", "percent": None},
+                    "error": {
+                        "message": "模型请求失败",
+                        "actions": [{"type": "handoff_agent", "label": "交给 Agent"}],
+                    },
+                },
+            }
+        ]
+    )
+
+    with pytest.raises(CliError) as exc:
+        wait_persistent_job(api, {"id": "job_2"}, {"id_path": "id"}, 60)
+
+    assert exc.value.exit_code == ExitCode.TASK_FAILED
+    assert exc.value.message == "模型请求失败"
+    assert "Agent" in (exc.value.hint or "")

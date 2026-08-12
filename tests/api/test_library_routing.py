@@ -12,6 +12,8 @@
 
 from __future__ import annotations
 
+import time
+
 import httpx
 import pytest
 import pytest_asyncio
@@ -327,3 +329,33 @@ def test_routing_options_endpoint(client) -> None:
         p["key"] == "jp_kr" and p["countries"] == ["JP", "KR"] for p in data["region_presets"]
     )
     assert data["country_names"]["CN"] == "中国大陆"
+
+
+def test_manual_scan_is_a_persistent_job(client, tmp_path) -> None:
+    """手动扫描回传 Job id，完成结论在进程状态之外仍可从库详情读取。"""
+    root = tmp_path / "movies"
+    root.mkdir()
+    created = client.post(
+        "/api/v1/libraries",
+        json={"name": "作业电影库", "kind": "movie", "root_paths": [str(root)]},
+    ).json()["data"]
+
+    response = client.post(f"/api/v1/libraries/{created['id']}/scan")
+    assert response.status_code == 202
+    job_id = response.json()["data"]["job_id"]
+    assert job_id.startswith("job_")
+
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        job = client.get(f"/api/v1/jobs/{job_id}").json()["data"]
+        if job["status"] == "succeeded":
+            break
+        time.sleep(0.01)
+    assert job["status"] == "succeeded"
+    assert job["job_type"] == "library.scan"
+    assert job["resources"] == [
+        {"resource_type": "library", "resource_id": str(created["id"]), "relation": "target"}
+    ]
+    detail = client.get(f"/api/v1/libraries/{created['id']}").json()["data"]
+    assert detail["scanning"] is False
+    assert detail["last_scan"]["cancelled"] is False

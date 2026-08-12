@@ -39,8 +39,9 @@ class DownloaderView(BaseModel):
     username: str | None = None
     save_path: str | None = Field(default=None, description="提交下载时的默认保存目录")
     path_mappings: list[PathMapping] | None = Field(
-        default=None, description="路径映射 JSON 数组（movieclaw 路径 → 下载器路径），"
-        '形如 [{"local":"/volume1/downloads","remote":"/downloads"}]'
+        default=None,
+        description="路径映射 JSON 数组（movieclaw 路径 → 下载器路径），"
+        '形如 [{"local":"/volume1/downloads","remote":"/downloads"}]',
     )
     enabled: bool
     is_default: bool = Field(description="是否为默认下载器（一键下载不选目标时投给它）")
@@ -82,6 +83,66 @@ class DownloaderView(BaseModel):
             created_at=row.created_at,
             updated_at=row.updated_at,
         )
+
+
+class DownloadTaskUnitView(BaseModel):
+    """订阅下载覆盖的一个追踪单元；电影沿用 0/0 哨兵。"""
+
+    season_number: int
+    episode_number: int
+
+
+class DownloadTaskSubscriptionView(BaseModel):
+    """下载器任务关联的订阅摘要，供任务中心回到业务上下文。"""
+
+    id: int
+    media_item_id: int
+    media_title: str
+    media_kind: str
+    poster_url: str | None = None
+    units: list[DownloadTaskUnitView] = Field(default_factory=list)
+
+
+class DownloadTaskView(BaseModel):
+    """任务中心使用的下载器实时快照。
+
+    下载器仍是下载状态的事实源；这里只在请求时汇总快照，并通过 infohash
+    关联订阅工单或手动下载意图，不把下载进度复制进本地数据库。
+    """
+
+    id: str = Field(description="稳定前端键：下载器 ID + infohash；缺失任务用 missing 前缀")
+    info_hash: str
+    name: str | None
+    downloader_id: int | None
+    downloader_name: str | None
+    downloader_type: ClientType | None
+    progress: float | None = Field(default=None, ge=0, le=1)
+    size_bytes: int | None = None
+    dlspeed_bytes: int | None = None
+    eta_seconds: int | None = None
+    state: Literal["downloading", "stalled", "paused", "completed", "error", "missing", "unknown"]
+    source: Literal["subscription", "manual", "external"]
+    media_item_id: int | None = None
+    media_title: str | None = None
+    media_kind: str | None = None
+    poster_url: str | None = None
+    subscriptions: list[DownloadTaskSubscriptionView] = Field(default_factory=list)
+
+
+class DownloadTaskSourceView(BaseModel):
+    """一台下载器在本次快照中的可观测状态；单台故障不拖垮整页。"""
+
+    id: int
+    name: str
+    client_type: ClientType
+    status: Literal["active", "disabled", "unavailable", "error"]
+    message: str | None = None
+    task_count: int = 0
+
+
+class DownloadTaskListView(BaseModel):
+    items: list[DownloadTaskView]
+    sources: list[DownloadTaskSourceView]
 
 
 class DownloaderPayload(BaseModel):

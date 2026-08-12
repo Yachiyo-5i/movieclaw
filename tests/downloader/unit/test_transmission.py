@@ -52,6 +52,9 @@ class FakeTrClient:
     def get_session(self):
         return SimpleNamespace(version="4.0.5")
 
+    def get_torrents(self):
+        return list(self.store.values())
+
 
 def make_downloader(fake: FakeTrClient) -> TransmissionDownloader:
     downloader = TransmissionDownloader(CONFIG)
@@ -157,3 +160,22 @@ class TestConnection:
         )
         with pytest.raises(DownloaderConnectError):
             downloader._client()
+
+
+class TestListTorrents:
+    async def test_list_includes_task_center_progress_snapshot(self):
+        fake = FakeTrClient()
+        fake.store[TORRENT_HASH] = SimpleNamespace(
+            hash_string=TORRENT_HASH,
+            name="Task.Center.Movie",
+            percent_done=0.5,
+            fields={"eta": 60, "sizeWhenDone": 8192, "rateDownload": 2048, "status": 4},
+        )
+
+        rows = await make_downloader(fake).list_torrents()
+
+        assert rows[0].progress == 0.5
+        assert rows[0].size_bytes == 8192
+        assert rows[0].dlspeed_bytes == 2048
+        assert rows[0].eta_seconds == 60
+        assert rows[0].state == "downloading"

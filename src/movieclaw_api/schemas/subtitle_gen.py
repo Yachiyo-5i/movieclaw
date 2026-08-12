@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from datetime import datetime
-
 from pydantic import BaseModel, Field
 
 
@@ -12,6 +10,7 @@ class SourceCandidateView(BaseModel):
     key: str
     language: str | None
     format: str | None
+    provenance: str
     excluded: str | None  # 非空 = 被排除原因
     reasons: list[str]  # 打分明细（用户要能看懂"为什么选了这条"）
     selectable: bool  # 文本可直接选；PGS 可选后进入 OCR
@@ -68,60 +67,14 @@ class GenPreviewView(BaseModel):
     output_filename: str | None = None
 
 
-class GenQualityView(BaseModel):
-    """机检报告（§3.5）。"""
-
-    event_count: int
-    cps_overrun: int
-    overlong: int
-    kept_original: int
-    compressed: int
-    glossary_usage: dict[str, int]
-
-
-class GenResultView(BaseModel):
-    ok: bool
-    message: str
-    filename: str | None
-    sync_score: float | None
-    source_desc: str | None
-    report: GenQualityView | None
-    finished_at: datetime | None
-
-
-class GenProgressView(BaseModel):
-    """任务状态查询：running 时带实时进度，否则带最近一次结论。"""
-
-    running: bool
-    phase: str | None = None
-    message: str | None = None
-    done_blocks: int = 0
-    total_blocks: int = 0
-    done_events: int = 0
-    total_events: int = 0
-    active_blocks: list[int] = Field(default_factory=list)
-    parallelism: int = 0
-    uses_ocr: bool = False
-    target_language: str | None = None
-    secondary_language: str | None = None
-    source_candidate_key: str | None = None
-    elapsed_seconds: int = 0
-    last_result: GenResultView | None = None
-
-
 class GenStartPayload(BaseModel):
-    target_language: str = "chs"  # 文件名语言 token（默认简体中文）
-    secondary_language: str | None = None  # 双语第二行语言；None=单语
-    source_candidate_key: str | None = None  # 绑定预检时选中的 embedded/external 候选
-    convert_pgs: bool = False  # 仅在预检明确要求且用户确认后允许 OCR
-    pgs_candidate_key: str | None = None  # 兼容旧客户端；新请求统一用 source_candidate_key
-    pgs_ocr_language: str | None = None  # 异常时由用户确认的 PGS 图片语言
-
-
-class GenStartView(BaseModel):
-    """已入队的确认回执（含预估，前端展示）。"""
-
-    preview: GenPreviewView
+    target_language: str = Field(default="chs", description="目标语言，如 chs / eng")
+    secondary_language: str | None = Field(default=None, description="双语第二行语言")
+    source_candidate_key: str | None = Field(
+        default=None, description="参考字幕标识，如 embedded:1"
+    )
+    convert_pgs: bool = Field(default=False, description="确认把图片字幕识别为文本")
+    pgs_ocr_language: str | None = Field(default=None, description="图片字幕原始语言")
 
 
 class CalibratePayload(BaseModel):

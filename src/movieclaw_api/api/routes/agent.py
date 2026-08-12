@@ -80,6 +80,7 @@ _PAGE_ROUTES: list[tuple[str, str]] = [
     ("/library", "媒体库总览"),
     ("/library/{库ID}", "某个媒体库的内容（库 ID 来自 lib list）"),
     ("/library/{库ID}/item/{条目ID}", "库内条目详情（条目 ID 即 lib items 的 media_item_id）"),
+    ("/tasks", "任务中心（后台作业、下载与入库的统一观察页）"),
     ("/people/{影人ID}", "影人档案（ID 来自 people 域）"),
     ("/settings", "设置页"),
 ]

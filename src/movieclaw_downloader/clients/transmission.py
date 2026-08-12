@@ -199,15 +199,25 @@ class TransmissionDownloader(BaseDownloader):
         with _translate_errors(self.config.url):
             torrents = client.get_torrents()
         # Transmission 的任务名即落盘根目录/文件名，无独立的 content_path
-        return [
-            TorrentBrief(
-                name=torrent.name,
-                content_name=torrent.name,
-                completed=float(torrent.percent_done) >= 1.0,
-                info_hash=str(torrent.hash_string).lower(),
+        briefs: list[TorrentBrief] = []
+        for torrent in torrents:
+            progress = float(torrent.percent_done)
+            completed = progress >= 1.0
+            eta = int(torrent.fields.get("eta", -1))
+            briefs.append(
+                TorrentBrief(
+                    name=torrent.name,
+                    content_name=torrent.name,
+                    completed=completed,
+                    info_hash=str(torrent.hash_string).lower(),
+                    progress=progress,
+                    size_bytes=int(torrent.fields.get("sizeWhenDone", 0)) or None,
+                    dlspeed_bytes=int(torrent.fields.get("rateDownload", 0)),
+                    eta_seconds=eta if eta > 0 else None,
+                    state=_normalize_state(torrent, completed=completed),
+                )
             )
-            for torrent in torrents
-        ]
+        return briefs
 
     async def test_connection(self) -> DownloaderInfo:
         return await asyncio.to_thread(self._test_connection_sync)

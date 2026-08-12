@@ -123,7 +123,7 @@ async def test_target_rule_transfers_without_library_ledger(db, tmp_path, monkey
     (entry / "ep1.mkv").write_bytes(b"video")
 
     for _ in range(2):
-        await ingest_mod._sweep_dir(_target_rule(watch, staging), None)
+        await ingest_mod._sweep_dir(_target_rule(watch, staging), None, execute_inline=True)
 
     # 落点：自定义目录下的库同款命名结构，库根不受任何影响
     final = staging / "某日剧 (2023)" / "Season 01" / "某日剧 (2023) - S01E01.mkv"
@@ -198,7 +198,7 @@ async def test_target_rule_claimed_identity_keeps_wanted_open(db, tmp_path, monk
     entry.mkdir()
     (entry / "ep1.mkv").write_bytes(b"video")
 
-    await ingest_mod._sweep_dir(_target_rule(watch, staging), None)
+    await ingest_mod._sweep_dir(_target_rule(watch, staging), None, execute_inline=True)
 
     # 认领拿到了身份（规范命名），但落点由规则声明决定——不进订阅定格的库
     assert (staging / "某动画 (2023)" / "Season 01" / "某动画 (2023) - S01E01.mkv").exists()
@@ -356,7 +356,7 @@ async def test_target_rule_skips_units_already_in_library(db, tmp_path, monkeypa
     (entry / "ep2.mkv").write_bytes(b"video")
 
     for _ in range(2):
-        await ingest_mod._sweep_dir(_target_rule(watch, staging), None)
+        await ingest_mod._sweep_dir(_target_rule(watch, staging), None, execute_inline=True)
 
     # 只有未回流的第 2 集进了中转；第 1 集被跳过
     season_dir = staging / "某日剧 (2023)" / "Season 01"

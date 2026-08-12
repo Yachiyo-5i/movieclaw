@@ -20,13 +20,26 @@ from collections import deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Literal
 
 from movieclaw_api.services.subtitle_gen.extract import SubEvent, cache_dir
 from movieclaw_api.services.subtitle_gen.validate import looks_translated, reading_speed_limit
 
 logger = logging.getLogger("movieclaw_api.subtitle_gen")
 
-ChatFn = Callable[[str, str], Awaitable[str]]
+
+@dataclass(frozen=True)
+class ChatCall:
+    """一次字幕模型调用的业务语义，供接入层选择参数并写可观测信息。"""
+
+    purpose: Literal["glossary", "translate", "compress"]
+    block_index: int | None = None  # 面向用户的一基块序号
+    event_count: int = 0
+    bilingual: bool = False
+    attempt: int = 1
+
+
+ChatFn = Callable[[str, str, ChatCall], Awaitable[str]]
 
 BLOCK_SIZE = 50  # 每块事件数（§3.1）
 _CONTEXT_LINES = 3  # 滚动上下文条数
@@ -39,6 +52,7 @@ _RATE_LIMIT_MAX_RETRIES = 5
 _RATE_LIMIT_MIN_DELAY = 1.0
 _RATE_LIMIT_MAX_DELAY = 60.0
 _CONCURRENCY_RECOVERY_SUCCESSES = 8
+_PROGRESS_HEARTBEAT_SECONDS = 10.0
 
 _LANG_NAMES = {
     "chs": "简体中文",
@@ -72,6 +86,8 @@ class TranslationStats:
     total_blocks: int = 0
     failed_blocks: int = 0
     kept_original: int = 0
+    validation_retries: int = 0
+    rate_limit_count: int = 0
     glossary: dict[str, str] = field(default_factory=dict)
 
 
@@ -85,6 +101,10 @@ class TranslationProgress:
     total_events: int
     active_blocks: tuple[int, ...]  # 面向用户的一基块序号
     concurrency: int
+    oldest_active_seconds: int = 0
+    last_completed_seconds_ago: int | None = None
+    validation_retries: int = 0
+    rate_limit_count: int = 0
 
 
 class TranslationAborted(Exception):
@@ -167,7 +187,7 @@ def system_prompt(
         pairs = "；".join(f"{k}→{v}" for k, v in list(glossary.items())[:40])
         lines.append(f"术语表（人名地名译名必须全片一致）：{pairs}")
     lines.append(
-        '输出格式：JSON 数组，每个元素形如 {"i": 序号, "t": "译文"}，'
+        '输出格式：JSON 对象 {"items": [{"i": 序号, "t": "译文"}]}，'
         "序号与输入一一对应，不输出任何其他内容"
     )
     return "\n".join(lines)
@@ -175,8 +195,9 @@ def system_prompt(
 
 _GLOSSARY_PROMPT = (
     "下面是影片对白抽样。找出其中反复出现的人名、地名、组织与专有名词，"
-    "给出适合该影片的统一{lang}译名。只输出 JSON 数组，元素形如 "
-    '{{"src": "原文", "dst": "译名"}}，最多 30 条，没有则输出 []'
+    "给出适合该影片的统一{lang}译名。只输出 JSON 对象，格式为 "
+    '{{"items": [{{"src": "原文", "dst": "译名"}}]}}，最多 30 条，没有则输出 '
+    '{{"items": []}}'
 )
 
 
@@ -186,11 +207,22 @@ def _parse_json_block(raw: str):
     fence = re.search(r"```(?:json)?\s*(.*?)```", text, re.DOTALL)
     if fence:
         text = fence.group(1).strip()
-    start = text.find("[")
-    end = text.rfind("]")
-    if start >= 0 and end > start:
-        text = text[start : end + 1]
-    return json.loads(text)
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        # 兼容没有 JSON mode 的模型偶尔附加一句说明，以及历史上直接返回数组
+        # 的响应。优先截取数组，数组不存在时再尝试对象。
+        start = text.find("[")
+        end = text.rfind("]")
+        if start < 0 or end <= start:
+            start = text.find("{")
+            end = text.rfind("}")
+        if start < 0 or end <= start:
+            raise
+        parsed = json.loads(text[start : end + 1])
+    if isinstance(parsed, dict) and isinstance(parsed.get("items"), list):
+        return parsed["items"]
+    return parsed
 
 
 async def build_glossary(
@@ -208,6 +240,11 @@ async def build_glossary(
         raw = await chat(
             f"你是影视字幕翻译助理。影片：{_film_intro(ctx)}",
             _GLOSSARY_PROMPT.format(lang=lang) + "\n\n" + sample,
+            ChatCall(
+                purpose="glossary",
+                event_count=min(300, len(events)),
+                bilingual=secondary_language is not None,
+            ),
         )
         entries = _parse_json_block(raw)
         glossary = {
@@ -322,15 +359,27 @@ async def _translate_block(
     block_index: int,
     target_language: str,
     secondary_language: str | None = None,
-) -> tuple[int, list[str], bool]:
+) -> tuple[int, list[str], bool, int]:
     """翻译一个块；仅返回结果，不在并发协程里写共享断点。"""
     result: list[str] | None = None
+    validation_retries = 0
     for attempt in range(_BLOCK_RETRIES + 1):
         try:
-            raw = await chat(system, user)
+            raw = await chat(
+                system,
+                user,
+                ChatCall(
+                    purpose="translate",
+                    block_index=block_index + 1,
+                    event_count=len(block),
+                    bilingual=secondary_language is not None,
+                    attempt=attempt + 1,
+                ),
+            )
             result = _validate_block(raw, block, target_language, secondary_language)
             break
         except (ValueError, json.JSONDecodeError) as exc:
+            validation_retries += 1
             logger.warning(
                 "字幕翻译第 %d 块校验失败（第 %d 次尝试）：%s",
                 block_index + 1,
@@ -338,9 +387,9 @@ async def _translate_block(
                 exc,
             )
     if result is not None:
-        return block_index, result, False
+        return block_index, result, False, validation_retries
     # 输出结构连续失败时保留原文；失败率熔断由中央协调器统一判断。
-    return block_index, [text for _, text in block], True
+    return block_index, [text for _, text in block], True, validation_retries
 
 
 def _validate_block(
@@ -433,10 +482,18 @@ async def translate_events(
         len(translated[bi]) for bi in checkpoint.failed_blocks if bi in translated
     )
     target_concurrency = TRANSLATION_CONCURRENCY
+    active_started: dict[int, float] = {}
+    last_completed_at: float | None = None
 
     def notify(active: tuple[int, ...] = ()) -> None:
         if progress is None:
             return
+        now = time.monotonic()
+        active_indices = tuple(index - 1 for index in active)
+        oldest_active = max(
+            (now - active_started[index] for index in active_indices if index in active_started),
+            default=0.0,
+        )
         progress(
             TranslationProgress(
                 done_blocks=len(translated),
@@ -445,6 +502,12 @@ async def translate_events(
                 total_events=len(events),
                 active_blocks=active,
                 concurrency=target_concurrency,
+                oldest_active_seconds=max(0, int(oldest_active)),
+                last_completed_seconds_ago=(
+                    max(0, int(now - last_completed_at)) if last_completed_at is not None else None
+                ),
+                validation_retries=stats.validation_retries,
+                rate_limit_count=stats.rate_limit_count,
             )
         )
 
@@ -454,7 +517,28 @@ async def translate_events(
     else:
         if phase is not None:
             phase("glossary", "正在统一人名和专有名词")
-        glossary = await build_glossary(chat, events, ctx, target_language, secondary_language)
+        glossary_task = asyncio.create_task(
+            build_glossary(chat, events, ctx, target_language, secondary_language),
+            name="subtitle-build-glossary",
+        )
+        glossary_started = time.monotonic()
+        try:
+            while not glossary_task.done():
+                done, _pending = await asyncio.wait(
+                    {glossary_task}, timeout=_PROGRESS_HEARTBEAT_SECONDS
+                )
+                if done:
+                    break
+                if cancelled is not None and cancelled():
+                    raise TranslationAborted("任务被用户取消（已完成块已暂存，可续传）")
+                if phase is not None:
+                    elapsed = max(1, int(time.monotonic() - glossary_started))
+                    phase("glossary", f"正在分析人名和术语，模型已处理 {elapsed} 秒")
+            glossary = await glossary_task
+        finally:
+            if not glossary_task.done():
+                glossary_task.cancel()
+                await asyncio.gather(glossary_task, return_exceptions=True)
         checkpoint.glossary = glossary
         checkpoint.save()
     stats.glossary = glossary
@@ -469,7 +553,7 @@ async def translate_events(
         )
 
     remaining = deque(bi for bi in range(stats.total_blocks) if bi not in translated)
-    running: dict[asyncio.Task[tuple[int, list[str], bool]], int] = {}
+    running: dict[asyncio.Task[tuple[int, list[str], bool, int]], int] = {}
     rate_limit_attempts: dict[int, int] = {}
     stable_successes = 0
     cooldown_until = 0.0
@@ -506,6 +590,7 @@ async def translate_events(
                 name=f"subtitle-translate-block-{bi + 1}",
             )
             running[task] = bi
+            active_started[bi] = time.monotonic()
 
     schedule()
     notify(tuple(sorted(bi + 1 for bi in running.values())))
@@ -528,10 +613,13 @@ async def translate_events(
                 continue
 
             cooldown_left = max(0.0, cooldown_until - time.monotonic())
+            wait_timeout = _PROGRESS_HEARTBEAT_SECONDS
+            if cooldown_left:
+                wait_timeout = min(wait_timeout, cooldown_left)
             done, _pending = await asyncio.wait(
                 running,
                 return_when=asyncio.FIRST_COMPLETED,
-                timeout=cooldown_left or None,
+                timeout=wait_timeout,
             )
             if not done:
                 schedule()
@@ -541,9 +629,11 @@ async def translate_events(
             # 避免上游瞬时错误让已经付费完成的块白白丢失。
             ordered_done = sorted(done, key=lambda task: running[task])
             finished_blocks = {task: running.pop(task) for task in ordered_done}
+            for bi in finished_blocks.values():
+                active_started.pop(bi, None)
             # 同一事件循环 tick 内完成的块按原顺序落断点，文件始终由这个
             # 协调器单写，避免多个模型回调同时覆盖 checkpoint。
-            results: list[tuple[int, list[str], bool]] = []
+            results: list[tuple[int, list[str], bool, int]] = []
             rate_limited: list[int] = []
             retry_delay = 0.0
             first_error: BaseException | None = None
@@ -551,6 +641,7 @@ async def translate_events(
                 try:
                     results.append(task.result())
                 except ChatRateLimited as exc:
+                    stats.rate_limit_count += 1
                     bi = finished_blocks[task]
                     attempt = rate_limit_attempts.get(bi, 0) + 1
                     rate_limit_attempts[bi] = attempt
@@ -573,8 +664,9 @@ async def translate_events(
                 except BaseException as exc:  # noqa: BLE001 -- 写完同批成功断点再原样抛出
                     if first_error is None:
                         first_error = exc
-            for bi, result, block_failed in results:
+            for bi, result, block_failed, validation_retries in results:
                 rate_limit_attempts.pop(bi, None)
+                stats.validation_retries += validation_retries
                 translated[bi] = result
                 checkpoint.blocks[bi] = result
                 if block_failed:
@@ -582,6 +674,7 @@ async def translate_events(
                     stats.failed_blocks += 1
                     stats.kept_original += len(blocks[bi])
                 checkpoint.save()
+                last_completed_at = time.monotonic()
                 notify(tuple(sorted(index + 1 for index in running.values())))
 
             if rate_limited:
@@ -671,7 +764,8 @@ _COMPRESS_BATCH = 30
 _COMPRESS_PROMPT = (
     "下列译文在字幕显示时长内读不完，请在**不丢核心语义**的前提下压缩改写：\n"
     "每条给出目标字数上限，删冗余语气词、化长句为短句；禁增删条目、禁截断句意。\n"
-    '只输出 JSON 数组，元素形如 {{"i": 序号, "t": "压缩后译文"}}：\n{payload}'
+    '只输出 JSON 对象，格式为 {{"items": [{{"i": 序号, "t": "压缩后译文"}}]}}：\n'
+    "{payload}"
 )
 
 
@@ -707,7 +801,15 @@ async def compress_overruns(
             ensure_ascii=False,
         )
         try:
-            raw = await chat(system, _COMPRESS_PROMPT.format(payload=payload))
+            raw = await chat(
+                system,
+                _COMPRESS_PROMPT.format(payload=payload),
+                ChatCall(
+                    purpose="compress",
+                    event_count=len(batch),
+                    bilingual=secondary_language is not None,
+                ),
+            )
             parsed = _parse_json_block(raw)
             by_index = {
                 int(item["i"]): str(item["t"]).strip()

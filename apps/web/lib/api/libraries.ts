@@ -434,12 +434,14 @@ export function listLibraryItemIndex(id: number): Promise<LibraryIndexEntry[]> {
   return unwrap(request<ApiEnvelope<LibraryIndexEntry[]>>(`/libraries/${id}/item-index`));
 }
 
-/** 触发一次库扫描（后台执行；已在扫描中时后端返回 409）。 */
-export function startLibraryScan(id: number): Promise<{ started: boolean; message: string }> {
+/** 触发一次可恢复的库扫描；重复点击复用同一条后台作业。 */
+export function startLibraryScan(
+  id: number,
+): Promise<{ started: boolean; message: string; job_id: string; created: boolean }> {
   return unwrap(
-    request<ApiEnvelope<{ started: boolean; message: string }>>(`/libraries/${id}/scan`, {
-      method: "POST",
-    }),
+    request<
+      ApiEnvelope<{ started: boolean; message: string; job_id: string; created: boolean }>
+    >(`/libraries/${id}/scan`, { method: "POST" }),
   );
 }
 
@@ -467,9 +469,16 @@ export function previewLibraryOrganize(id: number): Promise<OrganizePreview> {
 }
 
 /** 开始整理：按规范命名批量改名归位（后台执行，与扫描互斥）。 */
-export function startLibraryOrganize(id: number): Promise<{ started: boolean; message: string }> {
+export interface PersistentJobStart {
+  started: boolean;
+  message?: string;
+  job_id: string;
+  created: boolean;
+}
+
+export function startLibraryOrganize(id: number): Promise<PersistentJobStart> {
   return unwrap(
-    request<ApiEnvelope<{ started: boolean; message: string }>>(`/libraries/${id}/organize`, {
+    request<ApiEnvelope<PersistentJobStart>>(`/libraries/${id}/organize`, {
       method: "POST",
     }),
   );
@@ -499,11 +508,11 @@ export interface MetadataRefreshProgress {
 
 /**
  * 整库刷新元数据：全部已识别条目**全量重刮**（重拉档案 + 按当前尺寸档位
- * 重下图片 + 覆盖媒体目录镜像）。后台执行、并发 3 路；重复触发返回 409。
+ * 重下图片 + 覆盖媒体目录镜像）。后台执行、并发 3 路；重复触发复用同一作业。
  */
-export function startLibraryMetadataRefresh(id: number): Promise<{ started: boolean }> {
+export function startLibraryMetadataRefresh(id: number): Promise<PersistentJobStart> {
   return unwrap(
-    request<ApiEnvelope<{ started: boolean }>>(`/libraries/${id}/metadata/refresh`, {
+    request<ApiEnvelope<PersistentJobStart>>(`/libraries/${id}/metadata/refresh`, {
       method: "POST",
     }),
   );
@@ -529,9 +538,9 @@ export function getMetadataRefreshProgress(id: number): Promise<MetadataRefreshP
 export function refreshItemMetadata(
   libraryId: number,
   mediaItemId: number,
-): Promise<{ started: boolean }> {
+): Promise<PersistentJobStart> {
   return unwrap(
-    request<ApiEnvelope<{ started: boolean }>>(
+    request<ApiEnvelope<PersistentJobStart>>(
       `/libraries/${libraryId}/items/${mediaItemId}/metadata/refresh`,
       { method: "POST" },
     ),
@@ -1148,9 +1157,9 @@ export function transferLibraryItem(
   libraryId: number,
   mediaItemId: number,
   targetLibraryId: number,
-): Promise<{ started: boolean; message: string }> {
+): Promise<PersistentJobStart> {
   return unwrap(
-    request<ApiEnvelope<{ started: boolean; message: string }>>(
+    request<ApiEnvelope<PersistentJobStart>>(
       `/libraries/${libraryId}/items/${mediaItemId}/transfer`,
       { method: "POST", body: JSON.stringify({ target_library_id: targetLibraryId }) },
     ),

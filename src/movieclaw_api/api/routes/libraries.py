@@ -4,7 +4,7 @@ import asyncio
 from pathlib import Path, PurePath
 from typing import Annotated, Literal
 
-from fastapi import APIRouter, BackgroundTasks, Depends, Query, Request, Response
+from fastapi import APIRouter, BackgroundTasks, Depends, Header, Query, Request, Response
 from fastapi.responses import FileResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
@@ -72,7 +72,7 @@ from movieclaw_api.schemas.library import (
     UnidentifiedGroupView,
 )
 from movieclaw_api.schemas.response import ApiResponse, ok
-from movieclaw_api.services import media_scrape
+from movieclaw_api.services import jobs, media_scrape
 from movieclaw_api.services.auth import Principal
 from movieclaw_api.services.library import claim as library_claim
 from movieclaw_api.services.library.access import (
@@ -94,21 +94,20 @@ from movieclaw_api.services.library.items import (
 from movieclaw_api.services.library.layout import entry_dir_of
 from movieclaw_api.services.library.organize import (
     build_organize_plan,
+    enqueue_organize_job,
     is_organizing,
     last_organize,
-    organize_library,
     organize_progress,
 )
 from movieclaw_api.services.library.scan import (
     PHASE_LABELS,
     ScanPhase,
     busy_phase,
-    is_scanning,
+    enqueue_scan_job,
     last_scan,
     preview_reidentify,
     reidentify_item,
     request_stop_scan,
-    scan_library,
     scan_progress,
 )
 from movieclaw_api.services.library.subtitle_preview import (
@@ -123,17 +122,20 @@ from movieclaw_api.services.library.subtitles import (
 from movieclaw_api.services.library.transfer import (
     assert_transferable,
     build_transfer_plan,
+    enqueue_transfer_job,
     is_transferring,
     last_transfer,
-    start_transfer,
     transfer_state,
 )
 from movieclaw_api.services.media_discover import get_tmdb_client
 from movieclaw_api.services.media_library import MediaLibraryService
 from movieclaw_api.services.media_server_notify import notify_media_server_refresh
 from movieclaw_api.services.subscription import SubscriptionService
-from movieclaw_db.engine import get_session
+from movieclaw_db.engine import get_database, get_session
 from movieclaw_db.models import (
+    ACTIVE_JOB_STATUSES,
+    Job,
+    JobStatus,
     LibraryFile,
     MediaItem,
     MediaSeason,
@@ -145,6 +147,13 @@ from movieclaw_media.genres import COUNTRY_NAMES, MOVIE_GENRES, REGION_PRESETS, 
 from movieclaw_media.models import MediaKind
 
 router = APIRouter(prefix="/libraries", tags=["libraries"])
+
+
+def _job_origin(client_name: object) -> str:
+    """从统一客户端头识别 Web/CLI；直接调用路由的测试对象安全退回 Web。"""
+    if isinstance(client_name, str) and client_name.lower() in {"web", "cli", "agent"}:
+        return client_name.lower()
+    return "web"
 
 
 async def require_library_visible(
@@ -232,6 +241,91 @@ def _last_scan_view(library_id: int) -> LastScanView | None:
     )
 
 
+def _job_last_scan_view(job: Job) -> LastScanView | None:
+    """从 Job 结论或取消检查点恢复最近扫描视图。"""
+    if job.finished_at is None:
+        return None
+    if job.result:
+        payload = job.result
+    elif job.status is JobStatus.CANCELLED:
+        progress = job.progress or {}
+        payload = progress.get("details") if isinstance(progress.get("details"), dict) else {}
+    else:
+        return None
+    return LastScanView(
+        finished_at=job.finished_at,
+        scanned=int(payload.get("scanned") or 0),
+        identified=int(payload.get("identified") or 0),
+        unidentified=int(payload.get("unidentified") or 0),
+        marked_missing=int(payload.get("marked_missing") or 0),
+        cleared_missing=int(payload.get("cleared_missing") or 0),
+        deferred=int(payload.get("deferred") or 0),
+        retried=int(payload.get("retried") or 0),
+        cancelled=job.status is JobStatus.CANCELLED or bool(payload.get("cancelled")),
+        errors=list(payload.get("errors") or []),
+    )
+
+
+def _first_job_last_scan(rows: list[Job]) -> LastScanView | None:
+    for row in rows:
+        view = _job_last_scan_view(row)
+        if view is not None:
+            return view
+    return None
+
+
+async def _persistent_scan_views(
+    session: AsyncSession, library_id: int
+) -> tuple[bool, ScanProgressView | None, LastScanView | None]:
+    """合并进程内细粒度状态与 Job 台账，服务重启时库卡片不丢进度。"""
+    legacy_progress = _scan_progress_view(library_id)
+    legacy_last = _last_scan_view(library_id)
+    rows = await jobs.list_jobs(
+        session,
+        resource_type="library",
+        resource_id=library_id,
+        job_type="library.scan",
+        limit=10,
+    )
+    active = next(
+        (
+            row
+            for row in rows
+            if row.status in ACTIVE_JOB_STATUSES and row.status is not JobStatus.BLOCKED
+        ),
+        None,
+    )
+    if active is not None:
+        if legacy_progress is not None:
+            progress_view = legacy_progress
+        else:
+            progress = active.progress or {}
+            phase = str(progress.get("phase") or ScanPhase.WALKING.value)
+            if phase not in {
+                ScanPhase.WALKING.value,
+                ScanPhase.INGESTING.value,
+                ScanPhase.PROBING.value,
+                ScanPhase.ASSETS.value,
+            }:
+                phase = ScanPhase.WALKING.value
+            progress_view = ScanProgressView(
+                phase=phase,
+                processed=int(progress.get("current") or 0),
+                total=int(progress.get("total") or 0),
+            )
+        previous = _first_job_last_scan([row for row in rows if row is not active])
+        return True, progress_view, legacy_last or previous
+
+    job_last = _first_job_last_scan(rows)
+    if legacy_progress is not None:
+        return True, legacy_progress, legacy_last or job_last
+    if legacy_last is not None and (
+        job_last is None or legacy_last.finished_at >= job_last.finished_at
+    ):
+        return False, None, legacy_last
+    return False, None, job_last
+
+
 def _metadata_refresh_view(library_id: int) -> MetadataRefreshView | None:
     """整库元数据刷新的实时状态；没在刷返回 None。
 
@@ -281,6 +375,71 @@ def _last_organize_view(library_id: int) -> LastOrganizeView | None:
         skipped=summary.skipped,
         removed_dirs=summary.removed_dirs,
         errors=list(summary.errors),
+    )
+
+
+async def _persistent_organize_views(
+    session: AsyncSession, library_id: int
+) -> tuple[bool, ScanProgressView | None, LastOrganizeView | None]:
+    """用 Job 补齐重启窗口与持久化结论；运行期细节仍优先读领域状态。"""
+    legacy_progress = _organize_progress_view(library_id)
+    legacy_last = _last_organize_view(library_id)
+    if legacy_progress is not None:
+        return True, legacy_progress, legacy_last
+    latest = await jobs.latest_job_for_resource(
+        session, "library", library_id, job_type="library.organize"
+    )
+    if latest is None:
+        return False, None, legacy_last
+    if latest.status in ACTIVE_JOB_STATUSES:
+        progress = latest.progress or {}
+        return (
+            True,
+            ScanProgressView(
+                phase="organizing",
+                processed=int(progress.get("current") or 0),
+                total=int(progress.get("total") or 0),
+            ),
+            legacy_last,
+        )
+    if latest.result and latest.finished_at is not None:
+        result = latest.result
+        return (
+            False,
+            None,
+            LastOrganizeView(
+                finished_at=latest.finished_at,
+                renamed=int(result.get("renamed") or 0),
+                sidecars_renamed=int(result.get("sidecars_renamed") or 0),
+                already_ok=int(result.get("already_ok") or 0),
+                skipped=int(result.get("skipped") or 0),
+                removed_dirs=int(result.get("removed_dirs") or 0),
+                errors=list(result.get("errors") or []),
+            ),
+        )
+    return False, None, legacy_last
+
+
+async def _persistent_metadata_refresh_view(
+    session: AsyncSession, library_id: int
+) -> MetadataRefreshView | None:
+    legacy = _metadata_refresh_view(library_id)
+    if legacy is not None:
+        return legacy
+    latest = await jobs.latest_job_for_resource(
+        session, "library", library_id, job_type="library.metadata.refresh"
+    )
+    if latest is None or latest.status not in ACTIVE_JOB_STATUSES:
+        return None
+    progress = latest.progress or {}
+    details = progress.get("details") if isinstance(progress.get("details"), dict) else {}
+    return MetadataRefreshView(
+        refreshing=True,
+        processed=int(progress.get("current") or 0),
+        total=int(progress.get("total") or 0),
+        failed=int(details.get("failed") or 0),
+        stopping=latest.status is JobStatus.CANCELLING,
+        active=[],
     )
 
 
@@ -341,13 +500,16 @@ async def list_libraries(
     if visible is not None:
         rows = [r for r in rows if r.id in visible]
     stats = await _stats_by_library(session)
+    scan_views = {
+        row.id: await _persistent_scan_views(session, row.id) for row in rows if row.id is not None
+    }
     views = [
         LibraryView.from_model(
             r,
             stats=stats.get(r.id or -1),
-            scanning=is_scanning(r.id or -1),
-            scan_progress=_scan_progress_view(r.id or -1),
-            last_scan=_last_scan_view(r.id or -1),
+            scanning=scan_views.get(r.id, (False, None, None))[0],
+            scan_progress=scan_views.get(r.id, (False, None, None))[1],
+            last_scan=scan_views.get(r.id, (False, None, None))[2],
             organizing=is_organizing(r.id or -1),
             organize_progress=_organize_progress_view(r.id or -1),
             last_organize=_last_organize_view(r.id or -1),
@@ -642,18 +804,22 @@ async def get_library(
 ) -> ApiResponse[LibraryView]:
     service = LibraryConfigService(session)
     row = await service.get(library_id)
+    scanning, scan_view, last_scan_view = await _persistent_scan_views(session, library_id)
+    organizing, organize_view, last_organize_view = await _persistent_organize_views(
+        session, library_id
+    )
     # 字段口径与列表接口保持一致（stats/metadata_refresh 一个不缺）：
     # 单库接口少给字段就是给调用方埋雷——stats 会静默回全零默认值
     view = LibraryView.from_model(
         row,
         stats=(await _stats_by_library(session)).get(library_id),
-        scanning=is_scanning(library_id),
-        scan_progress=_scan_progress_view(library_id),
-        last_scan=_last_scan_view(library_id),
-        organizing=is_organizing(library_id),
-        organize_progress=_organize_progress_view(library_id),
-        last_organize=_last_organize_view(library_id),
-        metadata_refresh=_metadata_refresh_view(library_id),
+        scanning=scanning,
+        scan_progress=scan_view,
+        last_scan=last_scan_view,
+        organizing=organizing,
+        organize_progress=organize_view,
+        last_organize=last_organize_view,
+        metadata_refresh=await _persistent_metadata_refresh_view(session, library_id),
     )
     if not principal.is_admin:
         # 成员不暴露服务器目录结构（与列表接口同一口径）
@@ -671,7 +837,7 @@ async def get_library(
 )
 async def create_library(
     payload: LibraryPayload,
-    background_tasks: BackgroundTasks,
+    client_name: str | None = Header(default=None, alias="X-MovieClaw-Client"),
     session: AsyncSession = Depends(get_session),
 ) -> ApiResponse[LibraryView]:
     service = LibraryConfigService(session)
@@ -684,14 +850,14 @@ async def create_library(
     )
     # 建库即扫描：根路径下的存量文件立刻开始识别入账，不用用户再手动点一次
     assert row.id is not None
-    background_tasks.add_task(scan_library, row.id)
+    await enqueue_scan_job(session, row.id, row.name, origin=_job_origin(client_name))
     return ok(
         LibraryView.from_model(row, scanning=True, scan_progress=_queued_scan_view()),
         message=f"已创建媒体库「{row.name}」，正在扫描存量文件",
     )
 
 
-def _assert_not_busy(library_name: str, library_id: int) -> None:
+async def _assert_not_busy(session: AsyncSession, library_name: str, library_id: int) -> None:
     """扫描/整理/转移期间锁定库的编辑与删除——这些任务都在按当前根路径
     批量读写台账，此刻改根路径或删库会让进行中的任务写入过期配置。"""
     phase = busy_phase(library_id)
@@ -705,6 +871,72 @@ def _assert_not_busy(library_name: str, library_id: int) -> None:
         )
     if is_transferring(library_id):
         raise ConflictException(f"「{library_name}」正在转移条目，暂不能编辑或删除；请等待转移完成")
+    active = await jobs.list_jobs(
+        session,
+        active_only=True,
+        resource_type="library",
+        resource_id=library_id,
+        limit=20,
+    )
+    labels = {
+        "library.scan": "扫描媒体库",
+        "library.organize": "整理文件名",
+        "library.transfer": "转移条目",
+        "library.metadata.refresh": "刷新元数据",
+    }
+    blocking = next((row for row in active if row.job_type in labels), None)
+    if blocking is not None:
+        raise ConflictException(
+            f"「{library_name}」正在{labels[blocking.job_type]}，暂不能编辑或删除；"
+            "可到任务中心查看进度"
+        )
+
+
+async def _quiesce_scan_for_mutation(
+    session: AsyncSession, library_name: str, library_id: int
+) -> None:
+    """根路径变更/删库会取代旧扫描，先协作取消并等到安全边界。
+
+    持久化 Job 接口会立即返回，用户很可能建库后马上修正路径或删除误建的
+    库。让这类操作永远撞 409 是执行模型泄漏；但直接改又会让旧扫描按过期
+    根路径写台账。这里最多等五秒让逐文件扫描收口，长单元仍明确提示稍后重试。
+    """
+    phase = busy_phase(library_id)
+    if phase is ScanPhase.REIDENTIFYING:
+        raise ConflictException(f"「{library_name}」正在重新识别条目，请等待完成后再操作")
+    active = await jobs.list_jobs(
+        session,
+        active_only=True,
+        job_type="library.scan",
+        resource_type="library",
+        resource_id=library_id,
+        limit=10,
+    )
+    for row in active:
+        await jobs.request_cancel(session, row.id, requested_by="媒体库配置变更")
+    if phase is not None and not active:
+        request_stop_scan(library_id)  # 文件监听/定时对账触发的兼容扫描
+    if not active and phase is None:
+        return
+
+    deadline = asyncio.get_running_loop().time() + 5.0
+    db = get_database()
+    while asyncio.get_running_loop().time() < deadline:
+        async with db.session() as check_session:
+            remaining = await jobs.list_jobs(
+                check_session,
+                active_only=True,
+                job_type="library.scan",
+                resource_type="library",
+                resource_id=library_id,
+                limit=1,
+            )
+        if not remaining and busy_phase(library_id) is None:
+            return
+        await asyncio.sleep(0.05)
+    raise ConflictException(
+        f"「{library_name}」的扫描正在安全停止，请稍后重试；可到任务中心查看进度"
+    )
 
 
 @router.put(
@@ -731,23 +963,27 @@ async def reorder_libraries(
 @router.put(
     "/{library_id}",
     response_model=ApiResponse[LibraryView],
-    summary="更新媒体库（名称与根路径；类型创建后不可改；扫描/整理中锁定）",
+    summary="更新媒体库（类型创建后不可改；变更根路径时要求库空闲）",
     operation_id="lib.update",
     dependencies=[Depends(require_admin)],
 )
 async def update_library(
     library_id: int,
     payload: LibraryPayload,
-    background_tasks: BackgroundTasks,
+    client_name: str | None = Header(default=None, alias="X-MovieClaw-Client"),
     session: AsyncSession = Depends(get_session),
 ) -> ApiResponse[LibraryView]:
     service = LibraryConfigService(session)
     before = await service.get(library_id)
-    _assert_not_busy(before.name, library_id)
     # ``service.update`` 在同一 ORM 会话里原地修改实体；先取不可变快照，后台
     # 扫描才能知道这次编辑真正替换的是哪些根，而不是读到更新后的新根列表。
     previous_root_paths = list(before.root_paths)
     roots_changed = previous_root_paths != [p.strip() for p in payload.root_paths if p.strip()]
+    # 扫描/整理依赖根路径，只有真的改路径才需要锁库；改展示名称、收藏规则
+    # 或下轮扫描策略不触碰当前任务正在使用的路径与台账，允许即时保存。
+    if roots_changed:
+        await _quiesce_scan_for_mutation(session, before.name, library_id)
+        await _assert_not_busy(session, before.name, library_id)
     row = await service.update(
         library_id,
         name=payload.name,
@@ -760,9 +996,11 @@ async def update_library(
         # 这轮扫描额外按 inode 对账旧根遗留台账：根路径只是换了挂载别名/软链接
         # 入口时，原行随迁而不是把同一文件再入账一遍。普通手动扫描不做该
         # 对账，避免为已移除根路径下的历史记录反复触发文件系统访问。
-        background_tasks.add_task(
-            scan_library,
+        await enqueue_scan_job(
+            session,
             library_id,
+            row.name,
+            origin=_job_origin(client_name),
             reconcile_root_change=True,
             previous_root_paths=previous_root_paths,
         )
@@ -807,7 +1045,8 @@ async def delete_library(
 
     service = LibraryConfigService(session)
     row = await service.get(library_id)
-    _assert_not_busy(row.name, library_id)
+    await _quiesce_scan_for_mutation(session, row.name, library_id)
+    await _assert_not_busy(session, row.name, library_id)
     # 删库前记下涉及的条目：库删掉后台账行随之级联消失，届时就查不到了
     affected = [
         i
@@ -843,12 +1082,13 @@ async def delete_library(
     operation_id="lib.scan.start",
     dependencies=[Depends(require_admin)],
     openapi_extra={
-        "x-cli-long-task": {"progress_op": "lib.show", "progress_field": "scan_progress"},
+        "x-cli-job": {"id_path": "job_id", "wait_op": "jobs.wait"},
     },
+    status_code=202,
 )
 async def start_scan(
     library_id: int,
-    background_tasks: BackgroundTasks,
+    client_name: str | None = Header(default=None, alias="X-MovieClaw-Client"),
     session: AsyncSession = Depends(get_session),
 ) -> ApiResponse[ScanResultView]:
     """增量扫描：已在台账的文件秒过；新文件走 NFO → 文件名解析 → TMDB
@@ -860,10 +1100,23 @@ async def start_scan(
         raise ConflictException(f"「{library.name}」{PHASE_LABELS[phase]}，请等待完成")
     if is_organizing(library_id):
         raise ConflictException(f"「{library.name}」正在整理文件名，请等待整理完成后再扫描")
-    background_tasks.add_task(scan_library, library_id)
+    if is_transferring(library_id):
+        raise ConflictException(f"「{library.name}」正在转移条目，请等待转移完成后再扫描")
+    created = await enqueue_scan_job(
+        session, library_id, library.name, origin=_job_origin(client_name)
+    )
     return ok(
-        ScanResultView(started=True, message=f"已开始扫描「{library.name}」"),
-        message=f"已开始扫描「{library.name}」，完成后库存自动更新",
+        ScanResultView(
+            started=True,
+            message=f"已开始扫描「{library.name}」",
+            job_id=created.job.id,
+            created=created.created,
+        ),
+        message=(
+            f"已开始扫描「{library.name}」，可在任务中心继续观察"
+            if created.created
+            else f"「{library.name}」的扫描已在任务中心进行中"
+        ),
     )
 
 
@@ -880,6 +1133,23 @@ async def stop_scan(
 ) -> ApiResponse[dict]:
     service = LibraryConfigService(session)
     library = await service.get(library_id)
+    active = await jobs.list_jobs(
+        session,
+        active_only=True,
+        job_type="library.scan",
+        resource_type="library",
+        resource_id=library_id,
+        limit=1,
+    )
+    if active:
+        job, accepted = await jobs.request_cancel(
+            session, active[0].id, requested_by="媒体库扫描停止入口"
+        )
+        if job is not None and accepted:
+            return ok(
+                {"job_id": job.id},
+                message=f"正在停止「{library.name}」的扫描（当前单位处理完即停下）",
+            )
     if not request_stop_scan(library_id):
         # 重识别占着同一把库级锁但不可中途停止，得说清楚是什么在跑，
         # 不能笼统回一句"没有扫描"让用户以为界面在骗人
@@ -898,16 +1168,15 @@ async def stop_scan(
 @router.post(
     "/{library_id}/metadata/refresh",
     response_model=ApiResponse[dict],
-    summary="整库刷新元数据：全部已识别条目重新刮削（后台执行，串行）",
+    summary="整库刷新元数据：全部已识别条目重新刮削（可恢复后台作业）",
     operation_id="lib.refresh.start",
     dependencies=[Depends(require_admin)],
-    openapi_extra={
-        "x-cli-long-task": {"progress_op": "lib.refresh.progress", "done_field": "refreshing"},
-    },
+    openapi_extra={"x-cli-job": {"id_path": "job_id", "wait_op": "jobs.wait"}},
+    status_code=202,
 )
 async def start_metadata_refresh(
     library_id: int,
-    background_tasks: BackgroundTasks,
+    client_name: str | None = Header(default=None, alias="X-MovieClaw-Client"),
     session: AsyncSession = Depends(get_session),
 ) -> ApiResponse[dict]:
     """遍历库内全部已识别条目逐个重刮 TMDB（文本全量覆盖、图片缺失补下）。
@@ -915,12 +1184,16 @@ async def start_metadata_refresh(
 
     service = LibraryConfigService(session)
     library = await service.get(library_id)
-    if media_scrape.is_library_refreshing(library_id):
-        raise ConflictException(f"「{library.name}」正在刷新元数据，请等待完成")
-    background_tasks.add_task(media_scrape.refresh_library_metadata, library_id)
+    created = await media_scrape.enqueue_library_metadata_refresh_job(
+        session, library_id, library.name, origin=_job_origin(client_name)
+    )
     return ok(
-        {"started": True},
-        message=f"已开始刷新「{library.name}」的元数据，完成后详情自动更新",
+        {"started": True, "job_id": created.job.id, "created": created.created},
+        message=(
+            f"已开始刷新「{library.name}」的元数据，可在任务中心继续观察"
+            if created.created
+            else f"「{library.name}」的元数据刷新已在进行中"
+        ),
     )
 
 
@@ -938,7 +1211,17 @@ async def stop_metadata_refresh(
 
     service = LibraryConfigService(session)
     library = await service.get(library_id)
-    if not media_scrape.request_stop_library_refresh(library_id):
+    active = await jobs.list_jobs(
+        session,
+        active_only=True,
+        job_type="library.metadata.refresh",
+        resource_type="library",
+        resource_id=library_id,
+        limit=1,
+    )
+    if active:
+        await jobs.request_cancel(session, active[0].id, requested_by="媒体库页面")
+    elif not media_scrape.request_stop_library_refresh(library_id):
         raise ConflictException(f"「{library.name}」当前没有进行中的元数据刷新")
     return ok({}, message=f"正在停止「{library.name}」的元数据刷新（当前条目刷完即停下）")
 
@@ -957,31 +1240,60 @@ async def metadata_refresh_progress(
     """与库列表里的 metadata_refresh 同一份状态；单库页用它做 2 秒级的
     阶段刷新（库列表 10 秒一轮的节奏跟不上阶段变化）。"""
     await LibraryConfigService(session).get(library_id)  # 404 检查
-    return ok(_metadata_refresh_view(library_id) or MetadataRefreshView(refreshing=False))
+    legacy = _metadata_refresh_view(library_id)
+    if legacy is not None:
+        return ok(legacy)
+    latest = await jobs.latest_job_for_resource(
+        session, "library", library_id, job_type="library.metadata.refresh"
+    )
+    if latest is None or latest.status not in ACTIVE_JOB_STATUSES:
+        return ok(MetadataRefreshView(refreshing=False))
+    progress = latest.progress or {}
+    details = progress.get("details") if isinstance(progress.get("details"), dict) else {}
+    return ok(
+        MetadataRefreshView(
+            refreshing=True,
+            processed=int(progress.get("current") or 0),
+            total=int(progress.get("total") or 0),
+            failed=int(details.get("failed") or 0),
+            stopping=latest.status is JobStatus.CANCELLING,
+            active=[],
+        )
+    )
 
 
 @router.post(
     "/{library_id}/items/{media_item_id}/metadata/refresh",
     response_model=ApiResponse[dict],
-    summary="刷新单个条目的元数据（强制重刮 TMDB 并重新下载图片，后台执行）",
+    summary="刷新单个条目的元数据（强制重刮 TMDB，可恢复后台作业）",
     operation_id="lib.items.refresh",
     dependencies=[Depends(require_admin)],
+    openapi_extra={"x-cli-job": {"id_path": "job_id", "wait_op": "jobs.wait"}},
+    status_code=202,
 )
 async def refresh_item_metadata(
     library_id: int,
     media_item_id: int,
-    background_tasks: BackgroundTasks,
+    client_name: str | None = Header(default=None, alias="X-MovieClaw-Client"),
     session: AsyncSession = Depends(get_session),
 ) -> ApiResponse[dict]:
 
     await LibraryConfigService(session).get(library_id)  # 404 检查
     item, _rows = await _item_rows(session, library_id, media_item_id)  # 404 检查
-    if media_scrape.is_scraping(media_item_id):
-        raise ConflictException(f"《{item.title}》正在刮削中，请稍候")
-    background_tasks.add_task(media_scrape.scrape_media_item, media_item_id, force=True)
+    created = await media_scrape.enqueue_item_metadata_refresh_job(
+        session,
+        library_id=library_id,
+        media_item_id=media_item_id,
+        title=item.title,
+        origin=_job_origin(client_name),
+    )
     return ok(
-        {"started": True},
-        message=f"正在重新刮削《{item.title}》的元数据，稍后刷新页面查看",
+        {"started": True, "job_id": created.job.id, "created": created.created},
+        message=(
+            f"已开始刷新《{item.title}》的元数据，可在任务中心继续观察"
+            if created.created
+            else f"《{item.title}》的元数据刷新已在进行中"
+        ),
     )
 
 
@@ -1100,16 +1412,15 @@ async def preview_organize(
 @router.post(
     "/{library_id}/organize",
     response_model=ApiResponse[OrganizeStartView],
-    summary="开始整理：按规范命名批量改名归位（后台执行，与扫描互斥）",
+    summary="开始整理：按规范命名批量改名归位（可恢复后台作业）",
     operation_id="lib.organize.start",
     dependencies=[Depends(require_admin)],
-    openapi_extra={
-        "x-cli-long-task": {"progress_op": "lib.show", "progress_field": "organize_progress"},
-    },
+    openapi_extra={"x-cli-job": {"id_path": "job_id", "wait_op": "jobs.wait"}},
+    status_code=202,
 )
 async def start_organize(
     library_id: int,
-    background_tasks: BackgroundTasks,
+    client_name: str | None = Header(default=None, alias="X-MovieClaw-Client"),
     session: AsyncSession = Depends(get_session),
 ) -> ApiResponse[OrganizeStartView]:
     """执行时重新计算计划并逐文件「改名 → 台账随迁」。改名直接发生在
@@ -1121,10 +1432,23 @@ async def start_organize(
     phase = busy_phase(library_id)
     if phase is not None:
         raise ConflictException(f"「{library.name}」{PHASE_LABELS[phase]}，请等待完成后再整理")
-    background_tasks.add_task(organize_library, library_id)
+    # 用户确认后再按磁盘现场重算一次，并把这一份精确计划写进 Job。这样
+    # 重启发生在“改名成功、台账提交前”时，处理器知道该补哪一行台账。
+    plan = await build_organize_plan(session, library)
+    created = await enqueue_organize_job(session, library, plan, origin=_job_origin(client_name))
+    message = (
+        f"已开始整理「{library.name}」，可在任务中心继续观察"
+        if created.created
+        else f"「{library.name}」的整理作业已在进行中"
+    )
     return ok(
-        OrganizeStartView(started=True, message=f"已开始整理「{library.name}」"),
-        message=f"已开始整理「{library.name}」，完成后文件名将符合规范",
+        OrganizeStartView(
+            started=True,
+            message=message,
+            job_id=created.job.id,
+            created=created.created,
+        ),
+        message=message,
     )
 
 
@@ -1568,7 +1892,7 @@ async def delete_library_item(
     不同，调用方必须先向用户明确确认再调用（CLI 已强制 --yes）。删除失败的文件保留台账行。"""
     service = LibraryConfigService(session)
     library = await service.get(library_id)
-    _assert_not_busy(library.name, library_id)
+    await _assert_not_busy(session, library.name, library_id)
     item, rows = await _item_rows(session, library_id, media_item_id)
     all_rows = await LibraryFileRepository(session).list_by_library(library_id)
     result = await delete_item_files(session, library, media_item_id, rows, all_rows)
@@ -1613,7 +1937,7 @@ async def delete_library_file(
     升级为整条目删除（不留只剩 NFO/海报的空刮削目录），确认界面须告知。"""
     service = LibraryConfigService(session)
     library = await service.get(library_id)
-    _assert_not_busy(library.name, library_id)
+    await _assert_not_busy(session, library.name, library_id)
     item, rows = await _item_rows(session, library_id, media_item_id)
     row = next((r for r in rows if r.id == file_id), None)
     if row is None:
@@ -1728,7 +2052,7 @@ async def reidentify_library_item(
     只有少量 TMDB 查询，秒级返回），结果当场回给用户。"""
     service = LibraryConfigService(session)
     library = await service.get(library_id)
-    _assert_not_busy(library.name, library_id)
+    await _assert_not_busy(session, library.name, library_id)
     await _item_rows(session, library_id, media_item_id)  # 404 检查
 
     summary = await reidentify_item(library_id, media_item_id)
@@ -1837,12 +2161,17 @@ async def preview_transfer(
     summary="转移条目到另一个媒体库：整个条目目录搬到目标库主根，台账随迁",
     operation_id="lib.items.transfer",
     dependencies=[Depends(require_admin)],
-    openapi_extra={"x-cli-dangerous": "destructive"},
+    openapi_extra={
+        "x-cli-dangerous": "destructive",
+        "x-cli-job": {"id_path": "job_id", "wait_op": "jobs.wait"},
+    },
+    status_code=202,
 )
 async def transfer_library_item(
     library_id: int,
     media_item_id: int,
     payload: TransferPayload,
+    client_name: str | None = Header(default=None, alias="X-MovieClaw-Client"),
     session: AsyncSession = Depends(get_session),
 ) -> ApiResponse[TransferStartView]:
     """分错库的补救通道（如韩剧被路由进了「大陆华语剧」）。执行时**重新
@@ -1859,11 +2188,28 @@ async def transfer_library_item(
     if not plan.moves and not plan.missing_file_ids:
         detail = "；".join(s.reason for s in plan.skips) or "台账为空"
         raise BadRequestException(f"「{item.title}」没有可转移的内容：{detail}")
-    start_transfer(plan)
-    message = f"已开始把「{item.title}」转移到「{target.name}」"
+    created = await enqueue_transfer_job(
+        session,
+        plan,
+        target_library_name=target.name,
+        origin=_job_origin(client_name),
+    )
+    message = (
+        f"已开始把「{item.title}」转移到「{target.name}」，可在任务中心继续观察"
+        if created.created
+        else f"「{item.title}」的转移作业已在进行中"
+    )
     if plan.cross_device:
         message += "（跨盘转移需要完整复制文件，耗时取决于体积）"
-    return ok(TransferStartView(started=True, message=message), message=message)
+    return ok(
+        TransferStartView(
+            started=True,
+            message=message,
+            job_id=created.job.id,
+            created=created.created,
+        ),
+        message=message,
+    )
 
 
 @router.get(
@@ -1892,6 +2238,45 @@ async def get_transfer_status(
                 total=state.total,
             )
         )
+    latest = await jobs.latest_job_for_resource(
+        session, "library", library_id, job_type="library.transfer"
+    )
+    if latest is not None:
+        progress = latest.progress or {}
+        details = progress.get("details") if isinstance(progress.get("details"), dict) else {}
+        raw_plan = latest.input_data.get("plan")
+        plan = raw_plan if isinstance(raw_plan, dict) else {}
+        if latest.status in ACTIVE_JOB_STATUSES:
+            return ok(
+                TransferStatusView(
+                    running=True,
+                    media_item_id=int(details.get("media_item_id") or 0) or None,
+                    title=str(plan.get("title") or latest.subject or ""),
+                    target_library_id=int(details.get("target_library_id") or 0) or None,
+                    processed=int(progress.get("current") or 0),
+                    total=int(progress.get("total") or 0),
+                )
+            )
+        if latest.result:
+            result = latest.result
+            return ok(
+                TransferStatusView(
+                    running=False,
+                    media_item_id=int(result.get("media_item_id") or 0) or None,
+                    title=str(result.get("title") or latest.subject or ""),
+                    target_library_id=int(result.get("target_library_id") or 0) or None,
+                    processed=len(result.get("moved_paths") or []),
+                    total=len(result.get("moved_paths") or []),
+                    finished_at=latest.finished_at,
+                    target_library_name=str(result.get("target_library_name") or ""),
+                    moved_paths=list(result.get("moved_paths") or []),
+                    files_relocated=int(result.get("files_relocated") or 0),
+                    bytes_moved=int(result.get("bytes_moved") or 0),
+                    removed_dirs=int(result.get("removed_dirs") or 0),
+                    subscription_moved=bool(result.get("subscription_moved")),
+                    errors=list(result.get("errors") or []),
+                )
+            )
     last = last_transfer(library_id)
     if last is None:
         return ok(TransferStatusView(running=False))

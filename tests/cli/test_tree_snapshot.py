@@ -35,6 +35,8 @@ KNOWN_NON_GENERATED = {
     "search.stream",
     "agent.runs.stream",
     "fs.browse",  # 仅 Web 端目录选择器用；CLI/Agent 有 bash 等通用工具，不再暴露
+    "jobs.stream",  # 前端全局事件流；CLI 使用 jobs wait/events
+    "dl.tasks",  # 任务中心的下载器聚合投影；CLI 直接使用 downloader 命令
 }
 
 
@@ -80,9 +82,13 @@ def test_non_generated_endpoints_are_all_known() -> None:
 
 
 def test_dangerous_and_long_task_flow_into_commands() -> None:
-    """x-cli 标注确实驱动了命令行为：危险端点带 ⚠ 提示，长任务端点带 --wait。"""
+    """x-cli 标注驱动危险确认与两类后台等待协议。"""
     ops = {op["operation_id"]: op for op in iter_operations(load_baseline())}
     assert ops["lib.items.delete"]["dangerous"] == "destructive"
     assert ops["sub.delete"]["dangerous"] == "confirm"
-    assert ops["lib.scan.start"]["long_task"]["progress_op"] == "lib.show"
-    assert ops["lib.refresh.start"]["long_task"]["done_field"] == "refreshing"
+    assert ops["lib.scan.start"]["job"]["id_path"] == "job_id"
+    assert ops["lib.refresh.start"]["job"]["id_path"] == "job_id"
+    assert ops["lib.organize.start"]["job"]["id_path"] == "job_id"
+    assert ops["lib.items.refresh"]["job"]["id_path"] == "job_id"
+    assert ops["lib.items.transfer"]["job"]["id_path"] == "job_id"
+    assert ops["lib.subgen.start"]["job"]["id_path"] == "id"

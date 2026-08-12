@@ -165,9 +165,7 @@ def test_full_nfo_refresh_alignment(tmp_path) -> None:
     nfo = entry / "movie.nfo"
 
     # 既有富 NFO（同 tmdbid）+ 新档案 → 对齐重写
-    nfo.write_text(
-        "<movie><tmdbid>42</tmdbid><plot>旧简介</plot></movie>", encoding="utf-8"
-    )
+    nfo.write_text("<movie><tmdbid>42</tmdbid><plot>旧简介</plot></movie>", encoding="utf-8")
     write_full_nfo(entry, item, meta)
     text = nfo.read_text(encoding="utf-8")
     assert "新简介" in text and "旧简介" not in text
@@ -315,6 +313,65 @@ async def test_scan_recognizes_bluray_disc(db, tmp_path) -> None:
         assert row.file_path.endswith("阿凡达 (2009)")
         assert row.size_bytes == 110  # 盘内文件总大小
         assert row.media_item_id is not None
+
+
+def _bluray_clpi_payload() -> bytes:
+    """新原盘入库测试用的最小 CLPI：英文音轨 + 中文字幕。"""
+    entries = bytearray()
+    for pid, info in (
+        (0x1100, bytes([0x83, 0]) + b"eng"),
+        (0x1200, bytes([0x90]) + b"zho" + b"\0"),
+    ):
+        entries.extend(pid.to_bytes(2, "big"))
+        entries.append(len(info))
+        entries.extend(info)
+    body = bytearray(b"\0\1")
+    body.extend((0).to_bytes(4, "big"))
+    body.extend((0x100).to_bytes(2, "big"))
+    body.extend(bytes([2, 0]))
+    body.extend(entries)
+    header = bytearray(32)
+    header[:8] = b"HDMV0200"
+    header[12:16] = (32).to_bytes(4, "big")
+    return bytes(header) + len(body).to_bytes(4, "big") + bytes(body)
+
+
+async def test_new_bluray_scan_enriches_languages_from_clpi(db, tmp_path, monkeypatch) -> None:
+    """新 BDMV 首次扫描即按 PID 合并 CLPI，数据库不先落一版 language=NULL。"""
+    root = tmp_path / "movies"
+    disc = root / "阿凡达 (2009)"
+    stream_dir = disc / "BDMV" / "STREAM"
+    clipinf_dir = disc / "BDMV" / "CLIPINF"
+    stream_dir.mkdir(parents=True)
+    clipinf_dir.mkdir(parents=True)
+    (stream_dir / "00001.m2ts").write_bytes(b"movie")
+    (clipinf_dir / "00001.clpi").write_bytes(_bluray_clpi_payload())
+    monkeypatch.setattr(
+        scan_mod,
+        "probe_media",
+        lambda _path: MediaSpec(
+            resolution="1080p",
+            video_codec="h264",
+            hdr=None,
+            bit_depth=8,
+            duration_seconds=7200,
+            bit_rate=20_000_000,
+            audio_streams=[{"codec": "truehd", "pid": 0x1100, "language": None}],
+            subtitle_streams=[{"codec": "hdmv_pgs_subtitle", "pid": 0x1200, "language": None}],
+        ),
+    )
+    async with db.session() as session:
+        library = await LibraryRepository(session).create(
+            name="电影库", kind="movie", root_paths=[str(root)]
+        )
+
+    summary = await scan_library(library.id)
+    assert summary.identified == 1
+    async with db.session() as session:
+        row = (await session.execute(select(LibraryFile))).scalars().one()
+        assert row.audio_streams[0]["language"] == "eng"
+        assert row.subtitle_streams[0]["language"] == "zho"
+        assert row.subtitle_streams[0]["language_source"] == "clpi"
 
 
 async def test_movie_runtime_disambiguation(db, tmp_path, monkeypatch) -> None:
