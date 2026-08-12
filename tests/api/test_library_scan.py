@@ -11,7 +11,6 @@ from __future__ import annotations
 import os
 import shutil
 from pathlib import Path
-from types import SimpleNamespace
 
 import httpx
 import pytest_asyncio
@@ -502,14 +501,15 @@ async def test_adding_root_does_not_merge_matching_fingerprint_on_another_device
         stat = real_stat(path, *args, **kwargs)
         if path == other_file:
             # 临时目录通常都在同一文件系统，无法真实挂两块盘；只改 st_dev
-            # 来覆盖「保留旧根 + 新增另一设备根」的安全边界。
-            return SimpleNamespace(
-                st_dev=stat.st_dev + 1,
-                st_ino=stat.st_ino,
-                st_size=stat.st_size,
-                st_mtime=stat.st_mtime,
-                st_mtime_ns=stat.st_mtime_ns,
-            )
+            # 来覆盖「保留旧根 + 新增另一设备根」的安全边界。委托原结果而
+            # 非手写精简对象，Path.is_dir() 等 pathlib 内部调用仍需要 st_mode。
+            class CrossDeviceStat:
+                st_dev = stat.st_dev + 1
+
+                def __getattr__(self, name: str):
+                    return getattr(stat, name)
+
+            return CrossDeviceStat()
         return stat
 
     monkeypatch.setattr(Path, "stat", cross_device_stat)
