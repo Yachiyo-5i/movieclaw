@@ -198,6 +198,28 @@ def request_stop(file_id: int) -> bool:
     return stopped
 
 
+def is_generation_running(file_id: int) -> bool:
+    """该台账行是否正有字幕生成任务在执行。"""
+    return _tasks.running(file_id)
+
+
+def discard_removed_file_job_state(file_id: int) -> None:
+    """台账行已提交删除后，清理它遗留的字幕续传状态。
+
+    调用方先以 ``is_generation_running`` 确认没有在跑的任务，且只能在删除
+    台账事务提交成功后调用。这样服务重启时不会续传一个已经不存在的文件，
+    同时避免提交失败却提前丢掉用户已确认的任务意图。
+    """
+    _discard_file_intents(file_id)
+    for path in extract.cache_dir().glob(f"{file_id}.*.checkpoint.json"):
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as exc:
+            logger.warning("清理字幕翻译断点失败：file=%s %s", file_id, exc)
+    # 防止 SQLite 以后复用这个 id 时，详情页读到被删除行遗留的“最近结果”。
+    _tasks.discard(file_id)
+
+
 async def _load_row(session: AsyncSession, file_id: int) -> LibraryFile:
     row = (
         await session.execute(select(LibraryFile).where(LibraryFile.id == file_id))
