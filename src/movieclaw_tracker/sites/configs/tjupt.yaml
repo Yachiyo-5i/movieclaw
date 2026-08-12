@@ -1,0 +1,51 @@
+# 北洋园 TJUPT（天津大学）
+# 页面结构经 2026-08-12 实抓校准。会话凭据为 access_token JWT Cookie；
+# Cookie 模式可使用浏览器同步的最新令牌，credential 模式通过登录表单获取。
+site_id: tjupt
+display_name: 北洋园 TJUPT
+base_url: https://tjupt.org
+framework: nexusphp
+
+auth:
+  supported: [cookie, credential]
+
+min_request_interval: 5.0
+
+selectors:
+  # ---------- 登录 ----------
+  # form action 为相对路径 takelogin.php，由通用认证流程解析。
+  login_path: login.php
+  login_username_field: username
+  login_password_field: password
+  login_success_css: "a[href*='logout.php']"
+  login_select_defaults:
+    logout: "7"
+
+  # ---------- 种子列表 ----------
+  # 每行共有 15 个后代 td，但外层 table.torrents 行只有 9 个直接列；
+  # 第 2 列内嵌 6 个 td，nth-child 必须按外层 9 列定位。
+  torrent_row_css: "table.torrents > tr:not(:first-child)"
+  torrent_title_css: ":scope > td:nth-child(2) a[href*='details.php']"
+  torrent_category_css: ":scope > td:nth-child(1) a::attr(href)"
+  torrent_time_css: ":scope > td:nth-child(4)"
+  torrent_time_fallback_css: ""
+  torrent_size_css: ":scope > td:nth-child(5)"
+  torrent_seeders_css: ":scope > td:nth-child(6)"
+  torrent_leechers_css: ":scope > td:nth-child(7)"
+  torrent_snatched_css: ":scope > td:nth-child(8)"
+  torrent_uploader_css: ":scope > td:nth-child(9)"
+  torrent_hr_css: ""
+
+  # ---------- 用户资料 ----------
+  profile_path: userdetails.php
+  profile_uid_css: "a.User_Name::attr(href)"
+  profile_username_css: "a.User_Name b"
+  profile_class_css: "td.rowhead:contains('等级') + td img::attr(title)"
+  profile_bonus_css: "td.rowhead:contains('魔力值') + td"
+  profile_uploaded_css: "td.rowhead:contains('上传量') + td::text"
+
+  # 以下统计由 AJAX 动态加载，初始 HTML 不提供静态值。
+  profile_downloaded_css: ""
+  profile_ratio_css: ""
+  profile_seeding_css: ""
+  profile_leeching_css: ""

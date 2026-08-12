@@ -145,11 +145,19 @@ def _parse_selectors(raw: dict[str, Any], selector_cls: type) -> Any:
     """
     defaults = selector_cls()
     overrides = raw.get("selectors", {})
-    for rule_key in ("promo_download_rules", "promo_upload_rules"):
+    for rule_key in (
+        "promo_download_rules",
+        "promo_upload_rules",
+        "login_extra_form_data",
+        "login_select_defaults",
+    ):
         if rule_key in overrides and isinstance(overrides[rule_key], dict):
             overrides[rule_key] = tuple(
-                (css, float(factor)) for css, factor in overrides[rule_key].items()
+                (key, str(value)) for key, value in overrides[rule_key].items()
             )
+    for rule_key in ("promo_download_rules", "promo_upload_rules"):
+        if rule_key in overrides and isinstance(overrides[rule_key], tuple):
+            overrides[rule_key] = tuple((css, float(factor)) for css, factor in overrides[rule_key])
     return dataclasses.replace(defaults, **overrides) if overrides else defaults
 
 
