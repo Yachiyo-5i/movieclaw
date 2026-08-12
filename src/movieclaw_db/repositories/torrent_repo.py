@@ -248,14 +248,40 @@ class TorrentRepository:
         return False
 
     async def bulk_upsert(self, observations: list[TorrentObservation]) -> UpsertStats:
-        """批量 upsert，返回统计。同一批内按 torrent_id 去重（保留首条）。"""
+        """批量 upsert，返回统计。同一批内按 torrent_id 去重（保留首条）。
+
+        先按站点批量取回已有行，避免逐条 ``SELECT``。站点首刷/回补可能一次写入
+        数百至数千条；逐条查询会无谓延长任务并放大 SQLite 争用。每批 ID 控制在
+        900 个以内，兼容 SQLite 的绑定参数上限。
+        """
         stats = UpsertStats()
         seen: set[str] = set()
+        unique: list[TorrentObservation] = []
         for obs in observations:
             if obs.torrent_id in seen:
                 continue
             seen.add(obs.torrent_id)
-            row = await self.get(obs.site_id, obs.torrent_id)
+            unique.append(obs)
+
+        ids_by_site: dict[str, list[str]] = {}
+        for obs in unique:
+            ids_by_site.setdefault(obs.site_id, []).append(obs.torrent_id)
+
+        existing: dict[tuple[str, str], SiteTorrent] = {}
+        for site_id, torrent_ids in ids_by_site.items():
+            for offset in range(0, len(torrent_ids), 900):
+                batch_ids = torrent_ids[offset : offset + 900]
+                result = await self._session.execute(
+                    select(SiteTorrent).where(
+                        SiteTorrent.site_id == site_id,
+                        SiteTorrent.torrent_id.in_(batch_ids),  # type: ignore[attr-defined]
+                    )
+                )
+                for row in result.scalars().all():
+                    existing[(row.site_id, row.torrent_id)] = row
+
+        for obs in unique:
+            row = existing.get((obs.site_id, obs.torrent_id))
             if row is None:
                 self._session.add(self._build_new(obs))
                 stats.inserted += 1
