@@ -2,12 +2,14 @@
 
 所有测试通过 Mock HttpClient 完成，不发送真实 HTTP 请求。
 """
+
 from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock, PropertyMock
 
 import httpx
 import pytest
+from parsel import Selector
 
 from movieclaw_tracker.auth import CredentialAuthProvider
 from movieclaw_tracker.exceptions import TrackerAuthError
@@ -24,6 +26,48 @@ LOGIN_PAGE_NO_CAPTCHA = """
   <input name="username" />
   <input name="password" type="password" />
   <input type="submit" value="Login" />
+</form>
+</body></html>
+"""
+
+LOGIN_PAGE_TJUPT = """
+<html><body>
+<form action="takelogin.php" method="post">
+  <input type="hidden" name="logout" value="7" />
+  <input name="username" />
+  <input name="password" type="password" />
+</form>
+</body></html>
+"""
+
+LOGIN_PAGE_WITH_EMPTY_ACTION = """
+<html><body>
+<form action="" method="post">
+  <input type="hidden" name="logout" value="7" />
+  <input name="username" />
+  <input name="password" type="password" />
+</form>
+</body></html>
+"""
+
+LOGIN_PAGE_WITH_LEADING_SEARCH_FORM = """
+<html><body>
+<form action="search.php" method="get"><input name="query" /></form>
+<form action="takelogin.php" method="post">
+  <input type="hidden" name="token" value="first" />
+  <input type="hidden" name="token" value="second" />
+  <input type="hidden" name="disabled-token" value="ignored" disabled />
+  <input name="username" />
+  <input name="password" type="password" />
+</form>
+</body></html>
+"""
+
+LOGIN_PAGE_WITH_CROSS_ORIGIN_ACTION = """
+<html><body>
+<form action="https://attacker.example/collect" method="post">
+  <input name="username" />
+  <input name="password" type="password" />
 </form>
 </body></html>
 """
@@ -149,8 +193,97 @@ async def test_login_success_no_captcha() -> None:
 
     # 验证 POST 提交了正确的表单数据
     call_kwargs = client.raw_post.call_args
-    assert call_kwargs.kwargs["data"]["username"] == "user"
-    assert call_kwargs.kwargs["data"]["password"] == "pass"
+    assert call_kwargs.args[0] == "https://example.com/login.php"
+    assert ("username", "user") in call_kwargs.kwargs["data"]
+    assert ("password", "pass") in call_kwargs.kwargs["data"]
+
+
+@pytest.mark.asyncio
+async def test_login_posts_to_form_action_and_includes_hidden_fields() -> None:
+    """登录页声明相对 form action 时，应提交到该 action 并带上隐藏字段。"""
+    login_page_resp = _make_response(LOGIN_PAGE_TJUPT)
+    success_resp = _make_response(SUCCESS_PAGE)
+
+    client = MagicMock()
+    client.raw_get = AsyncMock(return_value=login_page_resp)
+    client.raw_post = AsyncMock(return_value=success_resp)
+    type(client).cookies = PropertyMock(return_value=httpx.Cookies({"access_token": "jwt-fixture"}))
+
+    provider = CredentialAuthProvider(username="user", password="pass")
+    provider.bind(base_url="https://tjupt.org", login_selectors=LoginSelectors())
+
+    result = await provider.authenticate(client)
+
+    assert result.success is True
+    assert result.cookies == {"access_token": "jwt-fixture"}
+    assert client.raw_post.call_args.args[0] == "https://tjupt.org/takelogin.php"
+    assert ("logout", "7") in client.raw_post.call_args.kwargs["data"]
+
+
+@pytest.mark.asyncio
+async def test_empty_form_action_falls_back_to_login_path() -> None:
+    """空 form action 应保持原有 login_path 行为。"""
+    client = MagicMock()
+    client.raw_get = AsyncMock(return_value=_make_response(LOGIN_PAGE_WITH_EMPTY_ACTION))
+    client.raw_post = AsyncMock(return_value=_make_response(SUCCESS_PAGE))
+    type(client).cookies = PropertyMock(return_value=httpx.Cookies())
+
+    provider = CredentialAuthProvider(username="user", password="pass")
+    provider.bind(base_url="https://example.com", login_selectors=LoginSelectors())
+
+    await provider.authenticate(client)
+
+    assert client.raw_post.call_args.args[0] == "https://example.com/login.php"
+
+
+@pytest.mark.asyncio
+async def test_login_selects_form_with_configured_credential_fields() -> None:
+    """页面有多个 form 时，只能使用同时包含用户名和密码字段的登录表单。"""
+    client = MagicMock()
+    client.raw_get = AsyncMock(return_value=_make_response(LOGIN_PAGE_WITH_LEADING_SEARCH_FORM))
+    client.raw_post = AsyncMock(return_value=_make_response(SUCCESS_PAGE))
+    type(client).cookies = PropertyMock(return_value=httpx.Cookies())
+
+    provider = CredentialAuthProvider(username="user", password="pass")
+    provider.bind(base_url="https://example.com")
+
+    await provider.authenticate(client)
+
+    assert client.raw_post.call_args.args[0] == "https://example.com/takelogin.php"
+    assert client.raw_post.call_args.kwargs["data"] == [
+        ("token", "first"),
+        ("token", "second"),
+        ("username", "user"),
+        ("password", "pass"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_login_rejects_cross_origin_form_action() -> None:
+    """登录页不能把账号密码提交到其他 origin。"""
+    client = MagicMock()
+    client.raw_get = AsyncMock(return_value=_make_response(LOGIN_PAGE_WITH_CROSS_ORIGIN_ACTION))
+    client.raw_post = AsyncMock()
+    type(client).cookies = PropertyMock(return_value=httpx.Cookies())
+
+    provider = CredentialAuthProvider(username="user", password="pass")
+    provider.bind(base_url="https://example.com")
+
+    with pytest.raises(TrackerAuthError, match="跨站"):
+        await provider.authenticate(client)
+
+    client.raw_post.assert_not_called()
+
+
+def test_form_action_treats_explicit_default_port_as_same_origin() -> None:
+    """显式默认端口与省略端口应视为同源。"""
+    form = Selector(text='<form action="https://example.com:443/takelogin.php"></form>').css(
+        "form"
+    )[0]
+
+    assert CredentialAuthProvider._form_action(form, "https://example.com/login.php") == (
+        "https://example.com:443/takelogin.php"
+    )
 
 
 @pytest.mark.asyncio
@@ -174,7 +307,9 @@ async def test_login_success_with_captcha() -> None:
     type(client).cookies = PropertyMock(return_value=cookie_jar)
 
     provider = CredentialAuthProvider(
-        username="user", password="pass", captcha_solver=solver,
+        username="user",
+        password="pass",
+        captcha_solver=solver,
     )
     provider.bind(base_url="https://example.com")
 
@@ -186,8 +321,8 @@ async def test_login_success_with_captcha() -> None:
 
     # 验证表单中包含验证码字段
     form_data = client.raw_post.call_args.kwargs["data"]
-    assert form_data["imagestring"] == "x7k9"
-    assert form_data["imagehash"] == "abc123"
+    assert ("imagestring", "x7k9") in form_data
+    assert ("imagehash", "abc123") in form_data
 
 
 @pytest.mark.asyncio
@@ -237,7 +372,9 @@ async def test_login_captcha_retry() -> None:
     type(client).cookies = PropertyMock(return_value=cookie_jar)
 
     provider = CredentialAuthProvider(
-        username="user", password="pass", captcha_solver=solver,
+        username="user",
+        password="pass",
+        captcha_solver=solver,
     )
     provider.bind(base_url="https://example.com")
 
@@ -333,6 +470,34 @@ async def test_extra_form_data() -> None:
 
     assert result.success is True
     form_data = client.raw_post.call_args.kwargs["data"]
-    assert form_data["passan"] == ""
-    assert form_data["passid"] == "0"
-    assert form_data["lang"] == "0"
+    assert ("passan", "") in form_data
+    assert ("passid", "0") in form_data
+    assert ("lang", "0") in form_data
+
+
+@pytest.mark.asyncio
+async def test_select_defaults_only_submit_fields_present_in_form() -> None:
+    """站点配置的 select 默认值只应写入实际存在的表单字段。"""
+    page = _make_response(
+        LOGIN_PAGE_NO_CAPTCHA.replace(
+            '  <input type="submit" value="Login" />',
+            '  <select name="logout"><option value="7">7 days</option></select>\n'
+            '  <input type="submit" value="Login" />',
+        )
+    )
+    client = MagicMock()
+    client.raw_get = AsyncMock(return_value=page)
+    client.raw_post = AsyncMock(return_value=_make_response(SUCCESS_PAGE))
+    type(client).cookies = PropertyMock(return_value=httpx.Cookies())
+
+    provider = CredentialAuthProvider(username="user", password="pass")
+    provider.bind(
+        base_url="https://example.com",
+        login_selectors=LoginSelectors(select_defaults=(("logout", "7"), ("missing", "x"))),
+    )
+
+    await provider.authenticate(client)
+
+    form_data = client.raw_post.call_args.kwargs["data"]
+    assert ("logout", "7") in form_data
+    assert not any(key == "missing" for key, _ in form_data)

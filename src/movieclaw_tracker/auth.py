@@ -257,6 +257,7 @@ class CredentialAuthProvider(AuthProvider):
         if self._selectors is not None:
             return self._selectors
         from movieclaw_tracker.selectors import LoginSelectors
+
         return LoginSelectors()
 
     def _url(self, path: str) -> str:
@@ -266,6 +267,39 @@ class CredentialAuthProvider(AuthProvider):
                 "CredentialAuthProvider 尚未绑定站点，请通过 create_site 创建或手动调用 bind()",
             )
         return f"{self._base_url}/{path.lstrip('/')}"
+
+    @staticmethod
+    def _form_action(form: Selector | None, form_url: str) -> str:
+        """解析同源登录表单 action；缺失或空值时回退到登录页 URL。"""
+        action = form.css("::attr(action)").get("").strip() if form else ""
+        post_url = urllib.parse.urljoin(form_url, action or form_url)
+        form_origin = urllib.parse.urlsplit(form_url)
+        post_origin = urllib.parse.urlsplit(post_url)
+
+        def normalized_origin(
+            parts: urllib.parse.SplitResult,
+        ) -> tuple[str, str | None, int | None]:
+            default_port = {"http": 80, "https": 443}.get(parts.scheme)
+            return parts.scheme, parts.hostname, parts.port or default_port
+
+        if normalized_origin(form_origin) != normalized_origin(post_origin):
+            raise TrackerAuthError("登录表单 action 指向跨站地址，已拒绝提交凭据")
+        return post_url
+
+    @staticmethod
+    def _login_form(doc: Selector, sel: LoginSelectors) -> Selector | None:
+        """选择同时包含配置用户名和密码控件的登录表单。"""
+        for form in doc.css("form"):
+            field_names = {node.attrib.get("name", "") for node in form.css("[name]")}
+            if sel.username_field in field_names and sel.password_field in field_names:
+                return form
+        return None
+
+    @staticmethod
+    def _set_form_field(form_data: list[tuple[str, str]], name: str, value: str) -> None:
+        """覆盖同名表单字段，同时保留其他字段的原始顺序和重复值。"""
+        form_data[:] = [(key, current) for key, current in form_data if key != name]
+        form_data.append((name, value))
 
     async def authenticate(self, client: HttpClient) -> AuthResult:
         """执行用户名/密码登录流程。"""
@@ -312,9 +346,7 @@ class CredentialAuthProvider(AuthProvider):
                 logger.info("验证码识别结果：%s", captcha_text)
 
                 # 提取 imagehash 隐藏字段
-                hash_input = doc.css(
-                    f'input[name="{sel.captcha_hash_field}"]::attr(value)'
-                )
+                hash_input = doc.css(f'input[name="{sel.captcha_hash_field}"]::attr(value)')
                 captcha_hash = hash_input.get()
 
                 # 也尝试从验证码 URL 的查询参数中提取 imagehash
@@ -327,24 +359,33 @@ class CredentialAuthProvider(AuthProvider):
                         captcha_hash = hash_values[0]
 
             # 3. 构造登录表单
-            form_data: dict[str, str] = {
-                sel.username_field: self._username,
-                sel.password_field: self._password,
-            }
+            # NexusPHP 站点通常把 logout 等参数放在 hidden input 中；
+            # 保留重复字段并忽略 disabled 控件，与浏览器 successful controls 语义一致。
+            form = self._login_form(doc, sel)
+            form_data: list[tuple[str, str]] = []
+            for input_el in form.css("input[type='hidden'][name]:not([disabled])") if form else ():
+                form_data.append((input_el.attrib["name"], input_el.attrib.get("value", "")))
+
+            self._set_form_field(form_data, sel.username_field, self._username)
+            self._set_form_field(form_data, sel.password_field, self._password)
+            for select_name, default_value in sel.select_defaults:
+                if form and form.css(f"select[name='{select_name}']"):
+                    self._set_form_field(form_data, select_name, default_value)
 
             # 验证码相关字段
             if captcha_text:
-                form_data[sel.captcha_field] = captcha_text
+                self._set_form_field(form_data, sel.captcha_field, captcha_text)
             if captcha_hash:
-                form_data[sel.captcha_hash_field] = captcha_hash
+                self._set_form_field(form_data, sel.captcha_hash_field, captcha_hash)
 
             # 站点特殊的额外表单字段
             for key, value in sel.extra_form_data:
-                form_data[key] = value
+                self._set_form_field(form_data, key, value)
 
             # 4. POST 登录
             headers = {"Referer": login_url}
-            res = await client.raw_post(login_url, data=form_data, headers=headers)
+            post_url = self._form_action(form, login_url)
+            res = await client.raw_post(post_url, data=form_data, headers=headers)
             response_text = res.text
 
             # 5. 判定登录结果
