@@ -179,6 +179,40 @@ def test_update_name_and_paths(client) -> None:
     assert data["root_paths"] == ["/media/movies", "/mnt/disk2/movies"]
 
 
+def test_update_root_scan_receives_previous_roots(client, monkeypatch) -> None:
+    """改根的后台扫描必须带上修改前根列表，不能从历史台账反推。"""
+    from movieclaw_api.api.routes import libraries as library_routes
+
+    calls: list[tuple[int, dict]] = []
+
+    async def fake_scan(library_id: int, **kwargs) -> None:  # noqa: ANN003
+        calls.append((library_id, kwargs))
+
+    monkeypatch.setattr(library_routes, "scan_library", fake_scan)
+    library_id = _create(client, name="电影库", kind="movie", root="/media/movies")["id"]
+    calls.clear()  # 建库本身也会排一次普通扫描
+
+    response = client.put(
+        f"/api/v1/libraries/{library_id}",
+        json={
+            "name": "电影库",
+            "kind": "movie",
+            "root_paths": ["/mnt/movies"],
+        },
+    )
+
+    assert response.status_code == 200
+    assert calls == [
+        (
+            library_id,
+            {
+                "reconcile_root_change": True,
+                "previous_root_paths": ["/media/movies"],
+            },
+        )
+    ]
+
+
 def test_delete_default_hands_over_within_kind(client) -> None:
     tv_default = _create(client, name="剧集库", kind="tv", root="/media/tv")
     anime = _create(client, name="动漫库", kind="tv", root="/media/anime")

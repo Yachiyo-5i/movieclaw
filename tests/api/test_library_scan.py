@@ -8,8 +8,10 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest_asyncio
@@ -22,6 +24,8 @@ from movieclaw_api.core.config import get_settings
 from movieclaw_api.services.library.scan import scan_library
 from movieclaw_api.services.media_library import MediaLibraryService
 from movieclaw_api.services.subscription import SubscriptionService
+from movieclaw_api.services.subtitle_gen import tasks as subtitle_tasks
+from movieclaw_api.services.task_state import TaskState
 from movieclaw_db.engine import dispose_db, get_database, init_db
 from movieclaw_db.migrations import run_migrations
 from movieclaw_db.models import LibraryFile, MediaItem, WantedItem
@@ -335,6 +339,485 @@ async def test_scan_survives_paths_ledgered_under_another_library(db, tmp_path) 
         files = list((await session.execute(select(LibraryFile))).scalars().all())
         assert len(files) == 3  # 原地更新，没有产生重复行
         assert {f.library_id for f in files} == {second.id}  # 行转归后扫的库
+
+
+async def test_rescan_after_root_alias_change_relocates_same_file_ledger(db, tmp_path) -> None:
+    """编辑根路径为同目录的软链接入口，重扫只迁移原台账行，不重复入账。"""
+    root = tmp_path / "media" / "movies"
+    entry = root / "某电影 (2020)"
+    entry.mkdir(parents=True)
+    (entry / "某电影.2020.mkv").write_bytes(b"movie")
+    (entry / "movie.nfo").write_text("<movie><tmdbid>300</tmdbid></movie>", encoding="utf-8")
+    alias = tmp_path / "mounted-movies"
+    alias.symlink_to(root, target_is_directory=True)
+
+    async with db.session() as session:
+        repo = LibraryRepository(session)
+        library = await repo.create(name="电影库", kind="movie", root_paths=[str(root)])
+    await scan_library(library.id)
+
+    async with db.session() as session:
+        old = (await session.execute(select(LibraryFile))).scalar_one()
+        old_id = old.id
+        old_item_id = old.media_item_id
+        await LibraryRepository(session).update(
+            library.id, name="电影库", root_paths=[str(alias)]
+        )
+
+    summary = await scan_library(
+        library.id,
+        reconcile_root_change=True,
+        previous_root_paths=[str(root)],
+    )
+    assert summary.scanned == 0
+    assert summary.root_relinked == 1
+    async with db.session() as session:
+        rows = list((await session.execute(select(LibraryFile))).scalars().all())
+    assert len(rows) == 1
+    assert rows[0].id == old_id
+    assert rows[0].media_item_id == old_item_id
+    assert rows[0].file_path == str(alias / "某电影 (2020)" / "某电影.2020.mkv")
+
+
+async def test_rescan_merges_duplicate_rows_left_by_root_alias_change(db, tmp_path) -> None:
+    """已经由旧版本产生的同实体重复台账，下一次扫描自动收敛为一行。"""
+    root = tmp_path / "media" / "movies"
+    entry = root / "某电影 (2020)"
+    entry.mkdir(parents=True)
+    (entry / "某电影.2020.mkv").write_bytes(b"movie")
+    (entry / "movie.nfo").write_text("<movie><tmdbid>300</tmdbid></movie>", encoding="utf-8")
+    alias = tmp_path / "mounted-movies"
+    alias.symlink_to(root, target_is_directory=True)
+
+    async with db.session() as session:
+        repo = LibraryRepository(session)
+        library = await repo.create(name="电影库", kind="movie", root_paths=[str(root)])
+    await scan_library(library.id)
+
+    async with db.session() as session:
+        old = (await session.execute(select(LibraryFile))).scalar_one()
+        old.identity_source = IdentitySource.MANUAL
+        old.audio_streams = [{"codec": "truehd"}]
+        await session.commit()
+        old_id = old.id
+        item_id = old.media_item_id
+        # 模拟修复上线前第一次改根重扫已经写出的第二行：旧路径行与当前
+        # 根路径行并存，且二者实际指向同一文件。
+        duplicate = LibraryFile(
+            library_id=library.id,
+            media_item_id=item_id,
+            season_number=0,
+            episode_number=0,
+            file_path=str(alias / "某电影 (2020)" / "某电影.2020.mkv"),
+            size_bytes=5,
+            source="scanned",
+        )
+        session.add(duplicate)
+        await session.commit()
+        await LibraryRepository(session).update(
+            library.id, name="电影库", root_paths=[str(alias)]
+        )
+
+    summary = await scan_library(
+        library.id,
+        reconcile_root_change=True,
+        previous_root_paths=[str(root)],
+    )
+    assert summary.root_relinked == 1
+    async with db.session() as session:
+        rows = list((await session.execute(select(LibraryFile))).scalars().all())
+    assert len(rows) == 1
+    assert rows[0].id == old_id  # 保留原台账主键，Jellyfin 来源 ID 不变
+    assert rows[0].file_path == str(alias / "某电影 (2020)" / "某电影.2020.mkv")
+    assert rows[0].identity_source == IdentitySource.MANUAL
+    assert rows[0].audio_streams == [{"codec": "truehd"}]
+
+
+async def test_rescan_after_adding_root_alias_keeps_single_ledger_row(db, tmp_path) -> None:
+    """保留原根同时新增同目录别名，两个遍历入口仍只复用一条台账。"""
+    root = tmp_path / "media" / "movies"
+    entry = root / "某电影 (2020)"
+    entry.mkdir(parents=True)
+    (entry / "某电影.2020.mkv").write_bytes(b"movie")
+    (entry / "movie.nfo").write_text("<movie><tmdbid>300</tmdbid></movie>", encoding="utf-8")
+    alias = tmp_path / "mounted-movies"
+    alias.symlink_to(root, target_is_directory=True)
+
+    async with db.session() as session:
+        library = await LibraryRepository(session).create(
+            name="电影库", kind="movie", root_paths=[str(root)]
+        )
+    await scan_library(library.id)
+
+    async with db.session() as session:
+        old = (await session.execute(select(LibraryFile))).scalar_one()
+        old_id = old.id
+        await LibraryRepository(session).update(
+            library.id, name="电影库", root_paths=[str(root), str(alias)]
+        )
+
+    summary = await scan_library(
+        library.id,
+        reconcile_root_change=True,
+        previous_root_paths=[str(root)],
+    )
+    assert summary.scanned == 0
+    assert summary.root_relinked == 1
+    async with db.session() as session:
+        rows = list((await session.execute(select(LibraryFile))).scalars().all())
+    assert len(rows) == 1
+    assert rows[0].id == old_id
+    assert rows[0].file_path == str(entry / "某电影.2020.mkv")
+
+
+async def test_adding_root_does_not_merge_matching_fingerprint_on_another_device(
+    db, tmp_path, monkeypatch
+) -> None:
+    """保留原根时，不能把另一设备上巧合同指纹的文件当作别名。"""
+    root = tmp_path / "media" / "movies"
+    entry = root / "某电影 (2020)"
+    entry.mkdir(parents=True)
+    original = entry / "某电影.2020.mkv"
+    original.write_bytes(b"movie")
+    (entry / "movie.nfo").write_text("<movie><tmdbid>300</tmdbid></movie>", encoding="utf-8")
+
+    async with db.session() as session:
+        library = await LibraryRepository(session).create(
+            name="电影库", kind="movie", root_paths=[str(root)]
+        )
+    await scan_library(library.id)
+
+    other_root = tmp_path / "other-mount"
+    other_entry = other_root / "某电影 (2020)"
+    other_entry.mkdir(parents=True)
+    other_file = other_entry / "某电影.2020.mkv"
+    shutil.copy2(original, other_file)
+    os.utime(other_file, ns=(original.stat().st_atime_ns, original.stat().st_mtime_ns))
+    (other_entry / "movie.nfo").write_text(
+        "<movie><tmdbid>300</tmdbid></movie>", encoding="utf-8"
+    )
+    real_stat = Path.stat
+
+    def cross_device_stat(path: Path, *args, **kwargs):  # noqa: ANN002, ANN003
+        stat = real_stat(path, *args, **kwargs)
+        if path == other_file:
+            # 临时目录通常都在同一文件系统，无法真实挂两块盘；只改 st_dev
+            # 来覆盖「保留旧根 + 新增另一设备根」的安全边界。
+            return SimpleNamespace(
+                st_dev=stat.st_dev + 1,
+                st_ino=stat.st_ino,
+                st_size=stat.st_size,
+                st_mtime=stat.st_mtime,
+                st_mtime_ns=stat.st_mtime_ns,
+            )
+        return stat
+
+    monkeypatch.setattr(Path, "stat", cross_device_stat)
+
+    async with db.session() as session:
+        await LibraryRepository(session).update(
+            library.id, name="电影库", root_paths=[str(root), str(other_root)]
+        )
+
+    summary = await scan_library(
+        library.id,
+        reconcile_root_change=True,
+        previous_root_paths=[str(root)],
+    )
+    assert summary.root_relinked == 0
+    async with db.session() as session:
+        rows = list((await session.execute(select(LibraryFile))).scalars().all())
+    assert len(rows) == 2
+
+
+async def test_adding_root_alias_merges_historical_duplicate_without_reinserting_old_path(
+    db, tmp_path
+) -> None:
+    """别名根已有历史重复行时，合并后原根与别名遍历均复用同一行。"""
+    root = tmp_path / "media" / "movies"
+    entry = root / "某电影 (2020)"
+    entry.mkdir(parents=True)
+    (entry / "某电影.2020.mkv").write_bytes(b"movie")
+    (entry / "movie.nfo").write_text("<movie><tmdbid>300</tmdbid></movie>", encoding="utf-8")
+    alias = tmp_path / "mounted-movies"
+    alias.symlink_to(root, target_is_directory=True)
+
+    async with db.session() as session:
+        library = await LibraryRepository(session).create(
+            name="电影库", kind="movie", root_paths=[str(root)]
+        )
+    await scan_library(library.id)
+
+    async with db.session() as session:
+        old = (await session.execute(select(LibraryFile))).scalar_one()
+        old_id = old.id
+        session.add(
+            LibraryFile(
+                library_id=library.id,
+                media_item_id=old.media_item_id,
+                file_path=str(alias / "某电影 (2020)" / "某电影.2020.mkv"),
+                size_bytes=5,
+                source="scanned",
+            )
+        )
+        await session.commit()
+        await LibraryRepository(session).update(
+            library.id, name="电影库", root_paths=[str(root), str(alias)]
+        )
+
+    summary = await scan_library(
+        library.id,
+        reconcile_root_change=True,
+        previous_root_paths=[str(root)],
+    )
+    assert summary.scanned == 0
+    async with db.session() as session:
+        rows = list((await session.execute(select(LibraryFile))).scalars().all())
+    assert len(rows) == 1
+    assert rows[0].id == old_id
+    assert rows[0].file_path == str(entry / "某电影.2020.mkv")
+
+
+async def test_rescan_relinks_when_old_root_is_unavailable(db, tmp_path) -> None:
+    """旧挂载点已撤掉时，以同相对路径的尺寸与 mtime 指纹延续台账。"""
+    old_root = tmp_path / "old-mount"
+    old_entry = old_root / "某电影 (2020)"
+    old_entry.mkdir(parents=True)
+    old_file = old_entry / "某电影.2020.mkv"
+    old_file.write_bytes(b"movie")
+    (old_entry / "movie.nfo").write_text("<movie><tmdbid>300</tmdbid></movie>", encoding="utf-8")
+
+    async with db.session() as session:
+        library = await LibraryRepository(session).create(
+            name="电影库", kind="movie", root_paths=[str(old_root)]
+        )
+    await scan_library(library.id)
+
+    new_root = tmp_path / "new-mount"
+    new_entry = new_root / "某电影 (2020)"
+    new_entry.mkdir(parents=True)
+    new_file = new_entry / "某电影.2020.mkv"
+    shutil.copy2(old_file, new_file)
+    (new_entry / "movie.nfo").write_text("<movie><tmdbid>300</tmdbid></movie>", encoding="utf-8")
+    old_file.unlink()
+    (old_entry / "movie.nfo").unlink()
+    old_entry.rmdir()
+    old_root.rmdir()
+
+    async with db.session() as session:
+        old = (await session.execute(select(LibraryFile))).scalar_one()
+        old_id = old.id
+        await LibraryRepository(session).update(
+            library.id, name="电影库", root_paths=[str(new_root)]
+        )
+
+    summary = await scan_library(
+        library.id,
+        reconcile_root_change=True,
+        previous_root_paths=[str(old_root)],
+    )
+    assert summary.scanned == 0
+    assert summary.root_relinked == 1
+    async with db.session() as session:
+        rows = list((await session.execute(select(LibraryFile))).scalars().all())
+    assert len(rows) == 1
+    assert rows[0].id == old_id
+    assert rows[0].file_path == str(new_file)
+
+
+async def test_rescan_does_not_merge_same_fingerprint_different_inode(db, tmp_path) -> None:
+    """旧入口仍可访问且 inode 已不同，不能被尺寸/mtime 指纹误合并。"""
+    old_root = tmp_path / "old-mount"
+    old_entry = old_root / "某电影 (2020)"
+    old_entry.mkdir(parents=True)
+    old_file = old_entry / "某电影.2020.mkv"
+    old_file.write_bytes(b"movie")
+    (old_entry / "movie.nfo").write_text("<movie><tmdbid>300</tmdbid></movie>", encoding="utf-8")
+
+    async with db.session() as session:
+        library = await LibraryRepository(session).create(
+            name="电影库", kind="movie", root_paths=[str(old_root)]
+        )
+    await scan_library(library.id)
+
+    new_root = tmp_path / "new-mount"
+    new_entry = new_root / "某电影 (2020)"
+    new_entry.mkdir(parents=True)
+    new_file = new_entry / "某电影.2020.mkv"
+    shutil.copy2(old_file, new_file)
+    os.utime(new_file, ns=(old_file.stat().st_atime_ns, old_file.stat().st_mtime_ns))
+    (new_entry / "movie.nfo").write_text("<movie><tmdbid>300</tmdbid></movie>", encoding="utf-8")
+
+    async with db.session() as session:
+        await LibraryRepository(session).update(
+            library.id, name="电影库", root_paths=[str(new_root)]
+        )
+
+    summary = await scan_library(
+        library.id,
+        reconcile_root_change=True,
+        previous_root_paths=[str(old_root)],
+    )
+    assert summary.root_relinked == 0
+    async with db.session() as session:
+        rows = list((await session.execute(select(LibraryFile))).scalars().all())
+    assert len(rows) == 2
+
+
+async def test_reconcile_duplicate_clears_idle_subtitle_job_state(
+    db, tmp_path, monkeypatch
+) -> None:
+    """合并重复行时清理未执行的字幕续传状态，不让它在重启后指向已删行。"""
+    root = tmp_path / "media" / "movies"
+    entry = root / "某电影 (2020)"
+    entry.mkdir(parents=True)
+    (entry / "某电影.2020.mkv").write_bytes(b"movie")
+    (entry / "movie.nfo").write_text("<movie><tmdbid>300</tmdbid></movie>", encoding="utf-8")
+    alias = tmp_path / "mounted-movies"
+    alias.symlink_to(root, target_is_directory=True)
+    monkeypatch.chdir(tmp_path)
+
+    async with db.session() as session:
+        library = await LibraryRepository(session).create(
+            name="电影库", kind="movie", root_paths=[str(root)]
+        )
+    await scan_library(library.id)
+
+    async with db.session() as session:
+        old = (await session.execute(select(LibraryFile))).scalar_one()
+        duplicate = LibraryFile(
+            library_id=library.id,
+            media_item_id=old.media_item_id,
+            file_path=str(alias / "某电影 (2020)" / "某电影.2020.mkv"),
+            size_bytes=5,
+            source="scanned",
+        )
+        session.add(duplicate)
+        await session.commit()
+        assert duplicate.id is not None
+        await LibraryRepository(session).update(
+            library.id, name="电影库", root_paths=[str(alias)]
+        )
+
+    intent = subtitle_tasks.GenerationIntent(duplicate.id, "chs")
+    subtitle_tasks._persist_intent(intent)
+    checkpoint = subtitle_tasks.translate.Checkpoint(duplicate.id, "chs", "test")
+    checkpoint.save()
+    subtitle_tasks._tasks.finish(
+        duplicate.id,
+        result=subtitle_tasks.GenResult(ok=True, message="旧结果"),
+    )
+
+    await scan_library(
+        library.id,
+        reconcile_root_change=True,
+        previous_root_paths=[str(root)],
+    )
+    assert not subtitle_tasks._intent_path(intent).exists()
+    assert not checkpoint.path.exists()
+    assert subtitle_tasks.last_result(duplicate.id) is None
+    async with db.session() as session:
+        rows = list((await session.execute(select(LibraryFile))).scalars().all())
+    assert len(rows) == 1
+
+
+async def test_reconcile_duplicate_preserves_running_subtitle_task(
+    db, tmp_path, monkeypatch
+) -> None:
+    """重复行正在生成字幕时保留它的 id，任务可继续且台账仍会收敛。"""
+    root = tmp_path / "media" / "movies"
+    entry = root / "某电影 (2020)"
+    entry.mkdir(parents=True)
+    (entry / "某电影.2020.mkv").write_bytes(b"movie")
+    (entry / "movie.nfo").write_text("<movie><tmdbid>300</tmdbid></movie>", encoding="utf-8")
+    alias = tmp_path / "mounted-movies"
+    alias.symlink_to(root, target_is_directory=True)
+    states: TaskState[subtitle_tasks.GenState] = TaskState()
+    monkeypatch.setattr(subtitle_tasks, "_tasks", states)
+
+    async with db.session() as session:
+        library = await LibraryRepository(session).create(
+            name="电影库", kind="movie", root_paths=[str(root)]
+        )
+    await scan_library(library.id)
+
+    async with db.session() as session:
+        old = (await session.execute(select(LibraryFile))).scalar_one()
+        duplicate = LibraryFile(
+            library_id=library.id,
+            media_item_id=old.media_item_id,
+            file_path=str(alias / "某电影 (2020)" / "某电影.2020.mkv"),
+            size_bytes=5,
+            source="scanned",
+        )
+        session.add(duplicate)
+        await session.commit()
+        assert duplicate.id is not None
+        assert states.try_start(duplicate.id, subtitle_tasks.GenState())
+        await LibraryRepository(session).update(
+            library.id, name="电影库", root_paths=[str(alias)]
+        )
+
+    summary = await scan_library(
+        library.id,
+        reconcile_root_change=True,
+        previous_root_paths=[str(root)],
+    )
+    assert summary.errors == []
+    async with db.session() as session:
+        rows = list((await session.execute(select(LibraryFile))).scalars().all())
+    assert len(rows) == 1
+    assert rows[0].id == duplicate.id
+    assert subtitle_tasks.is_generation_running(duplicate.id)
+
+
+async def test_reconcile_duplicate_waits_when_both_subtitle_tasks_are_running(
+    db, tmp_path, monkeypatch
+) -> None:
+    """两条重复台账各有运行任务时，不删任一行，留待任务结束后再合并。"""
+    root = tmp_path / "media" / "movies"
+    entry = root / "某电影 (2020)"
+    entry.mkdir(parents=True)
+    (entry / "某电影.2020.mkv").write_bytes(b"movie")
+    (entry / "movie.nfo").write_text("<movie><tmdbid>300</tmdbid></movie>", encoding="utf-8")
+    alias = tmp_path / "mounted-movies"
+    alias.symlink_to(root, target_is_directory=True)
+    states: TaskState[subtitle_tasks.GenState] = TaskState()
+    monkeypatch.setattr(subtitle_tasks, "_tasks", states)
+
+    async with db.session() as session:
+        library = await LibraryRepository(session).create(
+            name="电影库", kind="movie", root_paths=[str(root)]
+        )
+    await scan_library(library.id)
+
+    async with db.session() as session:
+        old = (await session.execute(select(LibraryFile))).scalar_one()
+        duplicate = LibraryFile(
+            library_id=library.id,
+            media_item_id=old.media_item_id,
+            file_path=str(alias / "某电影 (2020)" / "某电影.2020.mkv"),
+            size_bytes=5,
+            source="scanned",
+        )
+        session.add(duplicate)
+        await session.commit()
+        assert old.id is not None and duplicate.id is not None
+        assert states.try_start(old.id, subtitle_tasks.GenState())
+        assert states.try_start(duplicate.id, subtitle_tasks.GenState())
+        await LibraryRepository(session).update(
+            library.id, name="电影库", root_paths=[str(alias)]
+        )
+
+    summary = await scan_library(
+        library.id,
+        reconcile_root_change=True,
+        previous_root_paths=[str(root)],
+    )
+    assert any("两个字幕任务" in error for error in summary.errors)
+    async with db.session() as session:
+        rows = list((await session.execute(select(LibraryFile))).scalars().all())
+    assert len(rows) == 2
 
 
 async def test_scan_prefers_nfo_identity(db, tmp_path) -> None:

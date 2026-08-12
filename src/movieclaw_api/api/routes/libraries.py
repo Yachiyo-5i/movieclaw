@@ -744,7 +744,10 @@ async def update_library(
     service = LibraryConfigService(session)
     before = await service.get(library_id)
     _assert_not_busy(before.name, library_id)
-    roots_changed = list(before.root_paths) != [p.strip() for p in payload.root_paths if p.strip()]
+    # ``service.update`` 在同一 ORM 会话里原地修改实体；先取不可变快照，后台
+    # 扫描才能知道这次编辑真正替换的是哪些根，而不是读到更新后的新根列表。
+    previous_root_paths = list(before.root_paths)
+    roots_changed = previous_root_paths != [p.strip() for p in payload.root_paths if p.strip()]
     row = await service.update(
         library_id,
         name=payload.name,
@@ -754,7 +757,15 @@ async def update_library(
     )
     # 根路径变了就自动补扫：新目录的存量立刻入账，移除目录下的文件标记 missing
     if roots_changed:
-        background_tasks.add_task(scan_library, library_id)
+        # 这轮扫描额外按 inode 对账旧根遗留台账：根路径只是换了挂载别名/软链接
+        # 入口时，原行随迁而不是把同一文件再入账一遍。普通手动扫描不做该
+        # 对账，避免为已移除根路径下的历史记录反复触发文件系统访问。
+        background_tasks.add_task(
+            scan_library,
+            library_id,
+            reconcile_root_change=True,
+            previous_root_paths=previous_root_paths,
+        )
         return ok(
             LibraryView.from_model(row, scanning=True, scan_progress=_queued_scan_view()),
             message="已更新，正在按新的根路径重新扫描",

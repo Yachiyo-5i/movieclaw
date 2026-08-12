@@ -295,6 +295,7 @@ class ScanSummary:
     unidentified: int = 0  # 落账但待识别
     kind_mismatched: int = 0  # 其中因"类型与本库不符"待识别的（库类型可能选错了）
     relinked: int = 0  # 改名归并：旧台账行迁到新路径（身份延续，不算新入账）
+    root_relinked: int = 0  # 改根路径后的同实体台账随迁（不算新入账）
     skipped_known: int = 0  # 已在台账、直接跳过
     skipped_ignored: int = 0  # 用户忽略过的文件，不再重走识别链
     marked_missing: int = 0  # 台账有但磁盘上已消失，标记 missing
@@ -382,6 +383,8 @@ async def scan_library(
     *,
     backfill_existing_specs: bool = True,
     reprobe_paths: set[str] | None = None,
+    reconcile_root_change: bool = False,
+    previous_root_paths: list[str] | None = None,
 ) -> ScanSummary:
     """扫描一个库的全部根路径（后台任务入口；自开会话，不向外抛异常）。
 
@@ -396,6 +399,12 @@ async def scan_library(
     (size, mtime)，确认变化才重探——视频原地替换（洗版/重灌同路径）后
     介质规格与内封字幕轨不再永久陈旧。手动扫描（backfill_existing_specs
     开启）则对全部在位行做该比对，无需点名。
+
+    ``reconcile_root_change`` 仅由媒体库编辑根路径后的后台扫描传入，且必须
+    同时给出编辑前的 ``previous_root_paths``。它以旧/新根下相同的相对路径
+    为候选，用 inode（被替换的旧入口不可访问时退回台账指纹）确认同一实体，防止
+    挂载别名、软链接等换入口时重复入账。普通手动扫描/监听扫描不做这一步，
+    以免把已移除根目录下的历史记录误作迁移。
     """
     from movieclaw_api.services.library.organize import is_organizing
     from movieclaw_api.services.library.transfer import is_transferring
@@ -430,6 +439,8 @@ async def scan_library(
             state,
             backfill_existing_specs=backfill_existing_specs,
             reprobe_paths=reprobe_paths or set(),
+            reconcile_root_change=reconcile_root_change,
+            previous_root_paths=previous_root_paths or [],
         )
     except Exception:  # noqa: BLE001 -- 后台任务兜底
         logger.exception("媒体库 #%s 扫描时发生未知错误", library_id)
@@ -450,6 +461,8 @@ async def _scan(
     *,
     backfill_existing_specs: bool,
     reprobe_paths: set[str],
+    reconcile_root_change: bool,
+    previous_root_paths: list[str],
 ) -> ScanSummary:
     db = get_database()
     async with db.session() as session:
@@ -505,6 +518,23 @@ async def _scan(
                     continue
                 seen_paths.add(str(file))
                 pending.append((root_path, file, is_disc))
+
+        # 根路径编辑后的同实体收敛：用户可能把 ``/media/movies`` 改成指向
+        # 同一目录的挂载别名/软链接。此时磁盘对象没有变，台账里的旧路径却已
+        # 不在当前根下；若直接按字符串入账，就会把同一文件显示成两份。
+        #
+        # 不把 inode 当作全局去重键：当前根里的两个硬链接可能是用户有意保留的
+        # 两个版本。只有「旧台账路径脱离当前根」且「本轮扫描路径在当前根」的
+        # 组合，才是根路径改写遗留的确定信号，见 _relink_legacy_root_paths。
+        if reconcile_root_change:
+            await _relink_legacy_root_paths(
+                session,
+                library,
+                known,
+                pending,
+                summary,
+                previous_root_paths=previous_root_paths,
+            )
 
         assert library.id is not None
         # 分母定了，进入逐文件入账阶段
@@ -749,7 +779,7 @@ async def _scan(
         )
     logger.info(
         "媒体库 #%s 文件入账完成：新入账 %d（已识别 %d / 待识别 %d），识别重试 %d，"
-        "身份复核 %d（存疑 %d），改名归并 %d，跳过已知 %d，跳过已忽略 %d，"
+        "身份复核 %d（存疑 %d），改名归并 %d，根路径随迁 %d，跳过已知 %d，跳过已忽略 %d，"
         "标记丢失 %d，清理丢失 %d，暂缓 %d，问题 %d",
         library_id,
         summary.scanned - summary.relinked,
@@ -759,6 +789,7 @@ async def _scan(
         summary.reviewed,
         summary.review_flagged,
         summary.relinked,
+        summary.root_relinked,
         summary.skipped_known,
         summary.skipped_ignored,
         summary.marked_missing,
@@ -990,6 +1021,272 @@ def _walk_videos(
                 logger.debug("跳过花絮/预告类文件（命中「%s」）：%s", marker, entry)
                 continue
             yield entry, False
+
+
+async def _relink_legacy_root_paths(
+    session,
+    library: Library,
+    known: dict[str, LibraryFile],
+    pending: list[tuple[Path, Path, bool]],
+    summary: ScanSummary,
+    *,
+    previous_root_paths: list[str],
+) -> None:
+    """根路径编辑后，将同一实体的旧台账路径迁到当前扫描路径。
+
+    根编辑请求同时带来修改前后的根列表。只将同一旧根/新根组合下**相同
+    相对路径**的文件配对：这既让新增软链接别名根也能复用原行，又不会把
+    同库不同目录里用户有意保留的硬链接误合并。旧入口能访问时必须同 inode；
+    旧挂载点已经撤掉时，则由台账中已记录的尺寸和 mtime 双重校验兜底。
+
+    不扫描历史 ``missing`` 行：它们的路径不一定仍对应用户本次编辑的根，
+    静默复活会污染缺失清单。一个新路径有多个候选时同样不处理，宁可本轮
+    重新走原有入账链路，也不能猜测并吞掉人工台账。
+    """
+    old_roots = [Path(root) for root in previous_root_paths]
+    new_roots = [Path(root) for root in library.root_paths]
+    if not old_roots or not new_roots:
+        return
+
+    def _stat(path: Path):
+        try:
+            return path.stat()
+        except OSError:
+            return None
+
+    pending_by_path = {str(file): file for _root, file, _is_disc in pending}
+    # 记录候选所属的旧根：旧根仍在新配置中时，跨设备号的尺寸/mtime 一致
+    # 不足以证明同一实体（两个独立根也可能恰好有同名、同大小的文件）。
+    candidates_by_path: dict[str, list[tuple[LibraryFile, Path]]] = {}
+    for row in known.values():
+        if row.missing_since is not None:
+            continue
+        old_path = Path(row.file_path)
+        for old_root in old_roots:
+            try:
+                relative = old_path.relative_to(old_root)
+            except ValueError:
+                continue
+            for new_root in new_roots:
+                new_path = str(new_root / relative)
+                if new_path != row.file_path and new_path in pending_by_path:
+                    candidates_by_path.setdefault(new_path, []).append((row, old_root))
+            break
+
+    changed = False
+    removed_subtitle_job_ids: list[int] = []
+    for path_str, old_rows in candidates_by_path.items():
+        if len(old_rows) != 1:
+            continue
+        old, old_root = old_rows[0]
+        file = pending_by_path[path_str]
+        current_stat, old_stat = await asyncio.gather(
+            asyncio.to_thread(_stat, file),
+            asyncio.to_thread(_stat, Path(old.file_path)),
+        )
+        if current_stat is None:
+            continue
+        if old_stat is not None and old_stat.st_dev == current_stat.st_dev:
+            # 同一文件系统中 inode 不同就是不同实体，不能由尺寸/mtime 推翻。
+            if old_stat.st_ino != current_stat.st_ino:
+                continue
+        elif old_root in new_roots or not _matches_ledger_fingerprint(old, current_stat):
+            # 保留旧根又新增另一根时，跨设备号不能只凭持久化指纹合并：两个
+            # 独立目录可能刚好同大小、同 mtime。仅在旧根已被替换时，才允许
+            # 旧入口不可达/跨挂载命名空间时的指纹回退；它不替代同文件系统
+            # 内明确的 inode 反证。
+            continue
+        current = known.get(path_str)
+        if current is old:
+            continue
+        if current is None:
+            # 新增的是原根的别名时，原路径仍会在这一轮被遍历。保留它作为
+            # 主台账路径，并把别名映射到同一行，扫描主循环因此两边都秒过，
+            # 而不是把原行迁到别名后又把原路径重新入账。
+            if old.file_path in pending_by_path:
+                known[path_str] = old
+                summary.root_relinked += 1
+                logger.info("根路径新增别名，同一文件复用原台账：%s ↔ %s", old.file_path, path_str)
+                continue
+            old_path = old.file_path
+            _relocate_root_ledger_row(old, path_str)
+            known.pop(old_path, None)
+            known[path_str] = old
+            summary.root_relinked += 1
+            changed = True
+            logger.info("根路径变更，同一文件台账已随迁：%s → %s", old_path, path_str)
+            continue
+        # 当前路径已经有行，说明此前一次重扫已经造成重复。只有身份完全一致
+        # （或一边还未识别）才自动合并；互相冲突时宁可保留两行并记问题，不能
+        # 静默吞掉用户人工认领的结论。
+        if not _can_merge_same_file_rows(old, current):
+            summary.errors.append(
+                f"同一文件存在冲突台账，未自动合并：{old.file_path} ↔ {path_str}"
+            )
+            logger.warning(
+                "根路径变更发现同一文件的台账身份冲突，未自动合并：%s ↔ %s",
+                old.file_path,
+                path_str,
+            )
+            continue
+        assert old.id is not None and current.id is not None
+        from movieclaw_api.services.subtitle_gen.tasks import (
+            is_generation_running,
+        )
+
+        old_running = is_generation_running(old.id)
+        current_running = is_generation_running(current.id)
+        if old_running and current_running:
+            summary.errors.append(
+                f"同一文件的重复台账有两个字幕任务在运行，暂不合并：{path_str}"
+            )
+            continue
+        survivor, duplicate = (current, old) if current_running else (old, current)
+        assert duplicate.id is not None
+        old_path = old.file_path
+        old_path_is_still_scanned = old_path in pending_by_path
+        await _merge_same_file_rows(
+            session,
+            survivor,
+            duplicate,
+            # 保留原根又新增别名时，两个入口本轮都会被遍历。若无运行任务，
+            # 原路径仍是更早的权威台账地址；若要保留新路径的运行任务，则它
+            # 本来就已指向别名路径。无论哪种情况，下面都会让两个 key 指向
+            # 同一行，避免主循环把另一个入口重新入账。
+            file_path=(
+                old_path
+                if old_path_is_still_scanned and survivor is old
+                else path_str
+            ),
+        )
+        known.pop(old_path, None)
+        if old_path_is_still_scanned:
+            known[old_path] = survivor
+        known[path_str] = survivor
+        removed_subtitle_job_ids.append(duplicate.id)
+        summary.root_relinked += 1
+        changed = True
+        logger.info(
+            "根路径变更的重复台账已合并：%s → %s%s",
+            old_path,
+            path_str,
+            "（保留正在生成字幕的当前台账行）" if current_running else "",
+        )
+    if changed:
+        # 根路径改写往往涉及整库几千行；必须作为一次事务提交，而不是每个
+        # 文件一次 SQLite fsync。任何中途异常都会由 session 上下文回滚，
+        # 不会留下半迁移台账。
+        await session.commit()
+        # 任务意图/断点属于文件系统状态，只能在行删除已经提交后再清理；否则
+        # 数据库提交失败时会出现“台账还在、续传状态先没了”的不一致。
+        from movieclaw_api.services.subtitle_gen.tasks import discard_removed_file_job_state
+
+        for file_id in removed_subtitle_job_ids:
+            discard_removed_file_job_state(file_id)
+
+
+def _matches_ledger_fingerprint(row: LibraryFile, stat) -> bool:
+    """旧根不可访问时，确认新文件仍是原台账记录的受限回退证据。
+
+    inode 只能在同一挂载命名空间中比较；用户把 ``/mnt/media`` 换成另一个
+    容器挂载点后，旧路径常已不可见、``st_dev`` 也会变化。此时只有尺寸和
+    mtime 均在旧行中存在且精确一致才允许迁移，缺一项就放弃，不能用弱指纹
+    把同尺寸洗版误认为同一文件。
+    """
+    return (
+        row.size_bytes == stat.st_size
+        and row.file_mtime_ns is not None
+        and row.file_mtime_ns == stat.st_mtime_ns
+    )
+
+
+def _can_merge_same_file_rows(old: LibraryFile, current: LibraryFile) -> bool:
+    """同一实体的两行台账能否无损自动合并。
+
+    同一文件原则上身份应当相同；允许一边尚未识别，或同一 media item 的季集
+    号尚有旧数据缺失。人工认领和机器结果互相指向不同单元时必须由用户处理。
+    """
+    if old.media_item_id is not None and current.media_item_id is not None:
+        if old.media_item_id != current.media_item_id:
+            return False
+        return (old.season_number, old.episode_number) == (
+            current.season_number,
+            current.episode_number,
+        )
+    return True
+
+
+def _relocate_root_ledger_row(row: LibraryFile, file_path: str) -> None:
+    """原地改写台账路径，保留主键及全部既有识别、规格与来源信息。"""
+    row.file_path = file_path
+    row.missing_since = None
+    row.updated_at = utcnow()
+
+
+async def _merge_same_file_rows(
+    session, survivor: LibraryFile, duplicate: LibraryFile, *, file_path: str
+) -> None:
+    """把根路径编辑产生的重复行合并进保留行，再删除另一行。
+
+    常规路径保留根编辑前的原台账行，Jellyfin 来源 ID 等外部引用因此不中断；
+    但若新路径行正在生成字幕，保留它才能让任务继续按原 file_id 取行。重复
+    行中更完整的人工身份、规格和来源信息会补回保留行。数据库没有外键引用
+    ``library_file``，删除另一行不会留下悬空关联。
+    """
+    survivor_is_manual = survivor.identity_source == IdentitySource.MANUAL
+    duplicate_is_manual = duplicate.identity_source == IdentitySource.MANUAL
+    if duplicate.media_item_id is not None and (
+        survivor.media_item_id is None or duplicate_is_manual and not survivor_is_manual
+    ):
+        survivor.media_item_id = duplicate.media_item_id
+        survivor.season_number = duplicate.season_number
+        survivor.episode_number = duplicate.episode_number
+        survivor.identity_source = duplicate.identity_source
+        survivor.resolved_version = duplicate.resolved_version
+        survivor.review_suggestion = duplicate.review_suggestion
+        survivor.unidentified_reason = None
+        survivor.unidentified_code = None
+        survivor.unidentified_candidates = None
+    if survivor.file_mtime_ns is None:
+        survivor.file_mtime_ns = duplicate.file_mtime_ns
+    if survivor.container is None:
+        survivor.container = duplicate.container
+    for field_name in (
+        "resolution",
+        "video_codec",
+        "hdr",
+        "bit_depth",
+        "duration_seconds",
+        "bit_rate",
+        "audio_streams",
+        "subtitle_streams",
+        "external_subtitles",
+        "media_source",
+        "release_group",
+        "site_id",
+        "torrent_id",
+    ):
+        if getattr(survivor, field_name) is None:
+            setattr(survivor, field_name, getattr(duplicate, field_name))
+    if survivor.source == FileSource.SCANNED and duplicate.source == FileSource.IMPORTED:
+        survivor.source = duplicate.source
+    if survivor.ignored_at is None:
+        survivor.ignored_at = duplicate.ignored_at
+    if survivor.media_item_id is None:
+        for field_name in (
+            "unidentified_reason",
+            "unidentified_code",
+            "unidentified_candidates",
+        ):
+            if getattr(survivor, field_name) is None:
+                setattr(survivor, field_name, getattr(duplicate, field_name))
+    # file_path 有唯一索引，必须先让重复行的 DELETE 落到数据库，才能把原行
+    # 迁到新路径；同一事务保证外界只会看到合并前或合并后的完整状态。
+    await session.delete(duplicate)
+    await session.flush()
+    survivor.file_path = file_path
+    survivor.missing_since = None
+    survivor.updated_at = utcnow()
 
 
 async def _refresh_known_row(
