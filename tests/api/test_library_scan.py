@@ -1538,7 +1538,7 @@ async def test_identity_review_lifecycle(db, tmp_path, monkeypatch) -> None:
 
         # ⑥ 采纳建议：改挂新条目并转人工
         await resolve_identity_review(
-            ReviewResolvePayload(file_ids=group.file_ids, accept=True),
+            ReviewResolvePayload(file_ids=group.file_ids, decision="accept_suggestion"),
             BackgroundTasks(),
             session,
         )
@@ -1580,7 +1580,7 @@ async def test_identity_review_reject_keeps_identity(db, tmp_path, monkeypatch) 
     async with db.session() as session:
         row = (await session.execute(select(LibraryFile))).scalars().one()
         await resolve_identity_review(
-            ReviewResolvePayload(file_ids=[row.id], accept=False),
+            ReviewResolvePayload(file_ids=[row.id], decision="keep_current"),
             BackgroundTasks(),
             session,
         )
@@ -2437,7 +2437,7 @@ async def test_claim_batch_fixes_whole_group_at_once(db, tmp_path, monkeypatch) 
 
     async with db.session() as session:
         rows = list((await session.execute(select(LibraryFile))).scalars().all())
-        payload = ClaimBatchPayload(file_ids=[r.id for r in rows], tmdb_id=900)
+        payload = ClaimBatchPayload(file_ids=[r.id for r in rows], title_ref="tmdb:tv:900")
         resp = await claim_files_batch(payload, BackgroundTasks(), session)
     assert resp.data["claimed"] == 2
 

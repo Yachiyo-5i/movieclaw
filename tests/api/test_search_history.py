@@ -39,7 +39,7 @@ def _history(client: TestClient, **params) -> list[dict]:
 
 def test_search_records_history_with_scope_snapshot(client: TestClient) -> None:
     client.get(
-        "/api/v1/search",
+        "/api/v1/search/torrents",
         params={
             "keyword": "沙丘",
             "categories": ["movie", "documentary"],
@@ -63,11 +63,11 @@ def test_search_records_history_with_scope_snapshot(client: TestClient) -> None:
 def test_same_scope_dedups_regardless_of_order(client: TestClient) -> None:
     """同关键词 + 同组合（顺序不同）视为同一条历史，只累加计数。"""
     client.get(
-        "/api/v1/search",
+        "/api/v1/search/torrents",
         params={"keyword": "沙丘", "categories": ["movie", "tv"], "label": "A"},
     )
     client.get(
-        "/api/v1/search",
+        "/api/v1/search/torrents",
         params={"keyword": "沙丘", "categories": ["tv", "movie"], "label": "B"},
     )
 
@@ -79,10 +79,10 @@ def test_same_scope_dedups_regardless_of_order(client: TestClient) -> None:
 
 
 def test_different_scope_kept_apart(client: TestClient) -> None:
-    client.get("/api/v1/search", params={"keyword": "沙丘"})
-    client.get("/api/v1/search", params={"keyword": "沙丘", "categories": ["movie"]})
+    client.get("/api/v1/search/torrents", params={"keyword": "沙丘"})
+    client.get("/api/v1/search/torrents", params={"keyword": "沙丘", "categories": ["movie"]})
     client.get(
-        "/api/v1/search",
+        "/api/v1/search/torrents",
         params={"keyword": "沙丘", "categories": ["movie"], "sites": ["mteam"]},
     )
 
@@ -92,7 +92,7 @@ def test_different_scope_kept_apart(client: TestClient) -> None:
 
 def test_unscoped_search_has_null_label_empty_lists(client: TestClient) -> None:
     """「全部」标签的搜索：label 为 null、组合为空列表。"""
-    client.get("/api/v1/search", params={"keyword": "沙丘"})
+    client.get("/api/v1/search/torrents", params={"keyword": "沙丘"})
 
     items = _history(client)
     assert items[0]["label"] is None
@@ -101,8 +101,8 @@ def test_unscoped_search_has_null_label_empty_lists(client: TestClient) -> None:
 
 
 def test_pagination_not_recorded_again(client: TestClient) -> None:
-    client.get("/api/v1/search", params={"keyword": "沙丘"})
-    client.get("/api/v1/search", params={"keyword": "沙丘", "page": 2})
+    client.get("/api/v1/search/torrents", params={"keyword": "沙丘"})
+    client.get("/api/v1/search/torrents", params={"keyword": "沙丘", "page": 2})
 
     items = _history(client)
     assert len(items) == 1
@@ -112,23 +112,23 @@ def test_pagination_not_recorded_again(client: TestClient) -> None:
 def test_no_history_search_not_recorded(client: TestClient) -> None:
     """无痕搜索（no_history=true，来自开了「无痕」的自定义分类）不落历史。"""
     resp = client.get(
-        "/api/v1/search", params={"keyword": "沙丘", "no_history": "true"}
+        "/api/v1/search/torrents", params={"keyword": "沙丘", "no_history": "true"}
     )
     assert resp.status_code == 200  # 搜索本身正常执行
 
     assert _history(client) == []
 
     # 同关键词的普通搜索照常记录，计数从 1 开始（无痕那次没有被计入）
-    client.get("/api/v1/search", params={"keyword": "沙丘"})
+    client.get("/api/v1/search/torrents", params={"keyword": "沙丘"})
     items = _history(client)
     assert len(items) == 1
     assert items[0]["search_count"] == 1
 
 
 def test_history_ordered_by_recency(client: TestClient) -> None:
-    client.get("/api/v1/search", params={"keyword": "沙丘"})
-    client.get("/api/v1/search", params={"keyword": "奥本海默"})
-    client.get("/api/v1/search", params={"keyword": "沙丘"})  # 再搜一次，应升到最前
+    client.get("/api/v1/search/torrents", params={"keyword": "沙丘"})
+    client.get("/api/v1/search/torrents", params={"keyword": "奥本海默"})
+    client.get("/api/v1/search/torrents", params={"keyword": "沙丘"})  # 再搜一次，应升到最前
 
     items = _history(client)
     assert [i["keyword"] for i in items] == ["沙丘", "奥本海默"]
@@ -139,14 +139,14 @@ def test_history_ordered_by_recency(client: TestClient) -> None:
 
 def test_history_limit_counts_keyword_groups(client: TestClient) -> None:
     """同关键词的不同范围属于一组，limit=1 仍应返回该组的全部记录。"""
-    client.get("/api/v1/search", params={"keyword": "奥本海默"})
-    client.get("/api/v1/search", params={"keyword": "星际穿越"})
+    client.get("/api/v1/search/torrents", params={"keyword": "奥本海默"})
+    client.get("/api/v1/search/torrents", params={"keyword": "星际穿越"})
     client.get(
-        "/api/v1/search",
+        "/api/v1/search/torrents",
         params={"keyword": "星际穿越", "categories": ["movie"], "label": "电影"},
     )
     client.get(
-        "/api/v1/search",
+        "/api/v1/search/torrents",
         params={"keyword": "星际穿越", "categories": ["tv"], "label": "剧集"},
     )
 
@@ -157,7 +157,7 @@ def test_history_limit_counts_keyword_groups(client: TestClient) -> None:
 
 
 def test_delete_single_history(client: TestClient) -> None:
-    client.get("/api/v1/search", params={"keyword": "沙丘"})
+    client.get("/api/v1/search/torrents", params={"keyword": "沙丘"})
     history_id = _history(client)[0]["id"]
 
     assert client.delete(f"/api/v1/search/history/{history_id}").status_code == 200
@@ -167,8 +167,8 @@ def test_delete_single_history(client: TestClient) -> None:
 
 
 def test_clear_all_history(client: TestClient) -> None:
-    client.get("/api/v1/search", params={"keyword": "沙丘"})
-    client.get("/api/v1/search", params={"keyword": "奥本海默"})
+    client.get("/api/v1/search/torrents", params={"keyword": "沙丘"})
+    client.get("/api/v1/search/torrents", params={"keyword": "奥本海默"})
 
     assert client.delete("/api/v1/search/history").status_code == 200
     assert _history(client) == []

@@ -7,8 +7,8 @@ import { useConfirm } from "@/components/feedback";
 import { SearchIcon } from "@/components/icons";
 import {
   clearSearchHistory,
-  deleteSearchHistory,
-  fetchSearchHistory,
+  deleteSearchHistoryEntry,
+  listSearchHistory,
   type SearchHistoryItem,
 } from "@/lib/api/search";
 import {
@@ -264,7 +264,7 @@ function SearchPalette({
   // 历史存在后端（search_history 表）；limit 按关键词组计算，组内范围会完整返回。
   useEffect(() => {
     let cancelled = false;
-    fetchSearchHistory(8)
+    listSearchHistory(8)
       .then((list) => !cancelled && setItems(list))
       .catch(() => !cancelled && setItems([]));
     return () => {
@@ -276,7 +276,7 @@ function SearchPalette({
     () =>
       groupHistory(
         (items ?? []).filter((item) =>
-          item.vertical === "media" ? searchAccess.canMedia : searchAccess.canTorrent,
+          item.vertical === "titles" ? searchAccess.canMedia : searchAccess.canTorrent,
         ),
       ),
     [items, searchAccess.canMedia, searchAccess.canTorrent],
@@ -310,7 +310,7 @@ function SearchPalette({
   /** 点开一条历史：按记录自身的垂直回放，有快照进快照预览，没有发起实时搜索。 */
   const pick = (item: SearchHistoryItem) => {
     const snapshotId = item.has_snapshot ? item.id : undefined;
-    if (item.vertical === "media") {
+    if (item.vertical === "titles") {
       onSearch(item.keyword, SCOPE_ALL, { vertical: "media", snapshotId });
       return;
     }
@@ -380,7 +380,7 @@ function SearchPalette({
 
   const removeOne = (id: number) => {
     setItems((prev) => (prev ? prev.filter((i) => i.id !== id) : prev));
-    deleteSearchHistory(id).catch(() => undefined);
+    deleteSearchHistoryEntry(id).catch(() => undefined);
   };
 
   const removeGroup = async (group: HistoryGroup) => {
@@ -396,7 +396,7 @@ function SearchPalette({
     }
     const ids = new Set(group.items.map((item) => item.id));
     setItems((prev) => (prev ? prev.filter((item) => !ids.has(item.id)) : prev));
-    Promise.all(group.items.map((item) => deleteSearchHistory(item.id))).catch(() => undefined);
+    Promise.all(group.items.map((item) => deleteSearchHistoryEntry(item.id))).catch(() => undefined);
   };
 
   const toggleGroup = (groupKey: string) => {
@@ -659,7 +659,7 @@ function HistoryGroupRow({
   onRemoveGroup: () => void;
 }) {
   const latest = group.items[0];
-  const mediaCount = group.items.filter((item) => item.vertical === "media").length;
+  const mediaCount = group.items.filter((item) => item.vertical === "titles").length;
   const torrentCount = group.items.length - mediaCount;
 
   // 单条记录不制造「只有一个孩子的分组」：沿用旧版扁平行，点击即进入该记录。
@@ -831,7 +831,7 @@ function HistoryVariantRow({
         className="flex min-w-0 flex-1 items-center gap-2 py-1.5 pl-2 text-left"
       >
         <span className="min-w-0 flex-1 truncate text-sub text-[var(--text-muted)]">
-          {item.vertical === "media" ? "影视" : `资源 · ${item.label ?? "全部"}`}
+          {item.vertical === "titles" ? "影视" : `资源 · ${item.label ?? "全部"}`}
         </span>
         {item.has_snapshot && (
           <span className="shrink-0 rounded-md bg-[#6aa7ff]/15 px-1.5 py-0.5 text-micro text-[#9cc2ff]">
@@ -843,7 +843,7 @@ function HistoryVariantRow({
         </span>
       </button>
       <DeleteHistoryButton
-        label={`删除搜索历史：${item.keyword}（${item.vertical === "media" ? "影视" : item.label ?? "资源全部"}）`}
+        label={`删除搜索历史：${item.keyword}（${item.vertical === "titles" ? "影视" : item.label ?? "资源全部"}）`}
         onClick={onRemove}
         className="touch-reveal mr-1 opacity-0 group-hover/variant:opacity-100"
       />
@@ -853,7 +853,7 @@ function HistoryVariantRow({
 
 /** 单记录组在主行直接显示垂直与资源分类，不必展开才能辨认。 */
 function HistoryTypeBadges({ item }: { item: SearchHistoryItem }) {
-  const isMedia = item.vertical === "media";
+  const isMedia = item.vertical === "titles";
   return (
     <>
       <span

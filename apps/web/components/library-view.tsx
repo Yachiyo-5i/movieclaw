@@ -24,7 +24,7 @@ import {
   type RoutingOptions,
   createLibrary,
   deleteLibrary,
-  getRoutingOptions,
+  listLibraryRoutingOptions,
   listLibraries,
   listLibraryItems,
   reorderLibraries,
@@ -64,7 +64,7 @@ function useRoutingOptions(): RoutingOptions | null {
   const [options, setOptions] = useState<RoutingOptions | null>(null);
   useEffect(() => {
     let cancelled = false;
-    routingOptionsPromise ??= getRoutingOptions();
+    routingOptionsPromise ??= listLibraryRoutingOptions();
     void routingOptionsPromise
       .then((o) => {
         if (!cancelled) setOptions(o);

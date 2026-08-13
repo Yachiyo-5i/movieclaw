@@ -41,6 +41,7 @@ async def claim_files(
     file_ids: list[int],
     *,
     tmdb_id: int,
+    target_kind: MediaKind | None = None,
     explicit_unit: tuple[int | None, int | None] | None = None,
 ) -> tuple[MediaItem, int, set[int]]:
     """把一组文件认领到指定 TMDB 条目，返回 ``(条目, 认领数, 被腾空的旧条目 id)``。
@@ -70,6 +71,10 @@ async def claim_files(
         raise BadRequestException("一次只能认领同一个媒体库内的文件")
     library = await LibraryConfigService(session).get(rows[0].library_id)
     kind = MediaKind(library.kind)
+    if target_kind is not None and target_kind is not kind:
+        raise BadRequestException(
+            f"影视条目类型 {target_kind.value} 与媒体库类型 {kind.value} 不一致"
+        )
     if explicit_unit is not None and kind is MediaKind.MOVIE and any(explicit_unit):
         raise BadRequestException("电影文件不需要季集号")
 

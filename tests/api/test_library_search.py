@@ -1,4 +1,4 @@
-"""媒体库搜索接口（GET /libraries/search）的端到端测试。
+"""媒体库搜索接口（GET /search/library-items）的端到端测试。
 
 覆盖：标题/原名子串匹配（忽略英文大小写）、按库分组与组内拼音排序、
 未识别文件不参与搜索、无命中回空列表。搜索页「媒体库」垂直的数据源。
@@ -107,7 +107,7 @@ async def _seed(db) -> None:
 
 
 async def _search(client: AsyncClient, keyword: str) -> list[dict]:
-    resp = await client.get("/api/v1/libraries/search", params={"keyword": keyword})
+    resp = await client.get("/api/v1/search/library-items", params={"keyword": keyword})
     assert resp.status_code == 200
     return resp.json()["data"]
 

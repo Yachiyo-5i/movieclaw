@@ -132,7 +132,7 @@ evaluate(rules, facts) -> bool:
 路由发生在**订阅创建那一刻**，结论固化进 `subscription.library_id`——
 之后的每次投递读的都是定格值，`dispatch()` 的三级兜底逻辑**一行不改**：
 
-- **弹窗预检**：`/subscriptions/dispatch-preview` 增加可选参数 `tmdb_id`。
+- **弹窗预检**：`/subscriptions/download-routing-preview` 接受可选参数 `tmdb_id`。
   `library_id` 缺省且能取到 facts 时返回路由结论与理由，前端预选该库并展示
   "自动：命中「动漫库」（类型=动画）"，用户可改——改了就是显式指定，规则退让；
 - **创建**：`payload.library_id` 为 None 时（前端异常/API 直调）后端兜底
@@ -279,7 +279,7 @@ evaluate(rules, facts) -> bool:
 是"订阅后能不能自动下载并入库"。体检以这个问题为锚，落位在新的
 「设置 → 订阅」分区（该分区同时是规则组等订阅级配置的家，此前缺位）。
 
-- **链路体检**（`/subscriptions/pipeline-health`）：逐库预演
+- **链路体检**（`/subscriptions/automation-readiness`）：逐库预演
   投递（下载器就绪/投递目录/映射覆盖）→ 转移（硬链同盘/监听生效，watch
   模式）两段。判定复用真实投递/搬运的同一批原语（resolve_dispatch_rule
   兜底顺序、mapping_covers、st_dev 比对）——**口径同源**，不存在"体检说好、

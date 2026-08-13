@@ -165,20 +165,20 @@ async def test_duplicate_subscribe_becomes_follow_and_cancel_semantics(db) -> No
         await service.assert_can_manage(sub.id, None)  # 超管直通
 
         # B 取消 = 只删关注行，订阅还在
-        message = await service.delete(sub.id, member_id=b)
+        message = await service.unsubscribe(sub.id, member_id=b)
         assert "关注" in message
         assert await repo.get(sub.id) is not None
         assert await repo.follower_member_ids(sub.id) == []
 
         # B 重新关注后 A 退出：发起人转移给 B，订阅继续活着
         await service.create(MediaKind.MOVIE, 100, member_id=b)
-        message = await service.delete(sub.id, member_id=a)
+        message = await service.unsubscribe(sub.id, member_id=a)
         assert "接管" in message or "继续" in message
         transferred = await repo.get(sub.id)
         assert transferred is not None and transferred.created_by_member_id == b
 
         # 新发起人 B 退出且无人关注：真删
-        await service.delete(sub.id, member_id=b)
+        await service.unsubscribe(sub.id, member_id=b)
         assert await repo.get(sub.id) is None
 
 

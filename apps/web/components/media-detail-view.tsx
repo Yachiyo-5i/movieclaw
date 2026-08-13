@@ -22,8 +22,8 @@ import { MediaRow } from "@/components/media-row";
 import { PosterImage } from "@/components/poster-image";
 import { SubscribeDialog, type SubscribeTarget } from "@/components/subscribe-dialog";
 import {
-  fetchDoubanMediaDetail,
-  fetchMediaDetail,
+  fetchDiscoveredTitleDetails,
+  titleRef,
   type MediaDetailData,
   type MediaImage,
 } from "@/lib/api/discover";
@@ -67,7 +67,7 @@ import {
  *   8. 相似推荐 —— 复用 MediaRow，点击可继续跳详情。
  *
  * 数据分两段呈现：点卡片时已有的列表字段（标题/海报/简介）立即渲染，
- * 词条信息与相似推荐从 /discover/{type}/{id} 异步补齐（回填片长/季数）。
+ * 词条信息与相似推荐从稳定 titleRef 对应的详情接口异步补齐（回填片长/季数）。
  */
 export function MediaDetailView({
   type,
@@ -94,30 +94,29 @@ export function MediaDetailView({
   // 订阅弹层的打开参数；null = 关闭
   const [subscribeTarget, setSubscribeTarget] = useState<SubscribeTarget | null>(null);
   // 站内点卡片跳转时预存的列表字段（标题/海报/简介），用于首屏零白屏；
-  // 硬刷新 / 分享链接直达时为空，此时全靠 /discover/{type}/{id} 拉取。
+  // 硬刷新 / 分享链接直达时为空，此时全靠 Discover 详情接口拉取。
   const listItem = getMediaSeed(source, id);
+  // 站内跳转优先沿用列表响应给出的稳定引用；硬刷新没有 seed 时，详情 URL
+  // 本身已携带等价的来源/类型/ID，再据此恢复引用。
+  const reference = listItem?.titleRef ?? titleRef(source, type ?? "movie", id);
 
   useEffect(() => {
     setDetail(null);
     setLoadFailed(false);
-    let cancelled = false;
-    const request =
-      source === "douban"
-        ? fetchDoubanMediaDetail(id)
-        : fetchMediaDetail(type ?? "movie", id);
-    request
+    const controller = new AbortController();
+    fetchDiscoveredTitleDetails(reference, {
+      signal: controller.signal,
+    })
       .then((data) => {
-        if (!cancelled) setDetail(data);
+        if (!controller.signal.aborted) setDetail(data);
       })
       .catch(() => {
         // 有 seed 时详情拉取失败不打断页面：列表字段仍可完整展示；
         // 无 seed（直达）时则没有任何可渲染内容，标记失败以显示兜底。
-        if (!cancelled) setLoadFailed(true);
+        if (!controller.signal.aborted) setLoadFailed(true);
       });
-    return () => {
-      cancelled = true;
-    };
-  }, [id, source, type]);
+    return () => controller.abort();
+  }, [reference]);
 
   // 详情接口回填过 extent（片长/季数）等字段，未返回前先用列表字段渲染
   const item = detail?.item ?? listItem;
@@ -182,13 +181,11 @@ export function MediaDetailView({
         item.badges.length > 0),
   );
 
-  /** 打开订阅弹层：TMDB 入口直接带 tmdb_id；豆瓣入口交给后端收敛。 */
+  /** 打开订阅弹层：稳定引用原样交给订阅 API，页面不再拆解来源与外部 ID。 */
   const openSubscribe = () =>
     setSubscribeTarget({
+      titleRef: reference,
       kind: item.type,
-      source,
-      tmdbId: source === "tmdb" ? Number(id) : undefined,
-      doubanId: source === "douban" ? id : undefined,
       title: item.title,
       year: item.year || undefined,
     });

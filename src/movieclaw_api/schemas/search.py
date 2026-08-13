@@ -1,4 +1,4 @@
-"""跨站点聚合搜索的返回 Schema。
+"""统一搜索中的种子结果、资源预设与历史结果 Schema。
 
 设计要点
 --------
@@ -63,7 +63,7 @@ class SearchResponse(BaseModel):
 
 # ---- SSE 流式搜索事件 ---------------------------------------------------------
 #
-# 流式搜索（GET /search/stream）把一次跨站搜索拆成一串事件推给前端，事件序列固定为：
+# 流式搜索（GET /search/torrents/stream）把一次跨站搜索拆成一串事件推给前端，事件序列固定为：
 #
 #   start → site_start × N → (site_result | site_error) × N → done
 #
@@ -160,16 +160,16 @@ class PresetTabItem(BaseModel):
 SearchTabItem = Annotated[CategoryTabItem | PresetTabItem, Field(discriminator="type")]
 
 
-class SearchPreferencesView(BaseModel):
-    """搜索偏好视图：永远返回**全量**内置分类（含隐藏项）+ 全部预设，供设置页完整渲染。"""
+class SearchPresetListView(BaseModel):
+    """资源搜索预设：全量内置分类（含隐藏项）+ 全部自定义组合。"""
 
-    tabs: list[SearchTabItem]
+    presets: list[SearchTabItem]
 
 
-class SearchPreferencesUpdate(BaseModel):
-    """保存搜索偏好的请求体：整份有序标签列表（缺失的内置分类由后端按默认补齐）。"""
+class SearchPresetUpdate(BaseModel):
+    """整体保存资源搜索预设；缺失的内置分类由后端按默认补齐。"""
 
-    tabs: list[SearchTabItem]
+    presets: list[SearchTabItem]
 
 
 class SearchHistoryItem(BaseModel):
@@ -181,7 +181,7 @@ class SearchHistoryItem(BaseModel):
 
     id: int
     keyword: str
-    vertical: str  # 搜索垂直：torrent=站点资源 / media=影视条目（豆瓣）
+    vertical: Literal["titles", "torrents"]
     label: str | None  # 展示名快照（分类中文名/预设名）；None=全部
     categories: list[str]  # 分类组合快照；空=不限分类
     site_ids: list[str]  # 站点组合快照；空=全部站点
@@ -204,7 +204,8 @@ class SearchHistoryItem(BaseModel):
         return cls(
             id=row.id,
             keyword=row.keyword,
-            vertical=row.vertical,
+            # 数据库存量值保持不变；公开契约使用可直接读懂的复数领域名。
+            vertical="titles" if row.vertical == "media" else "torrents",
             label=row.label,
             categories=json.loads(row.categories_json) if row.categories_json else [],
             site_ids=json.loads(row.site_ids_json) if row.site_ids_json else [],
@@ -215,14 +216,15 @@ class SearchHistoryItem(BaseModel):
         )
 
 
-class SearchSnapshotView(BaseModel):
-    """某条搜索历史的结果快照视图（GET /search/history/{id}/snapshot）。
+class TorrentSearchHistoryResultsView(BaseModel):
+    """一次历史 PT 资源搜索保存的完整结果。
 
     结构与 ``SearchResponse`` 同构（items/sites/total 直接复用前端结果页的渲染
     管线），外加历史行的范围回显与快照时间——前端据 ``snapshot_at`` 渲染
     「这是 X 分钟前的快照」提示条。
     """
 
+    vertical: Literal["torrents"] = "torrents"
     history_id: int
     keyword: str
     label: str | None
@@ -243,15 +245,10 @@ class SearchSnapshotView(BaseModel):
         return value.isoformat()
 
 
-class MediaSearchSnapshotView(BaseModel):
-    """媒体搜索历史的结果快照视图（GET /search/history/{id}/media-snapshot）。
+class TitleSearchHistoryResultsView(BaseModel):
+    """一次历史影视条目搜索保存的完整结果。"""
 
-    与 ``SearchSnapshotView``（种子快照）分成两个端点而非塞进同一个联合类型：
-    两种快照的载荷结构完全不同（豆瓣条目 vs 种子 + 站点状态），前端本来就从
-    历史行的 ``vertical`` 知道该调哪个，分开各自类型干净、互不迁就。
-    ``items`` 直接透传快照里的豆瓣条目原始字段（id/source/title/rating/poster_url）。
-    """
-
+    vertical: Literal["titles"] = "titles"
     history_id: int
     keyword: str
     snapshot_at: datetime  # 快照生成时间（UTC）
@@ -264,3 +261,9 @@ class MediaSearchSnapshotView(BaseModel):
         if value.tzinfo is None:
             value = value.replace(tzinfo=UTC)
         return value.isoformat()
+
+
+SearchHistoryResultsView = Annotated[
+    TorrentSearchHistoryResultsView | TitleSearchHistoryResultsView,
+    Field(discriminator="vertical"),
+]

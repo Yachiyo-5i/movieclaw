@@ -5,7 +5,7 @@ CLI 的命令树由 OpenAPI spec 自动生成，spec 里的元数据就是 CLI �
 
 - 每个端点必须有非空 summary（→ 命令一行简介）；
 - operation_id 必须显式声明、符合 `<域>.<动作>` 两/三段式命名约定
-  （→ 直接决定命令树：sub.list → mclaw sub list）且全局唯一。
+  （→ 直接决定命令树：subscriptions.list → mclaw subscriptions list）且全局唯一。
 
 漏写任何一项，这里直接红——模式对标 test_auth.py 的全路由鉴权守护。
 """
@@ -61,6 +61,36 @@ def test_operation_ids_are_unique(operations: list[tuple[str, str, dict]]) -> No
         else:
             seen[opid] = f"{method} {path}"
     assert not dup, f"operation_id 重复（命令名会冲突）：{dup}"
+
+
+def test_removed_compatibility_routes_do_not_return(
+    operations: list[tuple[str, str, dict]],
+) -> None:
+    """接口重构直接收口，不允许重新引入 legacy/deprecated 双轨实现。"""
+    old_paths = {
+        "/api/v1/discover/search",
+        "/api/v1/discover/douban/collection/{collection_id}",
+        "/api/v1/discover/douban/{douban_id}",
+        "/api/v1/discover/{kind}/layout",
+        "/api/v1/discover/{kind}/hero",
+        "/api/v1/discover/{kind}/rows/{row_id}",
+        "/api/v1/discover/{kind}/{tmdb_id}",
+        "/api/v1/subscriptions/prepare",
+        "/api/v1/subscriptions/dispatch-preview",
+        "/api/v1/subscriptions/pipeline-health",
+        "/api/v1/subscriptions/{subscription_id}/downloads",
+        "/api/v1/subscriptions/{subscription_id}/search-now",
+        "/api/v1/subscriptions/{subscription_id}/grab",
+        "/api/v1/subscriptions/{subscription_id}/pause",
+    }
+    remaining_paths = sorted(old_paths & {path for _method, path, _op in operations})
+    legacy_ops = [
+        op["operationId"]
+        for _method, _path, op in operations
+        if op["operationId"].startswith("legacy.") or op.get("deprecated")
+    ]
+    assert not remaining_paths, f"旧接口路径被重新引入：{remaining_paths}"
+    assert not legacy_ops, f"旧接口 operation_id/deprecated 被重新引入：{legacy_ops}"
 
 
 # ---------------------------------------------------------------------------

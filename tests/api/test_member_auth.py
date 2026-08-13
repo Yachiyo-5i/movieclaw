@@ -256,7 +256,7 @@ def test_search_capability_gate(client: TestClient) -> None:
     admin_cookie, member_cookie, member_id = _setup_admin_and_member(client)
 
     _use(client, member_cookie)
-    denied = client.get("/api/v1/search", params={"keyword": "沙丘"})
+    denied = client.get("/api/v1/search/torrents", params={"keyword": "沙丘"})
     assert denied.status_code == 403
     assert "搜索" in denied.json()["message"]
 
@@ -264,7 +264,28 @@ def test_search_capability_gate(client: TestClient) -> None:
     client.put(f"{_MEMBERS}/{member_id}", json={"allow_search": True})
 
     _use(client, member_cookie)
-    assert client.get("/api/v1/search", params={"keyword": "沙丘"}).status_code == 200
+    assert client.get("/api/v1/search/torrents", params={"keyword": "沙丘"}).status_code == 200
+
+
+def test_torrent_history_results_cannot_bypass_search_capability(client: TestClient) -> None:
+    """先搜索后被收回权限时，统一历史结果端点不能成为种子结果旁路。"""
+    admin_cookie, member_cookie, member_id = _setup_admin_and_member(client)
+
+    _use(client, admin_cookie)
+    client.put(f"{_MEMBERS}/{member_id}", json={"allow_search": True})
+
+    _use(client, member_cookie)
+    assert client.get("/api/v1/search/torrents", params={"keyword": "沙丘"}).status_code == 200
+    history_id = client.get("/api/v1/search/history").json()["data"][0]["id"]
+    assert client.get(f"/api/v1/search/history/{history_id}/results").status_code == 200
+
+    _use(client, admin_cookie)
+    client.put(f"{_MEMBERS}/{member_id}", json={"allow_search": False})
+
+    _use(client, member_cookie)
+    denied = client.get(f"/api/v1/search/history/{history_id}/results")
+    assert denied.status_code == 403
+    assert "搜索" in denied.json()["message"]
 
 
 def test_subscribe_capability_gate(client: TestClient) -> None:
@@ -276,9 +297,12 @@ def test_subscribe_capability_gate(client: TestClient) -> None:
 
     _use(client, member_cookie)
     assert client.get("/api/v1/subscriptions").status_code == 200
-    denied = client.post("/api/v1/subscriptions/prepare", json={})
+    denied = client.post("/api/v1/subscriptions/title-preview", json={})
     assert denied.status_code == 403
-    media_search = client.get("/api/v1/discover/search", params={"q": "沙丘"})
+    media_search = client.post(
+        "/api/v1/search/titles",
+        json={"query": "沙丘", "provider": "douban"},
+    )
     assert media_search.status_code == 403
 
 
@@ -463,19 +487,17 @@ _MEMBER_ALLOWLIST = {
     ("GET", "/api/v1/ui/preferences"),
     ("PUT", "/api/v1/ui/preferences"),
     # 发现页 / 详情 / 演职员 / 图片：纯浏览面
-    ("GET", "/api/v1/discover/search"),
-    ("GET", "/api/v1/discover/douban/collection/{collection_id}"),
-    ("GET", "/api/v1/discover/douban/{douban_id}"),
-    ("GET", "/api/v1/discover/{kind}/hero"),
-    ("GET", "/api/v1/discover/{kind}/layout"),
-    ("GET", "/api/v1/discover/{kind}/rows/{row_id}"),
-    ("GET", "/api/v1/discover/{kind}/{tmdb_id}"),
+    ("GET", "/api/v1/ui/discovery/{media_type}"),
+    ("GET", "/api/v1/discover/collections"),
+    ("GET", "/api/v1/discover/collections/{collection_ref}/titles"),
+    ("POST", "/api/v1/search/titles"),
+    ("GET", "/api/v1/discover/titles/{title_ref}"),
     ("GET", "/api/v1/people/{tmdb_person_id}"),
     ("GET", "/api/v1/images/assets/{path}"),
     ("GET", "/api/v1/images/proxy"),
     # 媒体库：浏览面（管理动作全部在库路由级挂 require_admin）
     ("GET", "/api/v1/libraries"),
-    ("GET", "/api/v1/libraries/search"),
+    ("GET", "/api/v1/search/library-items"),
     ("GET", "/api/v1/libraries/files/{file_id}/thumb"),
     # 字幕预览是媒体详情的浏览面；接口自身按文件所属库校验成员可见性，
     # 且轨引用只能命中该文件已登记的内封/外挂字幕，不能读取任意路径。
@@ -488,22 +510,21 @@ _MEMBER_ALLOWLIST = {
     ("GET", "/api/v1/libraries/{library_id}/items/{media_item_id}"),
     ("GET", "/api/v1/libraries/{library_id}/items/{media_item_id}/artwork"),
     ("GET", "/api/v1/libraries/{library_id}/items/{media_item_id}/episodes"),
-    # 搜索历史：个人数据；站点资源搜索/快照另由 allow_search 单独控制，
-    # 媒体快照随 allow_subscribe（默认开启）开放。
+    # 搜索历史：个人数据；统一结果端点再按记录类型检查对应能力。
     ("GET", "/api/v1/search/history"),
-    ("GET", "/api/v1/search/history/{history_id}/media-snapshot"),
+    ("GET", "/api/v1/search/history/{history_id}/results"),
     ("DELETE", "/api/v1/search/history/{history_id}"),
     ("DELETE", "/api/v1/search/history"),
     # 订阅：读 + 写（写受 allow_subscribe，默认开）；运维接口是管理员专属
     ("GET", "/api/v1/subscriptions"),
     ("POST", "/api/v1/subscriptions"),
-    ("POST", "/api/v1/subscriptions/prepare"),
+    ("POST", "/api/v1/subscriptions/title-preview"),
     ("GET", "/api/v1/subscriptions/{subscription_id}"),
     ("PATCH", "/api/v1/subscriptions/{subscription_id}"),
-    ("DELETE", "/api/v1/subscriptions/{subscription_id}"),
+    ("DELETE", "/api/v1/subscriptions/{subscription_id}/following"),
     ("GET", "/api/v1/subscriptions/{subscription_id}/activities"),
-    ("PATCH", "/api/v1/subscriptions/{subscription_id}/pause"),
-    ("POST", "/api/v1/subscriptions/{subscription_id}/search-now"),
+    ("PATCH", "/api/v1/subscriptions/{subscription_id}/tracking-state"),
+    ("POST", "/api/v1/subscriptions/{subscription_id}/missing-resource-searches"),
 }
 
 # 路径参数哑值（与 test_auth.py 的匿名守护测试保持一致）
@@ -514,6 +535,9 @@ _PATH_DUMMIES = {
     "{downloader_id}": "1",
     "{info_hash}": "f" * 40,
     "{kind}": "movie",
+    "{media_type}": "movie",
+    "{collection_ref}": "tmdb:movie:popular",
+    "{title_ref}": "tmdb:movie:1",
     "{row_id}": "popular",
     "{tmdb_id}": "1",
     "{tmdb_person_id}": "1",

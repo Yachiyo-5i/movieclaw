@@ -15,13 +15,14 @@ import { specSummary } from "@/components/rule-sets-panel";
 import { useSubscribeEntry } from "@/components/subscribe-entry";
 import { SubscriptionAdjustDialog } from "@/components/subscription-adjust-dialog";
 import {
-  deleteSubscription,
+  deleteSubscriptionPermanently,
   getSubscription,
+  listActiveSubscriptionDownloads,
   listRuleSets,
   listSubscriptionActivities,
-  listSubscriptionDownloads,
-  pauseSubscription,
-  searchSubscriptionNow,
+  searchMissingSubscriptionResources,
+  setSubscriptionTrackingState,
+  unsubscribeFromSubscription,
   updateSubscription,
   type RuleSet,
   type SubscriptionActivity,
@@ -59,7 +60,7 @@ export function SubscriptionInspectorView({ id }: { id: number }) {
   const confirm = useConfirm();
   // 暂停/取消订阅会改变全站订阅状态（海报卡片的「已订阅」徽标），操作后同步刷新
   const { canSubscribe, refresh: refreshSubscriptions } = useSubscribeEntry();
-  const { canManageSubscriptions, canSearch } = usePermissions();
+  const { canManageSubscriptions, canSearch, isAdmin } = usePermissions();
   const [detail, setDetail] = useState<SubscriptionDetail | null>(null);
   const [activities, setActivities] = useState<SubscriptionActivity[]>([]);
   const [ruleSets, setRuleSets] = useState<RuleSet[]>([]);
@@ -103,7 +104,7 @@ export function SubscriptionInspectorView({ id }: { id: number }) {
     () => {
       if (downloadsPending.current) return;
       downloadsPending.current = true;
-      listSubscriptionDownloads(id)
+      listActiveSubscriptionDownloads(id)
         .then(setDownloads)
         .catch(() => undefined)
         .finally(() => {
@@ -166,7 +167,10 @@ export function SubscriptionInspectorView({ id }: { id: number }) {
   const togglePause = async () => {
     setBusy(true);
     try {
-      await pauseSubscription(detail.id, detail.status !== "paused");
+      await setSubscriptionTrackingState(
+        detail.id,
+        detail.status === "paused" ? "active" : "paused",
+      );
       reload();
       refreshSubscriptions();
     } finally {
@@ -179,7 +183,7 @@ export function SubscriptionInspectorView({ id }: { id: number }) {
   const searchNow = async () => {
     setBusy(true);
     try {
-      const { reset_count } = await searchSubscriptionNow(detail.id);
+      const { reset_count } = await searchMissingSubscriptionResources(detail.id);
       toast.success(`${reset_count} 个缺口已重新排队，正在搜索`);
       reload();
     } catch (e) {
@@ -200,7 +204,8 @@ export function SubscriptionInspectorView({ id }: { id: number }) {
     if (!ok) return;
     setBusy(true);
     try {
-      await deleteSubscription(detail.id);
+      if (isAdmin) await deleteSubscriptionPermanently(detail.id);
+      else await unsubscribeFromSubscription(detail.id);
       refreshSubscriptions();
       router.push("/subscriptions");
     } finally {

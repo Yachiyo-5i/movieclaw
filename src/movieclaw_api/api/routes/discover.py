@@ -1,14 +1,13 @@
-"""发现页接口：发现电影 / 发现剧集的布局、逐行数据与条目详情（TMDB / 豆瓣）。
+"""影视发现接口：片单、稳定引用详情，以及统一搜索入口中的影视垂直。
 
-路由保持薄：编排逻辑全部在 movieclaw_media.service，这里只做两件事——
-调服务、把 TMDB 领域错误翻译成 API 层的统一异常（中文提示直达前端）。
+路由保持薄：业务编排交给 TitleDiscoveryService，这里负责鉴权、库存投影
+和把上游错误翻译成统一中文 API 异常。
 """
 
 from __future__ import annotations
 
 import json
 import logging
-from enum import StrEnum
 
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -16,29 +15,38 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from movieclaw_api.api.deps import require_login, require_subscribe_capability
 from movieclaw_api.exceptions import (
     AppException,
+    BadRequestException,
     NotFoundException,
     UpstreamServiceException,
     UpstreamUnreachableException,
+)
+from movieclaw_api.schemas.discover import (
+    DiscoveredTitleDetailsView,
+    DiscoveryCollectionListView,
+    DiscoveryCollectionTitlesView,
+    DiscoveryPageSectionView,
+    DiscoveryPageView,
+    DiscoveryPresentation,
+    TitleSearchPayload,
+    TitleSearchView,
 )
 from movieclaw_api.schemas.response import ApiResponse, ok
 from movieclaw_api.services.auth import Principal
 from movieclaw_api.services.discover_library import DiscoverLibraryProjectionService
 from movieclaw_api.services.library.access import visible_library_ids
-from movieclaw_api.services.media_discover import get_douban_media_service, get_media_service
+from movieclaw_api.services.title_discovery import (
+    TitleDiscoveryService,
+    get_title_discovery_service,
+)
 from movieclaw_db.engine import get_session
 from movieclaw_db.repositories.search_history_repo import SearchHistoryRepository
 from movieclaw_media import (
-    DiscoverLayout,
-    DoubanDiscoverService,
     DoubanError,
     DoubanNetworkError,
     DoubanNotFoundError,
-    MediaCard,
-    MediaDetail,
-    MediaDiscoverService,
     MediaKind,
-    MediaRow,
     MediaSearchItem,
+    MediaSource,
     TmdbError,
     TmdbNetworkError,
     TmdbNotFoundError,
@@ -47,6 +55,8 @@ from movieclaw_media import (
 logger = logging.getLogger("movieclaw_api.discover")
 
 router = APIRouter(prefix="/discover", tags=["discover"])
+ui_router = APIRouter(prefix="/ui/discovery", tags=["ui"])
+search_router = APIRouter(prefix="/search", tags=["search"])
 
 
 async def get_projection(
@@ -58,13 +68,6 @@ async def get_projection(
     return DiscoverLibraryProjectionService(
         session, visible_library_ids=await visible_library_ids(session, principal)
     )
-
-
-class DiscoverSource(StrEnum):
-    """发现页可切换的数据视角。"""
-
-    TMDB = "tmdb"
-    DOUBAN = "douban"
 
 
 def _translate(exc: TmdbError | DoubanError) -> AppException:
@@ -90,86 +93,166 @@ def _translate(exc: TmdbError | DoubanError) -> AppException:
     return UpstreamServiceException(str(exc))
 
 
-@router.get(
-    "/search",
-    response_model=ApiResponse[list[MediaSearchItem]],
-    summary="搜索影视元数据候选",
-    operation_id="discover.search",
-)
-async def search_media(
-    q: str = Query(min_length=1, max_length=100),
-    source: DiscoverSource = Query(
-        default=DiscoverSource.DOUBAN, description="元数据来源：tmdb / douban"
-    ),
-    history: bool = Query(
-        False,
-        description="是否记录搜索历史并留存结果快照（统一搜索入口传 True；"
-        "发现页工具栏等场景默认不记录）",
-    ),
-    principal: Principal = Depends(require_subscribe_capability),
-    session: AsyncSession = Depends(get_session),
-) -> ApiResponse[list[MediaSearchItem]]:
-    """搜索指定元数据来源：豆瓣移动端轻量搜索 / TMDB multi 搜索。
+# ---------------------------------------------------------------------------
+# 影视发现领域 API（OpenAPI 与 mclaw 共用同一组语义化 operation_id）
+# ---------------------------------------------------------------------------
 
-    ``history=True`` 时把本次搜索记入搜索历史（vertical=media，与站点资源
-    搜索混排展示）并留存结果快照——搜索失败不记录，空结果照常记录（「搜过
-    但没找到」也是有效历史）。历史写入失败只记日志，不影响搜索结果返回。
-    搜索页对同一关键词并行搜两个来源，历史只随豆瓣请求记一条，避免重复；
-    因此 TMDB 来源忽略 history 参数。
+
+@router.get(
+    "/collections",
+    response_model=ApiResponse[DiscoveryCollectionListView],
+    summary="列出指定来源中可浏览的电影或剧集片单",
+    operation_id="discover.list-collections",
+)
+async def list_discovery_collections(
+    media_type: MediaKind = Query(description="片单媒体类型：movie / tv"),
+    provider: MediaSource = Query(description="片单数据来源：tmdb / douban"),
+    service: TitleDiscoveryService = Depends(get_title_discovery_service),
+) -> ApiResponse[DiscoveryCollectionListView]:
+    """返回热门、热映、在播、高分、地区和类型等可浏览片单。
+
+    响应中的 ``collection_ref`` 是稳定引用；浏览某个片单时应原样传给
+    ``browse-collection``，不要自行拆分或拼接来源、类型与片单 ID。
     """
     try:
-        if source is DiscoverSource.DOUBAN:
-            results = await get_douban_media_service().search(q)
-        else:
-            results = await get_media_service().search(q)
+        collections = service.list_collections(media_type, provider)
     except (TmdbError, DoubanError) as exc:
         raise _translate(exc) from exc
-    if history and source is DiscoverSource.DOUBAN:
+    return ok(
+        DiscoveryCollectionListView(
+            provider=provider,
+            media_type=media_type,
+            collections=collections,
+        )
+    )
+
+
+@router.get(
+    "/collections/{collection_ref}/titles",
+    response_model=ApiResponse[DiscoveryCollectionTitlesView],
+    summary="浏览指定片单中的电影或剧集",
+    operation_id="discover.browse-collection",
+)
+async def browse_discovery_collection(
+    collection_ref: str,
+    limit: int = Query(20, ge=1, le=500, description="最多返回多少条；完整榜单可调大"),
+    service: TitleDiscoveryService = Depends(get_title_discovery_service),
+    projection: DiscoverLibraryProjectionService = Depends(get_projection),
+) -> ApiResponse[DiscoveryCollectionTitlesView]:
+    """读取 ``list-collections`` 返回的一个片单，并附带当前主体可见的库存摘要。"""
+    try:
+        result = await service.browse_collection(
+            collection_ref,
+            limit=limit,
+            projection=projection,
+        )
+    except ValueError as exc:
+        raise BadRequestException(str(exc)) from exc
+    except LookupError as exc:
+        raise NotFoundException(str(exc)) from exc
+    except (TmdbError, DoubanError) as exc:
+        raise _translate(exc) from exc
+    return ok(result)
+
+
+@search_router.post(
+    "/titles",
+    response_model=ApiResponse[TitleSearchView],
+    summary="按片名搜索 TMDB、豆瓣或全部影视来源",
+    operation_id="search.titles",
+)
+async def search_titles(
+    payload: TitleSearchPayload,
+    principal: Principal = Depends(require_subscribe_capability),
+    session: AsyncSession = Depends(get_session),
+    service: TitleDiscoveryService = Depends(get_title_discovery_service),
+) -> ApiResponse[TitleSearchView]:
+    """一次调用完成单来源或双来源搜索；双来源单边失败时仍返回另一边结果。"""
+    try:
+        outcome = await service.search_titles(payload.query, payload.provider)
+    except (TmdbError, DoubanError) as exc:
+        raise _translate(exc) from exc
+    history_id = None
+    if payload.save_history:
         member_id = principal.member_id if principal.member_id is not None else 0
-        await _record_media_history(session, q, results, member_id=member_id)
-    return ok(results)
+        history_id = await _record_media_history(
+            session,
+            payload.query,
+            outcome.raw_items,
+            member_id=member_id,
+        )
+    return ok(
+        TitleSearchView(
+            query=payload.query,
+            titles=outcome.titles,
+            providers=outcome.providers,
+            history_id=history_id,
+        )
+    )
 
 
 @router.get(
-    "/douban/collection/{collection_id}",
-    response_model=ApiResponse[MediaRow],
-    summary="豆瓣完整榜单（「看全部」落地页）",
-    operation_id="discover.douban.collection",
+    "/titles/{title_ref}",
+    response_model=ApiResponse[DiscoveredTitleDetailsView],
+    summary="获取影视条目的完整资料、演职员、图片和相关推荐",
+    operation_id="discover.get-title-details",
 )
-async def get_douban_full_collection(
-    collection_id: str,
+async def get_discovered_title_details(
+    title_ref: str,
+    service: TitleDiscoveryService = Depends(get_title_discovery_service),
     projection: DiscoverLibraryProjectionService = Depends(get_projection),
-) -> ApiResponse[MediaRow]:
-    """分页聚合返回一份完整榜单（如 Top 250、豆瓣高分电影 500 条）。
-
-    仅开放服务端白名单内的榜单 ID，其余返回 404；冷缓存时聚合受豆瓣限速
-    影响可能需要数秒，之后命中缓存即时返回。
-    """
+) -> ApiResponse[DiscoveredTitleDetailsView]:
+    """读取搜索或片单结果返回的 ``title_ref``；调用方不需要另传来源或媒体类型。"""
     try:
-        row = await get_douban_media_service().full_collection(collection_id)
-    except DoubanError as exc:
+        result = await service.get_title_details(title_ref, projection=projection)
+    except ValueError as exc:
+        raise BadRequestException(str(exc)) from exc
+    except (TmdbError, DoubanError) as exc:
         raise _translate(exc) from exc
-    await projection.apply_cards(row.items)
-    return ok(row)
+    return ok(result)
 
 
-@router.get(
-    "/douban/{douban_id}",
-    response_model=ApiResponse[MediaDetail],
-    summary="豆瓣影视条目详情",
-    operation_id="discover.douban.show",
+@ui_router.get(
+    "/{media_type}",
+    response_model=ApiResponse[DiscoveryPageView],
+    summary="发现页展示编排（分区引用与呈现方式）",
+    operation_id="ui.discovery.get",
+    openapi_extra={"x-cli-hidden": True},
 )
-async def get_douban_media_detail(
-    douban_id: str,
-    projection: DiscoverLibraryProjectionService = Depends(get_projection),
-) -> ApiResponse[MediaDetail]:
-    """返回豆瓣轻量详情；条目类型由豆瓣响应自动识别。"""
+async def get_discovery_page(
+    media_type: MediaKind,
+    provider: MediaSource = Query(default=MediaSource.TMDB, description="页面数据来源"),
+    service: TitleDiscoveryService = Depends(get_title_discovery_service),
+) -> ApiResponse[DiscoveryPageView]:
+    """Web 专用轻量协议：只决定 Hero/排名行/普通行，不携带任何片单条目。"""
     try:
-        detail = await get_douban_media_service().media_detail(douban_id)
-    except DoubanError as exc:
+        collections = service.list_collections(media_type, provider)
+    except (TmdbError, DoubanError) as exc:
         raise _translate(exc) from exc
-    await projection.apply_detail(detail)
-    return ok(detail)
+    sections = []
+    for collection in collections:
+        if collection.collection_ref.endswith(":featured-weekly"):
+            presentation = DiscoveryPresentation.HERO
+        elif collection.is_ranked:
+            presentation = DiscoveryPresentation.RANKED_ROW
+        else:
+            presentation = DiscoveryPresentation.POSTER_ROW
+        sections.append(
+            DiscoveryPageSectionView(
+                collection_ref=collection.collection_ref,
+                title=collection.name,
+                presentation=presentation,
+                preview_limit=collection.default_limit,
+                supports_full_listing=collection.supports_full_listing,
+            )
+        )
+    return ok(
+        DiscoveryPageView(
+            provider=provider,
+            media_type=media_type,
+            sections=sections,
+        )
+    )
 
 
 async def _record_media_history(
@@ -177,7 +260,7 @@ async def _record_media_history(
     keyword: str,
     results: list[MediaSearchItem],
     member_id: int = 0,
-) -> None:
+) -> int | None:
     """媒体搜索落历史 + 回写结果快照。辅助功能：任何失败只记日志。
 
     与种子搜索不同，本端点在请求内就拿到了完整结果，历史与快照可在同一个
@@ -187,7 +270,7 @@ async def _record_media_history(
         repo = SearchHistoryRepository(session)
         history_id = await repo.record(keyword, vertical="media", member_id=member_id)
         if history_id is None:
-            return
+            return None
         payload = json.dumps(
             {
                 "total": len(results),
@@ -196,103 +279,7 @@ async def _record_media_history(
             ensure_ascii=False,
         )
         await repo.save_snapshot(history_id, payload)
+        return history_id
     except Exception:  # noqa: BLE001 —— 历史写入失败不能拖垮搜索本身
         logger.warning("媒体搜索历史写入失败（不影响本次搜索结果）", exc_info=True)
-
-
-def _discover_service(source: DiscoverSource) -> DoubanDiscoverService | MediaDiscoverService:
-    """按数据源取发现页服务；TMDB 未配置 Key 时抛 TmdbNotConfiguredError。"""
-    return get_douban_media_service() if source is DiscoverSource.DOUBAN else get_media_service()
-
-
-# 发现页按「布局 + Hero + 单行」三个端点渐进提供（替代旧的整页聚合端点）：
-# 布局是纯配置毫秒级返回，前端据此撑起骨架后逐行拉数据，先就绪的行先渲染。
-# 豆瓣榜单受限速（每秒 1 个请求）约束，冷缓存整页聚合要十几秒，这是拆分的动因。
-# 注意路由顺序：/{kind}/layout 与 /{kind}/hero 必须注册在 /{kind}/{tmdb_id} 之前，
-# 否则会被后者按路径参数吞掉。
-
-
-@router.get(
-    "/{kind}/layout",
-    response_model=ApiResponse[DiscoverLayout],
-    summary="发现页布局（行清单，纯配置）",
-    operation_id="discover.layout",
-)
-async def get_discover_layout(
-    kind: MediaKind,
-    source: DiscoverSource = Query(
-        default=DiscoverSource.TMDB, description="数据来源：tmdb（热门榜单）/ douban（豆瓣榜单）"
-    ),
-) -> ApiResponse[DiscoverLayout]:
-    """返回发现页的行清单与 Hero 有无；不触发任何上游请求。"""
-    try:
-        return ok(_discover_service(source).layout(kind))
-    except (TmdbError, DoubanError) as exc:
-        raise _translate(exc) from exc
-
-
-@router.get(
-    "/{kind}/hero",
-    response_model=ApiResponse[list[MediaCard]],
-    summary="发现页 Hero 大横幅精选",
-    operation_id="discover.hero",
-)
-async def get_discover_hero(
-    kind: MediaKind,
-    source: DiscoverSource = Query(
-        default=DiscoverSource.TMDB, description="数据来源：tmdb（热门榜单）/ douban（豆瓣榜单）"
-    ),
-    projection: DiscoverLibraryProjectionService = Depends(get_projection),
-) -> ApiResponse[list[MediaCard]]:
-    """返回 Hero 轮播精选；布局声明无 Hero 的数据源（豆瓣）返回空列表。"""
-    try:
-        hero = await _discover_service(source).discover_hero(kind)
-    except (TmdbError, DoubanError) as exc:
-        raise _translate(exc) from exc
-    await projection.apply_cards(hero)
-    return ok(hero)
-
-
-@router.get(
-    "/{kind}/rows/{row_id}",
-    response_model=ApiResponse[MediaRow],
-    summary="发现页单行数据",
-    operation_id="discover.row",
-)
-async def get_discover_row(
-    kind: MediaKind,
-    row_id: str,
-    source: DiscoverSource = Query(
-        default=DiscoverSource.TMDB, description="数据来源：tmdb（热门榜单）/ douban（豆瓣榜单）"
-    ),
-    projection: DiscoverLibraryProjectionService = Depends(get_projection),
-) -> ApiResponse[MediaRow]:
-    """返回布局中一行的条目数据；条目太少的行返回空 items，由前端收起。"""
-    try:
-        row = await _discover_service(source).discover_row(kind, row_id)
-    except (TmdbError, DoubanError) as exc:
-        raise _translate(exc) from exc
-    if row is None:
-        raise NotFoundException(f"发现页布局中没有 id 为 {row_id} 的行")
-    await projection.apply_cards(row.items)
-    return ok(row)
-
-
-@router.get(
-    "/{kind}/{tmdb_id}",
-    response_model=ApiResponse[MediaDetail],
-    summary="影视条目详情（词条信息 + 相似推荐）",
-    operation_id="discover.show",
-)
-async def get_media_detail(
-    kind: MediaKind,
-    tmdb_id: int,
-    projection: DiscoverLibraryProjectionService = Depends(get_projection),
-) -> ApiResponse[MediaDetail]:
-    """返回单个条目的详情：回填片长/季数的卡片字段、演职员等词条信息、相似推荐。"""
-    try:
-        detail = await get_media_service().media_detail(kind, tmdb_id)
-    except TmdbError as exc:
-        raise _translate(exc) from exc
-    await projection.apply_detail(detail)
-    return ok(detail)
+        return None

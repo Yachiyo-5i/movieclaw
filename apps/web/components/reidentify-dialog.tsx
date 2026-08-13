@@ -35,9 +35,9 @@ import {
 import { useConfirm } from "@/components/feedback";
 import { Modal } from "@/components/modal";
 import {
-  claimFilesBatch,
-  detachFiles,
-  previewReidentify,
+  assignLibraryFilesToTitle,
+  markLibraryFilesAsExtras,
+  previewItemReidentification,
   type ReidentifyGroup,
   type ReidentifyPreview,
 } from "@/lib/api/libraries";
@@ -85,7 +85,7 @@ export function ReidentifyDialog({
     setPreview(null);
     setError(null);
     setSettled({});
-    previewReidentify(libraryId, mediaItemId)
+    previewItemReidentification(libraryId, mediaItemId)
       .then((data) => {
         if (!cancelled) setPreview(data);
       })
@@ -286,7 +286,10 @@ function GroupRow({
       }))
     )
       return;
-    act(() => detachFiles(group.file_ids), `${group.file_count} 个文件已标为非独立作品`);
+    act(
+      () => markLibraryFilesAsExtras(group.file_ids),
+      `${group.file_count} 个文件已标为非独立作品`,
+    );
   };
 
   if (settledMessage) {
@@ -458,7 +461,11 @@ function GroupRow({
           busy={busy}
           onConfirm={() =>
             act(
-              () => claimFilesBatch(group.file_ids, panel.seed.tmdbId),
+              () =>
+                assignLibraryFilesToTitle(
+                  group.file_ids,
+                  `tmdb:${movie ? "movie" : "tv"}:${panel.seed.tmdbId}`,
+                ),
               `${group.file_count} 个文件已改挂为《${panel.seed.title}》`,
             )
           }

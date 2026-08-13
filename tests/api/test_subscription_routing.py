@@ -181,7 +181,8 @@ def test_dispatch_preview_routes_by_tmdb(client, monkeypatch) -> None:
     )
 
     data = client.get(
-        "/api/v1/subscriptions/dispatch-preview", params={"kind": "tv", "tmdb_id": 300}
+        "/api/v1/subscriptions/download-routing-preview",
+        params={"kind": "tv", "tmdb_id": 300},
     ).json()["data"]
     assert data["library_id"] == anime_id
     assert data["route_matched"] is True
@@ -189,7 +190,7 @@ def test_dispatch_preview_routes_by_tmdb(client, monkeypatch) -> None:
 
     # 显式选库：不走路由，路由字段为 null
     data = client.get(
-        "/api/v1/subscriptions/dispatch-preview",
+        "/api/v1/subscriptions/download-routing-preview",
         params={"kind": "tv", "tmdb_id": 300, "library_id": default_id},
     ).json()["data"]
     assert data["library_id"] == default_id
@@ -197,7 +198,8 @@ def test_dispatch_preview_routes_by_tmdb(client, monkeypatch) -> None:
 
     # 未命中收藏范围的条目（404 的 tmdb 详情 → 事实不可得）→ 默认库兜底 + 理由
     data = client.get(
-        "/api/v1/subscriptions/dispatch-preview", params={"kind": "tv", "tmdb_id": 999}
+        "/api/v1/subscriptions/download-routing-preview",
+        params={"kind": "tv", "tmdb_id": 999},
     ).json()["data"]
     assert data["library_id"] == default_id
     assert data["route_matched"] is False

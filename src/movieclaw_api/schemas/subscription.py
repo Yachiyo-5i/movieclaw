@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 from datetime import UTC, date, datetime
+from enum import StrEnum
 from typing import Literal
 
 from pydantic import BaseModel, Field, field_serializer
@@ -31,27 +32,18 @@ def _iso_utc(value: datetime | None) -> str | None:
     return value.isoformat()
 
 
-# ---------------------------------------------------------------------------
-# prepare
-# ---------------------------------------------------------------------------
+class SubscriptionTargetPreviewPayload(BaseModel):
+    """订阅表单打开前的内部预览请求。
 
-
-class PreparePayload(BaseModel):
-    """订阅弹层打开时的预检请求。
-
-    - source=tmdb：带 kind + tmdb_id（发现页/详情页入口）；
-    - source=douban：带 kind + title（豆瓣入口，year/douban_id 尽量带上，
-      收敛精度更高）。
+    ``title_ref`` 必须直接来自 Discover；服务端负责识别来源、解析豆瓣候选并
+    建立 TMDB 锚点，Web 不再拼装 ``source/kind/external_id`` 组合。
     """
 
-    source: Literal["tmdb", "douban"] = Field(
-        default="tmdb", description="入口来源：tmdb（带 tmdb_id）/ douban（带 title，可配 year）"
+    title_ref: str = Field(
+        min_length=1,
+        max_length=160,
+        description="Discover 返回的影视条目稳定引用",
     )
-    kind: MediaKind
-    tmdb_id: int | None = Field(default=None, description="source=tmdb 时必填的 TMDB 条目 id")
-    title: str | None = Field(default=None, description="豆瓣入口：豆瓣标题")
-    year: int | None = Field(default=None, description="豆瓣入口：年份（可缺）")
-    douban_id: str | None = Field(default=None, description="豆瓣入口：豆瓣条目 ID")
 
 
 class MediaBrief(BaseModel):
@@ -124,13 +116,14 @@ class ResolveCandidateView(BaseModel):
     """豆瓣收敛歧义时的确认候选。"""
 
     tmdb_id: int
+    title_ref: str = Field(description="选定候选后用于订阅的稳定引用")
     title: str
     original_title: str
     year: int | None
     poster_url: str | None
 
     @classmethod
-    def from_model(cls, c: ResolveCandidate) -> ResolveCandidateView:
+    def from_model(cls, c: ResolveCandidate, *, kind: MediaKind) -> ResolveCandidateView:
         from movieclaw_api.core.config import get_settings
 
         poster_url = None
@@ -139,6 +132,7 @@ class ResolveCandidateView(BaseModel):
             poster_url = f"{base}/w342{c.poster_path}"
         return cls(
             tmdb_id=c.tmdb_id,
+            title_ref=f"tmdb:{kind.value}:{c.tmdb_id}",
             title=c.title,
             original_title=c.original_title,
             year=c.year,
@@ -200,15 +194,32 @@ class DispatchPreviewView(BaseModel):
 
 
 class SubscriptionCreatePayload(BaseModel):
-    kind: MediaKind
-    tmdb_id: int = Field(description="TMDB 条目 id（movie 用电影 id，tv 用剧集 id）")
+    """从 Discover 条目创建订阅的公开请求。
+
+    调用方只传递上游返回的稳定引用；来源识别、豆瓣到 TMDB 的锚定、媒体
+    建档和初始工单生成均由服务端完成。豆瓣发生歧义时，错误详情会返回可重试
+    的 TMDB ``title_ref`` 候选。
+    """
+
+    title_ref: str = Field(
+        min_length=1,
+        max_length=160,
+        description="Discover 搜索、片单或详情返回的影视条目稳定引用",
+    )
+    source_title_ref: str | None = Field(
+        default=None,
+        max_length=160,
+        description=(
+            "可选的原始来源引用；从豆瓣歧义候选改选 TMDB 条目时原样回传，"
+            "用于保留豆瓣身份"
+        ),
+    )
     selected_seasons: list[int] = Field(
         default_factory=list, description="剧集要订阅的季号数组，如 [1,2]；空=全部缺失季"
     )
     follow_future: bool = Field(default=False, description="持续追新：未来新季自动纳入订阅")
     rule_set_id: int | None = Field(default=None, description="缺省用默认规则组")
     library_id: int | None = Field(default=None, description="入库目标库；缺省用该类型默认库")
-    douban_id: str | None = Field(default=None, description="豆瓣入口时带上，留存来源身份")
 
 
 class SubscriptionUpdatePayload(BaseModel):
@@ -227,8 +238,17 @@ class SubscriptionUpdatePayload(BaseModel):
     )
 
 
-class SubscriptionPausePayload(BaseModel):
-    paused: bool = Field(description="true=暂停（停止抓种与投递）；false=恢复追踪")
+class SubscriptionTrackingState(StrEnum):
+    """用户可显式设置的追踪状态；完成态仍由工单自动派生。"""
+
+    ACTIVE = "active"
+    PAUSED = "paused"
+
+
+class SubscriptionTrackingStatePayload(BaseModel):
+    state: SubscriptionTrackingState = Field(
+        description="目标追踪状态：active 恢复追踪，paused 暂停搜索与投递"
+    )
 
 
 class DownloadUnitView(BaseModel):
@@ -239,13 +259,13 @@ class DownloadUnitView(BaseModel):
 
 
 class SearchNowView(BaseModel):
-    """立即搜索（sub.search-now）的结果。"""
+    """立即搜索缺失资源的结果。"""
 
     reset_count: int = Field(description="跳过冷却、重新排队的缺口工单数")
 
 
 class GrabPayload(BaseModel):
-    """手动选种（sub.grab）：把搜索结果里的一条种子直接投给本订阅。
+    """人工选择种子下载：把搜索结果里的一条种子直接投给本订阅。
 
     字段即搜索结果行（TorrentHit）原样回传——交互式搜索现算现返、不落
     种子索引，只能由前端带回。attrs 同样回传（它本就是搜索链路里服务端
@@ -337,7 +357,7 @@ class WantedView(BaseModel):
     status: str
     air_date: date | None
     priority: int
-    # 在途工单锚定的种子 hash；前端据此把工单行与 sub.downloads 的进度组对上
+    # 在途工单锚定的种子 hash；前端据此把工单行与实时下载进度组对上
     info_hash: str | None
     next_search_at: datetime | None
     search_attempts: int
@@ -391,8 +411,18 @@ class SubscriptionDetailView(SubscriptionView):
         )
 
 
+class SubscriptionCreateView(BaseModel):
+    """完整创建工作流结果：订阅本身以及管理员可见的下载路由预检。"""
+
+    subscription: SubscriptionDetailView
+    download_routing: DispatchPreviewView | None = Field(
+        default=None,
+        description="管理员可见的下载与入库路由预检；成员调用时为空",
+    )
+
+
 class SubscriptionDownloadView(BaseModel):
-    """订阅在途种子的实时下载快照（sub.downloads，详情页轮询展示）。
+    """订阅在途种子的实时下载快照（详情页轮询展示）。
 
     state 词表与 TorrentStatus.state 一致，另加 missing——种子已不在任何
     可用下载器中（可能被手动删除，救援巡检稍后会退回工单重新找资源）。

@@ -92,7 +92,7 @@ def test_search_merges_results_across_sites(client: TestClient, monkeypatch) -> 
         },
     )
 
-    data = client.get("/api/v1/search", params={"keyword": "沙丘"}).json()["data"]
+    data = client.get("/api/v1/search/torrents", params={"keyword": "沙丘"}).json()["data"]
 
     assert data["total"] == 3
     assert {i["site_id"] for i in data["items"]} == {"mteam", "ttg"}
@@ -110,7 +110,7 @@ def test_search_isolates_single_site_failure(client: TestClient, monkeypatch) ->
         },
     )
 
-    data = client.get("/api/v1/search", params={"keyword": "奥本海默"}).json()["data"]
+    data = client.get("/api/v1/search/torrents", params={"keyword": "奥本海默"}).json()["data"]
 
     # 失败站点不拖垮整体：正常站仍有结果，失败站记 error
     assert data["total"] == 1
@@ -125,7 +125,7 @@ def test_search_passes_multi_category_filter(client: TestClient, monkeypatch) ->
     _wire(monkeypatch, {"mteam": fake_site})
 
     resp = client.get(
-        "/api/v1/search",
+        "/api/v1/search/torrents",
         params={"keyword": "老友记", "categories": ["tv", "documentary"], "label": "剧集"},
     )
     assert resp.status_code == 200
@@ -142,7 +142,7 @@ def test_search_filters_site_subset(client: TestClient, monkeypatch) -> None:
     _wire(monkeypatch, {"mteam": mteam, "ttg": ttg})
 
     data = client.get(
-        "/api/v1/search", params={"keyword": "沙丘", "sites": ["mteam"]}
+        "/api/v1/search/torrents", params={"keyword": "沙丘", "sites": ["mteam"]}
     ).json()["data"]
 
     assert [s["site_id"] for s in data["sites"]] == ["mteam"]
@@ -155,7 +155,7 @@ def test_search_unknown_site_subset_yields_empty(client: TestClient, monkeypatch
     _wire(monkeypatch, {"mteam": _FakeSite(items=[_item("m1", "沙丘")])})
 
     data = client.get(
-        "/api/v1/search", params={"keyword": "沙丘", "sites": ["ttg"]}
+        "/api/v1/search/torrents", params={"keyword": "沙丘", "sites": ["ttg"]}
     ).json()["data"]
     assert data["total"] == 0
     assert data["sites"] == []
@@ -163,12 +163,12 @@ def test_search_unknown_site_subset_yields_empty(client: TestClient, monkeypatch
 
 def test_search_requires_keyword(client: TestClient) -> None:
     # 缺 keyword → 422；空 keyword 也被 min_length 拦下
-    assert client.get("/api/v1/search").status_code == 422
-    assert client.get("/api/v1/search", params={"keyword": ""}).status_code == 422
+    assert client.get("/api/v1/search/torrents").status_code == 422
+    assert client.get("/api/v1/search/torrents", params={"keyword": ""}).status_code == 422
 
 
 def test_search_rejects_invalid_category(client: TestClient) -> None:
-    r = client.get("/api/v1/search", params={"keyword": "x", "categories": "不存在"})
+    r = client.get("/api/v1/search/torrents", params={"keyword": "x", "categories": "不存在"})
     assert r.status_code == 422
 
 
@@ -206,7 +206,7 @@ def test_search_items_carry_enriched_attrs(client: TestClient, monkeypatch) -> N
     )
     _wire(monkeypatch, {"mteam": _FakeSite(items=[rich_item])})
 
-    data = client.get("/api/v1/search", params={"keyword": "dune"}).json()["data"]
+    data = client.get("/api/v1/search/torrents", params={"keyword": "dune"}).json()["data"]
 
     attrs = data["items"][0]["attrs"]
     assert attrs["year"] == 2024

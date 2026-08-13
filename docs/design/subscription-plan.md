@@ -9,14 +9,16 @@
 
 ```
 详情页点「订阅」
-  → POST /api/subscriptions/prepare        ① 建档/复用媒体条目，返回季集结构
+  → 把 Discover title_ref 原样交给订阅域
+  → POST /api/subscriptions/title-preview  ① 建档/复用媒体条目，返回季集结构
   → 前端弹层：季选择 + 追新开关 + 规则组     ② 用户决策
-  → POST /api/subscriptions                 ③ 创建订阅 + 生成 wanted
+  → POST /api/subscriptions                 ③ 服务端解析引用、预检路由、创建订阅与 wanted
 ```
 
 细节：
 
-1. **prepare 接口**（幂等）：按 `(kind, tmdb_id)` 查 `media_item`，不存在则建档——
+1. **title-preview 接口**（幂等、仅 Web 表单使用）：解析 Discover `title_ref`，再按
+   `(kind, tmdb_id)` 查 `media_item`，不存在则建档——
    一次 TMDB 请求拉 detail + `alternative_titles` + `translations` + `external_ids`
    （`append_to_response` 合并）；tv 再逐季拉 season detail 写 `media_season`（含集列表 JSON）。
    返回：条目摘要 + 每季 `{season_number, 已播集数/总集数, air_date}`，供弹层渲染。

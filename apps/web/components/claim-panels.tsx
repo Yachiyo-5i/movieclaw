@@ -3,11 +3,12 @@
 import { useEffect, useState } from "react";
 
 import {
-  fetchMediaDetail,
-  searchTmdbMedia,
+  fetchDiscoveredTitleDetails,
+  titleRef,
   type MediaDetailData,
   type MediaSearchItem,
 } from "@/lib/api/discover";
+import { searchTitles } from "@/lib/api/search";
 
 /* —— 人工认领的两块共享面板（库页「待识别」与监听导入清单共用）——
    认领一律走「详情确认面板」：点候选/搜索结果先看海报、简介、季数再
@@ -55,19 +56,19 @@ export function ClaimConfirmPanel({
   const kind = movie ? "movie" : "tv";
 
   useEffect(() => {
-    let cancelled = false;
+    const controller = new AbortController();
     setDetail(null);
     setFailed(false);
-    fetchMediaDetail(kind, String(seed.tmdbId))
+    fetchDiscoveredTitleDetails(titleRef("tmdb", kind, String(seed.tmdbId)), {
+      signal: controller.signal,
+    })
       .then((d) => {
-        if (!cancelled) setDetail(d);
+        if (!controller.signal.aborted) setDetail(d);
       })
       .catch(() => {
-        if (!cancelled) setFailed(true);
+        if (!controller.signal.aborted) setFailed(true);
       });
-    return () => {
-      cancelled = true;
-    };
+    return () => controller.abort();
   }, [kind, seed.tmdbId]);
 
   const item = detail?.item;
@@ -195,9 +196,9 @@ export function ClaimSearchPanel({
     if (!q || searching || idOnly) return;
     setSearching(true);
     setError(null);
-    searchTmdbMedia(q)
+    searchTitles(q, { provider: "tmdb" })
       // multi 搜索混排两种类型，认领只关心本库的类型
-      .then((items) => setResults(items.filter((it) => it.type === kind)))
+      .then(({ items }) => setResults(items.filter((it) => it.type === kind)))
       .catch((e) => {
         setResults(null);
         setError((e as Error).message);

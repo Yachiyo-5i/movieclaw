@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from enum import StrEnum
 from typing import Literal
 
 from pydantic import BaseModel, Field, field_serializer
@@ -670,9 +671,13 @@ class UnidentifiedGroupView(BaseModel):
 
 
 class ClaimPayload(BaseModel):
-    """人工认领：把待识别文件挂到 TMDB 条目。"""
+    """人工指定文件身份：把文件关联到 Discover 返回的影视条目。"""
 
-    tmdb_id: int = Field(description="认领目标的 TMDB 条目 id（剧集用整部剧的 id，不是季/集）")
+    title_ref: str = Field(
+        min_length=1,
+        max_length=160,
+        description="Discover 返回的 TMDB 影视条目稳定引用，如 tmdb:tv:1396",
+    )
     season_number: int = Field(default=0, description="季号；电影固定 0")
     episode_number: int = Field(default=0, description="集号；电影固定 0")
 
@@ -687,7 +692,11 @@ class ClaimBatchPayload(BaseModel):
     file_ids: list[int] = Field(
         min_length=1, description="待识别文件 id 数组（来自待识别清单接口），如 [101,102]"
     )
-    tmdb_id: int = Field(description="认领目标的 TMDB 条目 id（剧集用整部剧的 id）")
+    title_ref: str = Field(
+        min_length=1,
+        max_length=160,
+        description="Discover 返回的 TMDB 影视条目稳定引用，如 tmdb:tv:1396",
+    )
 
 
 class ReviewItemView(BaseModel):
@@ -719,15 +728,24 @@ class ReviewGroupView(BaseModel):
     suggestion: ReviewItemView = Field(description="新识别器给出的建议身份")
 
 
+class IdentityReviewDecision(StrEnum):
+    """身份复核的明确决策，避免调用方猜测布尔值含义。"""
+
+    ACCEPT_SUGGESTION = "accept_suggestion"
+    KEEP_CURRENT = "keep_current"
+
+
 class ReviewResolvePayload(BaseModel):
-    """复核拍板：``accept=True`` 采纳建议改挂新条目；否则维持现状。
+    """复核拍板：采纳识别器建议，或明确维持当前身份。
 
     两种拍板都把这些文件的身份来源转为 manual——用户已经看过并做了决定，
     后续识别器升级不再对它们提复核建议。
     """
 
     file_ids: list[int] = Field(min_length=1, description="同一复核组内的文件 id 数组")
-    accept: bool = Field(description="true=采纳建议改挂新条目；false=维持现状")
+    decision: IdentityReviewDecision = Field(
+        description="accept_suggestion=采纳建议；keep_current=维持当前身份"
+    )
 
 
 class ReidentifyOutcomeView(BaseModel):

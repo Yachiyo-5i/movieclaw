@@ -568,41 +568,52 @@ class SubscriptionService:
                 "只有订阅的发起人（或管理员）可以调整它；如不想再追，可在列表里取消关注"
             )
 
-    async def delete(self, subscription_id: int, *, member_id: int | None = None) -> str:
-        """删除/取消订阅，返回结果的中文描述（路由直接用作 message）。
+    async def unsubscribe(self, subscription_id: int, *, member_id: int) -> str:
+        """让成员停止关注订阅，返回可直接展示的结果描述。
 
-        超管（member_id=None）：真删（工单级联删除；不动已下载内容与下载器
-        任务）。成员：
+        这里表达的是成员的“退出”意图，不是管理员删除资源：
         - 非发起人 → 只删自己的关注行，订阅不受影响；
         - 发起人且仍有关注者 → 发起人转移给最早的关注者，订阅继续活着——
           成员的取消永远不影响别人正在追的内容；
         - 发起人且无关注者 → 真删。
         """
         subscription = await self._get_or_404(subscription_id)
-        if member_id is not None and subscription.created_by_member_id != member_id:
+        if subscription.created_by_member_id != member_id:
             if await self._repo.remove_follower(subscription_id, member_id):
                 logger.info("成员 #%d 已取消关注订阅 #%d", member_id, subscription_id)
                 return "已取消关注；订阅本身不受影响"
             raise ForbiddenException(
                 "只有订阅的发起人（或管理员）可以删除它；你当前也没有关注本订阅"
             )
-        if member_id is not None:
-            followers = await self._repo.follower_member_ids(subscription_id)
-            if followers:
-                heir = followers[0]
-                subscription.created_by_member_id = heir
-                await self._repo.save(subscription)
-                await self._repo.remove_follower(subscription_id, heir)
-                await self._log(
-                    subscription, ActivityType.CREATED, "发起人退出，订阅转由最早的关注者接管"
-                )
-                logger.info(
-                    "订阅 #%d 发起人 #%d 退出，转移给成员 #%d", subscription_id, member_id, heir
-                )
-                return "你已退出；订阅转由其他关注的家人继续追更"
+        followers = await self._repo.follower_member_ids(subscription_id)
+        if followers:
+            heir = followers[0]
+            subscription.created_by_member_id = heir
+            await self._repo.save(subscription)
+            await self._repo.remove_follower(subscription_id, heir)
+            await self._log(
+                subscription, ActivityType.CREATED, "发起人退出，订阅转由最早的关注者接管"
+            )
+            logger.info(
+                "订阅 #%d 发起人 #%d 退出，转移给成员 #%d", subscription_id, member_id, heir
+            )
+            return "你已退出；订阅转由其他关注的家人继续追更"
         await self._repo.delete(subscription)
-        logger.info("订阅 #%s 已删除", subscription_id)
+        logger.info("成员 #%d 退出并删除无人关注的订阅 #%d", member_id, subscription_id)
         return "已取消订阅"
+
+    async def delete_permanently(self, subscription_id: int) -> str:
+        """管理员永久删除订阅记录与工单，不影响已下载文件或下载器任务。"""
+        subscription = await self._get_or_404(subscription_id)
+        await self._repo.delete(subscription)
+        logger.info("管理员已永久删除订阅 #%d", subscription_id)
+        return "订阅已永久删除；已下载内容不受影响"
+
+    async def delete(self, subscription_id: int, *, member_id: int | None = None) -> str:
+        """兼容旧调用；新代码应明确选择 ``unsubscribe`` 或 ``delete_permanently``。"""
+        if member_id is None:
+            return await self.delete_permanently(subscription_id)
+        return await self.unsubscribe(subscription_id, member_id=member_id)
 
     async def list_with_progress(
         self, *, kind: str | None = None, member_id: int | None = None
@@ -784,5 +795,3 @@ class SubscriptionService:
         if item is None:  # 外键保证下理论不可达
             raise NotFoundException("订阅关联的媒体条目不存在")
         return item
-
-

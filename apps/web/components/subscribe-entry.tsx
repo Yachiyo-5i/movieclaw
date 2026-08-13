@@ -12,7 +12,7 @@ import {
 
 import type { PosterVisualItem } from "@/components/poster-card";
 import { SubscribeDialog, type SubscribeTarget } from "@/components/subscribe-dialog";
-import { fetchDoubanMediaDetail } from "@/lib/api/discover";
+import { fetchDiscoveredTitleDetails, titleRef } from "@/lib/api/discover";
 import { listSubscriptions, type Subscription } from "@/lib/api/subscriptions";
 import type { MediaType } from "@/lib/media-types";
 import { usePermissions } from "@/lib/permissions";
@@ -87,17 +87,16 @@ export function SubscribeEntryProvider({ children }: { children: ReactNode }) {
   const open = useCallback(async (item: PosterVisualItem) => {
     if (!canSubscribe) return;
     const source = item.source ?? "tmdb";
+    const reference = item.titleRef ?? titleRef(source, item.type ?? "movie", item.id);
     let kind = item.type;
     if (!kind && source === "douban") {
-      kind = await fetchDoubanMediaDetail(item.id)
+      kind = await fetchDiscoveredTitleDetails(reference)
         .then((detail) => detail.item.type)
         .catch(() => undefined);
     }
     setTarget({
+      titleRef: reference,
       kind: kind ?? "movie",
-      source,
-      tmdbId: source === "tmdb" ? Number(item.id) : undefined,
-      doubanId: source === "douban" ? item.id : undefined,
       title: item.title,
       year: item.year,
     });

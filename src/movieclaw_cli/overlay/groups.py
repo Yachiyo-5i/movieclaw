@@ -1,11 +1,11 @@
 """精选层的命令组基建。
 
 DefaultCommandGroup：带「默认子命令」的命令组——首个参数不是已知子命令时，
-整串参数转交给默认子命令。用于 `mclaw search "沙丘2"`（= search run）与
+整串参数转交给默认子命令。用于 `mclaw search "沙丘2"`（= search torrents）与
 `mclaw search history list` 在同一个组下共存。
 
-极端情况（关键词恰好叫 history/prefs 等子命令名）用显式形态兜底：
-`mclaw search run history`。
+极端情况（关键词恰好叫 history/presets 等子命令名）用显式形态兜底：
+`mclaw search torrents history`。
 """
 
 from __future__ import annotations

@@ -5,11 +5,8 @@ import type { Route } from "next";
 
 import { PosterCardVisual, type PosterVisualItem } from "@/components/poster-card";
 import { libraryCardAction } from "@/components/library-view";
-import {
-  searchLibraryItems,
-  type LibraryItem,
-  type LibrarySearchGroup,
-} from "@/lib/api/libraries";
+import type { LibraryItem, LibrarySearchGroup } from "@/lib/api/libraries";
+import { searchLibraryItems } from "@/lib/api/search";
 import { imageUrl } from "@/lib/image-proxy";
 import { useScrollRestoration } from "@/lib/use-scroll-restoration";
 

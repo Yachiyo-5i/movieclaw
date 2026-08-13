@@ -1,7 +1,8 @@
-"""精选命令：mclaw search（SSE 聚合）与 mclaw download（衔接快照）。
+"""精选命令：统一搜索入口与 mclaw download（衔接种子快照）。
 
-search 一条命令背后是流式协议 + 客户端筛选排序 + 本地快照三件事：
-- 内部走 /search/stream（快的站点先出），站点进度打 stderr；
+``search titles / torrents / library-items`` 与公开 API 的能力名一一对应。
+其中 torrents 背后是流式协议 + 客户端筛选排序 + 本地快照三件事：
+- 内部走 /search/torrents/stream（快的站点先出），站点进度打 stderr；
 - stdout 输出**聚合完成后的稳定结果**（Agent 心智：一次调用一个完整结果），
   每行带稳定行号；
 - 结果落本地快照，`mclaw download <行号>` 直接引用，免去复制长 URL。
@@ -64,7 +65,82 @@ def _row_view(index: int, hit: dict) -> dict:
     }
 
 
-@click.command(name="run", short_help="跨站点搜索种子（流式聚合，结果可用行号直接下载）")
+@click.command(name="titles", short_help="按片名搜索 TMDB、豆瓣或全部影视来源")
+@click.argument("query")
+@click.option(
+    "--provider",
+    type=click.Choice(["all", "tmdb", "douban"]),
+    default="all",
+    show_default=True,
+    help="影视数据来源",
+)
+@click.option("--incognito", is_flag=True, help="无痕搜索：不写入服务端搜索历史")
+@output_option
+@click.pass_obj
+def search_titles(
+    settings,
+    output_override: str | None,
+    query: str,
+    provider: str,
+    incognito: bool,
+):
+    """搜索影视条目。
+
+    示例：
+
+        mclaw search titles "沙丘" --provider all
+
+    TMDB 与豆瓣单边失败时仍会返回另一边结果；默认记录搜索历史。
+    """
+    api = settings.make_api()
+    try:
+        result = (
+            api.request(
+                "POST",
+                "/search/titles",
+                json_body={
+                    "query": query,
+                    "provider": provider,
+                    "save_history": not incognito,
+                },
+            )
+            or {}
+        )
+        for status in result.get("providers") or []:
+            if not status.get("success"):
+                print(
+                    f"{status.get('provider')} 搜索失败：{status.get('message') or '未知错误'}",
+                    file=sys.stderr,
+                )
+        emit(
+            result.get("titles") or [],
+            output=output_override or settings.output,
+            quiet=settings.quiet,
+        )
+    finally:
+        api.close()
+
+
+@click.command(name="library-items", short_help="搜索全部可见媒体库中的已入库条目")
+@click.argument("keyword")
+@output_option
+@click.pass_obj
+def search_library_items(settings, output_override: str | None, keyword: str):
+    """按标题或原名搜索本地媒体库。
+
+    示例：
+
+        mclaw search library-items "沙丘"
+    """
+    api = settings.make_api()
+    try:
+        result = api.request("GET", "/search/library-items", params={"keyword": keyword}) or []
+        emit(result, output=output_override or settings.output, quiet=settings.quiet)
+    finally:
+        api.close()
+
+
+@click.command(name="torrents", short_help="跨 PT 站点搜索种子（结果行号可直接下载）")
 @click.argument("keyword")
 @click.option("--category", "categories", multiple=True, help="分类过滤（可多次指定）")
 @click.option("--site", "sites", multiple=True, help="限定站点（可多次指定，站点 id）")
@@ -90,7 +166,7 @@ def _row_view(index: int, hit: dict) -> dict:
     help="输出格式（覆盖全局设置）",
 )
 @click.pass_obj
-def search(
+def search_torrents(
     settings,
     keyword: str,
     categories: tuple[str, ...],
@@ -109,7 +185,7 @@ def search(
     快的站点先出结果（进度在 stderr），全部站点返回后输出按 --sort 排序的
     稳定结果；每行的 row 行号可直接用于下载：
 
-        mclaw search "沙丘2" --resolution 2160p
+        mclaw search torrents "沙丘2" --resolution 2160p
 
         mclaw download 3          # 下载上面结果里的第 3 行
     """
@@ -126,7 +202,7 @@ def search(
     site_status: list[dict] = []
     saw_done = False
     try:
-        for event in api.stream_sse("/search/stream", params=params):
+        for event in api.stream_sse("/search/torrents/stream", params=params):
             payload = json.loads(event.data) if event.data else {}
             if stream_events:
                 print(json.dumps({"event": event.event, **payload}, ensure_ascii=False))
@@ -160,7 +236,7 @@ def search(
         raise CliError(
             f"搜索流提前中断，结果不完整（仅收到 {len(collected)} 条，未落快照）",
             exit_code=ExitCode.NETWORK,
-            hint="网络可能不稳或服务已重启，请重试 mclaw search",
+            hint="网络可能不稳或服务已重启，请重试 mclaw search torrents",
         )
     if stream_events:
         return

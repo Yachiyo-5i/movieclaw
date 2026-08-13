@@ -13,7 +13,7 @@ import type { MediaItem, MediaSource } from "@/lib/media-types";
  * 都通过这里的 open() 跳转，保持「点卡片开详情」的调用方式不变。
  *
  * seed 缓存：点卡片时列表里已有的字段（标题/海报/简介）先存一份，
- * 详情页挂载时立即用它渲染首屏，再等 /discover/{type}/{id} 补齐词条信息——
+ * 详情页挂载时立即用它渲染首屏，再按 seed 中的 titleRef 补齐词条信息——
  * 站内跳转零白屏。硬刷新 / 分享链接直达时缓存为空，详情页转为加载态等接口。
  */
 const seedCache = new Map<string, MediaItem>();
@@ -49,6 +49,19 @@ function originTrailOf(pathname: string, search: string): PageNavItem[] | null {
     return [
       { label: "发现电影", href: "/discover/movie" },
       { label: "豆瓣高分电影", href: here },
+    ];
+  }
+  const collection = pathname.match(
+    /^\/discover\/(movie|tv)\/collections\/(tmdb|douban)\/[^/]+$/,
+  );
+  if (collection) {
+    const [, mediaType, provider] = collection;
+    return [
+      {
+        label: mediaType === "tv" ? "发现剧集" : "发现电影",
+        href: `/discover/${mediaType}?source=${provider}`,
+      },
+      { label: "影视片单", href: here },
     ];
   }
   if (pathname === "/search") {

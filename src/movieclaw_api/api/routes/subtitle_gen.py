@@ -28,7 +28,7 @@ from movieclaw_api.services.auth import Principal
 from movieclaw_api.services.subtitle_gen import tasks as gen_tasks
 from movieclaw_db.engine import get_session
 
-router = APIRouter(prefix="/library/files", tags=["subtitle-gen"])
+router = APIRouter(prefix="/libraries/files", tags=["subtitle-gen"])
 
 
 def _preview_view(pv: gen_tasks.Preview) -> GenPreviewView:
@@ -102,10 +102,10 @@ def _request_origin(principal: Principal, client_name: str | None) -> str:
 
 
 @router.get(
-    "/{file_id}/subtitles/generate/preview",
+    "/{file_id}/subtitles/generation-preview",
     response_model=ApiResponse[GenPreviewView],
     summary="AI 字幕生成预检：选源结果与成本估算（发起确认框素材）",
-    operation_id="lib.subgen.preview",
+    operation_id="library.subtitles.preview-generation",
 )
 async def gen_preview(
     file_id: int,
@@ -125,10 +125,10 @@ async def gen_preview(
 
 
 @router.post(
-    "/{file_id}/subtitles/generate",
+    "/{file_id}/subtitles/generations",
     response_model=ApiResponse[JobView],
     summary="发起 AI 字幕生成（后台执行；同文件单飞）",
-    operation_id="lib.subgen.start",
+    operation_id="library.subtitles.generate",
     openapi_extra={
         "x-cli-job": {"id_path": "id", "wait_op": "jobs.wait"},
     },
@@ -163,10 +163,10 @@ async def gen_start(
 
 
 @router.post(
-    "/{file_id}/subtitles/calibrate",
+    "/{file_id}/subtitles/timing-calibration",
     response_model=ApiResponse[CalibrateResultView],
     summary="一键校准外挂字幕时间轴（音轨互相关；strm 退字幕对字幕）",
-    operation_id="lib.subgen.calibrate",
+    operation_id="library.subtitles.calibrate-timing",
 )
 async def subtitle_calibrate(
     file_id: int,

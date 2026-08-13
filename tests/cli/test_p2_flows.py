@@ -69,105 +69,34 @@ def _transport(routes: dict[tuple[str, str], httpx.Response], calls: list[dict])
     return httpx.MockTransport(handler)
 
 
-# ---------------------------------------------------------------------------
-# sub create：prepare 消歧 → 投递预检 → 创建
-# ---------------------------------------------------------------------------
-
-
-def test_sub_create_ambiguous_exits_7_with_candidates(run_cli) -> None:
+def test_subscriptions_create_is_one_api_call(run_cli) -> None:
+    """新 CLI 与 API 同契约：title_ref 一次调用完成建档、预检与创建。"""
     calls: list[dict] = []
     transport = _transport(
         {
-            ("POST", "/api/v1/subscriptions/prepare"): httpx.Response(
-                200,
-                json=_envelope(
-                    {
-                        "status": "ambiguous",
-                        "candidates": [
-                            {"tmdb_id": 1, "title": "沙丘", "original_title": "Dune", "year": 2021},
-                            {
-                                "tmdb_id": 2,
-                                "title": "沙丘（1984）",
-                                "original_title": "Dune",
-                                "year": 1984,
-                            },
-                        ],
-                    }
-                ),
-            )
-        },
-        calls,
-    )
-    code, out, err = run_cli(
-        ["sub", "create", "--kind", "movie", "--title", "沙丘", "-o", "json"], transport
-    )
-    assert code == 7
-    candidates = json.loads(out)
-    assert [c["tmdb_id"] for c in candidates] == [1, 2]
-    assert "--tmdb" in err  # hint 给出消歧后的重跑方式
-    assert len(calls) == 1  # 歧义即停，不会继续预检/创建
-
-
-def test_sub_create_full_flow(run_cli) -> None:
-    calls: list[dict] = []
-    transport = _transport(
-        {
-            ("POST", "/api/v1/subscriptions/prepare"): httpx.Response(
-                200,
-                json=_envelope({"status": "ready", "media": {"tmdb_id": 693134, "title": "沙丘2"}}),
-            ),
-            ("GET", "/api/v1/subscriptions/dispatch-preview"): httpx.Response(
-                200,
-                json=_envelope(
-                    {
-                        "mode": "watch",
-                        "library_name": "电影库",
-                        "downloader_name": "qb",
-                        "path": "/downloads/watch",
-                        "ok": True,
-                    }
-                ),
-            ),
             ("POST", "/api/v1/subscriptions"): httpx.Response(
-                200, json=_envelope({"id": 7, "title": "沙丘2"}, message="订阅已创建")
-            ),
-        },
-        calls,
-    )
-    code, out, err = run_cli(
-        ["sub", "create", "--kind", "movie", "--tmdb", "693134", "-o", "json"], transport
-    )
-    assert code == 0, err
-    assert json.loads(out)["id"] == 7
-    assert [c["path"] for c in calls] == [
-        "/api/v1/subscriptions/prepare",
-        "/api/v1/subscriptions/dispatch-preview",
-        "/api/v1/subscriptions",
-    ]
-    assert "投递路由：watch" in err and "订阅已创建" in err
-    created_body = json.loads(calls[2]["body"])
-    assert created_body["tmdb_id"] == 693134
-
-
-def test_sub_create_existing_subscription_is_business_error(run_cli) -> None:
-    transport = _transport(
-        {
-            ("POST", "/api/v1/subscriptions/prepare"): httpx.Response(
                 200,
                 json=_envelope(
                     {
-                        "status": "ready",
-                        "media": {"tmdb_id": 1, "title": "沙丘"},
-                        "existing_subscription_id": 42,
-                    }
+                        "subscription": {"id": 7, "media": {"title": "沙丘2"}},
+                        "download_routing": {"ok": True, "mode": "watch"},
+                    },
+                    message="已加入订阅",
                 ),
             )
         },
-        [],
+        calls,
     )
-    code, _out, err = run_cli(["sub", "create", "--kind", "movie", "--tmdb", "1"], transport)
-    assert code == 1
-    assert "已在订阅中" in err and "mclaw sub show 42" in err
+
+    code, out, err = run_cli(
+        ["subscriptions", "create", "--title-ref", "tmdb:movie:693134", "-o", "json"],
+        transport,
+    )
+
+    assert code == 0, err
+    assert json.loads(out)["subscription"]["id"] == 7
+    assert [call["path"] for call in calls] == ["/api/v1/subscriptions"]
+    assert json.loads(calls[0]["body"]) == {"title_ref": "tmdb:movie:693134"}
 
 
 # ---------------------------------------------------------------------------
@@ -219,7 +148,7 @@ _SSE_BODY = (
 def _search_transport(calls: list[dict]):
     return _transport(
         {
-            ("GET", "/api/v1/search/stream"): httpx.Response(
+            ("GET", "/api/v1/search/torrents/stream"): httpx.Response(
                 200, content=_SSE_BODY.encode(), headers={"content-type": "text/event-stream"}
             ),
             ("POST", "/api/v1/downloaders/submit"): httpx.Response(
@@ -269,6 +198,70 @@ def test_search_resolution_filter(run_cli) -> None:
     assert len(rows) == 1 and rows[0]["resolution"] == "2160p"
 
 
+def test_search_titles_uses_unified_route(run_cli) -> None:
+    """CLI 的影视搜索命名、路径与公开 API 保持一致。"""
+    calls: list[dict] = []
+    transport = _transport(
+        {
+            ("POST", "/api/v1/search/titles"): httpx.Response(
+                200,
+                json=_envelope(
+                    {
+                        "query": "沙丘",
+                        "titles": [{"title_ref": "tmdb:movie:438631", "title": "沙丘"}],
+                        "providers": [
+                            {
+                                "provider": "tmdb",
+                                "success": True,
+                                "result_count": 1,
+                                "message": None,
+                            }
+                        ],
+                        "history_id": 7,
+                    }
+                ),
+            )
+        },
+        calls,
+    )
+
+    code, out, err = run_cli(
+        ["search", "titles", "沙丘", "--provider", "tmdb", "-o", "json"],
+        transport,
+    )
+
+    assert code == 0, err
+    assert json.loads(out) == [{"title_ref": "tmdb:movie:438631", "title": "沙丘"}]
+    assert json.loads(calls[0]["body"]) == {
+        "query": "沙丘",
+        "provider": "tmdb",
+        "save_history": True,
+    }
+
+
+def test_search_library_items_uses_unified_route(run_cli) -> None:
+    """本地库存搜索也位于同一个 search 命令域。"""
+    calls: list[dict] = []
+    transport = _transport(
+        {
+            ("GET", "/api/v1/search/library-items"): httpx.Response(
+                200,
+                json=_envelope([{"library_id": 1, "library_name": "电影库", "items": []}]),
+            )
+        },
+        calls,
+    )
+
+    code, out, err = run_cli(
+        ["search", "library-items", "沙丘", "-o", "json"],
+        transport,
+    )
+
+    assert code == 0, err
+    assert json.loads(out)[0]["library_name"] == "电影库"
+    assert calls[0]["params"] == {"keyword": "沙丘"}
+
+
 def test_download_row_out_of_range_exits_2(run_cli) -> None:
     calls: list[dict] = []
     run_cli(["search", "沙丘", "-o", "json"], _search_transport(calls))
@@ -284,14 +277,14 @@ def test_download_without_snapshot_hints_search_first(run_cli) -> None:
 
 
 # ---------------------------------------------------------------------------
-# lib organize：预览 → 确认 → 执行 → 等待
+# library organize-files：预览 → 确认 → 执行 → 等待
 # ---------------------------------------------------------------------------
 
 
 def _organize_transport(calls: list[dict]):
     return _transport(
         {
-            ("POST", "/api/v1/libraries/1/organize/preview"): httpx.Response(
+            ("POST", "/api/v1/libraries/1/file-organization-preview"): httpx.Response(
                 200,
                 json=_envelope(
                     {
@@ -302,7 +295,7 @@ def _organize_transport(calls: list[dict]):
                     }
                 ),
             ),
-            ("POST", "/api/v1/libraries/1/organize"): httpx.Response(
+            ("POST", "/api/v1/libraries/1/file-organizations"): httpx.Response(
                 200, json=_envelope({"started": True, "message": "已开始"}, message="整理已开始")
             ),
             ("GET", "/api/v1/libraries/1"): httpx.Response(
@@ -316,43 +309,49 @@ def _organize_transport(calls: list[dict]):
 def test_organize_dry_run_only_previews(run_cli) -> None:
     calls: list[dict] = []
     code, out, err = run_cli(
-        ["lib", "organize", "1", "--dry-run", "-o", "json"], _organize_transport(calls)
+        ["library", "organize-files", "1", "--dry-run", "-o", "json"],
+        _organize_transport(calls),
     )
     assert code == 0, err
     assert json.loads(out)["total"] == 10
-    assert [c["path"] for c in calls] == ["/api/v1/libraries/1/organize/preview"]
+    assert [c["path"] for c in calls] == ["/api/v1/libraries/1/file-organization-preview"]
     assert "改名 2 项" in err
 
 
 def test_organize_without_yes_exits_5(run_cli) -> None:
     calls: list[dict] = []
-    code, _out, err = run_cli(["lib", "organize", "1"], _organize_transport(calls))
+    code, _out, err = run_cli(["library", "organize-files", "1"], _organize_transport(calls))
     assert code == 5
     assert "--yes" in err
-    assert [c["path"] for c in calls] == ["/api/v1/libraries/1/organize/preview"]
+    assert [c["path"] for c in calls] == ["/api/v1/libraries/1/file-organization-preview"]
 
 
 def test_organize_with_yes_executes_and_waits(run_cli, monkeypatch) -> None:
     # 本用例验证轮询次数与终态判断，不验证真实时间流逝；跳过生产退避可省 5 秒。
     monkeypatch.setattr("time.sleep", lambda _seconds: None)
     calls: list[dict] = []
-    code, _out, err = run_cli(["lib", "organize", "1", "--yes"], _organize_transport(calls))
+    code, _out, err = run_cli(
+        ["library", "organize-files", "1", "--yes"], _organize_transport(calls)
+    )
     assert code == 0, err
     paths = [c["path"] for c in calls]
-    assert paths[:2] == ["/api/v1/libraries/1/organize/preview", "/api/v1/libraries/1/organize"]
+    assert paths[:2] == [
+        "/api/v1/libraries/1/file-organization-preview",
+        "/api/v1/libraries/1/file-organizations",
+    ]
     assert "/api/v1/libraries/1" in paths[2:]  # --wait 轮询到 organize_progress 为 null
     assert "任务已结束" in err
 
 
 # ---------------------------------------------------------------------------
-# lib reconcile-paths：预览 → 确认 → 创建修复扫描作业
+# library reconcile-paths：预览 → 确认 → 创建修复扫描作业
 # ---------------------------------------------------------------------------
 
 
 def _path_reconcile_transport(calls: list[dict]):
     return _transport(
         {
-            ("POST", "/api/v1/libraries/1/path-reconcile/preview"): httpx.Response(
+            ("POST", "/api/v1/libraries/1/path-reconciliation-preview"): httpx.Response(
                 200,
                 json=_envelope(
                     {
@@ -369,7 +368,7 @@ def _path_reconcile_transport(calls: list[dict]):
                     }
                 ),
             ),
-            ("POST", "/api/v1/libraries/1/path-reconcile"): httpx.Response(
+            ("POST", "/api/v1/libraries/1/path-reconciliations"): httpx.Response(
                 202,
                 json=_envelope(
                     {"started": True, "message": "已开始", "job_id": "repair-1", "created": True},
@@ -385,7 +384,7 @@ def test_path_reconcile_dry_run_only_previews(run_cli) -> None:
     calls: list[dict] = []
     code, out, err = run_cli(
         [
-            "lib",
+            "library",
             "reconcile-paths",
             "1",
             "--old-root",
@@ -400,7 +399,7 @@ def test_path_reconcile_dry_run_only_previews(run_cli) -> None:
     )
     assert code == 0, err
     assert json.loads(out)["safe_merges"] == 3
-    assert [call["path"] for call in calls] == ["/api/v1/libraries/1/path-reconcile/preview"]
+    assert [call["path"] for call in calls] == ["/api/v1/libraries/1/path-reconciliation-preview"]
     assert "磁盘删除 0" in err
 
 
@@ -408,7 +407,7 @@ def test_path_reconcile_requires_yes_before_start(run_cli) -> None:
     calls: list[dict] = []
     code, _out, err = run_cli(
         [
-            "lib",
+            "library",
             "reconcile-paths",
             "1",
             "--old-root",
@@ -420,14 +419,14 @@ def test_path_reconcile_requires_yes_before_start(run_cli) -> None:
     )
     assert code == 5
     assert "--yes" in err
-    assert [call["path"] for call in calls] == ["/api/v1/libraries/1/path-reconcile/preview"]
+    assert [call["path"] for call in calls] == ["/api/v1/libraries/1/path-reconciliation-preview"]
 
 
 def test_path_reconcile_with_yes_starts_job(run_cli) -> None:
     calls: list[dict] = []
     code, out, err = run_cli(
         [
-            "lib",
+            "library",
             "reconcile-paths",
             "1",
             "--old-root",
@@ -443,8 +442,8 @@ def test_path_reconcile_with_yes_starts_job(run_cli) -> None:
     assert code == 0, err
     assert json.loads(out)["job_id"] == "repair-1"
     assert [call["path"] for call in calls] == [
-        "/api/v1/libraries/1/path-reconcile/preview",
-        "/api/v1/libraries/1/path-reconcile",
+        "/api/v1/libraries/1/path-reconciliation-preview",
+        "/api/v1/libraries/1/path-reconciliations",
     ]
     assert "已开始修复" in err
 
@@ -555,7 +554,7 @@ def test_search_premature_close_exits_4_without_snapshot(run_cli, tmp_path) -> N
     calls: list[dict] = []
     transport = _transport(
         {
-            ("GET", "/api/v1/search/stream"): httpx.Response(
+            ("GET", "/api/v1/search/torrents/stream"): httpx.Response(
                 200, content=partial.encode(), headers={"content-type": "text/event-stream"}
             )
         },

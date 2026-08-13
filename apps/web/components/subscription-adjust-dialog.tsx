@@ -2,11 +2,11 @@
 
 /**
  * 调整订阅弹窗（订阅详情页「调整 ›」入口）：创建后修改季选择 / 持续追新 /
- * 入库目标库。后端 sub.update 早已支持 diff 重算工单（加季补工单、减季收
+ * 入库目标库。后端 subscriptions.update 支持 diff 重算工单（加季补工单、减季收
  * 未投递工单、已下载/已入库一律保留），此前前端只放开了换规则组——本弹窗
  * 补齐剩余三项，用户不必再"取消订阅重订"（那会丢活动记录）。
  *
- * 数据源与订阅弹窗同源：季结构走 sub.prepare（幂等，带播出/库存进度），
+ * 数据源与订阅弹窗同源：季结构走内部 title-preview（幂等，带播出/库存进度），
  * 库选择即时走投递预检。只提交发生变化的字段（PATCH 部分更新语义）。
  */
 
@@ -17,8 +17,8 @@ import { Modal } from "@/components/modal";
 import { SeasonRow } from "@/components/subscribe-dialog";
 import { listLibraries, type MediaLibrary } from "@/lib/api/libraries";
 import {
-  getDispatchPreview,
-  prepareSubscription,
+  previewSubscriptionDownloadRouting,
+  previewSubscriptionTitle,
   updateSubscription,
   type DispatchPreview,
   type SeasonOverview,
@@ -56,10 +56,8 @@ export function SubscriptionAdjustDialog({
     Promise.all([
       isMovie
         ? Promise.resolve(null)
-        : prepareSubscription({
-            source: "tmdb",
-            kind: detail.media.kind,
-            tmdb_id: detail.media.tmdb_id,
+        : previewSubscriptionTitle({
+            title_ref: `tmdb:${detail.media.kind}:${detail.media.tmdb_id}`,
           }),
       canManageSubscriptions
         ? listLibraries(detail.media.kind)
@@ -86,7 +84,7 @@ export function SubscriptionAdjustDialog({
     }
     let cancelled = false;
     setPreview(null);
-    getDispatchPreview(detail.media.kind, libraryId, detail.media.tmdb_id)
+    previewSubscriptionDownloadRouting(detail.media.kind, libraryId, detail.media.tmdb_id)
       .then((p) => {
         if (!cancelled) setPreview(p);
       })

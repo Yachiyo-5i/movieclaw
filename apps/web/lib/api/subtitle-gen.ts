@@ -19,7 +19,7 @@ async function unwrap<T>(promise: Promise<ApiEnvelope<T>>): Promise<T> {
  */
 
 /** 一个候选参考字幕的打分结论（预检确认框展示）。 */
-export interface SubgenCandidate {
+export interface SubtitleSourceCandidate {
   kind: "embedded" | "external";
   key: string;
   language: string | null;
@@ -34,8 +34,8 @@ export interface SubgenCandidate {
   requires_ocr: boolean;
 }
 
-export interface SubgenPreview {
-  candidates: SubgenCandidate[];
+export interface SubtitleGenerationPreview {
+  candidates: SubtitleSourceCandidate[];
   /** "kind:key"；null = 没有可用参考 */
   chosen_key: string | null;
   /** 用户指定或默认英语策略实际选中的候选，PGS 也会有值。 */
@@ -83,24 +83,24 @@ export interface CalibrateResult {
 }
 
 /** 生成预检：选源结果 + 成本估算（确认框素材，不动 LLM）。 */
-export function subgenPreview(
+export function previewSubtitleGeneration(
   fileId: number,
   targetLanguage = "chs",
   secondaryLanguage: string | null = null,
   sourceCandidateKey: string | null = null,
-): Promise<SubgenPreview> {
+): Promise<SubtitleGenerationPreview> {
   const query = new URLSearchParams({ target_language: targetLanguage });
   if (secondaryLanguage) query.set("secondary_language", secondaryLanguage);
   if (sourceCandidateKey) query.set("source_candidate_key", sourceCandidateKey);
   return unwrap(
-    request<ApiEnvelope<SubgenPreview>>(
-      `/library/files/${fileId}/subtitles/generate/preview?${query}`,
+    request<ApiEnvelope<SubtitleGenerationPreview>>(
+      `/libraries/files/${fileId}/subtitles/generation-preview?${query}`,
     ),
   );
 }
 
 /** 发起生成（后台执行；同文件已在跑时后端 400）。 */
-export function subgenStart(
+export function generateSubtitles(
   fileId: number,
   targetLanguage = "chs",
   options: {
@@ -118,7 +118,7 @@ export function subgenStart(
   } = options;
   return unwrap(
     request<ApiEnvelope<JobView>>(
-      `/library/files/${fileId}/subtitles/generate`,
+      `/libraries/files/${fileId}/subtitles/generations`,
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -135,12 +135,18 @@ export function subgenStart(
 }
 
 /** 一键校准外挂字幕时间轴（零 LLM 成本；校准后覆盖写回）。 */
-export function calibrateSubtitle(fileId: number, filename: string): Promise<CalibrateResult> {
+export function calibrateSubtitleTiming(
+  fileId: number,
+  filename: string,
+): Promise<CalibrateResult> {
   return unwrap(
-    request<ApiEnvelope<CalibrateResult>>(`/library/files/${fileId}/subtitles/calibrate`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ filename }),
-    }),
+    request<ApiEnvelope<CalibrateResult>>(
+      `/libraries/files/${fileId}/subtitles/timing-calibration`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ filename }),
+      },
+    ),
   );
 }

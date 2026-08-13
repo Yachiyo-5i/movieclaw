@@ -55,13 +55,13 @@ movieclaw 的官方命令行工具。用于从 TMDB 和豆瓣发现实时热点�
 {service_map}
 
 使用协议：
-- 常用链路：discover 找片/找剧 → sub create 订阅；search 搜 PT 种子 → download 投递；\
-lib 查看和管理已入库内容。discover 搜的是影视条目和榜单，search 搜的是可下载种子，不要混用；\
+- 常用链路：search titles 找片/找剧 → subscriptions create 订阅；search torrents 搜 PT 种子 → \
+download 投递；search library-items 查已有库存，discover 浏览榜单，library 管理已入库内容；\
 订阅会持续追踪，并在出现符合规则的新资源后自动搜索、下载和整理入库。
 - 输出即数据：stdout 是 JSON（默认），stderr 是过程提示与错误原因。
 - 参数拿不准就先 --help（域级与命令级都有，含示例），不要凭记忆猜参数或取值。
 - 列表默认有条数上限、长字段有截断；下结论前确认数据没有被截断（--limit 可调）。
-- 带 ⚠ 的命令需要 --yes 确认。其中 lib items delete 会删除磁盘上的媒体文件：\
+- 带 ⚠ 的命令需要 --yes 确认。其中 library items delete 会删除磁盘上的媒体文件：\
 必须先用只读命令查清将删除的具体条目、向用户复述并取得本轮明确同意后才能执行；\
 用户泛泛说「清理/整理」不构成删除文件的同意。其余 ⚠ 命令（删配置、清记录）在用户\
 任务明确要求时可直接 --yes。
@@ -94,7 +94,7 @@ def make_mclaw_tool(
         except ValueError as exc:
             raise ValueError(f"参数串无法解析（引号不配对？）：{exc}") from None
         if not argv:
-            raise ValueError('args 不能为空；例如 args="sub list" 或 args="--help"')
+            raise ValueError('args 不能为空；例如 args="subscriptions list" 或 args="--help"')
         if note := _BLOCKED.get(argv[0]):
             raise ValueError(note)
 
@@ -142,8 +142,9 @@ def make_mclaw_tool(
                     "args": {
                         "type": "string",
                         "description": "mclaw 后面的完整参数串（不含 mclaw 本身），"
-                        "如 'discover layout movie --source tmdb'、'sub list' 或 "
-                        "'search \"沙丘2\" --resolution 2160p'",
+                        "如 'discover list-collections --media-type movie --provider tmdb'、"
+                        "'subscriptions list' 或 "
+                        "'search torrents \"沙丘2\" --resolution 2160p'",
                     },
                     "timeout": {
                         "type": "number",

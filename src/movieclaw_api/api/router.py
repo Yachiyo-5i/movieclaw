@@ -32,6 +32,8 @@ from movieclaw_api.api.routes.auth import router as auth_router
 from movieclaw_api.api.routes.channels import router as channels_router
 from movieclaw_api.api.routes.channels_im import router as channels_im_router
 from movieclaw_api.api.routes.discover import router as discover_router
+from movieclaw_api.api.routes.discover import search_router as title_search_router
+from movieclaw_api.api.routes.discover import ui_router as discovery_ui_router
 from movieclaw_api.api.routes.downloaders import router as downloaders_router
 from movieclaw_api.api.routes.downloaders import submit_router as download_submit_router
 from movieclaw_api.api.routes.extension import router as extension_router
@@ -41,6 +43,7 @@ from movieclaw_api.api.routes.images import router as images_router
 from movieclaw_api.api.routes.import_watch import router as import_watch_router
 from movieclaw_api.api.routes.jobs import router as jobs_router
 from movieclaw_api.api.routes.libraries import router as libraries_router
+from movieclaw_api.api.routes.libraries import search_router as library_search_router
 from movieclaw_api.api.routes.llm import router as llm_router
 from movieclaw_api.api.routes.logs import router as logs_router
 from movieclaw_api.api.routes.members import router as members_router
@@ -71,9 +74,12 @@ api_router.include_router(appearance_router)
 # ---- 成员区（挂载时统一注入登录鉴权；组内管理动作在路由级挂 require_admin）
 _MEMBER_ROUTERS = [
     ui_router,
+    discovery_ui_router,
     discover_router,
+    title_search_router,
     images_router,
     search_router,
+    library_search_router,
     subscriptions_router,
     libraries_router,
     people_router,

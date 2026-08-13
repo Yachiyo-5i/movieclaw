@@ -11,7 +11,7 @@ import { PosterImage } from "@/components/poster-image";
 import { Tooltip } from "@/components/tooltip";
 import type { SearchScope } from "@/lib/categories";
 import {
-  fetchSearchSnapshot,
+  getTorrentSearchHistoryResults,
   streamSearchTorrents,
   type SiteSearchStatus,
   type TorrentAttrs,
@@ -23,7 +23,10 @@ import {
   submitRememberedTarget,
   type DownloadTargetRequest,
 } from "@/components/download-target-dialog";
-import { getSubscription, grabForSubscription } from "@/lib/api/subscriptions";
+import {
+  downloadSelectedTorrentForSubscription,
+  getSubscription,
+} from "@/lib/api/subscriptions";
 import { cachedImageUrl } from "@/lib/image-proxy";
 import { usePermissions } from "@/lib/permissions";
 import { formatDateTime, formatRelativeTime } from "@/lib/time";
@@ -714,7 +717,7 @@ export function SearchResults({ query, onResearch, grabForSubscriptionId }: Sear
     // 快照预览：不打扰任何站点，直接加载历史留存的结果集一次性上屏。
     // 站点状态（含逐站耗时/失败原因）从快照回放，过程面板/进度条自然不出现。
     if (query.snapshotId != null) {
-      fetchSearchSnapshot(query.snapshotId, { signal: controller.signal })
+      getTorrentSearchHistoryResults(query.snapshotId, { signal: controller.signal })
         .then((snap) => {
           setItems(snap.items);
           setSiteProgress(
@@ -2461,7 +2464,7 @@ const GRAB_LABEL: Record<GrabState, string> = {
 
 /**
  * 手动选种按钮：仅在选种模式（GrabContext 非空）出现在下载按钮旁。
- * 把当前搜索结果行原样回传给 sub.grab——跳过规则组过滤直接投递；
+ * 把当前搜索结果行原样交给 subscriptions.download-selected-torrent；
  * 身份对不上/没有可满足缺口时后端给可读中文错误，进 toast 并可重试。
  */
 function GrabButton({ hit, className }: { hit: TorrentHit; className: string }) {
@@ -2475,7 +2478,7 @@ function GrabButton({ hit, className }: { hit: TorrentHit; className: string }) 
     if (state === "submitting" || state === "done") return;
     setState("submitting");
     try {
-      const { units } = await grabForSubscription(grabFor.id, {
+      const { units } = await downloadSelectedTorrentForSubscription(grabFor.id, {
         site_id: hit.site_id,
         torrent_id: hit.torrent_id,
         title: hit.title,

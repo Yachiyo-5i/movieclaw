@@ -294,7 +294,9 @@ def test_dispatch_preview_routes_and_warnings(client) -> None:
         "/api/v1/libraries",
         json={"name": "预检电影库", "kind": "movie", "root_paths": ["/vol1/media/movies"]},
     ).json()["data"]
-    r = client.get("/api/v1/subscriptions/dispatch-preview", params={"kind": "movie"})
+    r = client.get(
+        "/api/v1/subscriptions/download-routing-preview", params={"kind": "movie"}
+    )
     assert r.status_code == 200
     assert r.json()["data"]["ok"] is False
     assert "默认下载器" in r.json()["data"]["warning"]
@@ -302,7 +304,7 @@ def test_dispatch_preview_routes_and_warnings(client) -> None:
     # 有下载器 + 库无监听规则：inplace 模式，基底 = 库主根
     _add_default_downloader(client)
     r = client.get(
-        "/api/v1/subscriptions/dispatch-preview",
+        "/api/v1/subscriptions/download-routing-preview",
         params={"kind": "movie", "library_id": lib["id"]},
     )
     data = r.json()["data"]
@@ -323,7 +325,7 @@ def test_dispatch_preview_routes_and_warnings(client) -> None:
         },
     )
     r = client.get(
-        "/api/v1/subscriptions/dispatch-preview",
+        "/api/v1/subscriptions/download-routing-preview",
         params={"kind": "movie", "library_id": lib["id"]},
     )
     data = r.json()["data"]
@@ -350,7 +352,7 @@ def test_dispatch_preview_routes_and_warnings(client) -> None:
     )
     assert r.status_code == 200, r.json()
     r = client.get(
-        "/api/v1/subscriptions/dispatch-preview",
+        "/api/v1/subscriptions/download-routing-preview",
         params={"kind": "movie", "library_id": lib["id"]},
     )
     data = r.json()["data"]

@@ -40,7 +40,7 @@ import {
   getItemEpisodes,
   getLibrary,
   getLibraryItemDetail,
-  getTransferStatus,
+  getLibraryItemTransferStatus,
   listLibraries,
   previewItemTransfer,
   refreshItemMetadata,
@@ -1484,7 +1484,7 @@ function TransferDialog({
   useEffect(() => {
     if (!open || !running) return;
     const timer = setInterval(() => {
-      getTransferStatus(libraryId)
+      getLibraryItemTransferStatus(libraryId)
         .then((next) => {
           setStatus(next);
           if (!next.running && next.errors.length === 0 && next.target_library_id != null) {
@@ -1502,7 +1502,7 @@ function TransferDialog({
     setError(null);
     try {
       await transferLibraryItem(libraryId, detail.media_item_id, targetId);
-      const next = await getTransferStatus(libraryId);
+      const next = await getLibraryItemTransferStatus(libraryId);
       setStatus(next);
       if (!next.running && next.errors.length === 0 && next.target_library_id != null) {
         onFinished(next.target_library_id);

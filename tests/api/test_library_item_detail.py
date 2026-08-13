@@ -1419,7 +1419,9 @@ async def test_reidentify_preview_then_claim_applies_and_clears_orphan(db, tmp_p
     async with db.session() as session:
         row = (await session.execute(select(LibraryFile))).scalars().one()
         resp = await claim_files_batch(
-            ClaimBatchPayload(file_ids=[row.id], tmdb_id=300), BackgroundTasks(), session
+            ClaimBatchPayload(file_ids=[row.id], title_ref="tmdb:movie:300"),
+            BackgroundTasks(),
+            session,
         )
     assert resp.data["claimed"] == 1
 
@@ -1515,4 +1517,3 @@ async def test_actor_thumb_missing_only_when_tmdb_has_no_profile(db, tmp_path) -
         ("线上演员甲", True),
         ("线上演员乙", False),
     ]
-

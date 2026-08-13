@@ -72,8 +72,11 @@ bash）、文件系统浏览这些等价于服务器控制权的功能。
   一键下载单独由能力开关控制，见 §2.2）；
 - `/llm`、`/network`、`/webhook`、`/app`（含重启）、`/system/logs`、`/channels/*`；
 - `/auth/tokens`（PAT 创建，否则成员自发 PAT 即完成提权）；
-- `/subscriptions/dispatch-preview`、`/pipeline-health`、`/{id}/grab`、
-  `/{id}/downloads`（暴露落盘路径/种子/下载器细节）。
+- `/subscriptions/download-routing-preview`、`/automation-readiness`、
+  `/{id}/selected-torrent-downloads`、`/{id}/active-downloads`
+  （暴露落盘路径/种子/下载器细节），以及 `DELETE /subscriptions/{id}`
+  （永久删除共享订阅）。成员退出使用 `DELETE /subscriptions/{id}/following`，
+  不会误删其他成员仍在追踪的订阅。
 
 ## 2. 产品设计
 
@@ -373,7 +376,7 @@ class LibraryAccessService:
 全部消费面只调用这个入口，**不自行拼查询条件**：
 
 - `GET /libraries` 及全部 `/libraries/{id}/...` 读接口；
-- 全局搜索 `GET /libraries/search`：结果按可见库过滤；
+- 全局搜索 `GET /search/library-items`：结果按可见库过滤；
 - Jellyfin `/UserViews`、`/Items` 层级导航：按可见库投影（§3.7）；
 - 发现页/详情页的"已入库"徽标：按可见库计算，避免"显示已入库但点进去 404"。
 

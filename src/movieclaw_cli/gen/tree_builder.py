@@ -1,7 +1,7 @@
 """spec → click 命令树（docs/design/cli.md §3.2 参数映射规则）。
 
-命令名完全由 operation_id 决定：`sub.list` → `mclaw sub list`，
-`lib.items.claim` → `mclaw lib items claim`。help 来自 summary/description，
+命令名完全由 operation_id 决定：`subscriptions.list` → `mclaw subscriptions list`，
+`library.items.get` → `mclaw library items get`。help 来自 summary/description，
 参数来自 parameters / requestBody——spec 写好，命令即成，CLI 侧零手工维护。
 
 P1 全量映射（除 x-cli-hidden 与 x-cli-stream 外全部生成）：
@@ -27,7 +27,7 @@ from movieclaw_cli.core.errors import CliError, ExitCode
 from movieclaw_cli.core.http import Api
 from movieclaw_cli.core.output import emit
 
-# 允许写在子命令尾部的全局标志（kubectl 惯例：`mclaw sub list -o json`）。
+# 允许写在子命令尾部的全局标志（kubectl 惯例：`mclaw subscriptions list -o json`）。
 # 根组上的同名标志依然有效，叶子上的取值优先。
 _OVERRIDE_VALUE_OPTS = ("output", "server", "timeout")
 _OVERRIDE_FLAG_OPTS = ("quiet", "debug", "yes")
@@ -48,12 +48,12 @@ DOMAIN_HELP = {
     "appearance": "首页背景与图库",
     "auth": "个人信息、会话与 API 令牌",
     "channels": "微信、Telegram、Discord 消息推送与 AI 对话入口",
-    "discover": "从 TMDB/豆瓣发现最新、热门和高分电影/剧集，搜索条目并查看详情",
+    "discover": "浏览 TMDB/豆瓣电影与剧集片单，并读取影视条目完整资料",
     "dl": "qBittorrent/Transmission 下载器、路径映射与种子投递",
     "extension": "浏览器插件 Cookie 同步",
     "health": "API 存活检查",
     "jobs": "后台作业查询、事件、等待、取消与重试",
-    "lib": "本地电影/剧集媒体库、扫描入库、整理与元数据维护",
+    "library": "管理本地电影/剧集媒体库、库存文件、识别结果、元数据、图片与字幕",
     "llm": "OpenAI、阿里云百炼及 OpenAI 兼容模型接入与验证",
     "logs": "系统日志查看与实时跟随",
     "members": "家庭成员账号、能力开关与可见范围",
@@ -61,12 +61,26 @@ DOMAIN_HELP = {
     "notices": "系统待处理事项",
     "people": "本地媒体库影人档案与作品",
     "rules": "订阅资源质量与过滤规则组",
-    "search": "PT 站点种子跨站搜索、筛选排序、偏好与历史",
+    "search": "统一搜索影视条目、PT 种子和本地媒体库，并管理搜索预设与历史",
     "site": "PT 资源站点接入、鉴权验证与缓存状态",
-    "sub": "持续追踪电影/剧集新资源并自动下载入库",
+    "subscriptions": "持续追踪电影/剧集缺失资源并自动搜索、下载和整理入库",
     "ui": "Web 界面质感、布局与显示偏好",
     "watch": "下载完成目录监听、自动识别、标准命名与入库",
     "webhook": "播放、收藏等事件的 Webhook 推送与投递记录",
+}
+
+# 二级分组同样是模型的探索入口，必须说明“这里解决什么问题”。只给一级域
+# 描述会让 items / identification / metadata 等孤立名词失去选择依据。
+COMMAND_GROUP_HELP = {
+    "library.artwork": "查看、下载和选定媒体条目的海报或背景图",
+    "library.identification": "处理待识别、错识别和已忽略文件，明确指定文件所属影视条目",
+    "library.items": "查看和管理已经入库的电影、剧集条目及其物理文件",
+    "library.metadata": "刷新整个媒体库的 TMDB 元数据并查看或停止刷新任务",
+    "library.missing": "查看磁盘上已经缺失的库存记录、重新下载或清理台账",
+    "library.scan": "扫描媒体库根路径，把存量文件识别并登记到库存台账",
+    "library.subtitles": "预检和生成 AI 字幕，或校准外挂字幕时间轴",
+    "search.history": "列出、回放、删除或清空影视条目与 PT 种子搜索历史",
+    "search.presets": "列出或更新 PT 种子搜索的分类与站点组合预设",
 }
 
 _SIMPLE_TYPES = {"string", "integer", "number", "boolean"}
@@ -501,6 +515,8 @@ def _make_command(op: dict[str, Any], ops_by_id: dict[str, dict[str, Any]]) -> c
     for f in op["body_fields"]:
         schema = f["schema"]
         help_text = f["description"] or ""
+        if f["required"]:
+            help_text = f"[必填] {help_text}".rstrip()
         if f["kind"] == "json":
             help_text = (
                 (help_text + "（JSON 字面量）").strip("（） ")
@@ -586,11 +602,15 @@ def _example_line(op: dict[str, Any]) -> str:
     parts = ["mclaw", *op["operation_id"].split(".")]
     parts += [f"<{p['name']}>" for p in op["params"] if p["in"] == "path"]
     parts += [
-        f"--{p['name'].replace('_', '-')} <值>"
+        f"--{p['name'].replace('_', '-')} {_example_value(p['name'], p['schema'])}"
         for p in op["params"]
         if p["in"] == "query" and p["required"]
     ]
-    parts += [f"{_flag_name(f)} <值>" for f in op["body_fields"] if f["required"]]
+    parts += [
+        f"{_flag_name(f)} {_example_value(f['name'], f['schema'], json_value=f['kind'] == 'json')}"
+        for f in op["body_fields"]
+        if f["required"]
+    ]
     if op["is_upload"]:
         parts.append("--file <本地文件>")
     if op["is_download"]:
@@ -600,6 +620,32 @@ def _example_line(op: dict[str, Any]) -> str:
     return " ".join(parts)
 
 
+def _example_value(name: str, schema: dict[str, Any], *, json_value: bool = False) -> str:
+    """为自动示例选择可直接理解的值，避免对人和模型都无信息量的 ``<值>``。"""
+    semantic = {
+        "title_ref": "tmdb:movie:438631",
+        "collection_ref": "tmdb:movie:popular",
+        "media_type": "movie",
+        "provider": "tmdb",
+        "kind": "movie",
+        "state": "active",
+        "root_paths": "'[\"/media/movies\"]'",
+        "file_ids": "'[101,102]'",
+        "ordered_ids": "'[1,2]'",
+    }
+    if name in semantic:
+        return semantic[name]
+    if enum := schema.get("enum"):
+        return str(enum[0])
+    if json_value:
+        return "'[1,2]'" if schema.get("type") == "array" else "'<JSON>'"
+    if schema.get("type") == "boolean":
+        return "true"
+    if schema.get("type") in {"integer", "number"}:
+        return "1"
+    return f"<{name}>"
+
+
 def build_tree(root: click.Group, spec: dict[str, Any]) -> None:
     """把生成命令挂到根命令组。已存在的同名命令（精选层）优先，不覆盖。"""
     ops = [op for op in iter_operations(spec) if is_generable(op)]
@@ -607,10 +653,14 @@ def build_tree(root: click.Group, spec: dict[str, Any]) -> None:
     for op in ops:
         segments = op["operation_id"].split(".")
         group = root
-        for segment in segments[:-1]:
+        for index, segment in enumerate(segments[:-1]):
             existing = group.commands.get(segment)
             if existing is None:
-                existing = click.Group(name=segment, help=DOMAIN_HELP.get(segment))
+                prefix = ".".join(segments[: index + 1])
+                existing = click.Group(
+                    name=segment,
+                    help=DOMAIN_HELP.get(segment) or COMMAND_GROUP_HELP.get(prefix),
+                )
                 group.add_command(existing)
             elif not isinstance(existing, click.Group):
                 break  # 精选层占了同名命令，生成命令让位

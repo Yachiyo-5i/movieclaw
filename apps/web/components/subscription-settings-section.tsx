@@ -4,11 +4,12 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 import Link from "next/link";
 
-import { searchTmdbMedia, type MediaSearchItem } from "@/lib/api/discover";
+import type { MediaSearchItem } from "@/lib/api/discover";
+import { searchTitles } from "@/lib/api/search";
 import { RuleSetsPanel } from "@/components/rule-sets-panel";
 import {
-  getDispatchPreview,
-  getPipelineHealth,
+  checkSubscriptionAutomationReadiness,
+  previewSubscriptionDownloadRouting,
   type DispatchPreview,
   type FixOption,
   type LibraryPipeline,
@@ -84,7 +85,7 @@ function PipelineHealthPanel() {
   const reload = useCallback(() => {
     setFailed(false);
     setBusy(true);
-    getPipelineHealth()
+    checkSubscriptionAutomationReadiness()
       .then(setHealth)
       .catch(() => setFailed(true))
       .finally(() => setBusy(false));
@@ -569,8 +570,8 @@ function SimulatePanel() {
     }
     timer.current = setTimeout(() => {
       setSearching(true);
-      searchTmdbMedia(query.trim())
-        .then((items) => setCandidates(items.filter((it) => it.type).slice(0, 6)))
+      searchTitles(query.trim(), { provider: "tmdb" })
+        .then(({ items }) => setCandidates(items.filter((it) => it.type).slice(0, 6)))
         .catch(() => setCandidates([]))
         .finally(() => setSearching(false));
     }, 400);
@@ -583,7 +584,7 @@ function SimulatePanel() {
     setPicked(item);
     setPreview(null);
     if (!item.type) return;
-    void getDispatchPreview(item.type, null, Number(item.id))
+    void previewSubscriptionDownloadRouting(item.type, null, Number(item.id))
       .then(setPreview)
       .catch(() => setPreview(null));
   };
@@ -687,4 +688,3 @@ function SimStep({ n, text }: { n: number; text: string }) {
     </p>
   );
 }
-

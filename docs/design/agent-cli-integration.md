@@ -43,7 +43,7 @@ def make_mclaw_tool(
   "properties": {
     "args": {
       "type": "string",
-      "description": "mclaw 后面的完整参数串（不含 mclaw 本身），如 'sub list' 或 'search \"沙丘2\" --resolution 2160p'"
+      "description": "mclaw 后面的完整参数串（不含 mclaw 本身），如 'subscriptions list' 或 'search torrents \"沙丘2\" --resolution 2160p'"
     },
     "timeout": {
       "type": "number",
@@ -97,8 +97,8 @@ movieclaw 的官方命令行工具。用于从 TMDB 和豆瓣发现实时热点�
 - channels 消息推送与 AI 对话入口（微信、Telegram、Discord 配对/解绑，配置事件
   推送并测试；绑定后可发消息搜片、订阅、查进度）
 - discover 发现电影/剧集（来自 TMDB、豆瓣的实时热点、热映/待上映/在播、热门、
-  高分、口碑及地区/类型榜单；layout/hero/row 浏览，search 搜两站影视条目，
-  show 看详情/演职员/剧照/相似推荐）
+  高分、口碑及地区/类型片单；list-collections 列片单，browse-collection 浏览片单，
+  get-title-details 看资料/演职员/剧照/相关推荐）
 - dl       qBittorrent/Transmission 下载器与投递（接入/验证/启停/设默认实例，
   配置保存路径与路径映射，预演落点并提交种子）
 - extension Chromium 浏览器插件 Cookie 同步（管理同步令牌/支持站点，把页面中的
@@ -106,8 +106,8 @@ movieclaw 的官方命令行工具。用于从 TMDB 和豆瓣发现实时热点�
 - health   API 存活检查（通常优先用顶级 status 查看更完整的部署状态）
 - jobs     后台作业（按来源/状态/类型查询，查看事件与执行器健康，等待/取消/重试；
   订阅的在途下载进度看 sub downloads）
-- lib      本地电影/剧集媒体库（建库/根目录/默认路由，扫描识别与标准命名入库，
-  搜索/详情/文件，元数据/海报/AI 字幕，待识别/缺失/身份复核，条目转移与删除）
+- library  本地电影/剧集媒体库（建库与默认路由，扫描和规范命名入库；查看库存条目与
+  物理文件，处理待识别/错识别/缺失内容，并管理元数据、图片、字幕和跨库转移）
 - llm      AI 模型供应商（接入 OpenAI、阿里云百炼或任意 OpenAI 兼容服务，选择
   模型并验证连通性，供 AI 对话等智能能力使用）
 - net      网络与代理（配置全局/指定服务代理及镜像地址，立即生效；按 TMDB/豆瓣/
@@ -116,8 +116,8 @@ movieclaw 的官方命令行工具。用于从 TMDB 和豆瓣发现实时热点�
 - people   本地媒体库影人档案（按 TMDB 人物 ID 查看资料及已入库参演作品）
 - rules    订阅过滤规则组（管理分辨率、编码、HDR、字幕/音轨、免费/H&R、做种数、
   体积和制作组等条件及默认规则组）
-- search   PT 站点种子资源搜索（跨站并发，按站点/分类/分辨率/免费状态筛选，
-  按做种数/体积/完成数排序，管理搜索偏好/历史/结果快照；结果行号可交给 download）
+- search   统一搜索（titles 搜 TMDB/豆瓣影视条目，torrents 跨 PT 站点搜种子并可把
+  结果行号交给 download，library-items 搜已入库内容；另可管理搜索预设和历史结果）
 - site     PT 资源站点（查看支持目录/鉴权要求，配置、验证、启停站点，查看本地种子
   缓存统计；Cookie 可由 extension 同步）
 - sub      电影/剧集订阅与自动追更（持续追踪新资源，按规则自动搜索、下载并整理
@@ -132,14 +132,14 @@ movieclaw 的官方命令行工具。用于从 TMDB 和豆瓣发现实时热点�
 - status   部署总览：服务健康、当前身份、客户端/服务端版本与命令目录同步状态
 
 使用协议：
-- 常用链路：discover 找片/找剧 → sub create 订阅；search 搜 PT 种子 →
-  download 投递；lib 查看和管理已入库内容。discover 搜的是影视条目和榜单，
-  search 搜的是可下载种子，不要混用；订阅会持续追踪，并在出现符合规则的新资源
+- 常用链路：search titles 找片/找剧 → subscriptions create 订阅；search torrents
+  搜 PT 种子 → download 投递；search library-items 查库存，discover 浏览榜单，
+  library 管理已入库内容；订阅会持续追踪，并在出现符合规则的新资源
   后自动搜索、下载和整理入库。
 - 输出即数据：stdout 是 JSON（默认），stderr 是过程提示与错误原因。
 - 参数拿不准就先 --help（域级与命令级都有，含示例），不要凭记忆猜参数或取值。
 - 列表默认有条数上限、长字段有截断；下结论前确认数据没有被截断（--limit 可调）。
-- 带 ⚠ 的命令需要 --yes 确认。其中 lib items delete 会删除磁盘上的媒体文件：
+- 带 ⚠ 的命令需要 --yes 确认。其中 library items delete 会删除磁盘上的媒体文件：
   必须先用只读命令查清将删除的具体条目、向用户复述并取得本轮明确同意后才能
   执行；用户泛泛说「清理/整理」不构成删除文件的同意。其余 ⚠ 命令（删配置、
   清记录）在用户任务明确要求时可直接 --yes。
@@ -160,8 +160,8 @@ movieclaw 的官方命令行工具。用于从 TMDB 和豆瓣发现实时热点�
   每域的用户语义由 `_DOMAIN_LINES` 人工维护，测试强制每个开放域都经过润色。
   新域在运行期仍可回落 `DOMAIN_HELP` 保证可用，但提交代码时会被守卫测试拦下，
   必须补齐功能介绍并显式评审快照。
-- **明确相邻域分工**：工具协议直接说明 discover=影视条目/榜单、search=可下载
-  种子，并给出「发现 → 订阅」「搜种 → 投递」「入库 → 管理」三条常用链路，
+- **明确相邻域分工**：工具协议直接说明 discover=浏览榜单、search=搜索影视/种子/
+  库存，并给出「搜影视 → 订阅」「搜种 → 投递」「查库存 → 管理」三条常用链路，
   降低模型仅凭技术名词误选命令的概率。
 - **危险规约放 description 而非系统提示词**：这是 mclaw 的领域语义，按
   现有架构归工具承载；且模型每次调用工具时 description 都在注意力窗口里，

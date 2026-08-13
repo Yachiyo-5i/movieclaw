@@ -1,9 +1,10 @@
-"""搜索偏好（标签栏：内置分类 + 自定义分类）接口的端到端测试。
+"""搜索预设（内置分类 + 自定义站点组合）接口的端到端测试。
 
 覆盖：默认值（常用四类可见、成人默认隐藏）、混排保存与持久化、预设的
 校验规则（重名 / 空名 / 未知站点 / 数量上限）、缺失内置分类自动补齐、
 预设内分类去重。
 """
+
 from __future__ import annotations
 
 import pytest
@@ -39,10 +40,10 @@ def client(tmp_path, monkeypatch):
     get_settings.cache_clear()
 
 
-def _get_tabs(client: TestClient) -> list[dict]:
-    resp = client.get("/api/v1/search/preferences")
+def _get_presets(client: TestClient) -> list[dict]:
+    resp = client.get("/api/v1/search/presets")
     assert resp.status_code == 200
-    return resp.json()["data"]["tabs"]
+    return resp.json()["data"]["presets"]
 
 
 def _preset(name: str = "热门影剧", **overrides) -> dict:
@@ -61,7 +62,7 @@ def _preset(name: str = "热门影剧", **overrides) -> dict:
 
 def test_default_tabs(client: TestClient) -> None:
     """从未配置时返回默认：常用四类可见且排前，成人等隐藏，无预设。"""
-    tabs = _get_tabs(client)
+    tabs = _get_presets(client)
     assert all(t["type"] == "category" for t in tabs)
     assert [t["id"] for t in tabs[:4]] == ["movie", "tv", "documentary", "anime"]
     assert all(t["visible"] for t in tabs[:4])
@@ -71,13 +72,13 @@ def test_default_tabs(client: TestClient) -> None:
 
 def test_save_mixed_tabs_persists(client: TestClient) -> None:
     """预设插到内置分类中间保存，再次读取应原样返回（混排顺序保留）。"""
-    tabs = _get_tabs(client)
+    tabs = _get_presets(client)
     preset = _preset("MT 影剧", site_ids=["mteam"], poster_mode=True, skip_history=True)
     mixed = [tabs[0], preset, *tabs[1:]]
 
-    resp = client.put("/api/v1/search/preferences", json={"tabs": mixed})
+    resp = client.put("/api/v1/search/presets", json={"presets": mixed})
     assert resp.status_code == 200
-    saved = resp.json()["data"]["tabs"]
+    saved = resp.json()["data"]["presets"]
     assert saved[1]["type"] == "preset"
     assert saved[1]["name"] == "MT 影剧"
     assert saved[1]["categories"] == ["movie", "tv"]
@@ -86,102 +87,100 @@ def test_save_mixed_tabs_persists(client: TestClient) -> None:
     assert saved[1]["skip_history"] is True
 
     # 再次 GET：与保存结果一致（真正落库，而非只在内存）
-    assert _get_tabs(client) == saved
+    assert _get_presets(client) == saved
 
 
 def test_preset_optional_flags_default_off(client: TestClient) -> None:
     """不传 poster_mode / skip_history 的旧数据/旧前端：默认都关闭。"""
-    tabs = _get_tabs(client)
+    tabs = _get_presets(client)
     preset = _preset("无开关")
     del preset["poster_mode"]
     del preset["skip_history"]
-    resp = client.put("/api/v1/search/preferences", json={"tabs": [*tabs, preset]})
+    resp = client.put("/api/v1/search/presets", json={"presets": [*tabs, preset]})
     assert resp.status_code == 200
-    saved = resp.json()["data"]["tabs"][-1]
+    saved = resp.json()["data"]["presets"][-1]
     assert saved["poster_mode"] is False
     assert saved["skip_history"] is False
 
 
 def test_preset_empty_scope_means_unlimited(client: TestClient) -> None:
     """分类/站点都为空的预设合法：语义为「不限分类 × 全部站点」。"""
-    tabs = _get_tabs(client)
+    tabs = _get_presets(client)
     resp = client.put(
-        "/api/v1/search/preferences",
-        json={"tabs": [*tabs, _preset("全站", categories=[], site_ids=[])]},
+        "/api/v1/search/presets",
+        json={"presets": [*tabs, _preset("全站", categories=[], site_ids=[])]},
     )
     assert resp.status_code == 200
-    saved = resp.json()["data"]["tabs"][-1]
+    saved = resp.json()["data"]["presets"][-1]
     assert saved["categories"] == [] and saved["site_ids"] == []
 
 
 def test_preset_categories_deduped(client: TestClient) -> None:
     """预设内重复勾选的分类静默去重（保序）。"""
-    tabs = _get_tabs(client)
+    tabs = _get_presets(client)
     resp = client.put(
-        "/api/v1/search/preferences",
-        json={"tabs": [*tabs, _preset("去重", categories=["tv", "movie", "tv"])]},
+        "/api/v1/search/presets",
+        json={"presets": [*tabs, _preset("去重", categories=["tv", "movie", "tv"])]},
     )
     assert resp.status_code == 200
-    assert resp.json()["data"]["tabs"][-1]["categories"] == ["tv", "movie"]
+    assert resp.json()["data"]["presets"][-1]["categories"] == ["tv", "movie"]
 
 
 def test_duplicate_preset_name_rejected(client: TestClient) -> None:
-    tabs = _get_tabs(client)
+    tabs = _get_presets(client)
     resp = client.put(
-        "/api/v1/search/preferences",
-        json={"tabs": [*tabs, _preset("同名", id="p1"), _preset("同名", id="p2")]},
+        "/api/v1/search/presets",
+        json={"presets": [*tabs, _preset("同名", id="p1"), _preset("同名", id="p2")]},
     )
     assert resp.status_code == 400
     assert "同名" in resp.json()["message"]
 
 
 def test_blank_preset_name_rejected(client: TestClient) -> None:
-    tabs = _get_tabs(client)
+    tabs = _get_presets(client)
     resp = client.put(
-        "/api/v1/search/preferences",
-        json={"tabs": [*tabs, _preset("  ")]},
+        "/api/v1/search/presets",
+        json={"presets": [*tabs, _preset("  ")]},
     )
     assert resp.status_code == 422
 
 
 def test_unknown_site_rejected(client: TestClient) -> None:
-    tabs = _get_tabs(client)
+    tabs = _get_presets(client)
     resp = client.put(
-        "/api/v1/search/preferences",
-        json={"tabs": [*tabs, _preset("坏站点", site_ids=["not-a-site"])]},
+        "/api/v1/search/presets",
+        json={"presets": [*tabs, _preset("坏站点", site_ids=["not-a-site"])]},
     )
     assert resp.status_code == 400
     assert "not-a-site" in resp.json()["message"]
 
 
 def test_preset_count_capped(client: TestClient) -> None:
-    tabs = _get_tabs(client)
+    tabs = _get_presets(client)
     many = [_preset(f"预设{i}", id=f"p{i}") for i in range(21)]
-    resp = client.put("/api/v1/search/preferences", json={"tabs": [*tabs, *many]})
+    resp = client.put("/api/v1/search/presets", json={"presets": [*tabs, *many]})
     assert resp.status_code == 400
 
 
 def test_duplicate_builtin_category_rejected(client: TestClient) -> None:
-    tabs = _get_tabs(client)
-    resp = client.put(
-        "/api/v1/search/preferences", json={"tabs": [*tabs, tabs[0]]}
-    )
+    tabs = _get_presets(client)
+    resp = client.put("/api/v1/search/presets", json={"presets": [*tabs, tabs[0]]})
     assert resp.status_code == 400
 
 
 def test_missing_builtin_backfilled(client: TestClient) -> None:
     """只传部分内置分类时，缺失项按默认可见性补到末尾；预设不受影响。"""
     resp = client.put(
-        "/api/v1/search/preferences",
+        "/api/v1/search/presets",
         json={
-            "tabs": [
+            "presets": [
                 {"type": "category", "id": "av", "visible": True},
                 _preset("MT", site_ids=["mteam"]),
             ]
         },
     )
     assert resp.status_code == 200
-    saved = resp.json()["data"]["tabs"]
+    saved = resp.json()["data"]["presets"]
     # av + 预设 + 补齐的 7 个内置分类
     assert len(saved) == 9
     assert saved[0] == {"type": "category", "id": "av", "visible": True}

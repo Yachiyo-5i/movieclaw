@@ -22,6 +22,7 @@ from movieclaw_api.schemas.library import (
     ClaimPayload,
     DetachPayload,
     EpisodeView,
+    IdentityReviewDecision,
     ItemDeleteResultView,
     LastOrganizeView,
     LastScanView,
@@ -91,7 +92,9 @@ from movieclaw_api.services.library.items import (
     delete_single_file,
     find_episode_thumb,
     local_item_artwork,
-    search_library_items,
+)
+from movieclaw_api.services.library.items import (
+    search_library_items as search_visible_library_items,
 )
 from movieclaw_api.services.library.layout import entry_dir_of
 from movieclaw_api.services.library.organize import (
@@ -134,6 +137,7 @@ from movieclaw_api.services.media_discover import get_tmdb_client
 from movieclaw_api.services.media_library import MediaLibraryService
 from movieclaw_api.services.media_server_notify import notify_media_server_refresh
 from movieclaw_api.services.subscription import SubscriptionService
+from movieclaw_api.services.title_discovery import parse_title_ref
 from movieclaw_db.engine import get_database, get_session
 from movieclaw_db.models import (
     ACTIVE_JOB_STATUSES,
@@ -147,9 +151,21 @@ from movieclaw_db.models import (
 from movieclaw_db.repositories import MediaItemRepository
 from movieclaw_db.repositories.library_file_repo import LibraryFileRepository
 from movieclaw_media.genres import COUNTRY_NAMES, MOVIE_GENRES, REGION_PRESETS, TV_GENRES
-from movieclaw_media.models import MediaKind
+from movieclaw_media.models import MediaKind, MediaSource
 
 router = APIRouter(prefix="/libraries", tags=["libraries"])
+search_router = APIRouter(prefix="/search", tags=["search"])
+
+
+def _assignment_target(title_ref: str) -> tuple[MediaKind, int]:
+    """把 Discover 引用收敛为人工身份指定所需的 TMDB 锚点。"""
+    try:
+        provider, kind, external_id = parse_title_ref(title_ref)
+    except ValueError as exc:
+        raise BadRequestException(str(exc)) from exc
+    if provider is not MediaSource.TMDB or kind is None:
+        raise BadRequestException("文件身份指定只接受 Discover 返回的 TMDB title_ref")
+    return kind, int(external_id)
 
 
 def _job_origin(client_name: object) -> str:
@@ -495,7 +511,7 @@ async def _stats_by_library(session: AsyncSession) -> dict[int, LibraryStats]:
     "",
     response_model=ApiResponse[list[LibraryView]],
     summary="列出全部媒体库（含库存统计，可按类型过滤）",
-    operation_id="lib.list",
+    operation_id="library.list",
 )
 async def list_libraries(
     kind: str | None = Query(default=None, description="movie / tv，缺省全部"),
@@ -536,8 +552,8 @@ async def list_libraries(
 @router.get(
     "/routing-options",
     response_model=ApiResponse[dict],
-    summary="收藏范围的可选项（媒体类型与区域预设，配置库路由规则时使用）",
-    operation_id="lib.routing-options",
+    summary="列出媒体库路由规则可用的媒体类型、地区预设和类型标签",
+    operation_id="library.list-routing-options",
     dependencies=[Depends(require_admin)],
 )
 async def routing_options() -> ApiResponse[dict]:
@@ -610,10 +626,10 @@ async def _group_by_entry_dir(
 
 
 @router.get(
-    "/unidentified",
+    "/identification/unidentified-files",
     response_model=ApiResponse[list[UnidentifiedGroupView]],
     summary="待识别清单（按条目目录分组，不含已忽略，可按库过滤）",
-    operation_id="lib.unidentified.list",
+    operation_id="library.identification.list-unidentified-files",
     dependencies=[Depends(require_admin)],
 )
 async def list_unidentified(
@@ -626,10 +642,10 @@ async def list_unidentified(
 
 
 @router.get(
-    "/ignored",
+    "/identification/ignored-files",
     response_model=ApiResponse[list[UnidentifiedGroupView]],
     summary="已忽略清单（用户说过「别再问」的文件，可恢复）",
-    operation_id="lib.ignored.list",
+    operation_id="library.identification.list-ignored-files",
     dependencies=[Depends(require_admin)],
 )
 async def list_ignored(
@@ -648,10 +664,10 @@ async def list_ignored(
 
 
 @router.get(
-    "/review",
+    "/identification/review-cases",
     response_model=ApiResponse[list[ReviewGroupView]],
     summary="身份复核清单（识别器升级后的新旧结论分歧，可按库过滤）",
-    operation_id="lib.review.list",
+    operation_id="library.identification.list-review-cases",
     dependencies=[Depends(require_admin)],
 )
 async def list_identity_review(
@@ -732,10 +748,10 @@ async def list_identity_review(
 
 
 @router.post(
-    "/review/resolve",
+    "/identification/review-decisions",
     response_model=ApiResponse[dict],
-    summary="身份复核拍板：采纳建议或维持现状（整组）",
-    operation_id="lib.review.resolve",
+    summary="决定身份复核结果：采纳建议或维持当前身份",
+    operation_id="library.identification.resolve-review",
     dependencies=[Depends(require_admin)],
 )
 async def resolve_identity_review(
@@ -746,26 +762,28 @@ async def resolve_identity_review(
     """对复核清单里的文件拍板（实现见 services/library/claim.resolve_review）。"""
 
     resolved, title, displaced = await library_claim.resolve_review(
-        session, payload.file_ids, accept=payload.accept
+        session,
+        payload.file_ids,
+        accept=payload.decision is IdentityReviewDecision.ACCEPT_SUGGESTION,
     )
     # 改挂后旧条目可能一个文件都不剩，连同图片资产清掉，不在库里留空壳
     if displaced:
         background_tasks.add_task(media_scrape.cleanup_orphan_items, sorted(displaced))
     message = (
         f"{resolved} 个文件已改挂为《{title}》"
-        if payload.accept and title
+        if payload.decision is IdentityReviewDecision.ACCEPT_SUGGESTION and title
         else f"{resolved} 个文件维持现有身份，不再提醒"
     )
     return ok({"resolved": resolved}, message=message)
 
 
-@router.get(
-    "/search",
+@search_router.get(
+    "/library-items",
     response_model=ApiResponse[list[LibrarySearchGroupView]],
     summary="按关键词搜索已入库条目（跨全部媒体库，标题/原名匹配，按库分组）",
-    operation_id="lib.search",
+    operation_id="search.library-items",
 )
-async def search_libraries(
+async def search_library_items(
     keyword: str = Query(
         ..., min_length=1, max_length=100, description="搜索关键词（标题或原名的子串，忽略大小写）"
     ),
@@ -779,7 +797,7 @@ async def search_libraries(
     不是一次对外搜索，历史里混进它只会淹没真正要回放的记录。
     成员的结果按库可见性白名单过滤。
     """
-    matched = await search_library_items(session, keyword)
+    matched = await search_visible_library_items(session, keyword)
     libraries = await LibraryConfigService(session).list_all()
     visible = await visible_library_ids(session, principal)
     if visible is not None:
@@ -803,7 +821,7 @@ async def search_libraries(
     "/{library_id}",
     response_model=ApiResponse[LibraryView],
     summary="获取单个媒体库详情",
-    operation_id="lib.show",
+    operation_id="library.get",
     dependencies=[Depends(require_library_visible)],
 )
 async def get_library(
@@ -841,7 +859,7 @@ async def get_library(
     "",
     response_model=ApiResponse[LibraryView],
     summary="创建媒体库（该类型首个库自动成为默认，并自动开始首次扫描）",
-    operation_id="lib.create",
+    operation_id="library.create",
     dependencies=[Depends(require_admin)],
 )
 async def create_library(
@@ -949,10 +967,10 @@ async def _quiesce_scan_for_mutation(
 
 
 @router.put(
-    "/order",
+    "/display-order",
     response_model=ApiResponse[dict],
     summary="重排媒体库展示顺序（决定首页卡片与「最近添加」分区的排列）",
-    operation_id="lib.order.set",
+    operation_id="library.reorder",
     dependencies=[Depends(require_admin)],
 )
 async def reorder_libraries(
@@ -973,7 +991,7 @@ async def reorder_libraries(
     "/{library_id}",
     response_model=ApiResponse[LibraryView],
     summary="更新媒体库（类型创建后不可改；变更根路径时要求库空闲）",
-    operation_id="lib.update",
+    operation_id="library.update",
     dependencies=[Depends(require_admin)],
 )
 async def update_library(
@@ -1021,10 +1039,10 @@ async def update_library(
 
 
 @router.post(
-    "/{library_id}/default",
+    "/{library_id}/default-selection",
     response_model=ApiResponse[LibraryView],
     summary="设为该类型的默认库",
-    operation_id="lib.default.set",
+    operation_id="library.set-default",
     dependencies=[Depends(require_admin)],
 )
 async def set_default_library(
@@ -1042,7 +1060,7 @@ async def set_default_library(
     "/{library_id}",
     response_model=ApiResponse[dict],
     summary="删除媒体库（不动磁盘文件；其订阅回落到该类型默认库；扫描/整理中锁定）",
-    operation_id="lib.delete",
+    operation_id="library.delete",
     dependencies=[Depends(require_admin)],
     openapi_extra={"x-cli-dangerous": "confirm"},
 )
@@ -1088,7 +1106,7 @@ async def delete_library(
     "/{library_id}/scan",
     response_model=ApiResponse[ScanResultView],
     summary="扫描该库的根路径，把存量文件识别入账（后台执行）",
-    operation_id="lib.scan.start",
+    operation_id="library.scan.start",
     dependencies=[Depends(require_admin)],
     openapi_extra={
         "x-cli-job": {"id_path": "job_id", "wait_op": "jobs.wait"},
@@ -1153,10 +1171,10 @@ def _validated_reconcile_roots(
 
 
 @router.post(
-    "/{library_id}/path-reconcile/preview",
+    "/{library_id}/path-reconciliation-preview",
     response_model=ApiResponse[PathReconcilePreviewView],
     summary="预览历史根路径迁移修复（只读，不扫描、不修改台账）",
-    operation_id="lib.path-reconcile-preview",
+    operation_id="workflow.library.reconcile-paths.preview",
     dependencies=[Depends(require_admin)],
     # CLI 必须经精选层的「预览 → --yes」工作流，不能让生成命令绕过确认。
     openapi_extra={"x-cli-hidden": True},
@@ -1177,10 +1195,10 @@ async def preview_path_reconcile(
 
 
 @router.post(
-    "/{library_id}/path-reconcile",
+    "/{library_id}/path-reconciliations",
     response_model=ApiResponse[ScanResultView],
     summary="执行历史根路径迁移修复（重新扫描新根并收口旧路径台账）",
-    operation_id="lib.path-reconcile-start",
+    operation_id="workflow.library.reconcile-paths.start",
     dependencies=[Depends(require_admin)],
     openapi_extra={
         "x-cli-job": {"id_path": "job_id", "wait_op": "jobs.wait"},
@@ -1227,7 +1245,7 @@ async def start_path_reconcile(
     "/{library_id}/scan/stop",
     response_model=ApiResponse[dict],
     summary="停止进行中的扫描（已入账的保留，剩余文件下次扫描继续）",
-    operation_id="lib.scan.stop",
+    operation_id="library.scan.stop",
     dependencies=[Depends(require_admin)],
 )
 async def stop_scan(
@@ -1272,7 +1290,7 @@ async def stop_scan(
     "/{library_id}/metadata/refresh",
     response_model=ApiResponse[dict],
     summary="整库刷新元数据：全部已识别条目重新刮削（可恢复后台作业）",
-    operation_id="lib.refresh.start",
+    operation_id="library.metadata.refresh-library",
     dependencies=[Depends(require_admin)],
     openapi_extra={"x-cli-job": {"id_path": "job_id", "wait_op": "jobs.wait"}},
     status_code=202,
@@ -1304,7 +1322,7 @@ async def start_metadata_refresh(
     "/{library_id}/metadata/refresh/stop",
     response_model=ApiResponse[dict],
     summary="停止进行中的整库元数据刷新（已刷完的保留）",
-    operation_id="lib.refresh.stop",
+    operation_id="library.metadata.stop-refresh",
     dependencies=[Depends(require_admin)],
 )
 async def stop_metadata_refresh(
@@ -1333,7 +1351,7 @@ async def stop_metadata_refresh(
     "/{library_id}/metadata/refresh/progress",
     response_model=ApiResponse[MetadataRefreshView],
     summary="整库元数据刷新的实时状态（进度 + 正在处理哪几部、各在什么阶段）",
-    operation_id="lib.refresh.progress",
+    operation_id="library.metadata.get-refresh-status",
     dependencies=[Depends(require_admin)],
 )
 async def metadata_refresh_progress(
@@ -1369,7 +1387,7 @@ async def metadata_refresh_progress(
     "/{library_id}/items/{media_item_id}/metadata/refresh",
     response_model=ApiResponse[dict],
     summary="刷新单个条目的元数据（强制重刮 TMDB，可恢复后台作业）",
-    operation_id="lib.items.refresh",
+    operation_id="library.items.refresh-metadata",
     dependencies=[Depends(require_admin)],
     openapi_extra={"x-cli-job": {"id_path": "job_id", "wait_op": "jobs.wait"}},
     status_code=202,
@@ -1404,7 +1422,7 @@ async def refresh_item_metadata(
     "/{library_id}/items/{media_item_id}/artwork/candidates",
     response_model=ApiResponse[ArtworkCandidatesView],
     summary="条目的候选海报/背景图列表（选图前先看这里）",
-    operation_id="lib.items.artwork-candidates",
+    operation_id="library.artwork.list-candidates",
     dependencies=[Depends(require_admin)],
 )
 async def list_artwork_candidates_route(
@@ -1440,7 +1458,7 @@ async def list_artwork_candidates_route(
     "/{library_id}/items/{media_item_id}/artwork/select",
     response_model=ApiResponse[dict],
     summary="选定海报/背景（当场落盘并覆盖媒体目录；此后刷新不再覆盖）",
-    operation_id="lib.items.artwork-select",
+    operation_id="library.artwork.select",
     dependencies=[Depends(require_admin)],
 )
 async def select_artwork_route(
@@ -1470,11 +1488,12 @@ async def select_artwork_route(
 
 
 @router.post(
-    "/{library_id}/organize/preview",
+    "/{library_id}/file-organization-preview",
     response_model=ApiResponse[OrganizePreviewView],
     summary="预览整理计划：每个文件改成什么名、哪些跳过及原因（只读，不动磁盘）",
-    operation_id="lib.organize.preview",
+    operation_id="workflow.library.organize-files.preview",
     dependencies=[Depends(require_admin)],
+    openapi_extra={"x-cli-hidden": True},
 )
 async def preview_organize(
     library_id: int,
@@ -1513,12 +1532,15 @@ async def preview_organize(
 
 
 @router.post(
-    "/{library_id}/organize",
+    "/{library_id}/file-organizations",
     response_model=ApiResponse[OrganizeStartView],
     summary="开始整理：按规范命名批量改名归位（可恢复后台作业）",
-    operation_id="lib.organize.start",
+    operation_id="workflow.library.organize-files.start",
     dependencies=[Depends(require_admin)],
-    openapi_extra={"x-cli-job": {"id_path": "job_id", "wait_op": "jobs.wait"}},
+    openapi_extra={
+        "x-cli-job": {"id_path": "job_id", "wait_op": "jobs.wait"},
+        "x-cli-hidden": True,
+    },
     status_code=202,
 )
 async def start_organize(
@@ -1559,7 +1581,7 @@ async def start_organize(
     "/{library_id}/items",
     response_model=ApiResponse[list[LibraryItemView]],
     summary="库内媒体条目的库存聚合（单库海报墙数据源）",
-    operation_id="lib.items.list",
+    operation_id="library.items.list",
     dependencies=[Depends(require_library_visible)],
 )
 async def list_library_items(
@@ -1585,7 +1607,8 @@ async def list_library_items(
     "/{library_id}/item-ids",
     response_model=ApiResponse[list[int]],
     summary="库内条目 id 集合（前端判定「已入库」用）",
-    operation_id="lib.items.ids",
+    operation_id="ui.library.items.ids",
+    openapi_extra={"x-cli-hidden": True},
     dependencies=[Depends(require_library_visible)],
 )
 async def list_library_item_ids(
@@ -1611,7 +1634,8 @@ async def list_library_item_ids(
     "/{library_id}/item-index",
     response_model=ApiResponse[list[LibraryIndexEntryView]],
     summary="海报墙的 A-Z 首字母索引（按标题排序下的分档与起始位置）",
-    operation_id="lib.items.index",
+    operation_id="ui.library.items.index",
+    openapi_extra={"x-cli-hidden": True},
     dependencies=[Depends(require_library_visible)],
 )
 async def list_library_item_index(
@@ -1735,7 +1759,7 @@ def _file_view(row: LibraryFile, external_subs: list[str]) -> LibraryFileView:
     "/{library_id}/items/{media_item_id}",
     response_model=ApiResponse[LibraryItemDetailView],
     summary="条目详情：基本信息 + NFO 本地刮削元数据 + 逐文件真实介质规格",
-    operation_id="lib.items.show",
+    operation_id="library.items.get",
     dependencies=[Depends(require_library_visible)],
 )
 async def get_library_item(
@@ -1847,7 +1871,7 @@ async def get_library_item(
     "/{library_id}/items/{media_item_id}/episodes",
     response_model=ApiResponse[SeasonEpisodesView],
     summary="剧集条目一季的分集清单（集名/简介/剧照 + 拥有状态，分集横滚区数据源）",
-    operation_id="lib.items.episodes",
+    operation_id="library.items.list-episodes",
     dependencies=[Depends(require_library_visible)],
 )
 async def list_item_episodes(
@@ -1885,7 +1909,8 @@ async def list_item_episodes(
     "/files/{file_id}/thumb",
     response_class=FileResponse,
     summary="分集本地缩略图（视频同名 -thumb.jpg，Kodi 惯例）",
-    operation_id="lib.files.thumb",
+    operation_id="ui.library.files.thumb",
+    openapi_extra={"x-cli-hidden": True},
 )
 async def get_file_thumb(
     file_id: int,
@@ -1909,7 +1934,7 @@ async def get_file_thumb(
     "/files/{file_id}/subtitles/preview",
     response_model=ApiResponse[SubtitlePreviewView],
     summary="预览一条外挂或文本内封字幕的时间轴内容",
-    operation_id="lib.files.subtitles.preview",
+    operation_id="ui.library.files.preview-subtitles",
     openapi_extra={"x-cli-hidden": True},
 )
 async def preview_file_subtitle(
@@ -1954,7 +1979,7 @@ async def preview_file_subtitle(
     "/{library_id}/items/{media_item_id}/artwork",
     response_class=FileResponse,
     summary="条目目录里的本地美术图（poster/fanart，Kodi/Emby 命名惯例）",
-    operation_id="lib.items.artwork-download",
+    operation_id="library.artwork.download",
     dependencies=[Depends(require_library_visible)],
 )
 async def get_item_artwork(
@@ -1981,7 +2006,7 @@ async def get_item_artwork(
     "/{library_id}/items/{media_item_id}",
     response_model=ApiResponse[ItemDeleteResultView],
     summary="从磁盘彻底删除条目（整个刮削目录：视频+NFO+海报+字幕一起清除）",
-    operation_id="lib.items.delete",
+    operation_id="library.items.delete",
     dependencies=[Depends(require_admin)],
     openapi_extra={"x-cli-dangerous": "destructive"},
 )
@@ -2024,7 +2049,7 @@ async def delete_library_item(
     "/{library_id}/items/{media_item_id}/files/{file_id}",
     response_model=ApiResponse[ItemDeleteResultView],
     summary="从磁盘删除条目的单个文件（含同名 NFO/字幕/图片附属文件）",
-    operation_id="lib.items.files.delete",
+    operation_id="library.items.delete-file",
     dependencies=[Depends(require_admin)],
     openapi_extra={"x-cli-dangerous": "destructive"},
 )
@@ -2070,10 +2095,10 @@ async def delete_library_file(
 
 
 @router.post(
-    "/{library_id}/items/{media_item_id}/reidentify/preview",
+    "/{library_id}/items/{media_item_id}/reidentification-preview",
     response_model=ApiResponse[ReidentifyPreviewView],
     summary="修正识别结果（预览）：重走识别链只出结论，不改台账",
-    operation_id="lib.items.reidentify.preview",
+    operation_id="library.items.preview-reidentification",
     dependencies=[Depends(require_admin)],
 )
 async def preview_reidentify_item(
@@ -2085,8 +2110,9 @@ async def preview_reidentify_item(
 
     识别错挂时机器往往是**高置信地错**——同一条链重跑大概率复现同一个错
     答案，所以这里只出结论、**一行台账都不改**，由用户拍板：采纳某组结论
-    （走 ``/files/claim-batch``）、自己搜一个条目、或标为非独立作品
-    （走 ``/files/detach``）。关掉面板则台账零改动。
+    （走 ``library.identification.assign-files-to-title``）、自己搜一个条目、或标为
+    非独立作品（走 ``library.identification.mark-files-as-extras``）。关掉面板则
+    台账零改动。
 
     只读，因此不占库级锁、扫描进行中也能开——结论过时了大不了拍板时
     按那一刻的台账走。
@@ -2140,10 +2166,10 @@ async def preview_reidentify_item(
 
 
 @router.post(
-    "/{library_id}/items/{media_item_id}/reidentify",
+    "/{library_id}/items/{media_item_id}/reidentifications",
     response_model=ApiResponse[ReidentifyResultView],
     summary="重新识别条目：全部在位文件重走识别链（NFO → 名称解析 → TMDB 收敛）",
-    operation_id="lib.items.reidentify",
+    operation_id="library.items.reidentify",
     dependencies=[Depends(require_admin)],
 )
 async def reidentify_library_item(
@@ -2216,10 +2242,10 @@ async def _transfer_context(
 
 
 @router.get(
-    "/{library_id}/items/{media_item_id}/transfer/preview",
+    "/{library_id}/items/{media_item_id}/transfer-preview",
     response_model=ApiResponse[TransferPreviewView],
     summary="预览条目转移：哪些目录/文件搬到目标库的什么位置（只读，不动磁盘）",
-    operation_id="lib.items.transfer.preview",
+    operation_id="library.items.preview-transfer",
     dependencies=[Depends(require_admin)],
 )
 async def preview_transfer(
@@ -2259,13 +2285,13 @@ async def preview_transfer(
 
 
 @router.post(
-    "/{library_id}/items/{media_item_id}/transfer",
+    "/{library_id}/items/{media_item_id}/transfers",
     response_model=ApiResponse[TransferStartView],
     summary="转移条目到另一个媒体库：整个条目目录搬到目标库主根，台账随迁",
-    operation_id="lib.items.transfer",
+    operation_id="library.items.transfer",
     dependencies=[Depends(require_admin)],
     openapi_extra={
-        "x-cli-dangerous": "destructive",
+        "x-cli-dangerous": "confirm",
         "x-cli-job": {"id_path": "job_id", "wait_op": "jobs.wait"},
     },
     status_code=202,
@@ -2316,10 +2342,10 @@ async def transfer_library_item(
 
 
 @router.get(
-    "/{library_id}/transfer/status",
+    "/{library_id}/item-transfer-status",
     response_model=ApiResponse[TransferStatusView],
     summary="条目转移的实时进度与最近一次结论",
-    operation_id="lib.transfer.status",
+    operation_id="library.items.get-transfer-status",
     dependencies=[Depends(require_admin)],
 )
 async def get_transfer_status(
@@ -2408,7 +2434,7 @@ async def get_transfer_status(
     "/{library_id}/missing",
     response_model=ApiResponse[list[MissingItemView]],
     summary="缺失清单：文件已不在磁盘的库存，按条目聚合",
-    operation_id="lib.missing.list",
+    operation_id="library.missing.list",
     dependencies=[Depends(require_admin)],
 )
 async def list_missing(
@@ -2470,10 +2496,10 @@ async def list_missing(
 
 
 @router.post(
-    "/missing/clear",
+    "/missing-record-clearances",
     response_model=ApiResponse[dict],
     summary="清理缺失记录（只删台账，绝不动磁盘）；不带 media_item_id 清整库",
-    operation_id="lib.missing.clear",
+    operation_id="library.missing.clear-records",
     dependencies=[Depends(require_admin)],
     openapi_extra={"x-cli-dangerous": "confirm"},
 )
@@ -2490,10 +2516,10 @@ async def clear_missing(
 
 
 @router.post(
-    "/unidentified/clear",
+    "/identification/unidentified-file-ignores",
     response_model=ApiResponse[dict],
-    summary="批量忽略整库的待识别文件（只删台账，绝不动磁盘）",
-    operation_id="lib.unidentified.clear",
+    summary="忽略一个媒体库内的全部待识别文件（可恢复，不动磁盘）",
+    operation_id="library.identification.ignore-all-unidentified-files",
     dependencies=[Depends(require_admin)],
     openapi_extra={"x-cli-dangerous": "confirm"},
 )
@@ -2513,10 +2539,10 @@ async def clear_unidentified(
 
 
 @router.post(
-    "/missing/redownload",
+    "/missing-redownloads",
     response_model=ApiResponse[dict],
     summary="重新下载缺失内容：缺失单元交回订阅管线（无订阅则按缺失季创建）",
-    operation_id="lib.missing.redownload",
+    operation_id="library.missing.redownload",
     dependencies=[Depends(require_admin)],
 )
 async def redownload_missing(
@@ -2546,10 +2572,10 @@ async def redownload_missing(
 
 
 @router.post(
-    "/files/{file_id}/claim",
+    "/identification/files/{file_id}/title-assignment",
     response_model=ApiResponse[dict],
-    summary="认领待识别文件：挂到指定的 TMDB 条目",
-    operation_id="lib.files.claim",
+    summary="把一个文件明确关联到 Discover 影视条目",
+    operation_id="library.identification.assign-file-to-title",
     dependencies=[Depends(require_admin)],
 )
 async def claim_file(
@@ -2558,11 +2584,12 @@ async def claim_file(
     background_tasks: BackgroundTasks,
     session: AsyncSession = Depends(get_session),
 ) -> ApiResponse[dict]:
-
+    target_kind, tmdb_id = _assignment_target(payload.title_ref)
     item, _, displaced = await library_claim.claim_files(
         session,
         [file_id],
-        tmdb_id=payload.tmdb_id,
+        tmdb_id=tmdb_id,
+        target_kind=target_kind,
         explicit_unit=(payload.season_number, payload.episode_number),
     )
     # 一次入库刮削的资产补齐（图片 + 媒体目录镜像），后台执行
@@ -2574,10 +2601,10 @@ async def claim_file(
 
 
 @router.post(
-    "/files/claim-batch",
+    "/identification/file-title-assignments",
     response_model=ApiResponse[dict],
-    summary="整组认领：把多个待识别文件一次挂到同一个 TMDB 条目",
-    operation_id="lib.files.claim-batch",
+    summary="把多个文件一次关联到同一个 Discover 影视条目",
+    operation_id="library.identification.assign-files-to-title",
     dependencies=[Depends(require_admin)],
 )
 async def claim_files_batch(
@@ -2588,8 +2615,12 @@ async def claim_files_batch(
     """一次认领一整组（通常是一部剧的几十集），与单个认领共用
     services/library/claim.claim_files（季集号沿用文件名解析结果）。"""
 
+    target_kind, tmdb_id = _assignment_target(payload.title_ref)
     item, claimed, displaced = await library_claim.claim_files(
-        session, payload.file_ids, tmdb_id=payload.tmdb_id
+        session,
+        payload.file_ids,
+        tmdb_id=tmdb_id,
+        target_kind=target_kind,
     )
     # 一次入库刮削的资产补齐（图片 + 媒体目录镜像），后台执行
     background_tasks.add_task(media_scrape.ensure_assets, item.id)
@@ -2602,11 +2633,11 @@ async def claim_files_batch(
     )
 
 
-@router.delete(
-    "/files/{file_id}",
+@router.post(
+    "/identification/files/{file_id}/ignore",
     response_model=ApiResponse[dict],
     summary="忽略一个待识别文件：以后扫描不再过问（不动磁盘）",
-    operation_id="lib.files.ignore",
+    operation_id="library.identification.ignore-file",
     dependencies=[Depends(require_admin)],
     openapi_extra={"x-cli-dangerous": "confirm"},
 )
@@ -2628,10 +2659,10 @@ async def ignore_file(
 
 
 @router.post(
-    "/files/detach",
+    "/identification/files/mark-as-extras",
     response_model=ApiResponse[dict],
     summary="标为「非独立作品」：摘掉身份锚并忽略（花絮/预告类，不动磁盘）",
-    operation_id="lib.files.detach",
+    operation_id="library.identification.mark-files-as-extras",
     dependencies=[Depends(require_admin)],
     openapi_extra={"x-cli-dangerous": "confirm"},
 )
@@ -2666,10 +2697,10 @@ async def detach_files(
 
 
 @router.post(
-    "/files/restore",
+    "/identification/ignored-file-restorations",
     response_model=ApiResponse[dict],
     summary="恢复已忽略的文件：重新参与识别",
-    operation_id="lib.files.restore",
+    operation_id="library.identification.restore-files",
     dependencies=[Depends(require_admin)],
 )
 async def restore_ignored_files(

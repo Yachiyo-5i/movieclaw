@@ -285,7 +285,7 @@ async def list_download_tasks(
     response_model=ApiResponse[DownloadTaskDeleteView],
     summary="从指定下载器删除种子任务（可选删除数据文件）",
     operation_id="dl.torrent.delete",
-    openapi_extra={"x-cli-hidden": True},
+    openapi_extra={"x-cli-hidden": True, "x-cli-dangerous": "destructive"},
 )
 async def delete_download_task_from_downloader(
     downloader_id: int,

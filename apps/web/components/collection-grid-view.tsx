@@ -5,7 +5,7 @@ import { useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 import { PageNav } from "@/components/page-nav";
 import { SearchIcon } from "@/components/icons";
 import { PosterCard } from "@/components/poster-card";
-import { fetchDoubanCollection } from "@/lib/api/discover";
+import { browseDiscoveryCollection } from "@/lib/api/discover";
 import type { MediaItem } from "@/lib/media-types";
 import { useScrollRestoration } from "@/lib/use-scroll-restoration";
 
@@ -13,13 +13,13 @@ const PAGE_SIZE = 50;
 const MAX_COLLECTION_VISIBLE_COUNTS = 32;
 const collectionVisibleCounts = new Map<string, number>();
 
-function getCollectionVisibleCount(collectionId: string) {
-  return collectionVisibleCounts.get(collectionId) ?? PAGE_SIZE;
+function getCollectionVisibleCount(collectionRef: string) {
+  return collectionVisibleCounts.get(collectionRef) ?? PAGE_SIZE;
 }
 
-function rememberCollectionVisibleCount(collectionId: string, count: number) {
-  collectionVisibleCounts.delete(collectionId);
-  collectionVisibleCounts.set(collectionId, count);
+function rememberCollectionVisibleCount(collectionRef: string, count: number) {
+  collectionVisibleCounts.delete(collectionRef);
+  collectionVisibleCounts.set(collectionRef, count);
   while (collectionVisibleCounts.size > MAX_COLLECTION_VISIBLE_COUNTS) {
     const oldest = collectionVisibleCounts.keys().next().value;
     if (oldest === undefined) break;
@@ -28,55 +28,58 @@ function rememberCollectionVisibleCount(collectionId: string, count: number) {
 }
 
 /**
- * 豆瓣完整榜单落地页（「看全部」的目的地）：用纵向网格承载大量条目，
- * 避免几百张海报挤在一条横滚行。Top 250 与豆瓣高分等榜单共用本组件，
- * 数据来自后端的榜单聚合接口（服务端分页聚合并缓存）；前端只分批挂载
- * 图片节点，控制首屏开销。
+ * 完整片单落地页（「看全部」的目的地）：用纵向网格承载大量条目。
+ * collectionRef 同时携带来源、媒体类型和片单身份，页面不再为豆瓣榜单
+ * 硬编码专用接口；前端只分批挂载图片节点，控制首屏开销。
  */
 export function CollectionGridView({
-  collectionId,
-  title,
+  collectionRef,
 }: {
-  /** 后端白名单内的豆瓣榜单 ID，如 movie_top250 / movie_high_score */
-  collectionId: string;
-  /** 榜单展示名，用于标题与返回导航 */
-  title: string;
+  /** 由发现页展示清单返回的稳定片单引用。 */
+  collectionRef: string;
 }) {
-  const scrollRef = useScrollRestoration(`collection:${collectionId}`);
+  const scrollRef = useScrollRestoration(`collection:${collectionRef}`);
   const [items, setItems] = useState<MediaItem[] | null>(null);
+  const [title, setTitle] = useState("影视片单");
   const [query, setQuery] = useState("");
   const [selectedGenres, setSelectedGenres] = useState<string[]>([]);
-  const [visibleCount, setVisibleCount] = useState(() => getCollectionVisibleCount(collectionId));
+  const [visibleCount, setVisibleCount] = useState(() => getCollectionVisibleCount(collectionRef));
   const [error, setError] = useState<string | null>(null);
   const loadMoreRef = useRef<HTMLDivElement>(null);
-  const previousCollectionId = useRef(collectionId);
+  const previousCollectionRef = useRef(collectionRef);
+  const [provider, mediaType] = collectionRef.split(":");
 
   useEffect(() => {
     // 同一组件实例切换榜单时，先切换到新 key 的窗口；不要把旧榜单的数量
     // 在这一轮 effect 中写进新 key。
-    if (previousCollectionId.current !== collectionId) {
-      previousCollectionId.current = collectionId;
-      setVisibleCount(getCollectionVisibleCount(collectionId));
+    if (previousCollectionRef.current !== collectionRef) {
+      previousCollectionRef.current = collectionRef;
+      setVisibleCount(getCollectionVisibleCount(collectionRef));
       setQuery("");
       setSelectedGenres([]);
       return;
     }
-    rememberCollectionVisibleCount(collectionId, visibleCount);
-  }, [collectionId, visibleCount]);
+    rememberCollectionVisibleCount(collectionRef, visibleCount);
+  }, [collectionRef, visibleCount]);
 
   useEffect(() => {
-    let cancelled = false;
-    fetchDoubanCollection(collectionId)
-      .then((row) => {
-        if (!cancelled) setItems(row.items);
+    const controller = new AbortController();
+    // 同一动态路由切换片单时组件可能被 React 复用，先清掉上一片单的展示态，
+    // 避免新请求完成前短暂显示旧榜单，或失败后把旧数据误当成新结果。
+    setItems(null);
+    setTitle("影视片单");
+    setError(null);
+    browseDiscoveryCollection(collectionRef, 500, { signal: controller.signal })
+      .then((collection) => {
+        if (controller.signal.aborted) return;
+        setItems(collection.items);
+        setTitle(collection.name);
       })
       .catch((reason: Error) => {
-        if (!cancelled) setError(reason.message || "榜单加载失败，请稍后重试");
+        if (!controller.signal.aborted) setError(reason.message || "榜单加载失败，请稍后重试");
       });
-    return () => {
-      cancelled = true;
-    };
-  }, [collectionId]);
+    return () => controller.abort();
+  }, [collectionRef]);
 
   const genres = useMemo(() => {
     if (!items) return [];
@@ -156,7 +159,10 @@ export function CollectionGridView({
           容器已有 px-6，用 -mx-6 让吸顶蒙版铺满整宽 */}
       <PageNav
         items={[
-          { label: "发现电影", href: "/discover/movie?source=douban" },
+          {
+            label: mediaType === "tv" ? "发现剧集" : "发现电影",
+            href: `/discover/${mediaType === "tv" ? "tv" : "movie"}?source=${provider === "douban" ? "douban" : "tmdb"}`,
+          },
           { label: title },
         ]}
         className="-mx-6 max-md:-mx-4"
@@ -165,7 +171,7 @@ export function CollectionGridView({
         <div className="mt-1 flex flex-col justify-between gap-5 sm:flex-row sm:items-end">
           <div>
             <p className="text-sub font-semibold tracking-[0.18em] text-[var(--accent-2)]">
-              DOUBAN RANKING
+              {provider.toLocaleUpperCase()} COLLECTION
             </p>
             <h1 className="mt-1 text-3xl font-bold tracking-[-0.03em] text-[var(--text)]">
               {title}

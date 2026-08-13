@@ -8,7 +8,13 @@ from movieclaw_api.api.deps import (
     require_login,
     require_subscribe_capability,
 )
-from movieclaw_api.exceptions import BadRequestException, NotFoundException
+from movieclaw_api.exceptions import (
+    AppException,
+    BadRequestException,
+    ForbiddenException,
+    NotFoundException,
+    UpstreamServiceException,
+)
 from movieclaw_api.schemas.response import ApiResponse, ok
 from movieclaw_api.schemas.subscription import (
     ActivityView,
@@ -18,15 +24,17 @@ from movieclaw_api.schemas.subscription import (
     GrabResultView,
     MediaBrief,
     PipelineHealthView,
-    PreparePayload,
     PrepareView,
     ResolveCandidateView,
     SearchNowView,
     SeasonOverview,
     SubscriptionCreatePayload,
+    SubscriptionCreateView,
     SubscriptionDetailView,
     SubscriptionDownloadView,
-    SubscriptionPausePayload,
+    SubscriptionTargetPreviewPayload,
+    SubscriptionTrackingState,
+    SubscriptionTrackingStatePayload,
     SubscriptionUpdatePayload,
     SubscriptionView,
 )
@@ -34,15 +42,20 @@ from movieclaw_api.services.auth import Principal
 from movieclaw_api.services.media_discover import get_tmdb_client
 from movieclaw_api.services.media_library import MediaLibraryService
 from movieclaw_api.services.subscription import SubscriptionService
+from movieclaw_api.services.title_discovery import (
+    get_title_discovery_service,
+    parse_title_ref,
+)
 from movieclaw_db.engine import get_session
+from movieclaw_media import DoubanError, TmdbError
 from movieclaw_media.library import ResolveStatus
-from movieclaw_media.models import MediaKind
+from movieclaw_media.models import MediaKind, MediaSource
 
 router = APIRouter(prefix="/subscriptions", tags=["subscriptions"])
 
 # 权限分层（docs/design/member-management.md §2.2/§3.2）：
 # - 读（列表/详情/时间线）：登录即可（路由器挂载时已注入 require_login）；
-# - 写（发起/修改/暂停/删除/立即搜索）：路由级挂成员订阅能力开关；
+# - 写（发起/修改/追踪状态/退出/立即搜索）：路由级挂成员订阅能力开关；
 # - 运维（投递预检/链路体检/下载明细/手动选种）：暴露落盘路径、种子与
 #   下载器细节，路由级挂 require_admin。
 
@@ -52,53 +65,16 @@ def _service(session: AsyncSession) -> SubscriptionService:
     return SubscriptionService(session, library)
 
 
-@router.post(
-    "/prepare",
-    response_model=ApiResponse[PrepareView],
-    summary="订阅预检：建档条目、返回季集结构与库存；歧义时返回候选清单",
-    operation_id="sub.prepare",
-    dependencies=[Depends(require_subscribe_capability)],
-)
-async def prepare_subscription(
-    payload: PreparePayload,
-    session: AsyncSession = Depends(get_session),
-) -> ApiResponse[PrepareView]:
-    """幂等预检。TMDB 入口直接建档；豆瓣入口先收敛（命中→ready，
-    歧义→candidates 让用户确认后以 tmdb_id 重新 prepare，未收录→not_found）。"""
-    service = _service(session)
-
-    if payload.source == "douban":
-        if not payload.title:
-            raise BadRequestException("豆瓣入口预检必须携带标题")
-        library = MediaLibraryService(session, get_tmdb_client())
-        resolution, item = await library.resolve_douban(
-            payload.kind, payload.title, year=payload.year, douban_id=payload.douban_id
-        )
-        if resolution.status is ResolveStatus.NOT_FOUND:
-            return ok(
-                PrepareView(status="not_found"),
-                message="TMDB 未收录该条目，暂无法订阅",
-            )
-        if resolution.status is ResolveStatus.AMBIGUOUS:
-            return ok(
-                PrepareView(
-                    status="ambiguous",
-                    candidates=[ResolveCandidateView.from_model(c) for c in resolution.candidates],
-                ),
-                message="找到多个可能的条目，请确认是哪一部",
-            )
-        assert item is not None
-        tmdb_id = item.tmdb_id
-    else:
-        if payload.tmdb_id is None:
-            raise BadRequestException("TMDB 入口预检必须携带 tmdb_id")
-        tmdb_id = payload.tmdb_id
-
-    item, seasons, existing = await service.prepare(
-        payload.kind, tmdb_id, douban_id=payload.douban_id
-    )
-    # 库存概览（媒体库 L3 联通）：季选择器每行显示"库里已有 x 集"。
-    # 已播/在位口径走仓储层唯一实现（与海报墙缺集统计、工单生成同源）
+async def _prepare_resolved_target(
+    *,
+    kind: MediaKind,
+    tmdb_id: int,
+    douban_id: str | None,
+    service: SubscriptionService,
+    session: AsyncSession,
+) -> PrepareView:
+    """把已消歧的目标投影成订阅表单需要的季集、库存与现有订阅状态。"""
+    item, seasons, existing = await service.prepare(kind, tmdb_id, douban_id=douban_id)
     from movieclaw_db.repositories import MediaItemRepository
     from movieclaw_db.repositories.library_file_repo import LibraryFileRepository
 
@@ -110,63 +86,172 @@ async def prepare_subscription(
     aired_by_season: dict[int, int] = {}
     for season_number, _episode in aired_units.get(item.id, set()):
         aired_by_season[season_number] = aired_by_season.get(season_number, 0) + 1
-    return ok(
-        PrepareView(
-            status="ready",
-            media=MediaBrief.from_model(item),
-            seasons=[
-                SeasonOverview.from_row(
-                    s, aired_count=aired_by_season.get(s.season_number, 0), owned_units=owned
-                )
-                for s in seasons
-            ],
-            existing_subscription_id=existing.id if existing else None,
-            movie_owned=payload.kind == MediaKind.MOVIE and (0, 0) in owned,
+    return PrepareView(
+        status="ready",
+        media=MediaBrief.from_model(item),
+        seasons=[
+            SeasonOverview.from_row(
+                row,
+                aired_count=aired_by_season.get(row.season_number, 0),
+                owned_units=owned,
+            )
+            for row in seasons
+        ],
+        existing_subscription_id=existing.id if existing else None,
+        movie_owned=kind == MediaKind.MOVIE and (0, 0) in owned,
+    )
+
+
+async def _preview_title_ref(
+    title_ref: str,
+    *,
+    service: SubscriptionService,
+    session: AsyncSession,
+) -> PrepareView:
+    """解析 Discover 引用并完成订阅目标预览，不把来源组合规则泄漏给调用方。"""
+    try:
+        provider, kind, external_id = parse_title_ref(title_ref)
+        if provider is MediaSource.TMDB:
+            assert kind is not None
+            return await _prepare_resolved_target(
+                kind=kind,
+                tmdb_id=int(external_id),
+                douban_id=None,
+                service=service,
+                session=session,
+            )
+
+        details = await get_title_discovery_service().get_title_details(title_ref)
+        kind = details.title.media_type
+        if kind is None:
+            raise BadRequestException("豆瓣条目缺少电影/剧集类型，暂时无法创建订阅")
+        library = MediaLibraryService(session, get_tmdb_client())
+        resolution, item = await library.resolve_douban(
+            kind,
+            details.title.title,
+            year=details.title.release_year,
+            douban_id=external_id,
         )
+    except ValueError as exc:
+        raise BadRequestException(str(exc)) from exc
+    except (TmdbError, DoubanError) as exc:
+        raise UpstreamServiceException(str(exc)) from exc
+
+    if resolution.status is ResolveStatus.NOT_FOUND:
+        return PrepareView(status="not_found")
+    if resolution.status is ResolveStatus.AMBIGUOUS:
+        return PrepareView(
+            status="ambiguous",
+            candidates=[
+                ResolveCandidateView.from_model(candidate, kind=kind)
+                for candidate in resolution.candidates
+            ],
+        )
+    assert item is not None
+    return await _prepare_resolved_target(
+        kind=kind,
+        tmdb_id=item.tmdb_id,
+        douban_id=external_id,
+        service=service,
+        session=session,
     )
 
 
 @router.post(
+    "/title-preview",
+    response_model=ApiResponse[PrepareView],
+    summary="预览订阅目标的季集、库存和现有订阅状态",
+    operation_id="ui.subscriptions.preview-title",
+    dependencies=[Depends(require_subscribe_capability)],
+    openapi_extra={"x-cli-hidden": True},
+)
+async def preview_subscription_title(
+    payload: SubscriptionTargetPreviewPayload,
+    session: AsyncSession = Depends(get_session),
+) -> ApiResponse[PrepareView]:
+    """Web 表单内部能力；公开 CLI 直接使用一体化的 ``subscriptions create``。"""
+    service = _service(session)
+    return ok(await _preview_title_ref(payload.title_ref, service=service, session=session))
+
+
+@router.post(
     "",
-    response_model=ApiResponse[SubscriptionDetailView],
-    summary="创建订阅（生成初始工单；同条目重复订阅幂等返回已有）",
-    operation_id="sub.create",
+    response_model=ApiResponse[SubscriptionCreateView],
+    summary="从 Discover 影视条目创建订阅并生成初始追踪工单",
+    operation_id="subscriptions.create",
 )
 async def create_subscription(
     payload: SubscriptionCreatePayload,
     principal: Principal = Depends(require_subscribe_capability),
     session: AsyncSession = Depends(get_session),
-) -> ApiResponse[SubscriptionDetailView]:
-    """创建订阅。"立即踢一次缺口搜索"由 service 层统一触发，路由不用管。
+) -> ApiResponse[SubscriptionCreateView]:
+    """消费 Discover ``title_ref`` 完成来源解析、建档、路由预检与订阅创建。
 
-    成员发起时记录归属；同条目已有订阅时成员的"再订"幂等转为关注（§3.5）。
-    成员没有"选库/选规则组"的入口，这两个参数只对管理员生效。
+    同一条目已有订阅时不会重复创建工单，成员会加入现有共享订阅。管理员可
+    指定过滤规则与目标媒体库；成员调用时这两项由系统默认路由决定。
     """
     service = _service(session)
+    prepared = await _preview_title_ref(payload.title_ref, service=service, session=session)
+    if prepared.status == "not_found":
+        raise NotFoundException("TMDB 未收录该条目，暂时无法订阅")
+    if prepared.status == "ambiguous":
+        raise AppException(
+            status_code=409,
+            code="SUBSCRIPTION_TARGET_AMBIGUOUS",
+            message="该豆瓣条目对应多个可能的 TMDB 条目，请选择候选 title_ref 后重试",
+            details=[candidate.model_dump(mode="json") for candidate in prepared.candidates],
+        )
+    assert prepared.media is not None
+    kind = prepared.media.kind
+    douban_id = prepared.media.douban_id
+    if payload.source_title_ref:
+        try:
+            source_provider, _source_kind, source_id = parse_title_ref(payload.source_title_ref)
+        except ValueError as exc:
+            raise BadRequestException(str(exc)) from exc
+        if source_provider is not MediaSource.DOUBAN:
+            raise BadRequestException("source_title_ref 仅接受原始豆瓣 title_ref")
+        douban_id = source_id
+
     is_member = not principal.is_admin
+    download_routing = None
+    if principal.is_admin:
+        from movieclaw_api.services.subscription import preview_dispatch_route
+
+        download_routing = DispatchPreviewView(
+            **await preview_dispatch_route(
+                session,
+                kind=kind.value,
+                library_id=payload.library_id,
+                tmdb_id=prepared.media.tmdb_id,
+            )
+        )
     subscription = await service.create(
-        payload.kind,
-        payload.tmdb_id,
+        kind,
+        prepared.media.tmdb_id,
         selected_seasons=payload.selected_seasons,
         follow_future=payload.follow_future,
         rule_set_id=None if is_member else payload.rule_set_id,
         library_id=None if is_member else payload.library_id,
-        douban_id=payload.douban_id,
+        douban_id=douban_id,
         member_id=principal.member_id if is_member else None,
     )
     assert subscription.id is not None
     sub, item, wanted = await service.detail(subscription.id)
     return ok(
-        SubscriptionDetailView.from_detail(sub, item, wanted),
-        message="已加入订阅，正在搜索资源",
+        SubscriptionCreateView(
+            subscription=SubscriptionDetailView.from_detail(sub, item, wanted),
+            download_routing=download_routing,
+        ),
+        message="已加入订阅，正在搜索缺失资源",
     )
 
 
 @router.get(
-    "/dispatch-preview",
+    "/download-routing-preview",
     response_model=ApiResponse[DispatchPreviewView],
-    summary="投递路由预检：按类型与目标库预演下载会落到哪、能否自动入库",
-    operation_id="sub.dispatch-preview",
+    summary="预览订阅资源的下载目标与自动入库路径",
+    operation_id="subscriptions.preview-download-routing",
     dependencies=[Depends(require_admin)],
 )
 async def dispatch_preview(
@@ -177,9 +262,7 @@ async def dispatch_preview(
     ),
     session: AsyncSession = Depends(get_session),
 ) -> ApiResponse[DispatchPreviewView]:
-    """创建订阅前调用：与真实投递同源的三级兜底 + 映射守门判定，
-    配置有问题（映射不覆盖/无下载器/无库根）在订阅那一刻就亮出来；
-    未手选库时返回收藏范围路由结论（预选库 + 中文理由徽标）。"""
+    """按真实下载规则预演目标下载器、保存路径和最终媒体库，不产生任务。"""
     from movieclaw_api.services.subscription import preview_dispatch_route
 
     preview = await preview_dispatch_route(
@@ -189,10 +272,10 @@ async def dispatch_preview(
 
 
 @router.get(
-    "/pipeline-health",
+    "/automation-readiness",
     response_model=ApiResponse[PipelineHealthView],
-    summary="订阅链路体检：逐库预演「投递 → 转移 → 入库」，联合约束一次亮清",
-    operation_id="sub.health",
+    summary="检查订阅自动搜索、下载、转移与入库链路是否就绪",
+    operation_id="subscriptions.check-automation-readiness",
     dependencies=[Depends(require_admin)],
 )
 async def pipeline_health_check(
@@ -208,8 +291,8 @@ async def pipeline_health_check(
 @router.get(
     "",
     response_model=ApiResponse[list[SubscriptionView]],
-    summary="订阅列表（含工单进度）",
-    operation_id="sub.list",
+    summary="列出当前账号可见的电影和剧集订阅",
+    operation_id="subscriptions.list",
 )
 async def list_subscriptions(
     kind: str | None = Query(default=None, description="movie / tv，缺省全部"),
@@ -228,8 +311,8 @@ async def list_subscriptions(
 @router.get(
     "/{subscription_id}",
     response_model=ApiResponse[SubscriptionDetailView],
-    summary="订阅详情（含工单明细）",
-    operation_id="sub.show",
+    summary="获取一条订阅的设置、进度和缺失资源明细",
+    operation_id="subscriptions.get",
 )
 async def get_subscription(
     subscription_id: int,
@@ -241,10 +324,10 @@ async def get_subscription(
 
 
 @router.get(
-    "/{subscription_id}/downloads",
+    "/{subscription_id}/active-downloads",
     response_model=ApiResponse[list[SubscriptionDownloadView]],
-    summary="订阅在途种子的实时下载进度（速度/ETA，详情页轮询用）",
-    operation_id="sub.downloads",
+    summary="列出一条订阅当前正在进行的下载及实时进度",
+    operation_id="subscriptions.list-active-downloads",
     dependencies=[Depends(require_admin)],
 )
 async def list_subscription_downloads(
@@ -268,8 +351,8 @@ async def list_subscription_downloads(
 @router.get(
     "/{subscription_id}/activities",
     response_model=ApiResponse[list[ActivityView]],
-    summary="订阅活动时间线（系统对该订阅做过的每个动作，时间倒序）",
-    operation_id="sub.activities",
+    summary="按时间倒序列出一条订阅的活动记录",
+    operation_id="subscriptions.list-activities",
 )
 async def list_subscription_activities(
     subscription_id: int,
@@ -284,8 +367,8 @@ async def list_subscription_activities(
 @router.patch(
     "/{subscription_id}",
     response_model=ApiResponse[SubscriptionDetailView],
-    summary="修改订阅（季选择/追新/规则组，diff 重算工单）",
-    operation_id="sub.update",
+    summary="修改订阅的选季、持续追新、过滤规则或目标媒体库",
+    operation_id="subscriptions.update",
 )
 async def update_subscription(
     subscription_id: int,
@@ -311,10 +394,10 @@ async def update_subscription(
 
 
 @router.post(
-    "/{subscription_id}/search-now",
+    "/{subscription_id}/missing-resource-searches",
     response_model=ApiResponse[SearchNowView],
-    summary="立即搜索：缺口工单跳过冷却重新排队，随即触发一轮缺口搜索",
-    operation_id="sub.search-now",
+    summary="立即为一条订阅搜索目前缺失且已经可搜索的资源",
+    operation_id="subscriptions.search-missing-resources",
 )
 async def search_subscription_now(
     subscription_id: int,
@@ -332,10 +415,10 @@ async def search_subscription_now(
 
 
 @router.post(
-    "/{subscription_id}/grab",
+    "/{subscription_id}/selected-torrent-downloads",
     response_model=ApiResponse[GrabResultView],
-    summary="手动选种：把一条搜索结果直接投给本订阅（跳过规则组过滤）",
-    operation_id="sub.grab",
+    summary="下载为一条订阅人工选中的种子搜索结果",
+    operation_id="subscriptions.download-selected-torrent",
     dependencies=[Depends(require_admin)],
 )
 async def grab_subscription_torrent(
@@ -372,45 +455,78 @@ async def grab_subscription_torrent(
     return ok(GrabResultView(units=units), message=f"已投递，覆盖 {len(units)} 个追踪单元")
 
 
-@router.patch(
-    "/{subscription_id}/pause",
-    response_model=ApiResponse[SubscriptionDetailView],
-    summary="暂停 / 恢复订阅",
-    operation_id="sub.pause",
-)
-async def pause_subscription(
+async def _set_tracking_state(
     subscription_id: int,
-    payload: SubscriptionPausePayload,
-    principal: Principal = Depends(require_subscribe_capability),
-    session: AsyncSession = Depends(get_session),
+    *,
+    state: SubscriptionTrackingState,
+    principal: Principal,
+    session: AsyncSession,
 ) -> ApiResponse[SubscriptionDetailView]:
+    """追踪状态变更的唯一实现。"""
     service = _service(session)
     await service.assert_can_manage(
         subscription_id, None if principal.is_admin else principal.member_id
     )
-    await service.set_paused(subscription_id, payload.paused)
+    paused = state is SubscriptionTrackingState.PAUSED
+    await service.set_paused(subscription_id, paused)
     sub, item, wanted = await service.detail(subscription_id)
-    message = "已暂停，匹配与搜索将跳过该订阅" if payload.paused else "已恢复追踪"
+    message = "已暂停，资源匹配与搜索将跳过该订阅" if paused else "已恢复追踪"
     return ok(SubscriptionDetailView.from_detail(sub, item, wanted), message=message)
+
+
+@router.patch(
+    "/{subscription_id}/tracking-state",
+    response_model=ApiResponse[SubscriptionDetailView],
+    summary="把一条订阅的追踪状态明确设置为 active 或 paused",
+    operation_id="subscriptions.set-tracking-state",
+)
+async def set_subscription_tracking_state(
+    subscription_id: int,
+    payload: SubscriptionTrackingStatePayload,
+    principal: Principal = Depends(require_subscribe_capability),
+    session: AsyncSession = Depends(get_session),
+) -> ApiResponse[SubscriptionDetailView]:
+    return await _set_tracking_state(
+        subscription_id,
+        state=payload.state,
+        principal=principal,
+        session=session,
+    )
+
+
+@router.delete(
+    "/{subscription_id}/following",
+    response_model=ApiResponse[dict],
+    summary="成员停止关注一条订阅而不影响其他正在追踪的成员",
+    operation_id="subscriptions.unsubscribe",
+    openapi_extra={"x-cli-dangerous": "confirm"},
+)
+async def unsubscribe_from_subscription(
+    subscription_id: int,
+    principal: Principal = Depends(require_subscribe_capability),
+    session: AsyncSession = Depends(get_session),
+) -> ApiResponse[dict]:
+    if principal.is_admin or principal.member_id is None:
+        raise ForbiddenException("管理员没有成员关注关系；永久删除请使用 subscriptions delete")
+    message = await _service(session).unsubscribe(
+        subscription_id,
+        member_id=principal.member_id,
+    )
+    return ok({}, message=message)
 
 
 @router.delete(
     "/{subscription_id}",
     response_model=ApiResponse[dict],
-    summary="删除订阅（不影响已下载内容）",
-    operation_id="sub.delete",
+    summary="管理员永久删除一条订阅及其追踪工单（不删除已下载内容）",
+    operation_id="subscriptions.delete",
+    dependencies=[Depends(require_admin)],
     openapi_extra={"x-cli-dangerous": "confirm"},
 )
 async def delete_subscription(
     subscription_id: int,
-    principal: Principal = Depends(require_subscribe_capability),
     session: AsyncSession = Depends(get_session),
 ) -> ApiResponse[dict]:
-    """超管真删；成员按 §3.5 语义：非发起人取关、发起人退出时转移给最早的
-    关注者、无人关注才真删——绝不影响别人正在追的内容。"""
-    service = _service(session)
-    message = await service.delete(
-        subscription_id,
-        member_id=None if principal.is_admin else principal.member_id,
-    )
+    """管理员永久删除共享订阅；成员必须使用语义明确的取消关注接口。"""
+    message = await _service(session).delete_permanently(subscription_id)
     return ok({}, message=message)

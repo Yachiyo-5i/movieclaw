@@ -77,7 +77,7 @@ def test_second_library_not_default_until_set(client) -> None:
     anime = _create(client, name="动漫库", kind="tv", root="/media/anime")
     assert anime["is_default"] is False  # 该 kind 已有默认（先建的剧集库）
 
-    r = client.post(f"/api/v1/libraries/{anime['id']}/default")
+    r = client.post(f"/api/v1/libraries/{anime['id']}/default-selection")
     assert r.json()["data"]["is_default"] is True
     rows = client.get("/api/v1/libraries", params={"kind": "tv"}).json()["data"]
     defaults = [x for x in rows if x["is_default"]]
@@ -257,13 +257,15 @@ def test_path_reconcile_preview_and_start_require_removed_and_current_roots(
     monkeypatch.setattr(library_routes, "_assert_not_busy", fake_assert_not_busy)
     payload = {"old_root": "/strm/movies/", "new_root": "/media/movies/"}
 
-    preview = client.post(f"/api/v1/libraries/{library_id}/path-reconcile/preview", json=payload)
+    preview = client.post(
+        f"/api/v1/libraries/{library_id}/path-reconciliation-preview", json=payload
+    )
     assert preview.status_code == 200
     assert preview.json()["data"]["safe_merges"] == 2
     assert preview.json()["data"]["disk_files_to_delete"] == 0
     assert preview_calls == [(library_id, "/strm/movies", "/media/movies")]
 
-    started = client.post(f"/api/v1/libraries/{library_id}/path-reconcile", json=payload)
+    started = client.post(f"/api/v1/libraries/{library_id}/path-reconciliations", json=payload)
     assert started.status_code == 202
     assert started.json()["data"]["job_id"] == "path-reconcile-job"
     assert enqueue_calls == [
@@ -280,7 +282,7 @@ def test_path_reconcile_preview_and_start_require_removed_and_current_roots(
     ]
 
     invalid = client.post(
-        f"/api/v1/libraries/{library_id}/path-reconcile/preview",
+        f"/api/v1/libraries/{library_id}/path-reconciliation-preview",
         json={"old_root": "/media/movies", "new_root": "/media/movies"},
     )
     assert invalid.status_code == 400
@@ -311,7 +313,10 @@ def test_reorder_changes_list_order_and_new_library_goes_last(client) -> None:
     ids = [x["id"] for x in client.get("/api/v1/libraries").json()["data"]]
     assert ids == [a["id"], b["id"], c["id"]]  # 未排过序时保持创建顺序
 
-    r = client.put("/api/v1/libraries/order", json={"ordered_ids": [c["id"], a["id"], b["id"]]})
+    r = client.put(
+        "/api/v1/libraries/display-order",
+        json={"ordered_ids": [c["id"], a["id"], b["id"]]},
+    )
     assert r.status_code == 200
     ids = [x["id"] for x in client.get("/api/v1/libraries").json()["data"]]
     assert ids == [c["id"], a["id"], b["id"]]
@@ -325,7 +330,9 @@ def test_reorder_rejects_partial_duplicate_or_unknown_ids(client) -> None:
     """排序列表必须与现存库集合完全一致：漏库/重复/不存在的 id 都拒绝。"""
     a = _create(client, name="电影库", kind="movie", root="/media/movies")
     b = _create(client, name="剧集库", kind="tv", root="/media/tv")
-    put = lambda ids: client.put("/api/v1/libraries/order", json={"ordered_ids": ids})  # noqa: E731
+    put = lambda ids: client.put(  # noqa: E731
+        "/api/v1/libraries/display-order", json={"ordered_ids": ids}
+    )
     assert put([a["id"]]).status_code == 400  # 漏库
     assert put([a["id"], a["id"], b["id"]]).status_code == 400  # 重复
     assert put([a["id"], b["id"], 99999]).status_code == 400  # 不存在

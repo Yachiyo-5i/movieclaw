@@ -9,7 +9,10 @@ import { ContentEmptyState } from "@/components/content-empty-state";
 import { CompassIcon } from "@/components/icons";
 import { PosterCardVisual, type PosterVisualItem } from "@/components/poster-card";
 import { useSubscribeEntry } from "@/components/subscribe-entry";
-import { getPipelineHealth, type Subscription } from "@/lib/api/subscriptions";
+import {
+  checkSubscriptionAutomationReadiness,
+  type Subscription,
+} from "@/lib/api/subscriptions";
 import { cachedImageUrl } from "@/lib/image-proxy";
 import { usePageChrome } from "@/lib/page-chrome";
 import { usePermissions } from "@/lib/permissions";
@@ -46,7 +49,7 @@ export function SubscriptionsView() {
     setFailed(false);
     void refresh().then((ok) => setFailed(!ok));
     if (canManageSubscriptions) {
-      void getPipelineHealth()
+      void checkSubscriptionAutomationReadiness()
         .then((h) =>
           setHealthIssue(h.status === "error" ? { libraryErrors: h.error_count } : null),
         )

@@ -299,7 +299,7 @@ export interface RoutingOptions {
 let _routingOptionsCache: Promise<RoutingOptions> | null = null;
 
 /** 收藏范围可选项（进程内缓存：静态常量，一次拉取全程复用）。 */
-export function getRoutingOptions(): Promise<RoutingOptions> {
+export function listLibraryRoutingOptions(): Promise<RoutingOptions> {
   if (!_routingOptionsCache) {
     _routingOptionsCache = unwrap(
       request<ApiEnvelope<RoutingOptions>>("/libraries/routing-options"),
@@ -359,7 +359,11 @@ export function updateLibrary(id: number, payload: LibraryPayload): Promise<Medi
 
 /** 设为该类型的默认库。同类型其他库的默认标记随之取消，调用后应整体刷新列表。 */
 export function setDefaultLibrary(id: number): Promise<MediaLibrary> {
-  return unwrap(request<ApiEnvelope<MediaLibrary>>(`/libraries/${id}/default`, { method: "POST" }));
+  return unwrap(
+    request<ApiEnvelope<MediaLibrary>>(`/libraries/${id}/default-selection`, {
+      method: "POST",
+    }),
+  );
 }
 
 /**
@@ -368,7 +372,7 @@ export function setDefaultLibrary(id: number): Promise<MediaLibrary> {
  */
 export function reorderLibraries(orderedIds: number[]): Promise<Record<string, never>> {
   return unwrap(
-    request<ApiEnvelope<Record<string, never>>>(`/libraries/order`, {
+    request<ApiEnvelope<Record<string, never>>>(`/libraries/display-order`, {
       method: "PUT",
       body: JSON.stringify({ ordered_ids: orderedIds }),
     }),
@@ -414,12 +418,6 @@ export interface LibrarySearchGroup {
   items: LibraryItem[];
 }
 
-/** 跨全部媒体库按关键词搜索已入库条目（标题/原名子串匹配，忽略大小写）。 */
-export function searchLibraryItems(keyword: string): Promise<LibrarySearchGroup[]> {
-  const query = new URLSearchParams({ keyword });
-  return unwrap(request<ApiEnvelope<LibrarySearchGroup[]>>(`/libraries/search?${query}`));
-}
-
 /** 海报墙 A-Z 索引条的一档（按标题排序下的首字母分组）。 */
 export interface LibraryIndexEntry {
   /** 首字母档：A-Z；数字/符号/假名等落不进的归 # */
@@ -462,7 +460,7 @@ export function getLibrary(id: number): Promise<MediaLibrary> {
 /** 预览整理计划：每个文件改成什么名、哪些跳过及原因（只读，不动磁盘）。 */
 export function previewLibraryOrganize(id: number): Promise<OrganizePreview> {
   return unwrap(
-    request<ApiEnvelope<OrganizePreview>>(`/libraries/${id}/organize/preview`, {
+    request<ApiEnvelope<OrganizePreview>>(`/libraries/${id}/file-organization-preview`, {
       method: "POST",
     }),
   );
@@ -478,7 +476,7 @@ export interface PersistentJobStart {
 
 export function startLibraryOrganize(id: number): Promise<PersistentJobStart> {
   return unwrap(
-    request<ApiEnvelope<PersistentJobStart>>(`/libraries/${id}/organize`, {
+    request<ApiEnvelope<PersistentJobStart>>(`/libraries/${id}/file-organizations`, {
       method: "POST",
     }),
   );
@@ -574,7 +572,7 @@ export interface ArtworkCandidates {
 }
 
 /** 条目的候选海报/背景（「更换图片」弹层数据源）。 */
-export function getArtworkCandidates(
+export function listArtworkCandidates(
   libraryId: number,
   mediaItemId: number,
 ): Promise<ArtworkCandidates> {
@@ -604,50 +602,62 @@ export function selectArtwork(
 }
 
 /** 待识别清单，按条目目录分组（不含已忽略，可按库过滤）。 */
-export function listUnidentified(libraryId?: number): Promise<UnidentifiedGroup[]> {
+export function listUnidentifiedLibraryFiles(libraryId?: number): Promise<UnidentifiedGroup[]> {
   const qs = libraryId != null ? `?library_id=${libraryId}` : "";
-  return unwrap(request<ApiEnvelope<UnidentifiedGroup[]>>(`/libraries/unidentified${qs}`));
+  return unwrap(
+    request<ApiEnvelope<UnidentifiedGroup[]>>(
+      `/libraries/identification/unidentified-files${qs}`,
+    ),
+  );
 }
 
 /** 已忽略清单（用户说过「别再问」的文件），同样按条目目录分组。 */
-export function listIgnored(libraryId?: number): Promise<UnidentifiedGroup[]> {
+export function listIgnoredLibraryFiles(libraryId?: number): Promise<UnidentifiedGroup[]> {
   const qs = libraryId != null ? `?library_id=${libraryId}` : "";
-  return unwrap(request<ApiEnvelope<UnidentifiedGroup[]>>(`/libraries/ignored${qs}`));
+  return unwrap(
+    request<ApiEnvelope<UnidentifiedGroup[]>>(`/libraries/identification/ignored-files${qs}`),
+  );
 }
 
 /** 恢复已忽略的文件：清掉忽略标记，重新参与识别。 */
-export function restoreIgnored(fileIds: number[]): Promise<{ restored: number }> {
+export function restoreIgnoredLibraryFiles(fileIds: number[]): Promise<{ restored: number }> {
   return unwrap(
-    request<ApiEnvelope<{ restored: number }>>(`/libraries/files/restore`, {
-      method: "POST",
-      body: JSON.stringify({ file_ids: fileIds }),
-    }),
+    request<ApiEnvelope<{ restored: number }>>(
+      `/libraries/identification/ignored-file-restorations`,
+      {
+        method: "POST",
+        body: JSON.stringify({ file_ids: fileIds }),
+      },
+    ),
   );
 }
 
 /** 认领待识别文件：挂到指定 TMDB 条目。 */
-export function claimFile(
+export function assignLibraryFileToTitle(
   fileId: number,
-  payload: { tmdb_id: number; season_number?: number; episode_number?: number },
+  payload: { title_ref: string; season_number?: number; episode_number?: number },
 ): Promise<Record<string, never>> {
   return unwrap(
-    request<ApiEnvelope<Record<string, never>>>(`/libraries/files/${fileId}/claim`, {
-      method: "POST",
-      body: JSON.stringify(payload),
-    }),
+    request<ApiEnvelope<Record<string, never>>>(
+      `/libraries/identification/files/${fileId}/title-assignment`,
+      { method: "POST", body: JSON.stringify(payload) },
+    ),
   );
 }
 
 /** 整组认领：一次把多个待识别文件挂到同一个 TMDB 条目（各自沿用已解析的季集号）。 */
-export function claimFilesBatch(
+export function assignLibraryFilesToTitle(
   fileIds: number[],
-  tmdbId: number,
+  titleRef: string,
 ): Promise<{ claimed: number }> {
   return unwrap(
-    request<ApiEnvelope<{ claimed: number }>>(`/libraries/files/claim-batch`, {
-      method: "POST",
-      body: JSON.stringify({ file_ids: fileIds, tmdb_id: tmdbId }),
-    }),
+    request<ApiEnvelope<{ claimed: number }>>(
+      `/libraries/identification/file-title-assignments`,
+      {
+        method: "POST",
+        body: JSON.stringify({ file_ids: fileIds, title_ref: titleRef }),
+      },
+    ),
   );
 }
 
@@ -655,12 +665,12 @@ export function claimFilesBatch(
  * 标为「非独立作品」：摘掉身份锚并忽略（花絮/预告被高置信错挂时的出口）。
  * 不动磁盘，可在「已忽略」清单恢复。
  */
-export function detachFiles(fileIds: number[]): Promise<{ detached: number }> {
+export function markLibraryFilesAsExtras(fileIds: number[]): Promise<{ detached: number }> {
   return unwrap(
-    request<ApiEnvelope<{ detached: number }>>(`/libraries/files/detach`, {
-      method: "POST",
-      body: JSON.stringify({ file_ids: fileIds }),
-    }),
+    request<ApiEnvelope<{ detached: number }>>(
+      `/libraries/identification/files/mark-as-extras`,
+      { method: "POST", body: JSON.stringify({ file_ids: fileIds }) },
+    ),
   );
 }
 
@@ -690,40 +700,45 @@ export interface ReviewGroup {
 }
 
 /** 身份复核清单（可按库过滤）。 */
-export function listIdentityReview(libraryId?: number): Promise<ReviewGroup[]> {
+export function listLibraryIdentityReviewCases(libraryId?: number): Promise<ReviewGroup[]> {
   const qs = libraryId != null ? `?library_id=${libraryId}` : "";
-  return unwrap(request<ApiEnvelope<ReviewGroup[]>>(`/libraries/review${qs}`));
+  return unwrap(
+    request<ApiEnvelope<ReviewGroup[]>>(`/libraries/identification/review-cases${qs}`),
+  );
 }
 
-/** 身份复核拍板：accept=true 采纳建议改挂新条目，false 维持现状；整组生效。 */
-export function resolveIdentityReview(
+/** 身份复核拍板：明确采纳建议或维持现状；整组生效。 */
+export function resolveLibraryIdentityReview(
   fileIds: number[],
-  accept: boolean,
+  decision: "accept_suggestion" | "keep_current",
 ): Promise<{ resolved: number }> {
   return unwrap(
-    request<ApiEnvelope<{ resolved: number }>>(`/libraries/review/resolve`, {
-      method: "POST",
-      body: JSON.stringify({ file_ids: fileIds, accept }),
-    }),
+    request<ApiEnvelope<{ resolved: number }>>(
+      `/libraries/identification/review-decisions`,
+      { method: "POST", body: JSON.stringify({ file_ids: fileIds, decision }) },
+    ),
   );
 }
 
 /** 从台账忽略一个待识别文件（不动磁盘）。 */
-export function ignoreFile(fileId: number): Promise<Record<string, never>> {
+export function ignoreUnidentifiedLibraryFile(fileId: number): Promise<Record<string, never>> {
   return unwrap(
-    request<ApiEnvelope<Record<string, never>>>(`/libraries/files/${fileId}`, {
-      method: "DELETE",
-    }),
+    request<ApiEnvelope<Record<string, never>>>(
+      `/libraries/identification/files/${fileId}/ignore`,
+      { method: "POST" },
+    ),
   );
 }
 
-/** 批量忽略整库的待识别文件（只删台账，不动磁盘）。 */
-export function clearUnidentified(libraryId: number): Promise<{ cleared: number }> {
+/** 批量忽略整库的待识别文件（可恢复，不动磁盘）。 */
+export function ignoreAllUnidentifiedLibraryFiles(
+  libraryId: number,
+): Promise<{ cleared: number }> {
   return unwrap(
-    request<ApiEnvelope<{ cleared: number }>>(`/libraries/unidentified/clear`, {
-      method: "POST",
-      body: JSON.stringify({ library_id: libraryId }),
-    }),
+    request<ApiEnvelope<{ cleared: number }>>(
+      `/libraries/identification/unidentified-file-ignores`,
+      { method: "POST", body: JSON.stringify({ library_id: libraryId }) },
+    ),
   );
 }
 
@@ -750,17 +765,17 @@ export interface MissingItem {
 }
 
 /** 缺失清单（文件已不在磁盘的库存，按条目聚合）。 */
-export function listMissing(libraryId: number): Promise<MissingItem[]> {
+export function listMissingLibraryFiles(libraryId: number): Promise<MissingItem[]> {
   return unwrap(request<ApiEnvelope<MissingItem[]>>(`/libraries/${libraryId}/missing`));
 }
 
 /** 清理缺失记录（只删台账，绝不动磁盘）；不传 mediaItemId 清整库。 */
-export function clearMissing(
+export function clearMissingLibraryRecords(
   libraryId: number,
   mediaItemId?: number,
 ): Promise<{ cleared: number }> {
   return unwrap(
-    request<ApiEnvelope<{ cleared: number }>>(`/libraries/missing/clear`, {
+    request<ApiEnvelope<{ cleared: number }>>(`/libraries/missing-record-clearances`, {
       method: "POST",
       body: JSON.stringify({ library_id: libraryId, media_item_id: mediaItemId ?? null }),
     }),
@@ -1059,15 +1074,15 @@ export interface ReidentifyPreview {
 
 /**
  * 修正识别结果（预览）：重走识别链只出结论，**不改任何台账**。
- * 拍板由 claimFilesBatch（改挂）/ detachFiles（非独立作品）落库。
+ * 拍板由 assignLibraryFilesToTitle（改挂）/ markLibraryFilesAsExtras（花絮）落库。
  */
-export function previewReidentify(
+export function previewItemReidentification(
   libraryId: number,
   mediaItemId: number,
 ): Promise<ReidentifyPreview> {
   return unwrap(
     request<ApiEnvelope<ReidentifyPreview>>(
-      `/libraries/${libraryId}/items/${mediaItemId}/reidentify/preview`,
+      `/libraries/${libraryId}/items/${mediaItemId}/reidentification-preview`,
       { method: "POST" },
     ),
   );
@@ -1080,7 +1095,7 @@ export function reidentifyLibraryItem(
 ): Promise<ReidentifyResult> {
   return unwrap(
     request<ApiEnvelope<ReidentifyResult>>(
-      `/libraries/${libraryId}/items/${mediaItemId}/reidentify`,
+      `/libraries/${libraryId}/items/${mediaItemId}/reidentifications`,
       { method: "POST" },
     ),
   );
@@ -1144,14 +1159,14 @@ export function previewItemTransfer(
 ): Promise<TransferPreview> {
   return unwrap(
     request<ApiEnvelope<TransferPreview>>(
-      `/libraries/${libraryId}/items/${mediaItemId}/transfer/preview?target_library_id=${targetLibraryId}`,
+      `/libraries/${libraryId}/items/${mediaItemId}/transfer-preview?target_library_id=${targetLibraryId}`,
     ),
   );
 }
 
 /**
  * 转移条目到另一个媒体库：整个条目目录搬到目标库主根，台账随迁。
- * 后台执行，进度与结论走 {@link getTransferStatus}。
+ * 后台执行，进度与结论走 {@link getLibraryItemTransferStatus}。
  */
 export function transferLibraryItem(
   libraryId: number,
@@ -1160,16 +1175,16 @@ export function transferLibraryItem(
 ): Promise<PersistentJobStart> {
   return unwrap(
     request<ApiEnvelope<PersistentJobStart>>(
-      `/libraries/${libraryId}/items/${mediaItemId}/transfer`,
+      `/libraries/${libraryId}/items/${mediaItemId}/transfers`,
       { method: "POST", body: JSON.stringify({ target_library_id: targetLibraryId }) },
     ),
   );
 }
 
 /** 条目转移的实时进度与最近一次结论（源库/目标库任一侧查到的都是同一份）。 */
-export function getTransferStatus(libraryId: number): Promise<TransferStatus> {
+export function getLibraryItemTransferStatus(libraryId: number): Promise<TransferStatus> {
   return unwrap(
-    request<ApiEnvelope<TransferStatus>>(`/libraries/${libraryId}/transfer/status`),
+    request<ApiEnvelope<TransferStatus>>(`/libraries/${libraryId}/item-transfer-status`),
   );
 }
 
@@ -1180,7 +1195,7 @@ export function redownloadMissing(
 ): Promise<{ subscription_id: number; requeued: number }> {
   return unwrap(
     request<ApiEnvelope<{ subscription_id: number; requeued: number }>>(
-      `/libraries/missing/redownload`,
+      `/libraries/missing-redownloads`,
       {
         method: "POST",
         body: JSON.stringify({ library_id: libraryId, media_item_id: mediaItemId }),

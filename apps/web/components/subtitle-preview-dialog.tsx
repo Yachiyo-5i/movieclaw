@@ -9,7 +9,7 @@ import {
   type SubtitleStream,
   getSubtitlePreview,
 } from "@/lib/api/libraries";
-import { calibrateSubtitle } from "@/lib/api/subtitle-gen";
+import { calibrateSubtitleTiming } from "@/lib/api/subtitle-gen";
 
 function formatTimestamp(milliseconds: number): string {
   const totalSeconds = Math.floor(milliseconds / 1000);
@@ -74,7 +74,7 @@ export function SubtitlePreviewDialog({
     setCalibrating(true);
     setCalibrationNotice(null);
     try {
-      const result = await calibrateSubtitle(file.id, stream.file_name);
+      const result = await calibrateSubtitleTiming(file.id, stream.file_name);
       setCalibrationNotice(result.message);
       if (result.ok) {
         retry();

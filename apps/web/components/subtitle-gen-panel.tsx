@@ -20,10 +20,10 @@ import { Tooltip } from "@/components/tooltip";
 import { useAgentConversations } from "@/lib/agent-conversations";
 import type { LibraryItemFile } from "@/lib/api/libraries";
 import {
-  subgenPreview,
-  subgenStart,
-  type SubgenCandidate,
-  type SubgenPreview,
+  generateSubtitles,
+  previewSubtitleGeneration,
+  type SubtitleGenerationPreview,
+  type SubtitleSourceCandidate,
 } from "@/lib/api/subtitle-gen";
 import { cancelJob, type JobStatus, type JobView } from "@/lib/api/jobs";
 import { usePermissions } from "@/lib/permissions";
@@ -128,14 +128,14 @@ function formatLabel(format: string | null): string {
   return labels[format.toLowerCase()] ?? format.toUpperCase();
 }
 
-function candidateLabel(candidate: SubgenCandidate): string {
+function candidateLabel(candidate: SubtitleSourceCandidate): string {
   const location = candidate.kind === "embedded" ? "内封" : "外挂";
   const identity =
     candidate.kind === "embedded"
       ? `轨道 ${Number(candidate.key) + 1}`
       : candidate.key;
   const conversion = candidate.requires_ocr ? " · 需先识别" : "";
-  const provenanceLabels: Record<SubgenCandidate["provenance"], string> = {
+  const provenanceLabels: Record<SubtitleSourceCandidate["provenance"], string> = {
     original: "原始字幕",
     pgs_ocr: "图片字幕识别结果",
     ai: "AI 字幕",
@@ -144,7 +144,7 @@ function candidateLabel(candidate: SubgenCandidate): string {
   return `${languageLabel(candidate.language)} · ${formatLabel(candidate.format)} · ${provenanceLabels[candidate.provenance]} · ${location} ${identity}${conversion}`;
 }
 
-function candidateKey(candidate: SubgenCandidate): string {
+function candidateKey(candidate: SubtitleSourceCandidate): string {
   return `${candidate.kind}:${candidate.key}`;
 }
 
@@ -407,7 +407,7 @@ export function SubtitleGenPanel({
   const [bilingual, setBilingual] = useState(false);
   const [secondaryLanguage, setSecondaryLanguage] = useState<OutputLanguage>("eng");
   const [sourceCandidateKey, setSourceCandidateKey] = useState<string | null>(null);
-  const [preview, setPreview] = useState<SubgenPreview | null>(null);
+  const [preview, setPreview] = useState<SubtitleGenerationPreview | null>(null);
   const [pgsOcrLanguage, setPgsOcrLanguage] = useState("");
   const [dialogOpen, setDialogOpen] = useState(false);
   const [dialogMode, setDialogMode] = useState<"preview" | "status">("preview");
@@ -458,7 +458,7 @@ export function SubtitleGenPanel({
     setRequestError(null);
     setPreviewing(true);
     try {
-      const result = await subgenPreview(file.id, target, secondary, sourceKey);
+      const result = await previewSubtitleGeneration(file.id, target, secondary, sourceKey);
       if (previewRequestRef.current !== requestId) return;
       setPreview(result);
       setSourceCandidateKey(result.selected_source_key);
@@ -487,7 +487,7 @@ export function SubtitleGenPanel({
       preview?.blocker?.code === "pgs_conversion_required" &&
       preview.pgs_conversion?.available === true;
     try {
-      const started = await subgenStart(file.id, targetLanguage, {
+      const started = await generateSubtitles(file.id, targetLanguage, {
         convertPgs,
         pgsOcrLanguage: convertPgs ? pgsOcrLanguage || null : null,
         secondaryLanguage: bilingual ? secondaryLanguage : null,

@@ -27,24 +27,24 @@ import {
   type ReviewGroup,
   type MetadataRefreshProgress,
   type UnidentifiedGroup,
-  claimFilesBatch,
-  clearMissing,
-  clearUnidentified,
+  assignLibraryFilesToTitle,
+  clearMissingLibraryRecords,
   getMetadataRefreshProgress,
-  ignoreFile,
-  listIdentityReview,
-  listIgnored,
+  ignoreAllUnidentifiedLibraryFiles,
+  ignoreUnidentifiedLibraryFile,
+  listIgnoredLibraryFiles,
+  listLibraryIdentityReviewCases,
   listLibraries,
   listLibraryItemIds,
   listLibraryItemIndex,
   listLibraryItems,
   type LibraryIndexEntry,
   type LibraryItemSort,
-  listMissing,
-  listUnidentified,
+  listMissingLibraryFiles,
+  listUnidentifiedLibraryFiles,
   redownloadMissing,
-  restoreIgnored,
-  resolveIdentityReview,
+  resolveLibraryIdentityReview,
+  restoreIgnoredLibraryFiles,
   SCAN_PHASE_HINTS,
   SCAN_PHASE_LABELS,
   type ScanPhase,
@@ -223,10 +223,18 @@ export function LibraryDetailView({ libraryId }: { libraryId: number }) {
       Promise.all(itemPages).then((pages) => pages.flat()),
       listLibraryItemIds(libraryId).catch(() => []),
       listLibraryItemIndex(libraryId).catch(() => []),
-      canManageLibraries ? listUnidentified(libraryId).catch(() => []) : Promise.resolve([]),
-      canManageLibraries ? listIdentityReview(libraryId).catch(() => []) : Promise.resolve([]),
-      canManageLibraries ? listIgnored(libraryId).catch(() => []) : Promise.resolve([]),
-      canManageLibraries ? listMissing(libraryId).catch(() => []) : Promise.resolve([]),
+      canManageLibraries
+        ? listUnidentifiedLibraryFiles(libraryId).catch(() => [])
+        : Promise.resolve([]),
+      canManageLibraries
+        ? listLibraryIdentityReviewCases(libraryId).catch(() => [])
+        : Promise.resolve([]),
+      canManageLibraries
+        ? listIgnoredLibraryFiles(libraryId).catch(() => [])
+        : Promise.resolve([]),
+      canManageLibraries
+        ? listMissingLibraryFiles(libraryId).catch(() => [])
+        : Promise.resolve([]),
       listSubscriptions().catch(() => []),
     ])
       .then(([libs, libraryItems, ids, index, unknown, reviewGroups, ignoredGroups, missingItems, subs]) => {
@@ -1465,7 +1473,7 @@ function IssueDrawer({
                 )
                   return;
                 setBusy(true);
-                void clearMissing(libraryId)
+                void clearMissingLibraryRecords(libraryId)
                   .then(onChanged)
                   .catch(() => {})
                   .finally(() => setBusy(false));
@@ -1490,7 +1498,7 @@ function IssueDrawer({
                 )
                   return;
                 setBusy(true);
-                void clearUnidentified(libraryId)
+                void ignoreAllUnidentifiedLibraryFiles(libraryId)
                   .then(onChanged)
                   .catch(() => {})
                   .finally(() => setBusy(false));
@@ -1647,7 +1655,7 @@ function MissingRow({
                   tone: "danger",
                 });
                 if (!ok) return;
-                act(() => clearMissing(libraryId, item.media_item_id));
+                act(() => clearMissingLibraryRecords(libraryId, item.media_item_id));
               }}
               className="btn-glass px-3 py-1.5 text-sub font-medium disabled:opacity-50"
             >
@@ -1808,7 +1816,7 @@ function UnidentifiedGroupRow({
       }))
     )
       return;
-    act(() => Promise.all(fileIds.map((id) => ignoreFile(id))));
+    act(() => Promise.all(fileIds.map((id) => ignoreUnidentifiedLibraryFile(id))));
   };
 
   return (
@@ -1933,7 +1941,14 @@ function UnidentifiedGroupRow({
           movie={movie}
           fileCount={group.file_count}
           busy={busy}
-          onConfirm={() => act(() => claimFilesBatch(fileIds, panel.seed.tmdbId))}
+          onConfirm={() =>
+            act(() =>
+              assignLibraryFilesToTitle(
+                fileIds,
+                `tmdb:${movie ? "movie" : "tv"}:${panel.seed.tmdbId}`,
+              ),
+            )
+          }
           onCancel={() => setPanel(null)}
         />
       )}
@@ -1964,7 +1979,10 @@ function ReviewGroupRow({ group, onChanged }: { group: ReviewGroup; onChanged: (
   const act = (accept: boolean) => {
     setBusy(true);
     setError(null);
-    void resolveIdentityReview(group.file_ids, accept)
+    void resolveLibraryIdentityReview(
+      group.file_ids,
+      accept ? "accept_suggestion" : "keep_current",
+    )
       .then(onChanged)
       .catch((e) => setError((e as Error).message))
       .finally(() => setBusy(false));
@@ -2075,7 +2093,7 @@ function IgnoredGroupRow({
           onClick={() => {
             setBusy(true);
             setError(null);
-            void restoreIgnored(group.files.map((f) => f.id))
+            void restoreIgnoredLibraryFiles(group.files.map((f) => f.id))
               .then(onChanged)
               .catch((e) => setError((e as Error).message))
               .finally(() => setBusy(false));

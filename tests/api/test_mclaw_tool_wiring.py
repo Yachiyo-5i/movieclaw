@@ -43,15 +43,16 @@ def test_curated_lines_have_no_orphans() -> None:
     assert not orphans, f"_DOMAIN_LINES 含 spec 中不存在（或已被排除）的域：{orphans}"
 
 
-def test_service_map_distinguishes_discovery_from_resource_search() -> None:
-    """关键语义守卫：找影视内容与找可下载种子是两个域，不能让模型混用。"""
+def test_service_map_distinguishes_browsing_from_unified_search() -> None:
+    """关键语义守卫：discover 负责浏览，search 统一承接三类搜索目标。"""
     lines = render_service_map().splitlines()
     discover = next(line for line in lines if line.startswith("- discover "))
     search = next(line for line in lines if line.startswith("- search "))
 
     for keyword in ("电影", "剧集", "TMDB", "豆瓣", "热门", "高分"):
         assert keyword in discover
-    assert "PT" in search and "种子" in search and "download" in search
+    for keyword in ("titles", "torrents", "library-items", "PT", "种子", "download"):
+        assert keyword in search
 
 
 def test_service_map_reflects_frontend_product_language() -> None:
@@ -65,7 +66,7 @@ def test_service_map_reflects_frontend_product_language() -> None:
     for keyword in ("实时热点", "热映", "在播", "热门", "高分", "口碑"):
         assert keyword in lines["discover"]
     for keyword in ("持续追踪", "自动搜索", "下载", "整理入库"):
-        assert keyword in lines["sub"]
+        assert keyword in lines["subscriptions"]
     assert "AI 对话入口" in lines["channels"] and "搜片、订阅、查进度" in lines["channels"]
     assert "qBittorrent/Transmission" in lines["dl"]
     assert "首页背景" in lines["appearance"] and "界面质感" in lines["ui"]

@@ -64,6 +64,8 @@ const SUBSCRIBE_ACTION_META = {
  * 但仍复用与发现页完全相同的海报、评分、悬浮信息层和来源标识。
  */
 export interface PosterVisualItem {
+  /** Discover 返回的稳定条目引用；列表数据有值，历史/本地条目可能没有。 */
+  titleRef?: string;
   id: string;
   title: string;
   rating: number;

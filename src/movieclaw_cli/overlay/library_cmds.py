@@ -18,17 +18,20 @@ from movieclaw_cli.core.output import emit
 from movieclaw_cli.gen.tree_builder import wait_long_task
 from movieclaw_cli.overlay.groups import output_option
 
-# 进度轮询的端点描述（与生成层 lib.scan/organize 用的是同一个 wait 实现）
+# 进度轮询的端点描述（与生成层 library.scan 使用同一个 wait 实现）
 _PROGRESS_OPS = {
-    "lib.show": {
-        "operation_id": "lib.show",
+    "library.get": {
+        "operation_id": "library.get",
         "path": "/api/v1/libraries/{library_id}",
         "params": [{"name": "library_id", "in": "path"}],
     }
 }
 
 
-@click.command(name="organize", short_help="整理文件名（预览影响面 → --yes 确认 → 执行并等待）")
+@click.command(
+    name="organize-files",
+    short_help="按媒体库命名规范整理文件（预览影响面 → --yes 确认 → 执行并等待）",
+)
 @click.argument("library_id", type=int)
 @click.option("--dry-run", is_flag=True, help="只输出整理计划，不动磁盘")
 @click.option("--yes", is_flag=True, help="确认执行（正式整理必须显式给出）")
@@ -38,7 +41,7 @@ _PROGRESS_OPS = {
 )
 @output_option
 @click.pass_obj
-def lib_organize(
+def library_organize_files(
     settings,
     output_override: str | None,
     library_id: int,
@@ -51,15 +54,17 @@ def lib_organize(
 
     示例：
 
-        mclaw lib organize 1 --dry-run     # 只看计划
+        mclaw library organize-files 1 --dry-run     # 只看计划
 
-        mclaw lib organize 1 --yes         # 执行（先回显影响面）
+        mclaw library organize-files 1 --yes         # 执行（先回显影响面）
 
     源文件绝不删除；执行与扫描互斥（扫描进行中会被服务端拒绝）。
     """
     api = settings.make_api()
     try:
-        preview = api.request("POST", f"/libraries/{library_id}/organize/preview") or {}
+        preview = (
+            api.request("POST", f"/libraries/{library_id}/file-organization-preview") or {}
+        )
         renames = preview.get("renames") or []
         skips = preview.get("skips") or []
         print(
@@ -81,12 +86,17 @@ def lib_organize(
                 exit_code=ExitCode.NEED_CONFIRM,
                 hint="核对上面的整理计划后重跑并加 --yes；只看计划用 --dry-run",
             )
-        started = api.request("POST", f"/libraries/{library_id}/organize")
+        started = api.request("POST", f"/libraries/{library_id}/file-organizations")
         if api.last_message:
             print(api.last_message, file=sys.stderr)
         emit(started, output=output_override or settings.output, quiet=settings.quiet)
         if wait:
-            op = {"long_task": {"progress_op": "lib.show", "progress_field": "organize_progress"}}
+            op = {
+                "long_task": {
+                    "progress_op": "library.get",
+                    "progress_field": "organize_progress",
+                }
+            }
             wait_long_task(op, _PROGRESS_OPS, api, {"library_id": library_id}, wait_timeout)
     finally:
         api.close()
@@ -103,7 +113,7 @@ def lib_organize(
 @click.option("--yes", is_flag=True, help="确认执行修复（默认只预览）")
 @output_option
 @click.pass_obj
-def lib_reconcile_paths(
+def library_reconcile_paths(
     settings,
     output_override: str | None,
     library_id: int,
@@ -123,7 +133,7 @@ def lib_reconcile_paths(
         preview = (
             api.request(
                 "POST",
-                f"/libraries/{library_id}/path-reconcile/preview",
+                f"/libraries/{library_id}/path-reconciliation-preview",
                 json_body=payload,
             )
             or {}
@@ -149,7 +159,7 @@ def lib_reconcile_paths(
             )
         started = api.request(
             "POST",
-            f"/libraries/{library_id}/path-reconcile",
+            f"/libraries/{library_id}/path-reconciliations",
             json_body=payload,
         )
         if api.last_message:

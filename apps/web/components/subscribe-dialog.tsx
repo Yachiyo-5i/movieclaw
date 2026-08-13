@@ -9,10 +9,11 @@ import { RuleSetEditorDialog, specSummary } from "@/components/rule-sets-panel";
 import { listLibraries, type MediaLibrary } from "@/lib/api/libraries";
 import {
   createSubscription,
-  deleteSubscription,
-  getDispatchPreview,
+  deleteSubscriptionPermanently,
   listRuleSets,
-  prepareSubscription,
+  previewSubscriptionDownloadRouting,
+  previewSubscriptionTitle,
+  unsubscribeFromSubscription,
   type DispatchPreview,
   type PrepareResult,
   type ResolveCandidate,
@@ -24,14 +25,11 @@ import type { MediaType } from "@/lib/media-types";
 import { usePermissions } from "@/lib/permissions";
 
 /**
- * 订阅弹层的打开参数：TMDB 入口带 tmdbId；豆瓣入口带 doubanId + title(+year)，
- * 由后端收敛到 TMDB 锚（歧义时本弹层内让用户从候选中确认一次）。
+ * 订阅弹层只传递 Discover 签发的 titleRef；来源识别与 TMDB 锚定由后端负责。
  */
 export interface SubscribeTarget {
+  titleRef: string;
   kind: MediaType;
-  source: "tmdb" | "douban";
-  tmdbId?: number;
-  doubanId?: string;
   title: string;
   year?: number;
 }
@@ -39,7 +37,7 @@ export interface SubscribeTarget {
 /**
  * 订阅弹层：一次点击完成订阅，复杂度沉到默认值。
  *
- * 流程（对应后端 /subscriptions/prepare 的三态）：
+ * 流程（对应后端 /subscriptions/title-preview 的三态）：
  *   loading → ready（渲染季选择 + 追新开关 + 规则组）
  *           → ambiguous（豆瓣收敛歧义：候选墙确认一次后重新 prepare）
  *           → not_found（TMDB 未收录，无法订阅）
@@ -57,7 +55,7 @@ export function SubscribeDialog({
   onClose: () => void;
   onChanged?: () => void;
 }) {
-  const { canManageSubscriptions } = usePermissions();
+  const { canManageSubscriptions, isAdmin } = usePermissions();
   const [prepared, setPrepared] = useState<PrepareResult | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [ruleSets, setRuleSets] = useState<RuleSet[]>([]);
@@ -69,20 +67,22 @@ export function SubscribeDialog({
   const [creatingRuleSet, setCreatingRuleSet] = useState(false);
   const [libraryId, setLibraryId] = useState<number | null>(null);
   const [busy, setBusy] = useState(false);
+  const [selectedTitleRef, setSelectedTitleRef] = useState("");
   // 投递路由预检：选库即预演"下载会落到哪、能否自动入库"，配置问题当场亮出
   const [dispatchPreview, setDispatchPreview] = useState<DispatchPreview | null>(null);
   // 收藏范围路由的预选结论：打开弹窗时按作品特征算出的默认库 + 中文理由。
   // 规则只决定默认值——用户改选其它库即显式指定，徽标随之消失
   const [routed, setRouted] = useState<{ libraryId: number; reason: string | null } | null>(null);
+  const routingKind = prepared?.media?.kind ?? target?.kind;
 
   useEffect(() => {
-    if (!canManageSubscriptions || !target || libraryId === null) {
+    if (!canManageSubscriptions || !routingKind || libraryId === null) {
       setDispatchPreview(null);
       return;
     }
     let cancelled = false;
     setDispatchPreview(null);
-    getDispatchPreview(target.kind, libraryId)
+    previewSubscriptionDownloadRouting(routingKind, libraryId)
       .then((p) => {
         if (!cancelled) setDispatchPreview(p);
       })
@@ -92,31 +92,23 @@ export function SubscribeDialog({
     return () => {
       cancelled = true;
     };
-  }, [canManageSubscriptions, target, libraryId]);
+  }, [canManageSubscriptions, routingKind, libraryId]);
 
   /** 预检并按结果初始化表单默认值（候选确认后会带着 tmdbId 再次进入）。 */
   const runPrepare = useCallback(
     async (t: SubscribeTarget) => {
+      setSelectedTitleRef(t.titleRef);
       setPrepared(null);
       setError(null);
       try {
-        const [result, adminOptions] = await Promise.all([
-          prepareSubscription(
-            t.source === "douban" && !t.tmdbId
-              ? {
-                  source: "douban",
-                  kind: t.kind,
-                  title: t.title,
-                  year: t.year,
-                  douban_id: t.doubanId,
-                }
-              : { source: "tmdb", kind: t.kind, tmdb_id: t.tmdbId, douban_id: t.doubanId },
-          ),
-          canManageSubscriptions
-            ? Promise.all([listRuleSets(), listLibraries(t.kind)])
-            : Promise.resolve(null),
+        const [result, rules] = await Promise.all([
+          previewSubscriptionTitle({ title_ref: t.titleRef }),
+          canManageSubscriptions ? listRuleSets() : Promise.resolve([]),
         ]);
-        const [rules, libs] = adminOptions ?? [[], []];
+        // 豆瓣条目可能没有可靠的前端类型；媒体库和投递路由必须以后端
+        // 收敛后的 canonical kind 为准，避免电影/剧集选到错误的库。
+        const resolvedKind = result.media?.kind ?? t.kind;
+        const libs = canManageSubscriptions ? await listLibraries(resolvedKind) : [];
         setRuleSets(rules);
         setRuleSetId(rules.find((r) => r.is_default)?.id ?? rules[0]?.id ?? null);
         setLibraries(libs);
@@ -126,9 +118,11 @@ export function SubscribeDialog({
         setRouted(null);
         let pickedId = fallbackId;
         if (canManageSubscriptions && result.status === "ready" && result.media) {
-          const p = await getDispatchPreview(t.kind, null, result.media.tmdb_id).catch(
-            () => null,
-          );
+          const p = await previewSubscriptionDownloadRouting(
+            resolvedKind,
+            null,
+            result.media.tmdb_id,
+          ).catch(() => null);
           if (p?.library_id != null && libs.some((l) => l.id === p.library_id)) {
             pickedId = p.library_id;
             setRouted({ libraryId: p.library_id, reason: p.route_reason });
@@ -142,7 +136,7 @@ export function SubscribeDialog({
           .map((s) => s.season_number);
         setSelectedSeasons(new Set(airedSeasons));
         setFollowFuture(
-          t.kind === "tv" && result.media?.status === "Returning Series",
+          resolvedKind === "tv" && result.media?.status === "Returning Series",
         );
       } catch (e) {
         setError(e instanceof Error ? e.message : "预检失败，请稍后重试");
@@ -165,7 +159,7 @@ export function SubscribeDialog({
 
   const pickCandidate = (candidate: ResolveCandidate) => {
     if (!target) return;
-    void runPrepare({ ...target, tmdbId: candidate.tmdb_id });
+    void runPrepare({ ...target, titleRef: candidate.title_ref });
   };
 
   const submit = async () => {
@@ -174,13 +168,15 @@ export function SubscribeDialog({
     setError(null);
     try {
       await createSubscription({
-        kind: prepared.media.kind,
-        tmdb_id: prepared.media.tmdb_id,
+        title_ref: selectedTitleRef || target.titleRef,
+        source_title_ref:
+          target.titleRef.startsWith("douban:") && selectedTitleRef !== target.titleRef
+            ? target.titleRef
+            : null,
         selected_seasons: [...selectedSeasons].sort((a, b) => a - b),
         follow_future: followFuture,
         rule_set_id: canManageSubscriptions ? ruleSetId : null,
         library_id: canManageSubscriptions ? libraryId : null,
-        douban_id: target.doubanId ?? null,
       });
       onChanged?.();
       onClose();
@@ -195,7 +191,11 @@ export function SubscribeDialog({
     if (!prepared?.existing_subscription_id) return;
     setBusy(true);
     try {
-      await deleteSubscription(prepared.existing_subscription_id);
+      if (isAdmin) {
+        await deleteSubscriptionPermanently(prepared.existing_subscription_id);
+      } else {
+        await unsubscribeFromSubscription(prepared.existing_subscription_id);
+      }
       onChanged?.();
       onClose();
     } catch (e) {
