@@ -18,7 +18,7 @@ def test_tjupt_yaml_loads_credential_configuration() -> None:
     config = get_site_config("tjupt")
 
     assert config.site_class is NexusPHPSite
-    assert config.display_name == "北洋园 TJUPT"
+    assert config.display_name == "北洋园"
     assert config.base_url == "https://tjupt.org"
     assert config.min_request_interval == 5.0
     assert config.supported_auth_types == ("cookie", "credential")
