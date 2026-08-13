@@ -51,7 +51,8 @@ class Settings:
 @click.group(
     name="mclaw",
     context_settings={"help_option_names": ["-h", "--help"], "max_content_width": 100},
-    help="movieclaw 命令行工具：搜索、订阅、媒体库、下载、设置——页面能做的这里都能做。\n\n"
+    help="movieclaw 命令行工具：发现电影/剧集、搜索和下载 PT 资源、订阅追更、"
+    "管理本地媒体库；覆盖页面的主要业务流程和管理设置。\n\n"
     "探索方式：mclaw <域> --help 看该域全部命令，mclaw <域> <命令> --help 看参数与示例。\n"
     "机器输出：加 -o json（非终端环境默认即 JSON）。",
 )

@@ -452,8 +452,11 @@ class RuleSetPayload(BaseModel):
             "dv 策略（any/require/forbid，单独判断杜比视界，与 hdr 正交，"
             "如必须 HDR 但排除 DV = hdr:require + dv:forbid）、free_only 只要免费种、"
             "min_seeders 做种数下限、size_min_mb/size_max_mb 体积区间（整季包按每集均摊）、"
-            "exclude_hr 排除 H&R。"
-            '例：{"resolutions":["2160p"],"free_only":true}'
+            "exclude_hr 排除 H&R、hr_unknown_policy 决定 H&R 状态未知时宽松/严格处理、"
+            "未填写的条件均不限制。\n\n"
+            "subtitle_languages_require：要求的字幕语言（BCP 47，任一命中即通过）。\n\n"
+            "audio_languages_require：要求的音轨语言（BCP 47，任一命中即通过）。\n\n"
+            '示例：{"resolutions":["2160p"],"free_only":true}'
         ),
     )
 

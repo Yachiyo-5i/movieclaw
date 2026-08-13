@@ -22,11 +22,14 @@ _SNAPSHOT = Path(__file__).parent / "mclaw_tool_description_snapshot.txt"
 
 
 def test_service_map_covers_every_spec_domain() -> None:
-    """目录同步守护：spec 的每个开放域都必须出现在服务目录里。
+    """目录同步守护：spec 的每个开放域都必须有人工润色并出现在目录里。
 
-    新增业务域忘了在 _DOMAIN_LINES 润色时，这里也不会漏——渲染会回落
-    DOMAIN_HELP 短标签；本测试保证「出现」，润色质量靠快照测试评审。
+    运行期保留 DOMAIN_HELP 回落是为了部署韧性，但仓库内不接受只有技术短标签
+    的新域：能力地图是 Agent 选择工具的依据，必须显式评审用户语义。
     """
+    missing = spec_domains() - set(_DOMAIN_LINES)
+    assert not missing, f"以下开放域缺少人工功能介绍：{missing}"
+
     rendered = render_service_map()
     for domain in spec_domains():
         assert any(line.lstrip("- ").startswith(domain) for line in rendered.splitlines()), (
@@ -38,6 +41,35 @@ def test_curated_lines_have_no_orphans() -> None:
     """润色行不能指向不存在的域（防止改版后目录里残留幽灵条目）。"""
     orphans = set(_DOMAIN_LINES) - spec_domains()
     assert not orphans, f"_DOMAIN_LINES 含 spec 中不存在（或已被排除）的域：{orphans}"
+
+
+def test_service_map_distinguishes_discovery_from_resource_search() -> None:
+    """关键语义守卫：找影视内容与找可下载种子是两个域，不能让模型混用。"""
+    lines = render_service_map().splitlines()
+    discover = next(line for line in lines if line.startswith("- discover "))
+    search = next(line for line in lines if line.startswith("- search "))
+
+    for keyword in ("电影", "剧集", "TMDB", "豆瓣", "热门", "高分"):
+        assert keyword in discover
+    assert "PT" in search and "种子" in search and "download" in search
+
+
+def test_service_map_reflects_frontend_product_language() -> None:
+    """前端核心承诺必须进入能力地图，避免 Agent 只看到后台技术对象名。"""
+    lines = {
+        line.lstrip("- ").split(maxsplit=1)[0]: line
+        for line in render_service_map().splitlines()
+        if line.startswith("- ")
+    }
+
+    for keyword in ("实时热点", "热映", "在播", "热门", "高分", "口碑"):
+        assert keyword in lines["discover"]
+    for keyword in ("持续追踪", "自动搜索", "下载", "整理入库"):
+        assert keyword in lines["sub"]
+    assert "AI 对话入口" in lines["channels"] and "搜片、订阅、查进度" in lines["channels"]
+    assert "qBittorrent/Transmission" in lines["dl"]
+    assert "首页背景" in lines["appearance"] and "界面质感" in lines["ui"]
+    assert "播放、收藏" in lines["webhook"] and "HMAC" in lines["webhook"]
 
 
 def test_agent_domain_is_excluded() -> None:
@@ -53,7 +85,9 @@ def test_full_description_matches_snapshot() -> None:
     actual = build_description(render_service_map())
     if not _SNAPSHOT.exists():
         _SNAPSHOT.write_text(actual, encoding="utf-8")
-    expected = _SNAPSHOT.read_text(encoding="utf-8")
+    # 快照文件按仓库文本规范保留末尾换行；工具 description 本身不需要该换行。
+    # 只规范化一个 EOF 换行，其余字符仍逐字比较。
+    expected = _SNAPSHOT.read_text(encoding="utf-8").removesuffix("\n")
     assert actual == expected, (
         f"mclaw 工具描述与快照不一致。确认属预期变更后删除快照文件重新生成：\n  rm {_SNAPSHOT}"
     )

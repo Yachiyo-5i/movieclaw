@@ -39,30 +39,34 @@ RESERVED_PARAM_NAMES = (
 # "input" 不在保留清单：API 字段叫 input 时（如 agent.start 的用户输入），
 # API 字段优先，该命令放弃 --input 整体替代形态（逐字段传参仍完整可用）
 
-# 域分组的一行简介（click group 的 help；生成命令自身的 help 来自 spec）
+# 域分组的一行产品能力简介（click group 的 help；生成命令自身的参数与详细
+# 说明来自 spec）。模型会先看 mclaw 工具目录、再用域级 --help 探索命令，
+# 因此这里要用用户语义区分相邻域，不能只重复内部对象名。
 DOMAIN_HELP = {
-    "auth": "账号、会话与 API 令牌",
-    "appearance": "外观（背景图库）",
-    "agent": "AI 助手会话与运行",
-    "channels": "通知渠道（微信绑定）",
-    "discover": "发现页与影视元数据",
-    "dl": "下载器与一键下载",
+    "agent": "AI 助手对话任务、运行状态与历史记录",
+    "app": "外部访问设置、应用重启、版本升级/回退与 NER 模型更新",
+    "appearance": "首页背景与图库",
+    "auth": "个人信息、会话与 API 令牌",
+    "channels": "微信、Telegram、Discord 消息推送与 AI 对话入口",
+    "discover": "从 TMDB/豆瓣发现最新、热门和高分电影/剧集，搜索条目并查看详情",
+    "dl": "qBittorrent/Transmission 下载器、路径映射与种子投递",
     "extension": "浏览器插件 Cookie 同步",
-    "health": "服务健康检查",
-    "jobs": "后台任务",
-    "lib": "媒体库",
-    "llm": "AI 模型供应商",
-    "logs": "系统日志",
-    "net": "网络与代理",
+    "health": "API 存活检查",
+    "jobs": "后台作业查询、事件、等待、取消与重试",
+    "lib": "本地电影/剧集媒体库、扫描入库、整理与元数据维护",
+    "llm": "OpenAI、阿里云百炼及 OpenAI 兼容模型接入与验证",
+    "logs": "系统日志查看与实时跟随",
+    "members": "家庭成员账号、能力开关与可见范围",
+    "net": "全局/指定服务代理、镜像地址与连通性测试",
     "notices": "系统待处理事项",
-    "people": "影人档案（本地库）",
-    "rules": "订阅规则组",
-    "search": "站点资源搜索",
-    "site": "PT 站点配置",
-    "sub": "订阅",
-    "ui": "界面偏好",
-    "watch": "监听导入",
-    "webhook": "事件 Webhook 出站推送",
+    "people": "本地媒体库影人档案与作品",
+    "rules": "订阅资源质量与过滤规则组",
+    "search": "PT 站点种子跨站搜索、筛选排序、偏好与历史",
+    "site": "PT 资源站点接入、鉴权验证与缓存状态",
+    "sub": "持续追踪电影/剧集新资源并自动下载入库",
+    "ui": "Web 界面质感、布局与显示偏好",
+    "watch": "下载完成目录监听、自动识别、标准命名与入库",
+    "webhook": "播放、收藏等事件的 Webhook 推送与投递记录",
 }
 
 _SIMPLE_TYPES = {"string", "integer", "number", "boolean"}

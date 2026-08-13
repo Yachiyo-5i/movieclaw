@@ -18,36 +18,55 @@ from movieclaw_cli.gen.tree_builder import DOMAIN_HELP, is_generable, iter_opera
 
 logger = logging.getLogger("movieclaw_api.mclaw_tool")
 
-# 域 → 目录行（一行说明 + 关键子能力/入口提示）。新增域忘了补会被守护测试拦下，
-# 届时可先回落 DOMAIN_HELP 的短标签保证不漏。
+# 域 → 面向模型的产品能力地图（一行说明 + 关键子能力/入口提示）。这里不只写
+# 技术对象名，还要说清用户能完成什么、数据来自哪里、相邻域如何分工；否则模型
+# 虽然“看得到命令”，却未必会在正确的任务上选择它。新增域忘了补会被守护测试
+# 拦下，运行期仍回落 DOMAIN_HELP 的短标签，避免残缺部署直接阻断 Agent。
 _DOMAIN_LINES = {
-    "channels": "channels 通知渠道（微信扫码绑定与账号管理）",
-    "notices": "notices  系统待处理事项（list 查看活跃问题、dismiss 忽略）",
-    "search": 'search   站点资源搜索：search "关键词" 流式聚合出带行号的结果',
-    "sub": "sub      订阅：sub create 一步完成消歧/预检/创建；list/show/update/pause/delete",
-    "lib": "lib      媒体库：库管理、scan 扫描、organize 整理、items 条目、"
-    "unidentified 待识别认领、missing 缺失重下、review 身份复核",
-    "site": "site     PT 站点接入与验证（catalog 看支持哪些站）",
-    "dl": "dl       下载器接入、默认下载器与路径映射",
-    "watch": "watch    监听导入规则（下载完成目录 → 自动入库）",
-    "webhook": "webhook  事件 Webhook 出站推送（show/set 配置端点、test 试发、"
-    "deliveries 查投递记录、rotate-secret 轮换签名密钥）",
-    "rules": "rules    订阅过滤规则组（分辨率/制作组/体积等偏好）",
-    "discover": "discover 影视元数据与榜单（media 搜索条目、拿 TMDB ID）",
-    "people": "people   影人档案（本地库）",
-    "llm": "llm      AI 模型供应商配置",
-    "ui": "ui       界面偏好（Web 端玻璃质感参数）",
-    "net": "net      网络与代理（show/set/test）",
-    "auth": "auth     账号、API 令牌管理",
-    "appearance": "appearance 外观背景图库",
-    "extension": "extension 浏览器插件 Cookie 同步令牌",
-    "health": "health   服务健康检查（一般用 status 即可）",
+    "app": "app      应用设置与维护（设置外部访问地址、重启；检查/升级/回退应用，更新 NER "
+    "模型并查看进度/兼容性）",
+    "appearance": "appearance 首页背景与图库（查看、上传、下载、切换和删除背景图）",
+    "auth": "auth     个人信息与 CLI 访问（查看身份，修改头像/昵称/密码，创建/列出/吊销 API 令牌）",
+    "channels": "channels 消息推送与 AI 对话入口（微信、Telegram、Discord 配对/解绑，配置事件"
+    "推送并测试；绑定后可发消息搜片、订阅、查进度）",
+    "discover": "discover 发现电影/剧集（来自 TMDB、豆瓣的实时热点、热映/待上映/在播、热门、"
+    "高分、口碑及地区/类型榜单；layout/hero/row 浏览，search 搜两站影视条目，show 看详情/"
+    "演职员/剧照/相似推荐）",
+    "dl": "dl       qBittorrent/Transmission 下载器与投递（接入/验证/启停/设默认实例，配置"
+    "保存路径与路径映射，预演落点并提交种子）",
+    "extension": "extension Chromium 浏览器插件 Cookie 同步（管理同步令牌/支持站点，把页面中的"
+    " httpOnly 站点 Cookie 安全同步到服务端）",
+    "health": "health   API 存活检查（通常优先用顶级 status 查看更完整的部署状态）",
+    "jobs": "jobs     后台作业（按来源/状态/类型查询，查看事件与执行器健康，等待/取消/重试；"
+    "订阅的在途下载进度看 sub downloads）",
+    "lib": "lib      本地电影/剧集媒体库（建库/根目录/默认路由，扫描识别与标准命名入库，搜索/"
+    "详情/文件，元数据/海报/AI 字幕，待识别/缺失/身份复核，条目转移与删除）",
+    "llm": "llm      AI 模型供应商（接入 OpenAI、阿里云百炼或任意 OpenAI 兼容服务，选择模型"
+    "并验证连通性，供 AI 对话等智能能力使用）",
+    "net": "net      网络与代理（配置全局/指定服务代理及镜像地址，立即生效；按 TMDB/豆瓣/"
+    "GitHub/PT 站点等服务测试连通性）",
+    "notices": "notices  系统待处理事项（查看按严重程度排序的活跃问题，或忽略指定提示）",
+    "people": "people   本地媒体库影人档案（按 TMDB 人物 ID 查看资料及已入库参演作品）",
+    "rules": "rules    订阅过滤规则组（管理分辨率、编码、HDR、字幕/音轨、免费/H&R、做种数、"
+    "体积和制作组等条件及默认规则组）",
+    "search": "search   PT 站点种子资源搜索（跨站并发，按站点/分类/分辨率/免费状态筛选，按"
+    "做种数/体积/完成数排序，管理搜索偏好/历史/结果快照；结果行号可交给 download）",
+    "site": "site     PT 资源站点（查看支持目录/鉴权要求，配置、验证、启停站点，查看本地种子"
+    "缓存统计；Cookie 可由 extension 同步）",
+    "sub": "sub      电影/剧集订阅与自动追更（持续追踪新资源，按规则自动搜索、下载并整理入库；"
+    "支持消歧/选季、缺口工单、立即搜索/手动选种、暂停恢复、活动/下载进度与链路体检）",
+    "ui": "ui       Web 界面质感与显示偏好（读取或整体保存各页面的布局、显示和样式设置）",
+    "watch": "watch    监听导入（监控已完成且稳定的下载，自动识别、标准命名并转移到目标媒体库；"
+    "查看并认领、忽略或恢复异常条目）",
+    "webhook": "webhook  事件 Webhook（把播放、收藏等事件以 JSON 推送到外部端点；配置 HMAC "
+    "签名，测试投递、查记录并轮换密钥）",
 }
 
 # 不属于生成域、但必须让模型知道的顶级捷径
 _TOP_LEVEL_LINES = [
-    "download 下载：download <行号> 提交上次 search 结果的某行（或 --site-id + --url）",
-    "status   一眼看部署状态：服务健康、登录身份、版本同步",
+    "download 下载：把上次 search 的结果行号（或明确的站点+链接）投递到下载器，"
+    "可指定媒体库/保存目录",
+    "status   部署总览：服务健康、当前身份、客户端/服务端版本与命令目录同步状态",
 ]
 
 # 不进目录的域：
@@ -92,7 +111,7 @@ def render_service_map() -> str:
             ),
         ) from exc
 
-    lines = ['可用服务（一级目录；参数细节用 --help 现查，如 args="sub --help"）：']
+    lines = ['可用服务（按用户意图选一级目录；参数细节用 --help 现查，如 args="sub --help"）：']
     for domain in domains:
         lines.append("- " + _DOMAIN_LINES.get(domain, f"{domain}   {DOMAIN_HELP.get(domain, '')}"))
     for extra in _TOP_LEVEL_LINES:

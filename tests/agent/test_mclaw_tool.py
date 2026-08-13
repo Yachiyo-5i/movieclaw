@@ -82,3 +82,13 @@ def test_description_contains_service_map_and_protocol() -> None:
     assert "可用服务" in desc and "sub 订阅" in desc
     assert "--help" in desc and "--yes" in desc
     assert "bash" in desc  # 排他性引导：不要经 bash 调用
+    assert "discover 搜的是影视条目和榜单" in desc
+    assert "search 搜的是可下载种子" in desc
+
+
+def test_args_description_contains_representative_discovery_example(tmp_path: Path) -> None:
+    """参数提示同时示范发现内容与资源搜索，帮助模型形成正确的命令形态。"""
+    tool = _tool(tmp_path)
+    args_desc = tool.definition.parameters["properties"]["args"]["description"]
+    assert "discover layout movie --source tmdb" in args_desc
+    assert 'search "沙丘2" --resolution 2160p' in args_desc

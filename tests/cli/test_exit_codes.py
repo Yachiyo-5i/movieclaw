@@ -11,6 +11,8 @@ def test_help_exits_zero(run_mclaw) -> None:
     result = run_mclaw("--help")
     assert result.returncode == 0
     assert "movieclaw 命令行工具" in result.stdout
+    assert "发现电影/剧集" in result.stdout
+    assert "搜索和下载 PT 资源" in result.stdout
 
 
 def test_offline_help_browsable_without_server(run_mclaw) -> None:
@@ -19,6 +21,18 @@ def test_offline_help_browsable_without_server(run_mclaw) -> None:
         result = run_mclaw(*args)
         assert result.returncode == 0, result.stderr
         assert result.stdout
+
+
+def test_rules_help_lists_frontend_filter_fields(run_mclaw) -> None:
+    """规则页已暴露的字段也必须出现在离线 CLI 帮助里，Agent 才能正确组 JSON。"""
+    result = run_mclaw("rules", "create", "--help")
+    assert result.returncode == 0, result.stderr
+    for field in (
+        "subtitle_languages_require",
+        "audio_languages_require",
+        "hr_unknown_policy",
+    ):
+        assert field in result.stdout
 
 
 def test_usage_error_exits_2(run_mclaw) -> None:

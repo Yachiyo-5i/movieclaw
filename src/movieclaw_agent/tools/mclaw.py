@@ -46,13 +46,18 @@ _BLOCKED = {
 }
 
 _PROTOCOL = """\
-movieclaw 的官方命令行工具。对本产品的一切操作——搜索资源、订阅、媒体库、下载、\
-站点/下载器/规则等全部设置——都用本工具完成（不要通过 bash 调用，bash 环境没有授权）。\
-授权已自动配置，永远不需要 login。
+movieclaw 的官方命令行工具。用于从 TMDB 和豆瓣发现实时热点、最新、热映/在播、热门和\
+高分电影/剧集，搜索并下载 PT 资源，持续订阅追更并自动整理入库，管理本地媒体库；也可\
+查看任务进度，以及配置资源站点、下载器、规则、消息渠道、AI 模型、网络和应用更新。查询\
+或变更 movieclaw 产品状态都用本工具完成（不要通过 bash 调用，bash 环境没有授权）。授权\
+已自动配置，永远不需要 login。
 
 {service_map}
 
 使用协议：
+- 常用链路：discover 找片/找剧 → sub create 订阅；search 搜 PT 种子 → download 投递；\
+lib 查看和管理已入库内容。discover 搜的是影视条目和榜单，search 搜的是可下载种子，不要混用；\
+订阅会持续追踪，并在出现符合规则的新资源后自动搜索、下载和整理入库。
 - 输出即数据：stdout 是 JSON（默认），stderr 是过程提示与错误原因。
 - 参数拿不准就先 --help（域级与命令级都有，含示例），不要凭记忆猜参数或取值。
 - 列表默认有条数上限、长字段有截断；下结论前确认数据没有被截断（--limit 可调）。
@@ -137,7 +142,8 @@ def make_mclaw_tool(
                     "args": {
                         "type": "string",
                         "description": "mclaw 后面的完整参数串（不含 mclaw 本身），"
-                        '如 "sub list" 或 "search \\"沙丘2\\" --resolution 2160p"',
+                        "如 'discover layout movie --source tmdb'、'sub list' 或 "
+                        "'search \"沙丘2\" --resolution 2160p'",
                     },
                     "timeout": {
                         "type": "number",

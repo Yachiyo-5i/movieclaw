@@ -14,6 +14,7 @@ from pathlib import Path
 
 from movieclaw_cli.gen.spec_loader import load_baseline
 from movieclaw_cli.gen.tree_builder import (
+    DOMAIN_HELP,
     RESERVED_PARAM_NAMES,
     generated_command_paths,
     is_generable,
@@ -50,6 +51,30 @@ def test_command_tree_matches_snapshot() -> None:
         "open('tests/cli/command_tree_snapshot.txt','w').write("
         "'\\n'.join(generated_command_paths(load_baseline()))+'\\n')\""
     )
+
+
+def test_domain_help_covers_every_generated_domain() -> None:
+    """域级 --help 是模型二次探索入口：每个命令域都必须有人工功能介绍。"""
+    domains = {
+        op["operation_id"].split(".")[0]
+        for op in iter_operations(load_baseline())
+        if is_generable(op)
+    }
+    assert set(DOMAIN_HELP) == domains, (
+        f"域简介与命令域不一致：缺少 {domains - set(DOMAIN_HELP)}，"
+        f"多出 {set(DOMAIN_HELP) - domains}"
+    )
+
+
+def test_domain_help_uses_frontend_user_language() -> None:
+    """一级帮助沿用页面心智，并在短描述里区分容易混淆的相邻域。"""
+    assert "TMDB/豆瓣" in DOMAIN_HELP["discover"]
+    assert "PT 站点种子" in DOMAIN_HELP["search"]
+    assert "自动下载入库" in DOMAIN_HELP["sub"]
+    assert "AI 对话入口" in DOMAIN_HELP["channels"]
+    assert "家庭成员" in DOMAIN_HELP["members"]
+    assert "首页背景" in DOMAIN_HELP["appearance"]
+    assert "界面质感" in DOMAIN_HELP["ui"]
 
 
 def test_api_params_do_not_shadow_cli_flags() -> None:
