@@ -509,4 +509,7 @@ class NexusPHPSite(BaseSite):
         try:
             return float(cleaned)
         except ValueError:
-            return None
+            # 数值可能被说明文字或符号包裹（如魔力值 "]:1651637.4["），
+            # 退回提取首个数字再解析。
+            match = re.search(r"-?\d+(?:\.\d+)?", cleaned)
+            return float(match.group()) if match else None
