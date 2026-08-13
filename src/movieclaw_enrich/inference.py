@@ -23,6 +23,7 @@ import logging
 import os
 import re
 import threading
+from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
@@ -209,8 +210,33 @@ def _decode_spans(labels: list[str], probs, ids, offsets, sequence_ids) -> list[
     ]
 
 
+# 推理结果缓存条数。同一进程内模型不变，同输入必同输出，缓存永不失真。
+# 命中场景都是高频重复：种子同步每个 tick 重复观测首页的已知种子、媒体库
+# 扫描对同一目录名跨文件反复推理、用户重复搜索同一批结果。单条推理在弱
+# 机型上可达几十毫秒，命中后变成微秒级查表。条目是两段短文本 + 小字典，
+# 4096 条约几 MB 内存。
+_INFER_CACHE_SIZE = 4096
+
+
 def extract_with_model(title: str, subtitle: str = "") -> dict[str, object]:
-    """双段联合推理，返回 TorrentAttrs 对应字段的部分字典（模型缺席返回空字典）。"""
+    """双段联合推理，返回 TorrentAttrs 对应字段的部分字典（模型缺席返回空字典）。
+
+    结果经进程内 LRU 缓存（见 ``_INFER_CACHE_SIZE``）。出口对字典和其中的
+    列表做拷贝：调用方会就地改写返回值（enrich 的护栏否决会 pop 能力位、
+    替换语言列表），不能让这些改写污染缓存。
+    """
+    session, _tokenizer, _meta = _MODEL.get()
+    if session is None:
+        return {}  # 模型缺席时不占缓存：空结果没有复用价值
+    fields = _extract_cached(title, subtitle or "")
+    return {
+        key: list(value) if isinstance(value, list) else value
+        for key, value in fields.items()
+    }
+
+
+@lru_cache(maxsize=_INFER_CACHE_SIZE)
+def _extract_cached(title: str, subtitle: str) -> dict[str, object]:
     session, tokenizer, meta = _MODEL.get()
     if session is None:
         return {}

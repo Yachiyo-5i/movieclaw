@@ -439,3 +439,31 @@ class TestModelDeclChannel:
         attrs = enrich("Some.Show.2026.1080p.WEB-DL", "示例 | 内封简中字幕")
         assert attrs.subtitle_languages == ["zh-Hans"]
         assert attrs.audio_languages == []
+
+
+class TestInferenceCache:
+    """模型通道的进程内 LRU 缓存：命中省推理、改写不污染。"""
+
+    def test_repeat_inference_hits_cache_without_pollution(self):
+        from movieclaw_enrich import inference
+
+        if inference._MODEL.get()[0] is None:
+            pytest.skip("NER 模型缺席，缓存路径不生效")
+
+        inference._extract_cached.cache_clear()
+        title = "Dune.Part.Two.2024.2160p.UHD.BluRay.REMUX.HEVC-CHD"
+        first = inference.extract_with_model(title, "沙丘2 | 国语中字")
+        assert inference._extract_cached.cache_info().misses == 1
+
+        # 调用方就地改写返回值（enrich 的护栏否决正是这么做的），不能污染缓存
+        first["year"] = 9999
+        for value in first.values():
+            if isinstance(value, list):
+                value.append("污染")
+
+        second = inference.extract_with_model(title, "沙丘2 | 国语中字")
+        assert inference._extract_cached.cache_info().hits == 1
+        assert second.get("year") == 2024
+        assert all(
+            "污染" not in value for value in second.values() if isinstance(value, list)
+        )
