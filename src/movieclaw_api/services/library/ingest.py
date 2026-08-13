@@ -38,6 +38,9 @@
 - **环境故障 = 失败（failed）**：探测失败/搬运出错/TMDB 不可达，时间
   驱动的重试有意义，小时级退避 + 告警；告警按**源目录聚合**成一条
   （"某目录 N 个条目失败"），逐条目刷红灯在存量场景是灾难；
+- **部分入库不冒充完成**：季包只要还有文件因季集解析失败而跳过，就保留
+  pending；只要还有探测/搬运故障，就保留 failed。升级后的首轮补扫会自动
+  重试旧版误标成 imported 的同类记录，正常完成记录仍按指纹短路；
 - 识别顺序：订阅工单认领（info_hash）→ NFO 身份声明（第三方整理过的
   内容常自带 tmdbid，与扫描器同一解析器）→ 名称解析 + TMDB 收敛。
 
@@ -158,6 +161,15 @@ _BRIEFS_TTL_SECONDS = 15.0
 # 太大又会让取消/更新等待过久；NAS 上 64 MiB 通常在数秒内完成。
 _INGEST_COPY_CHUNK_BYTES = 64 * 1024 * 1024
 
+# Job 处理逻辑修订号不仅用于审计，也作为“升级后是否值得自动重试”的边界。
+# 修改季集解析/部分入库收口逻辑时必须递增；同一修订内的待处理条目不反复重跑。
+_INGEST_HANDLER_REVISION = "library.ingest.v2"
+
+# v0.10.0 以前，季包只要成功搬运一个文件就会被记成 imported，即使 message
+# 已明确写着其余文件因季集号解析失败而未入库。保留稳定中文片段用于识别这类
+# 历史脏状态；两种原因都不是作品身份歧义，解析能力升级后应自动补偿。
+_PARSER_GAP_MARKERS = ("解析不出集号，未入库", "解析不出季号，未入库")
+
 # 文件名含这些标记的视频不入库（与入库管线同口径）
 _IGNORE_MARKERS = ("sample",)
 
@@ -187,6 +199,11 @@ class IngestError(Exception):
 
 class IngestSourceChanged(Exception):
     """复制期间源文件继续变化；保留作业意图，等下载稳定后重新执行。"""
+
+
+def _has_parser_gap(record: IngestEntry | None) -> bool:
+    """台账是否仍有因季集解析失败而未入库的文件。"""
+    return bool(record and any(marker in (record.message or "") for marker in _PARSER_GAP_MARKERS))
 
 
 @dataclass
@@ -317,7 +334,7 @@ async def enqueue_ingest_job(
         resources=resources,
         dedupe_key=_ingest_dedupe_key(str(entry)),
         conflict_policy="return_existing",
-        handler_revision="library.ingest.v1",
+        handler_revision=_INGEST_HANDLER_REVISION,
         # 下载落地后的环境故障按小时退避；给足一天自动自愈窗口，超过后
         # 明确失败等待用户处理，不能无限占住活跃任务。
         max_attempts=24,
@@ -680,7 +697,24 @@ async def _process_entry(
             _failed_retry.pop(path_str, None)  # 失败后被人工忽略：不再退避重试
             return  # 用户拍板（或存量基线）永久忽略：指纹变化也不复活，恢复走接口
         latest_job = None if execute_inline else await _latest_ingest_job(session, path_str)
+        parser_retry = _has_parser_gap(record)
         if latest_job is not None and latest_job.status in ACTIVE_JOB_STATUSES:
+            if (
+                parser_retry
+                and latest_job.status == JobStatus.BLOCKED
+                and latest_job.handler_revision != _INGEST_HANDLER_REVISION
+            ):
+                # 旧处理器因季集解析能力不足而 blocked：新版本只自动唤醒一次。
+                # 同修订号不重跑，避免每轮巡检/每次重启反复消耗 NAS IO。
+                latest_job.handler_revision = _INGEST_HANDLER_REVISION
+                await jobs.retry_job(
+                    session,
+                    latest_job,
+                    actor_kind="system",
+                    actor_name="MovieClaw 升级补偿",
+                    origin="system",
+                )
+                logger.info("升级后重新尝试部分入库条目：%s（job=%s）", entry.name, latest_job.id)
             # Job 已接管后不再反复遍历条目树；运行、等待重试与待人工认领
             # 都以统一状态机为事实源，巡检只负责发现新的内容变化。
             _stability.pop(path_str, None)
@@ -713,10 +747,12 @@ async def _process_entry(
             return
 
         if record is not None and record.fingerprint == snap.fingerprint:
-            if record.status != IngestStatus.FAILED:
+            if record.status != IngestStatus.FAILED and not parser_retry:
                 return  # 已处理且没变化（pending 等的是人工拍板，不是时间）
+            if parser_retry:
+                logger.info("升级后重新检查旧版部分入库记录：%s", entry.name)
             elapsed = (utcnow() - record.attempted_at).total_seconds()
-            if elapsed < FAILED_RETRY_SECONDS:
+            if record.status == IngestStatus.FAILED and elapsed < FAILED_RETRY_SECONDS:
                 # 环境故障退避中。进程重启会丢失失败重试表——在此按已过的
                 # 退避时间补记，保证退避到点仍有第三唤醒源接得住
                 _failed_retry.setdefault(path_str, time.monotonic() - elapsed)
@@ -973,6 +1009,7 @@ async def _ingest_entry(
     # 逐文件的失败按性质分档：环境故障（探测失败/搬运出错）→ failed 退避
     # 重试；解析不出季集 → pending 等人（重试改变不了解析结果，改名才行）
     env_error = False
+    parser_gap = False
     if kind is MediaKind.MOVIE and len(snap.videos) > 1:
         notes.append(f"已取最大文件为正片，忽略其余 {len(snap.videos) - 1} 个视频")
 
@@ -994,10 +1031,12 @@ async def _ingest_entry(
             season, episode = _unit(file, entry)
             if not episode:
                 notes.append(f"「{file.name}」解析不出集号，未入库")
+                parser_gap = True
                 completed_bytes += file.stat().st_size
                 continue
             if season is None:
                 notes.append(f"「{file.name}」解析不出季号，未入库")
+                parser_gap = True
                 completed_bytes += file.stat().st_size
                 continue
         if staging is not None and (season, episode) in owned_units:
@@ -1147,7 +1186,14 @@ async def _ingest_entry(
             message += f"；{skipped_owned} 个文件的内容已在媒体库，跳过"
         if notes:
             message += "；" + "；".join(notes)
-        return await conclude(IngestStatus.IMPORTED, message, imported)
+        status = (
+            IngestStatus.FAILED
+            if env_error
+            else IngestStatus.PENDING
+            if parser_gap
+            else IngestStatus.IMPORTED
+        )
+        return await conclude(status, message, imported)
     elif notes:
         # 一个文件都没进：环境故障退避重试；纯解析问题进待处理等人拍板/改名
         return await conclude(
@@ -1714,13 +1760,18 @@ async def _run_ingest_job(
             }
         if record is not None and record.fingerprint == snap.fingerprint:
             await _attach_ingest_entry_resource(context, record)
-            if record.status in {IngestStatus.IMPORTED, IngestStatus.SKIPPED}:
+            parser_retry = _has_parser_gap(record)
+            if record.status in {IngestStatus.IMPORTED, IngestStatus.SKIPPED} and not parser_retry:
                 return {
                     "message": record.message or "监听条目已处理",
                     "entry_id": record.id,
                     "status": record.status,
                 }
-            if record.status == IngestStatus.PENDING and record.claimed_tmdb_id is None:
+            if (
+                record.status == IngestStatus.PENDING
+                and record.claimed_tmdb_id is None
+                and not parser_retry
+            ):
                 raise jobs.JobBlocked(
                     record.message or "无法自动识别该条目，请到监听导入清单认领",
                     code="INGEST_IDENTITY_REQUIRED",
@@ -1751,13 +1802,14 @@ async def _run_ingest_job(
         await refresh_source_notice(session, rule.source_path)
 
     if record.status == IngestStatus.PENDING:
+        parser_gap = _has_parser_gap(record)
         raise jobs.JobBlocked(
             record.message or "监听条目需要人工确认",
-            code="INGEST_IDENTITY_REQUIRED",
+            code="INGEST_EPISODE_PARSE_REQUIRED" if parser_gap else "INGEST_IDENTITY_REQUIRED",
             actions=[
                 {
                     "type": "open_settings",
-                    "label": "去监听导入认领",
+                    "label": "查看监听导入" if parser_gap else "去监听导入认领",
                     "target": "import-watch",
                 }
             ],
