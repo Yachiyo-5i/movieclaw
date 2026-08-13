@@ -2,7 +2,7 @@
 # 页面结构经 2026-08-12 实抓校准。会话凭据为 access_token JWT Cookie；
 # Cookie 模式可使用浏览器同步的最新令牌，credential 模式通过登录表单获取。
 site_id: tjupt
-display_name: 北洋园 TJUPT
+display_name: 北洋园
 base_url: https://tjupt.org
 framework: nexusphp
 

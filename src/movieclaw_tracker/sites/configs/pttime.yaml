@@ -47,16 +47,18 @@ selectors:
   detail_size_css: "td.rowhead:contains('基本信息') + td.rowfollow > b::next_sibling_text"
 
   # ---------- 用户资料 ----------
-  # 全部从顶部导航栏提取，兼容 userdetails.php 不带 id 的情况
-  profile_uid_css: "a[class*='_Name']::attr(href)"
-  profile_username_css: "a[class*='_Name'] b"
-  profile_class_css: "a[class*='_Name']::attr(class)"
-  profile_uploaded_css: "font.color_uploaded::next_sibling_text"
-  profile_downloaded_css: "font.color_downloaded::next_sibling_text"
-  profile_ratio_css: "font.color_ratio::next_sibling_text"
-  profile_bonus_css: "font.color_bonus"
-  profile_seeding_css: "img.arrowup::next_sibling_text"
-  profile_leeching_css: "img.arrowdown::next_sibling_text"
+  # 用户名/UID 限定在 #info_block 顶栏当前用户链接，禁止全页宽匹配 a[class*='_Name']
+  # （会误匹配评论区等其他用户）。等级取资料区「用户等级」字段的真实文字；
+  # 上传/下载/分享率/做种/下载数都在 #info_block 右侧新统计区域（原 font.color_* 已废弃）。
+  profile_uid_css: "#info_block span.medium a[href*='userdetails.php']::attr(href)"
+  profile_username_css: "#info_block span.medium a[href*='userdetails.php'] b"
+  profile_class_css: "td.rowhead:contains('用户等级') + td b::text"
+  profile_uploaded_css: "#info_block font:contains('上传:')::next_sibling_text"
+  profile_downloaded_css: "#info_block font:contains('下载:')::next_sibling_text"
+  profile_ratio_css: "#info_block font:contains('分享率:')::next_sibling_text"
+  profile_bonus_css: "#info_block a[href='mybonus.php']::next_sibling_text"
+  profile_seeding_css: "#info_block font[title='当前做种']::next_sibling_text"
+  profile_leeching_css: "#info_block font[title='当前下载']::next_sibling_text"
 categories:
   movie: [401]
   tv: [402, 403]
