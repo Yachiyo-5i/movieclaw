@@ -23,7 +23,7 @@ from movieclaw_cli.overlay.agent_cmds import agent_attach, agent_run
 from movieclaw_cli.overlay.auth_cmds import login, logout, status
 from movieclaw_cli.overlay.groups import DefaultCommandGroup
 from movieclaw_cli.overlay.jobs_cmds import jobs_wait
-from movieclaw_cli.overlay.lib_cmds import lib_organize
+from movieclaw_cli.overlay.lib_cmds import lib_organize, lib_reconcile_paths
 from movieclaw_cli.overlay.logs_cmds import logs_tail
 from movieclaw_cli.overlay.search_cmds import download, search
 from movieclaw_cli.overlay.sub_cmds import sub_create
@@ -99,6 +99,7 @@ def _assemble() -> None:
 
     lib_group = click.Group(name="lib", help=DOMAIN_HELP.get("lib"))
     lib_group.add_command(lib_organize)  # 整体覆盖生成层的 lib organize preview/start
+    lib_group.add_command(lib_reconcile_paths)
     cli.add_command(lib_group)
 
     agent_group = click.Group(name="agent", help=DOMAIN_HELP.get("agent"))

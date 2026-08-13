@@ -345,6 +345,111 @@ def test_organize_with_yes_executes_and_waits(run_cli, monkeypatch) -> None:
 
 
 # ---------------------------------------------------------------------------
+# lib reconcile-paths：预览 → 确认 → 创建修复扫描作业
+# ---------------------------------------------------------------------------
+
+
+def _path_reconcile_transport(calls: list[dict]):
+    return _transport(
+        {
+            ("POST", "/api/v1/libraries/1/path-reconcile/preview"): httpx.Response(
+                200,
+                json=_envelope(
+                    {
+                        "library_id": 1,
+                        "old_root": "/strm/movies",
+                        "new_root": "/media/movies",
+                        "same_path_candidates": 4,
+                        "safe_merges": 3,
+                        "marked_missing": 1,
+                        "conflicts": ["/strm/movies/conflict.mkv ↔ /media/movies/conflict.mkv"],
+                        "unconfirmed": [],
+                        "old_rows_to_delete_from_ledger": 3,
+                        "disk_files_to_delete": 0,
+                    }
+                ),
+            ),
+            ("POST", "/api/v1/libraries/1/path-reconcile"): httpx.Response(
+                202,
+                json=_envelope(
+                    {"started": True, "message": "已开始", "job_id": "repair-1", "created": True},
+                    message="已开始修复",
+                ),
+            ),
+        },
+        calls,
+    )
+
+
+def test_path_reconcile_dry_run_only_previews(run_cli) -> None:
+    calls: list[dict] = []
+    code, out, err = run_cli(
+        [
+            "lib",
+            "reconcile-paths",
+            "1",
+            "--old-root",
+            "/strm/movies",
+            "--new-root",
+            "/media/movies",
+            "--dry-run",
+            "-o",
+            "json",
+        ],
+        _path_reconcile_transport(calls),
+    )
+    assert code == 0, err
+    assert json.loads(out)["safe_merges"] == 3
+    assert [call["path"] for call in calls] == ["/api/v1/libraries/1/path-reconcile/preview"]
+    assert "磁盘删除 0" in err
+
+
+def test_path_reconcile_requires_yes_before_start(run_cli) -> None:
+    calls: list[dict] = []
+    code, _out, err = run_cli(
+        [
+            "lib",
+            "reconcile-paths",
+            "1",
+            "--old-root",
+            "/strm/movies",
+            "--new-root",
+            "/media/movies",
+        ],
+        _path_reconcile_transport(calls),
+    )
+    assert code == 5
+    assert "--yes" in err
+    assert [call["path"] for call in calls] == ["/api/v1/libraries/1/path-reconcile/preview"]
+
+
+def test_path_reconcile_with_yes_starts_job(run_cli) -> None:
+    calls: list[dict] = []
+    code, out, err = run_cli(
+        [
+            "lib",
+            "reconcile-paths",
+            "1",
+            "--old-root",
+            "/strm/movies",
+            "--new-root",
+            "/media/movies",
+            "--yes",
+            "-o",
+            "json",
+        ],
+        _path_reconcile_transport(calls),
+    )
+    assert code == 0, err
+    assert json.loads(out)["job_id"] == "repair-1"
+    assert [call["path"] for call in calls] == [
+        "/api/v1/libraries/1/path-reconcile/preview",
+        "/api/v1/libraries/1/path-reconcile",
+    ]
+    assert "已开始修复" in err
+
+
+# ---------------------------------------------------------------------------
 # agent run：start → SSE 渲染 → 终态定退出码
 # ---------------------------------------------------------------------------
 

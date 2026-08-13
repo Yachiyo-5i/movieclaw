@@ -315,6 +315,11 @@ class ScanSummary:
     kind_mismatched: int = 0  # 其中因"类型与本库不符"待识别的（库类型可能选错了）
     relinked: int = 0  # 改名归并：旧台账行迁到新路径（身份延续，不算新入账）
     root_relinked: int = 0  # 改根路径后的同实体台账随迁（不算新入账）
+    # 根路径已经从配置中移除时的遗留台账收口。它和普通 missing 分开计数，
+    # 让用户能区分「磁盘删文件」与「容器挂载前缀改写」两类结果。
+    removed_root_marked_missing: int = 0
+    removed_root_cleared: int = 0
+    removed_root_conflicts: int = 0
     skipped_known: int = 0  # 已在台账、直接跳过
     skipped_ignored: int = 0  # 用户忽略过的文件，不再重走识别链
     marked_missing: int = 0  # 台账有但磁盘上已消失，标记 missing
@@ -331,6 +336,28 @@ class ScanSummary:
     # 本轮挂上身份锚的条目（去重）：扫描收尾统一补齐图片资产与媒体目录
     # 镜像（docs/design/metadata.md 4.1；对外接口不暴露）
     identified_item_ids: set[int] = field(default_factory=set)
+
+
+@dataclass
+class RootPathReconcilePreview:
+    """显式修复入口的只读预览结果。
+
+    历史上已经完成根路径切换的库不会再触发 ``update_library`` 的补扫，
+    因此需要一个不写数据库的入口，让管理员在执行前看到会合并、会标缺失
+    与因身份冲突而保留的台账。这里的统计只基于当前台账；正式执行仍会先
+    扫描新根，避免把预览当成瞬时的磁盘事实。
+    """
+
+    library_id: int
+    old_root: str
+    new_root: str
+    same_path_candidates: int = 0
+    safe_merges: int = 0
+    marked_missing: int = 0
+    conflicts: list[str] = field(default_factory=list)
+    unconfirmed: list[str] = field(default_factory=list)
+    old_rows_to_delete_from_ledger: int = 0
+    disk_files_to_delete: int = 0
 
 
 def scan_summary_payload(summary: ScanSummary) -> dict[str, object]:
@@ -490,6 +517,7 @@ async def enqueue_scan_job(
     *,
     reconcile_root_change: bool = False,
     previous_root_paths: list[str] | None = None,
+    reconcile_new_root_paths: list[str] | None = None,
     actor_kind: str | None = None,
     actor_name: str | None = None,
     actor_id: str | None = None,
@@ -504,6 +532,7 @@ async def enqueue_scan_job(
         input_data.update(
             reconcile_root_change=True,
             previous_root_paths=previous_root_paths or [],
+            reconcile_new_root_paths=reconcile_new_root_paths or [],
         )
     return await jobs.create_job(
         session,
@@ -530,6 +559,7 @@ async def scan_library(
     reprobe_paths: set[str] | None = None,
     reconcile_root_change: bool = False,
     previous_root_paths: list[str] | None = None,
+    reconcile_new_root_paths: list[str] | None = None,
     job_context: jobs.JobContext | None = None,
     raise_unexpected: bool = False,
 ) -> ScanSummary:
@@ -617,6 +647,7 @@ async def scan_library(
             reprobe_paths=reprobe_paths or set(),
             reconcile_root_change=reconcile_root_change,
             previous_root_paths=previous_root_paths or [],
+            reconcile_new_root_paths=reconcile_new_root_paths or [],
             bridge=bridge,
         )
         finished_normally = True
@@ -675,9 +706,13 @@ async def _run_scan_job(
     }
     if input_data.get("reconcile_root_change") is True:
         roots = input_data.get("previous_root_paths")
+        new_roots = input_data.get("reconcile_new_root_paths")
         scan_kwargs.update(
             reconcile_root_change=True,
             previous_root_paths=([str(path) for path in roots] if isinstance(roots, list) else []),
+            reconcile_new_root_paths=(
+                [str(path) for path in new_roots] if isinstance(new_roots, list) else []
+            ),
         )
     summary = await scan_library(library_id, **scan_kwargs)
     payload = scan_summary_payload(summary)
@@ -699,6 +734,7 @@ async def _scan(
     reprobe_paths: set[str],
     reconcile_root_change: bool,
     previous_root_paths: list[str],
+    reconcile_new_root_paths: list[str],
     bridge: _ScanJobBridge | None,
 ) -> ScanSummary:
     db = get_database()
@@ -709,6 +745,9 @@ async def _scan(
             return summary
         repo = LibraryFileRepository(session)
         known = {row.file_path: row for row in await repo.list_by_library(library_id)}
+        # 显式历史修复只给出一个目标根；普通根路径编辑则默认取完整的新配置。
+        # 后续两个阶段必须使用同一组根，才能正确判断「旧根对应哪个新根」。
+        effective_reconcile_new_roots = reconcile_new_root_paths or list(library.root_paths)
         media_service = MediaLibraryService(session, get_tmdb_client())
         kind = MediaKind(library.kind)
         # 每轮扫描内的收敛缓存：同一部剧同一季几十集只查一次 TMDB
@@ -776,6 +815,7 @@ async def _scan(
                 pending,
                 summary,
                 previous_root_paths=previous_root_paths,
+                new_root_paths=effective_reconcile_new_roots,
             )
 
         assert library.id is not None
@@ -931,6 +971,24 @@ async def _scan(
                 rows_refreshed,
             )
 
+        # ``known`` 是扫描开场的快照；新路径的行可能在逐文件入账时新建，也
+        # 可能被改名归并迁入。根路径迁移的第二阶段必须重新读取它，才能看到
+        # 已经存在的历史重复行，而不能只拿旧快照误判为「新路径还没有台账」。
+        removed_root_result = _RemovedRootReconcileResult()
+        if reconcile_root_change and not summary.cancelled:
+            known.clear()
+            known.update({row.file_path: row for row in await repo.list_by_library(library_id)})
+            removed_root_result = await _reconcile_removed_root_ledger_rows(
+                session,
+                library,
+                known,
+                summary,
+                previous_root_paths=previous_root_paths,
+                new_root_paths=effective_reconcile_new_roots,
+                seen_paths=seen_paths,
+                roots_with_files={str(root_path) for root_path, _, _ in pending},
+            )
+
         # 收尾感知删除：在位根路径下、台账有但本轮没遍历到 → 标记 missing。
         # 不存在的根整个不参与（挂载失败/掉盘时不误伤），文件回归时
         # upsert_by_path 会自动清除标记。判定须读行上的当前路径而非快照
@@ -958,6 +1016,13 @@ async def _scan(
             # 本轮真的遍历出文件的根：空根是"挂载掉了但挂载点还在"的典型
             # 症状，自动清理不能把它当"用户把片子删光了"（见 _auto_clear_missing）
             roots_with_files={str(root_path) for root_path, _, _ in pending},
+            unreadable_dirs=unreadable_dirs,
+        )
+        await _auto_clear_removed_root_ledger(
+            repo,
+            library,
+            summary,
+            file_ids=removed_root_result.clearable_ids,
             unreadable_dirs=unreadable_dirs,
         )
         # 收尾后台账里仍标记丢失的条数：扫描结论要把"为什么 file_count 比
@@ -1028,7 +1093,7 @@ async def _scan(
     logger.info(
         "媒体库 #%s 文件入账完成：新入账 %d（已识别 %d / 待识别 %d），识别重试 %d，"
         "身份复核 %d（存疑 %d），改名归并 %d，根路径随迁 %d，跳过已知 %d，跳过已忽略 %d，"
-        "标记丢失 %d，清理丢失 %d，暂缓 %d，问题 %d",
+        "标记丢失 %d（旧根 %d），清理丢失 %d（旧根 %d），旧根冲突 %d，暂缓 %d，问题 %d",
         library_id,
         summary.scanned - summary.relinked,
         summary.identified,
@@ -1041,7 +1106,10 @@ async def _scan(
         summary.skipped_known,
         summary.skipped_ignored,
         summary.marked_missing,
+        summary.removed_root_marked_missing,
         summary.cleared_missing,
+        summary.removed_root_cleared,
+        summary.removed_root_conflicts,
         summary.deferred,
         len(summary.errors),
     )
@@ -1186,6 +1254,350 @@ async def _auto_clear_missing(
     )
 
 
+@dataclass
+class _RemovedRootReconcileResult:
+    """已移除根路径的本轮收口结果，供安全清理阶段继续判断。"""
+
+    clearable_ids: list[int] = field(default_factory=list)
+
+
+def _normalise_root_path(root: str | Path) -> str:
+    """按配置语义规范化根路径，只消除尾部斜杠，不解析软链接。
+
+    这里刻意不用 ``resolve()``：旧根在当前容器里正是不可访问的对象，解析
+    会把「配置上的挂载前缀」意外变成宿主可见路径，破坏这次迁移的边界。
+    """
+    value = str(Path(root))
+    return value if value == "/" else value.rstrip("/")
+
+
+def _removed_root_paths(previous_root_paths: list[str], new_root_paths: list[str]) -> list[Path]:
+    """找出本次编辑中真正退出配置的根，重复配置只保留第一次。"""
+    current = {_normalise_root_path(root) for root in new_root_paths}
+    removed: list[Path] = []
+    seen: set[str] = set()
+    for root in previous_root_paths:
+        normalised = _normalise_root_path(root)
+        if normalised in current or normalised in seen:
+            continue
+        seen.add(normalised)
+        removed.append(Path(normalised))
+    return removed
+
+
+def _row_under_root(row: LibraryFile, root: Path) -> Path | None:
+    """返回台账路径相对某个根的部分；不在该根下时返回 ``None``。"""
+    try:
+        return Path(row.file_path).relative_to(root)
+    except ValueError:
+        return None
+
+
+def _has_same_identity(old: LibraryFile, current: LibraryFile) -> bool:
+    """已移除根的宽松合并仍要求两侧身份锚完整且完全相同。
+
+    旧根不可访问时，尺寸与 mtime 已不足以作为实体证明；但若两个台账已经
+    指向同一媒体条目和同一季集，再结合根迁移后的相同相对路径，才允许消除
+    历史重复。任何一侧未识别都不做猜测，改为保留新行并把旧行收进 missing。
+    """
+    return (
+        old.media_item_id is not None
+        and current.media_item_id is not None
+        and old.media_item_id == current.media_item_id
+        and (old.season_number, old.episode_number)
+        == (current.season_number, current.episode_number)
+    )
+
+
+def _has_identity_conflict(old: LibraryFile, current: LibraryFile) -> bool:
+    """两侧都已识别却不一致时，必须留下人工可处理的冲突。"""
+    return (
+        old.media_item_id is not None
+        and current.media_item_id is not None
+        and not _has_same_identity(old, current)
+    )
+
+
+def _target_roots_by_old_root(
+    previous_root_paths: list[str], new_root_paths: list[str]
+) -> dict[str, set[str]]:
+    """推导每个旧根可被自动清理时所依赖的新根。
+
+    只有「恰好一个旧根被替换为恰好一个新根」才有足够证据自动清理。多根
+    编辑中按索引猜测配对会把 A→C 的旧行错误归到仍保留的 B，最终可能误删
+    台账；无法确认配对时仍可标 missing 和合并重复行，但不自动删除。
+    """
+    result: dict[str, set[str]] = {}
+    old = [_normalise_root_path(root) for root in previous_root_paths]
+    new = [_normalise_root_path(root) for root in new_root_paths]
+    current = set(new)
+    removed = {root for root in old if root not in current}
+    added = {root for root in new if root not in set(old)}
+    if len(removed) == len(added) == 1:
+        result[next(iter(removed))] = {next(iter(added))}
+    return result
+
+
+async def _subtitle_job_running(session: AsyncSession, row: LibraryFile) -> bool:
+    """合并前确认是否有运行中的字幕任务，避免删除运行中任务正在读取的行。"""
+    assert row.id is not None
+    return bool(
+        await jobs.list_jobs(
+            session,
+            active_only=True,
+            job_type="subtitle.generate",
+            resource_type="library_file",
+            resource_id=row.id,
+            limit=1,
+        )
+    )
+
+
+async def _merge_removed_root_duplicate(
+    session: AsyncSession,
+    old: LibraryFile,
+    current: LibraryFile,
+    *,
+    target_path: str,
+) -> tuple[LibraryFile, int] | None:
+    """合并已移除旧根和当前新根的重复台账，默认保留新路径行。
+
+    若旧行正在生成字幕，保留其主键并把路径迁到新入口；任务可无中断继续。
+    两边都有运行任务时没有安全的保留方，返回 ``None`` 交给调用方报告冲突。
+    """
+    old_running, current_running = await asyncio.gather(
+        _subtitle_job_running(session, old),
+        _subtitle_job_running(session, current),
+    )
+    if old_running and current_running:
+        return None
+    survivor, duplicate = (old, current) if old_running else (current, old)
+    assert duplicate.id is not None
+    duplicate_id = duplicate.id
+    await _merge_same_file_rows(session, survivor, duplicate, file_path=target_path)
+    return survivor, duplicate_id
+
+
+async def _cleanup_subtitle_checkpoints(file_ids: list[int]) -> None:
+    """删除已被合并台账的旧字幕断点；持久作业引用已在事务中改写。"""
+    for file_id in file_ids:
+        for path in Path("data/cache/subtitle_gen").glob(f"{file_id}.*.checkpoint.json"):
+            try:
+                path.unlink(missing_ok=True)
+            except OSError as exc:
+                logger.warning("清理重复台账的字幕断点失败：file=%s %s", file_id, exc)
+
+
+async def _reconcile_removed_root_ledger_rows(
+    session: AsyncSession,
+    library: Library,
+    known: dict[str, LibraryFile],
+    summary: ScanSummary,
+    *,
+    previous_root_paths: list[str],
+    new_root_paths: list[str],
+    seen_paths: set[str],
+    roots_with_files: set[str],
+) -> _RemovedRootReconcileResult:
+    """收口根路径编辑遗留的旧前缀台账，绝不删除磁盘文件。
+
+    此逻辑只由 ``reconcile_root_change`` 调用。严格 inode/指纹迁移已经在扫
+    描前完成；这里针对的是旧容器挂载点已经消失、且历史上已经形成新旧两行
+    的情形。身份完全一致才合并；无法确认时只把旧行标 missing，身份冲突则
+    保留两行以免吞掉人工认领。自动清理另由下一阶段按本轮可信度决定。
+    """
+    selected_new_roots = new_root_paths or list(library.root_paths)
+    removed_roots = _removed_root_paths(previous_root_paths, selected_new_roots)
+    if not removed_roots or not selected_new_roots:
+        return _RemovedRootReconcileResult()
+
+    root_available = {
+        _normalise_root_path(root): await asyncio.to_thread(root.exists) for root in removed_roots
+    }
+    trusted_new_roots = {_normalise_root_path(root) for root in roots_with_files}
+    cleanup_targets = _target_roots_by_old_root(previous_root_paths, selected_new_roots)
+    result = _RemovedRootReconcileResult()
+    now = utcnow()
+    changed = False
+    removed_subtitle_file_ids: list[int] = []
+    warned_accessible_roots: set[str] = set()
+
+    for old in list(known.values()):
+        if old.missing_since is not None:
+            continue
+        old_root = next(
+            (root for root in removed_roots if _row_under_root(old, root) is not None), None
+        )
+        if old_root is None:
+            continue
+        relative = _row_under_root(old, old_root)
+        assert relative is not None
+        old_root_key = _normalise_root_path(old_root)
+        # 根和该文件仍能访问时，不能把它当成被卸载的旧入口；保留原台账，
+        # 避免用户只是暂时调整根路径配置时被误收口。文件本身已经不存在时，
+        # 则仍按本次「旧根已移除」的语义标记缺失。
+        if root_available[old_root_key] and await asyncio.to_thread(Path(old.file_path).exists):
+            if old_root_key not in warned_accessible_roots:
+                logger.warning(
+                    "媒体库 #%s：已移除根「%s」仍可访问，暂不自动收口其旧路径台账",
+                    library.id,
+                    old_root,
+                )
+                warned_accessible_roots.add(old_root_key)
+            continue
+
+        candidates = [Path(root) / relative for root in selected_new_roots]
+        # 只有本轮确实遍历到的候选才参与合并；Path.exists 对网络挂载的权限/IO
+        # 错误会吞成 False，不把它当成「文件不存在」来合并。
+        current_rows = {
+            row.id: row
+            for candidate in candidates
+            if str(candidate) in seen_paths and str(candidate) in known
+            for row in [known[str(candidate)]]
+            if row is not old
+        }
+        existing_candidates = [
+            candidate for candidate in candidates if str(candidate) in seen_paths
+        ]
+        if len(current_rows) == 1:
+            current = next(iter(current_rows.values()))
+            target_path = current.file_path
+            if _has_same_identity(old, current):
+                old_path = old.file_path
+                merged = await _merge_removed_root_duplicate(
+                    session, old, current, target_path=target_path
+                )
+                if merged is None:
+                    summary.removed_root_conflicts += 1
+                    summary.errors.append(
+                        "旧根重复台账各有一个字幕任务在运行，暂不合并："
+                        f"{old.file_path} ↔ {target_path}"
+                    )
+                    continue
+                survivor, duplicate_id = merged
+                known.pop(old_path, None)
+                known[target_path] = survivor
+                removed_subtitle_file_ids.append(duplicate_id)
+                summary.root_relinked += 1
+                changed = True
+                logger.info("已合并已移除根的重复台账：%s → %s", old_path, target_path)
+                continue
+            if _has_identity_conflict(old, current):
+                summary.removed_root_conflicts += 1
+                summary.errors.append(
+                    f"已移除根存在身份冲突台账，未自动合并：{old.file_path} ↔ {target_path}"
+                )
+                logger.warning(
+                    "媒体库 #%s：已移除根的同相对路径台账身份冲突，已保留两行：%s ↔ %s",
+                    library.id,
+                    old.file_path,
+                    target_path,
+                )
+                continue
+        elif len(current_rows) > 1:
+            summary.removed_root_conflicts += 1
+            summary.errors.append(f"已移除根在多个新根有同相对路径记录，未自动合并：{old.file_path}")
+            continue
+
+        # 无新文件，或新行无法确认身份时，旧容器路径已不可用，不应继续被详情
+        # 页、缩略图刷新等业务当作在位文件。只标台账缺失，磁盘从不触碰。
+        old.missing_since = now
+        old.updated_at = now
+        summary.marked_missing += 1
+        summary.removed_root_marked_missing += 1
+        changed = True
+        # 删除条件需要一个明确、且本轮实际扫到文件的新根。没有可确定配对时
+        # 不删，保留 missing 供管理员在预览后手工处理；有同路径但身份未确认
+        # 时也可删旧行——旧容器路径已确认不可用，新行仍会完整保留。唯一例外
+        # 是候选已遍历却没有新台账（通常是写入静默窗暂缓）：等下轮入账后再说。
+        targets = cleanup_targets.get(old_root_key, set())
+        if targets and targets & trusted_new_roots and (not existing_candidates or current_rows):
+            assert old.id is not None
+            result.clearable_ids.append(old.id)
+        if existing_candidates:
+            logger.info(
+                "媒体库 #%s：旧根台账无法确认与新路径为同一媒体，已标记 missing：%s",
+                library.id,
+                old.file_path,
+            )
+
+    if changed:
+        await session.commit()
+        await _cleanup_subtitle_checkpoints(removed_subtitle_file_ids)
+    return result
+
+
+async def _auto_clear_removed_root_ledger(
+    repo: LibraryFileRepository,
+    library: Library,
+    summary: ScanSummary,
+    *,
+    file_ids: list[int],
+    unreadable_dirs: list[str],
+) -> None:
+    """按普通自动清理同等可信条件，删除本轮确认的旧根台账。"""
+    if not file_ids or not library.auto_clear_missing:
+        return
+    if summary.cancelled or unreadable_dirs:
+        logger.info(
+            "媒体库 #%s：本轮扫描未完全可信，已移除根的缺失台账只标记、不自动清理",
+            library.id,
+        )
+        return
+    cleared = await repo.delete_by_ids(file_ids)
+    summary.cleared_missing += cleared
+    summary.removed_root_cleared += cleared
+    if cleared:
+        logger.warning(
+            "媒体库 #%s：已清理 %d 条已移除根的遗留台账（仅数据库记录，磁盘未动）",
+            library.id,
+            cleared,
+        )
+
+
+async def preview_root_path_reconcile(
+    session: AsyncSession,
+    library: Library,
+    *,
+    old_root: str,
+    new_root: str,
+) -> RootPathReconcilePreview:
+    """预览历史根路径迁移修复，不扫描也不修改任何台账。"""
+    old_root_path = Path(_normalise_root_path(old_root))
+    new_root_path = Path(_normalise_root_path(new_root))
+    rows = await LibraryFileRepository(session).list_by_library(library.id)  # type: ignore[arg-type]
+    by_path = {row.file_path: row for row in rows}
+    old_root_available = await asyncio.to_thread(old_root_path.exists)
+    preview = RootPathReconcilePreview(
+        library_id=library.id,  # type: ignore[arg-type]
+        old_root=str(old_root_path),
+        new_root=str(new_root_path),
+    )
+    for old in rows:
+        if old.missing_since is not None:
+            continue
+        relative = _row_under_root(old, old_root_path)
+        if relative is None:
+            continue
+        if old_root_available and await asyncio.to_thread(Path(old.file_path).exists):
+            continue
+        candidate = new_root_path / relative
+        current = by_path.get(str(candidate))
+        if current is None:
+            preview.marked_missing += 1
+            continue
+        preview.same_path_candidates += 1
+        if _has_same_identity(old, current):
+            preview.safe_merges += 1
+            preview.old_rows_to_delete_from_ledger += 1
+        elif _has_identity_conflict(old, current):
+            preview.conflicts.append(f"{old.file_path} ↔ {candidate}")
+        else:
+            preview.marked_missing += 1
+            preview.unconfirmed.append(f"{old.file_path} ↔ {candidate}")
+    return preview
+
+
 def _is_disc_dir(directory: Path) -> bool:
     """原盘目录判定：蓝光（BDMV）或 DVD（VIDEO_TS）结构。"""
     return (directory / "BDMV").is_dir() or (directory / "VIDEO_TS").is_dir()
@@ -1287,6 +1699,7 @@ async def _relink_legacy_root_paths(
     summary: ScanSummary,
     *,
     previous_root_paths: list[str],
+    new_root_paths: list[str],
 ) -> None:
     """根路径编辑后，将同一实体的旧台账路径迁到当前扫描路径。
 
@@ -1300,7 +1713,7 @@ async def _relink_legacy_root_paths(
     重新走原有入账链路，也不能猜测并吞掉人工台账。
     """
     old_roots = [Path(root) for root in previous_root_paths]
-    new_roots = [Path(root) for root in library.root_paths]
+    new_roots = [Path(root) for root in (new_root_paths or list(library.root_paths))]
     if not old_roots or not new_roots:
         return
 

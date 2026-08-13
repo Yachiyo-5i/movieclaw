@@ -67,6 +67,15 @@ class LastScanView(BaseModel):
     cleared_missing: int = Field(
         default=0, description="本轮自动清理出台账的丢失记录数（库开了自动清理才非 0）"
     )
+    removed_root_marked_missing: int = Field(
+        default=0, description="本轮因已移除根路径而标记缺失的旧台账数"
+    )
+    removed_root_cleared: int = Field(
+        default=0, description="本轮因已移除根路径而自动清理的旧台账数"
+    )
+    removed_root_conflicts: int = Field(
+        default=0, description="本轮已移除根路径台账的身份冲突数（需人工处理）"
+    )
     deferred: int = Field(default=0, description="疑似写入中暂缓入账的文件数（稍后自动补扫）")
     retried: int = Field(
         default=0, description="识别重试数：在位但待识别的文件重走识别链（不算新入账）"
@@ -809,6 +818,28 @@ class MissingClearPayload(BaseModel):
     media_item_id: int | None = Field(
         default=None, description="只清理该条目的缺失记录；不传=清理整库"
     )
+
+
+class PathReconcilePayload(BaseModel):
+    """历史根路径迁移修复的范围：旧前缀与当前配置中的目标前缀。"""
+
+    old_root: str = Field(description="已移除、需要收口的旧根路径（绝对路径）")
+    new_root: str = Field(description="当前媒体库配置中的目标根路径（绝对路径）")
+
+
+class PathReconcilePreviewView(BaseModel):
+    """路径迁移修复预览：所有数字均只涉及数据库台账，磁盘文件永不删除。"""
+
+    library_id: int
+    old_root: str
+    new_root: str
+    same_path_candidates: int
+    safe_merges: int
+    marked_missing: int
+    conflicts: list[str] = Field(default_factory=list)
+    unconfirmed: list[str] = Field(default_factory=list)
+    old_rows_to_delete_from_ledger: int
+    disk_files_to_delete: int = Field(default=0)
 
 
 class RedownloadPayload(BaseModel):

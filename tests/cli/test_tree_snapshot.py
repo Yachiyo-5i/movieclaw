@@ -30,6 +30,8 @@ KNOWN_NON_GENERATED = {
     "images.proxy",
     "libraries.cover",  # 二进制图片直出（<img> 引用），CLI 无消费场景
     "lib.files.subtitles.preview",  # 详情页弹窗按需读取，CLI 无交互消费场景
+    "lib.path-reconcile-preview",  # 精选命令 reconcile-paths 负责预览 → --yes 工作流
+    "lib.path-reconcile-start",
     "system.spec",
     "auth.login",  # 精选命令 mclaw login 负责（要持久化本地凭证）
     "auth.logout",  # 精选命令 mclaw logout 负责
