@@ -4,10 +4,12 @@ import { useState } from "react";
 
 import type { Route } from "next";
 import { useRouter } from "next/navigation";
+import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
 
 import {
   ChevronRightIcon,
   ClockIcon,
+  MoreIcon,
 } from "@/components/icons";
 import { useLlmCapability } from "@/components/llm-gate";
 import { useAgentConversations } from "@/lib/agent-conversations";
@@ -82,30 +84,22 @@ const LANGUAGE_LABELS: Record<string, string> = {
   tha: "泰语",
 };
 
-const STATUS_STYLE: Record<
-  JobStatus,
-  { badge: string; dot: string; border?: string }
-> = {
-  queued: { badge: "bg-white/[0.07] text-white/55", dot: "bg-white/40" },
-  running: {
-    badge: "bg-[#7dd3fc]/[0.12] text-[#bae6fd]",
-    dot: "animate-pulse bg-[#7dd3fc]",
-  },
-  retry_wait: { badge: "bg-[#fcd34d]/[0.12] text-[#fde68a]", dot: "bg-[#fcd34d]" },
-  cancelling: { badge: "bg-[#fcd34d]/[0.12] text-[#fde68a]", dot: "bg-[#fcd34d]" },
-  waiting: { badge: "bg-white/[0.07] text-white/55", dot: "bg-white/40" },
+const STATUS_STYLE: Record<JobStatus, { dot: string; border?: string }> = {
+  queued: { dot: "bg-white/40" },
+  running: { dot: "animate-pulse bg-[#7dd3fc]" },
+  retry_wait: { dot: "bg-[#fcd34d]" },
+  cancelling: { dot: "bg-[#fcd34d]" },
+  waiting: { dot: "bg-white/40" },
   blocked: {
-    badge: "bg-[#fca5a5]/[0.12] text-[#fecaca]",
     dot: "bg-[#fca5a5]",
     border: "border-[#fca5a5]/20",
   },
-  succeeded: { badge: "bg-[#86efac]/10 text-[#bbf7d0]", dot: "bg-[#86efac]" },
+  succeeded: { dot: "bg-[#86efac]" },
   failed: {
-    badge: "bg-[#fca5a5]/[0.12] text-[#fecaca]",
     dot: "bg-[#fca5a5]",
     border: "border-[#fca5a5]/20",
   },
-  cancelled: { badge: "bg-white/[0.06] text-white/40", dot: "bg-white/30" },
+  cancelled: { dot: "bg-white/30" },
 };
 
 const SUPPORTED_ACTIONS = new Set([
@@ -267,18 +261,95 @@ function jobDetailItems(job: JobView): Array<{ label: string; alert?: boolean }>
   return items.slice(0, 4);
 }
 
-function StatusBadge({ status }: { status: JobStatus }) {
-  const style = STATUS_STYLE[status];
+/** 任务中心统一状态点：紧贴标题展示状态，完整文字通过 title 与无障碍标签保留。 */
+export function TaskStatusDot({
+  label,
+  dotClass,
+}: {
+  label: string;
+  dotClass: string;
+}) {
   return (
     <span
-      title={JOB_STATUS_LABELS[status] ?? status}
-      className={`flex shrink-0 items-center gap-1.5 rounded-full px-2.5 py-1 text-caption ${style.badge} max-md:bg-transparent max-md:p-1`}
+      title={label}
+      role="img"
+      aria-label={`状态：${label}`}
+      className={`size-2.5 shrink-0 rounded-full ${dotClass}`}
     >
-      <span className={`size-1.5 rounded-full ${style.dot}`} />
-      <span className="shrink-0 font-semibold max-md:hidden">
-        {JOB_STATUS_LABELS[status] ?? status}
-      </span>
+      <span className="sr-only">{label}</span>
     </span>
+  );
+}
+
+interface TaskActionMenuItem {
+  id: string;
+  label: string;
+  onSelect: () => void;
+  disabled?: boolean;
+  tone?: "default" | "danger";
+}
+
+/** 标准任务卡片操作入口：固定在右上角，避免不同任务类型各自发明布局。 */
+export function TaskActionsMenu({
+  ariaLabel,
+  disabled = false,
+  items,
+}: {
+  ariaLabel: string;
+  disabled?: boolean;
+  items: TaskActionMenuItem[];
+}) {
+  const itemClass =
+    "glass-row nav-item cursor-pointer px-3 py-2 text-sub font-medium outline-none " +
+    "data-[highlighted]:!bg-[var(--glass-fill-hover)] data-[disabled]:pointer-events-none " +
+    "data-[disabled]:opacity-40";
+
+  return (
+    <DropdownMenu.Root>
+      <DropdownMenu.Trigger asChild>
+        <button
+          type="button"
+          aria-label={ariaLabel}
+          disabled={disabled}
+          className="glass-row flex size-7 !w-7 items-center justify-center p-0 text-white/55 data-[state=open]:!bg-[var(--glass-fill-active)] data-[state=open]:!text-[var(--text)] disabled:opacity-40"
+        >
+          <MoreIcon className="size-4 max-md:size-5" />
+        </button>
+      </DropdownMenu.Trigger>
+      <DropdownMenu.Portal>
+        <DropdownMenu.Content
+          align="end"
+          sideOffset={6}
+          collisionPadding={12}
+          className="menu-surface z-50 min-w-[9rem] !rounded-xl p-1"
+        >
+          {items.map((item) => (
+            <DropdownMenu.Item
+              key={item.id}
+              onSelect={item.onSelect}
+              disabled={item.disabled}
+              className={`${itemClass} ${
+                item.tone === "danger"
+                  ? "!text-[#ff6b6b] data-[highlighted]:!bg-[#ff6b6b]/10"
+                  : "text-white/75"
+              }`}
+            >
+              {item.label}
+            </DropdownMenu.Item>
+          ))}
+        </DropdownMenu.Content>
+      </DropdownMenu.Portal>
+    </DropdownMenu.Root>
+  );
+}
+
+function StatusDot({ status }: { status: JobStatus }) {
+  const style = STATUS_STYLE[status];
+  return (
+    <TaskStatusDot
+      label={JOB_STATUS_LABELS[status] ?? status}
+      dotClass={style.dot}
+    />
   );
 }
 
@@ -378,31 +449,69 @@ export function JobCard({ job, onNavigate }: { job: JobView; onNavigate: () => v
     }
   }
 
+  async function cancelCurrentJob() {
+    setBusyAction("cancel");
+    setActionError(null);
+    try {
+      upsert(await cancelJob(job.id));
+    } catch (error) {
+      setActionError((error as Error).message || "取消任务失败，请稍后重试");
+    } finally {
+      setBusyAction(null);
+    }
+  }
+
+  const menuItems: TaskActionMenuItem[] = [
+    ...(cancellable
+      ? [
+          {
+            id: "cancel",
+            label: busyAction === "cancel" ? "正在取消…" : "取消任务",
+            onSelect: () => void cancelCurrentJob(),
+          },
+        ]
+      : []),
+    ...actions.map((action) => ({
+      id: `${action.type}:${action.target ?? ""}`,
+      label: busyAction === action.type ? "处理中…" : action.label,
+      onSelect: () => void runAction(action.type, action.target),
+    })),
+  ];
+
   return (
     <article
       className={`overflow-hidden rounded-2xl border bg-[rgba(14,16,22,0.52)] ${cardBorder} ${compact ? "px-4 py-3" : "p-4"}`}
     >
       <div className="min-w-0">
         <div className="flex items-start justify-between gap-3">
-          <div className="min-w-0">
-            <h3 title={title} className="truncate text-ui font-semibold text-white/90">
+          <div className="flex min-w-0 flex-1 items-center gap-2.5">
+            <StatusDot status={job.status} />
+            <h3 title={title} className="min-w-0 truncate text-ui font-semibold leading-5 text-white/90">
               {title}
             </h3>
           </div>
-          <StatusBadge status={job.status} />
+          {menuItems.length > 0 && (
+            <TaskActionsMenu
+              ariaLabel={`${title}的更多操作`}
+              disabled={busyAction !== null}
+              items={menuItems}
+            />
+          )}
         </div>
 
         <div
-          className={`mt-3 text-sub leading-5 ${
+          className={`mt-2.5 text-sub leading-5 ${
             attention
               ? "rounded-xl border border-[#fca5a5]/15 bg-[#fca5a5]/[0.06] px-3 py-2.5 text-[#fecaca]"
               : compact
-                ? "truncate text-white/50"
+                ? "text-white/50"
                 : "text-white/60"
           }`}
         >
-          {attention && <span className="mr-1.5 font-semibold">需要处理：</span>}
-          {summaryMessage}
+          <p className="line-clamp-2 min-h-10 break-words">
+            {attention && <span className="mr-1.5 font-semibold">需要处理：</span>}
+            {summaryMessage}
+          </p>
         </div>
 
           {!compact &&
@@ -515,47 +624,13 @@ export function JobCard({ job, onNavigate }: { job: JobView; onNavigate: () => v
             <p className="mt-2 text-caption leading-5 text-[#ff9f9f]">{actionError}</p>
           )}
       </div>
-      <footer
-        className={`mt-3 flex flex-wrap items-center gap-2 ${cancellable || actions.length > 0 ? "border-t border-white/[0.06] pt-3" : ""}`}
-      >
+      <footer className="mt-3 flex flex-wrap items-center gap-2">
         <p
           title={`${originLabel(job)} · ${formatDateTime(job.created_at)}`}
           className="min-w-0 truncate text-micro text-white/25"
         >
           {originLabel(job)} · {formatRelativeTime(job.created_at)}
         </p>
-        {(cancellable || actions.length > 0) && (
-          <div className="ml-auto flex flex-wrap items-center justify-end gap-2">
-            {cancellable && (
-              <button
-                type="button"
-                className="rounded-lg border border-white/10 px-3 py-1.5 text-caption text-white/65 hover:bg-white/[0.06]"
-                disabled={busyAction !== null}
-                onClick={() => {
-                  setBusyAction("cancel");
-                  setActionError(null);
-                  void cancelJob(job.id)
-                    .then(upsert)
-                    .catch((error: Error) => setActionError(error.message))
-                    .finally(() => setBusyAction(null));
-                }}
-              >
-                {busyAction === "cancel" ? "正在取消…" : "取消"}
-              </button>
-            )}
-            {actions.map((action) => (
-              <button
-                key={`${action.type}:${action.target ?? ""}`}
-                type="button"
-                className="rounded-lg border border-[#7dd3fc]/25 bg-[#7dd3fc]/[0.08] px-3 py-1.5 text-caption font-medium text-[#b9e8ff] hover:bg-[#7dd3fc]/[0.13]"
-                disabled={busyAction !== null}
-                onClick={() => void runAction(action.type, action.target)}
-              >
-                {busyAction === action.type ? "处理中…" : action.label}
-              </button>
-            ))}
-          </div>
-        )}
       </footer>
     </article>
   );

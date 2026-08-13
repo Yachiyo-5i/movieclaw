@@ -21,7 +21,7 @@ class BaseDownloader(abc.ABC):
     - 全部方法是 async。qbittorrent-api / transmission-rpc 都是同步实现
       （requests），适配器内部用 asyncio.to_thread 包装，避免阻塞事件循环。
     - 失败通过 DownloaderConnectError / DownloaderAuthError /
-      DownloaderSubmitError 抛出；正常返回即代表操作成功。
+      DownloaderSubmitError / DownloaderDeleteError 抛出；正常返回即代表操作成功。
     - 重复提交是幂等的：种子已存在时返回 already_exists=True，不报错。
     """
 
@@ -50,6 +50,14 @@ class BaseDownloader(abc.ABC):
 
         下载监听导入据此按**名称**判定条目是否下载完成——名称匹配免疫
         容器路径映射，比 save_path 比对可靠（见 TorrentBrief 注释）。
+        """
+
+    @abc.abstractmethod
+    async def delete_torrent(self, info_hash: str, *, delete_files: bool = False) -> None:
+        """按 infohash 删除下载任务。
+
+        ``delete_files=False`` 时只从下载器移除任务；显式传 True 时同时让
+        下载器删除任务数据。删除是幂等操作，任务已经不存在时也视为成功。
         """
 
     @abc.abstractmethod

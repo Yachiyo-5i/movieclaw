@@ -505,7 +505,7 @@ async def test_probe_gate_applies_per_file(db, tmp_path, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_wanted_identity_claim_via_info_hash(db, tmp_path, monkeypatch):
-    """匹配到订阅工单的种子：继承投递时锚定的精确身份，不走名称识别链。"""
+    """订阅身份优先认领；同 hash 的手动锚仍随成功入库一起消费。"""
     from movieclaw_db.models import RuleSet, Subscription, WantedItem, WantedStatus
     from movieclaw_downloader import TorrentBrief
 
@@ -532,15 +532,25 @@ async def test_wanted_identity_claim_via_info_hash(db, tmp_path, monkeypatch):
         session.add(sub)
         await session.commit()
         await session.refresh(sub)
-        session.add(
-            WantedItem(
-                subscription_id=sub.id,
-                media_item_id=item.id,
-                season_number=0,
-                episode_number=0,
-                status=WantedStatus.GRABBED,
-                info_hash="abc123",
-            )
+        session.add_all(
+            [
+                WantedItem(
+                    subscription_id=sub.id,
+                    media_item_id=item.id,
+                    season_number=0,
+                    episode_number=0,
+                    status=WantedStatus.GRABBED,
+                    info_hash="abc123",
+                ),
+                # 重复手动点过同一个种子时可能同时留下身份锚。识别优先级会
+                # 选择订阅工单，但成功入库仍必须消费这颗锚，不能让任务中心残留。
+                ManualDownloadIntent(
+                    info_hash="abc123",
+                    media_item_id=item.id,
+                    library_id=library_id,
+                    site_id="mteam",
+                ),
+            ]
         )
         await session.commit()
 
@@ -570,7 +580,9 @@ async def test_wanted_identity_claim_via_info_hash(db, tmp_path, monkeypatch):
     # 库存对账闭环：入库单元关闭了对应工单（订阅止于投递的另一半）
     async with db.session() as session:
         wanted = (await session.execute(select(WantedItem))).scalars().one()
+        manual = (await session.execute(select(ManualDownloadIntent))).scalar_one_or_none()
     assert wanted.status == WantedStatus.IMPORTED
+    assert manual is None
 
 
 @pytest.mark.asyncio

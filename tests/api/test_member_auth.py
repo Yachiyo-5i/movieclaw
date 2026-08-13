@@ -512,6 +512,7 @@ _PATH_DUMMIES = {
     "{history_id}": "1",
     "{backdrop_id}": "f" * 32,
     "{downloader_id}": "1",
+    "{info_hash}": "f" * 40,
     "{kind}": "movie",
     "{row_id}": "popular",
     "{tmdb_id}": "1",

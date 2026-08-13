@@ -19,6 +19,7 @@ from movieclaw_downloader.base import BaseDownloader
 from movieclaw_downloader.exceptions import (
     DownloaderAuthError,
     DownloaderConnectError,
+    DownloaderDeleteError,
     DownloaderSubmitError,
 )
 from movieclaw_downloader.models import (
@@ -217,6 +218,31 @@ class QBittorrentDownloader(BaseDownloader):
                 )
             )
         return briefs
+
+    async def delete_torrent(self, info_hash: str, *, delete_files: bool = False) -> None:
+        await asyncio.to_thread(self._delete_torrent_sync, info_hash, delete_files)
+
+    def _delete_torrent_sync(self, info_hash: str, delete_files: bool) -> None:
+        """按用户选择删除任务或连同数据；不存在的 hash 原生保持幂等。"""
+        client = self._client()
+        try:
+            # 认证/连接错误沿用公共翻译；删除接口自身的 API 错误在外层给出
+            # 精确语义，不能误报为“提交种子失败”。
+            with _translate_errors(self.config.url):
+                client.torrents_delete(
+                    torrent_hashes=info_hash.lower(),
+                    delete_files=delete_files,
+                )
+        except qbittorrentapi.APIError as exc:
+            raise DownloaderDeleteError(
+                "删除 qBittorrent 任务失败，请检查下载器状态",
+                details={"url": self.config.url, "error": str(exc)},
+            ) from exc
+        logger.info(
+            "已从 qBittorrent 删除任务%s: hash=%s",
+            "并删除数据文件" if delete_files else "并保留数据文件",
+            info_hash,
+        )
 
     async def test_connection(self) -> DownloaderInfo:
         return await asyncio.to_thread(self._test_connection_sync)

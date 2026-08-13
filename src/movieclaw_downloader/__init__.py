@@ -15,6 +15,7 @@ from movieclaw_downloader.base import BaseDownloader
 from movieclaw_downloader.exceptions import (
     DownloaderAuthError,
     DownloaderConnectError,
+    DownloaderDeleteError,
     DownloaderException,
     DownloaderNotSupportedError,
     DownloaderSubmitError,
@@ -38,6 +39,7 @@ __all__ = [
     "DownloaderAuthError",
     "DownloaderConfig",
     "DownloaderConnectError",
+    "DownloaderDeleteError",
     "DownloaderException",
     "DownloaderInfo",
     "DownloaderNotSupportedError",

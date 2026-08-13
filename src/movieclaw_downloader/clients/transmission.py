@@ -27,6 +27,7 @@ from movieclaw_downloader.base import BaseDownloader
 from movieclaw_downloader.exceptions import (
     DownloaderAuthError,
     DownloaderConnectError,
+    DownloaderDeleteError,
     DownloaderSubmitError,
 )
 from movieclaw_downloader.models import (
@@ -65,7 +66,7 @@ def _normalize_state(torrent, completed: bool) -> str:  # noqa: ANN001 -- transm
 
 
 @contextmanager
-def _translate_errors(url: str) -> Iterator[None]:
+def _translate_errors(url: str, *, operation: str = "submit") -> Iterator[None]:
     """把 transmission-rpc 的异常翻译成本模块的统一异常。"""
     try:
         yield
@@ -79,6 +80,11 @@ def _translate_errors(url: str) -> Iterator[None]:
             details={"url": url, "error": str(exc)},
         ) from exc
     except TransmissionError as exc:
+        if operation == "delete":
+            raise DownloaderDeleteError(
+                "删除 Transmission 任务失败，请检查下载器状态",
+                details={"url": url, "error": str(exc)},
+            ) from exc
         raise DownloaderSubmitError(
             "Transmission 拒绝了该请求（种子无效或下载器返回错误）",
             details={"url": url, "error": str(exc)},
@@ -218,6 +224,20 @@ class TransmissionDownloader(BaseDownloader):
                 )
             )
         return briefs
+
+    async def delete_torrent(self, info_hash: str, *, delete_files: bool = False) -> None:
+        await asyncio.to_thread(self._delete_torrent_sync, info_hash, delete_files)
+
+    def _delete_torrent_sync(self, info_hash: str, delete_files: bool) -> None:
+        """按用户选择删除任务或连同数据文件。"""
+        client = self._client()
+        with _translate_errors(self.config.url, operation="delete"):
+            client.remove_torrent(info_hash.lower(), delete_data=delete_files)
+        logger.info(
+            "已从 Transmission 删除任务%s: hash=%s",
+            "并删除数据文件" if delete_files else "并保留数据文件",
+            info_hash,
+        )
 
     async def test_connection(self) -> DownloaderInfo:
         return await asyncio.to_thread(self._test_connection_sync)

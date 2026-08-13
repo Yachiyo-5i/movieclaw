@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, BackgroundTasks, Depends
+from fastapi import APIRouter, BackgroundTasks, Depends, Path, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from movieclaw_api.api.deps import require_login
@@ -11,6 +11,7 @@ from movieclaw_api.schemas.downloader import (
     DownloaderView,
     DownloadSubmitPayload,
     DownloadSubmitView,
+    DownloadTaskDeleteView,
     DownloadTaskListView,
     DownloadTaskSourceView,
     DownloadTaskView,
@@ -276,6 +277,51 @@ async def list_download_tasks(
             items=[DownloadTaskView(**item) for item in snapshot["items"]],
             sources=[DownloadTaskSourceView(**source) for source in snapshot["sources"]],
         )
+    )
+
+
+@router.delete(
+    "/{downloader_id}/torrents/{info_hash}",
+    response_model=ApiResponse[DownloadTaskDeleteView],
+    summary="从指定下载器删除种子任务（可选删除数据文件）",
+    operation_id="dl.torrent.delete",
+    openapi_extra={"x-cli-hidden": True},
+)
+async def delete_download_task_from_downloader(
+    downloader_id: int,
+    info_hash: str = Path(
+        min_length=40,
+        max_length=64,
+        pattern=r"^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$",
+        description="BT v1（40 位）或 v2（64 位）infohash",
+    ),
+    delete_files: bool = Query(
+        default=False,
+        description="是否同时删除下载器任务对应的数据文件；默认仅移除任务",
+    ),
+    session: AsyncSession = Depends(get_session),
+) -> ApiResponse[DownloadTaskDeleteView]:
+    """删除下载器实时任务；只有显式选择时才同时删除数据文件。"""
+    from movieclaw_api.services.download_tasks import delete_download_task
+
+    normalized_hash = info_hash.lower()
+    await delete_download_task(
+        session,
+        downloader_id=downloader_id,
+        info_hash=normalized_hash,
+        delete_files=delete_files,
+    )
+    return ok(
+        DownloadTaskDeleteView(
+            downloader_id=downloader_id,
+            info_hash=normalized_hash,
+            delete_files=delete_files,
+        ),
+        message=(
+            "已删除种子任务和数据文件"
+            if delete_files
+            else "已删除种子任务，数据文件已保留"
+        ),
     )
 
 

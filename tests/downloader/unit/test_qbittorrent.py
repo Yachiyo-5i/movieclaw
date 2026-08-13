@@ -14,6 +14,7 @@ from movieclaw_downloader.clients.qbittorrent import QBittorrentDownloader
 from movieclaw_downloader.exceptions import (
     DownloaderAuthError,
     DownloaderConnectError,
+    DownloaderDeleteError,
     DownloaderSubmitError,
 )
 from movieclaw_downloader.models import DownloaderConfig, DownloaderType, DownloadRequest
@@ -41,6 +42,7 @@ class FakeQbtClient:
         self.store: dict[str, SimpleNamespace] = {}
         self.add_response = add_response
         self.add_calls: list[dict] = []
+        self.delete_calls: list[dict] = []
         # 添加成功后自动登记到 store 的 (hash, name)，模拟下载器注册行为
         self.register_on_add: tuple[str, str] | None = (TORRENT_HASH, "test.mkv")
 
@@ -56,6 +58,10 @@ class FakeQbtClient:
             info_hash, name = self.register_on_add
             self.store[info_hash] = SimpleNamespace(hash=info_hash, name=name)
         return self.add_response
+
+    def torrents_delete(self, **kwargs):
+        self.delete_calls.append(kwargs)
+        self.store.pop(kwargs["torrent_hashes"], None)
 
     def auth_log_in(self):
         pass
@@ -158,6 +164,37 @@ class TestConnection:
 
         with pytest.raises(DownloaderAuthError):
             await downloader.test_connection()
+
+
+class TestDeleteTorrent:
+    async def test_delete_keeps_downloaded_files_by_default(self):
+        fake = FakeQbtClient()
+
+        await make_downloader(fake).delete_torrent(TORRENT_HASH)
+
+        assert fake.delete_calls == [
+            {"torrent_hashes": TORRENT_HASH, "delete_files": False}
+        ]
+
+    async def test_delete_can_remove_downloaded_files(self):
+        fake = FakeQbtClient()
+
+        await make_downloader(fake).delete_torrent(TORRENT_HASH, delete_files=True)
+
+        assert fake.delete_calls == [
+            {"torrent_hashes": TORRENT_HASH, "delete_files": True}
+        ]
+
+    async def test_delete_error_translated(self):
+        fake = FakeQbtClient()
+
+        def raise_api(**kwargs):
+            raise qbittorrentapi.APIError("boom")
+
+        fake.torrents_delete = raise_api
+
+        with pytest.raises(DownloaderDeleteError, match="删除 qBittorrent 任务失败"):
+            await make_downloader(fake).delete_torrent(TORRENT_HASH)
 
 
 class TestListTorrents:

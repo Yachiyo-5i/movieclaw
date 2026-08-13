@@ -5,17 +5,22 @@ import { useMemo, useState } from "react";
 import type { Route } from "next";
 import Link from "next/link";
 
-import { JobCard } from "@/components/job-center";
+import { JobCard, TaskActionsMenu, TaskStatusDot } from "@/components/job-center";
+import { useToast } from "@/components/feedback";
 import {
   ClockIcon,
   DownloadIcon,
   FilmIcon,
   InfoIcon,
-  ServerIcon,
   TvIcon,
 } from "@/components/icons";
+import { Modal } from "@/components/modal";
 import { PosterImage } from "@/components/poster-image";
-import type { DownloadTask, DownloadTaskSource } from "@/lib/api/downloaders";
+import {
+  deleteDownloadTask,
+  type DownloadTask,
+  type DownloadTaskSource,
+} from "@/lib/api/downloaders";
 import { useDownloadTasks } from "@/lib/download-tasks";
 import { formatBytes, formatDuration } from "@/lib/format";
 import { imageUrl } from "@/lib/image-proxy";
@@ -30,7 +35,7 @@ const ATTENTION_JOB_STATUSES = new Set(["blocked", "failed"]);
 const VIEW_LABELS: { id: TaskView; label: string }[] = [
   { id: "all", label: "全部" },
   { id: "jobs", label: "后台作业" },
-  { id: "downloads", label: "下载与入库" },
+  { id: "downloads", label: "下载任务" },
 ];
 
 /**
@@ -40,6 +45,9 @@ const VIEW_LABELS: { id: TaskView; label: string }[] = [
  */
 export function TaskCenterView() {
   const [view, setView] = useState<TaskView>("all");
+  const [deletingTaskId, setDeletingTaskId] = useState<string | null>(null);
+  const [pendingDeleteTask, setPendingDeleteTask] = useState<DownloadTask | null>(null);
+  const toast = useToast();
   const { jobs, activeJobs } = useJobs();
   const {
     tasks: downloadTasks,
@@ -48,7 +56,26 @@ export function TaskCenterView() {
     loading,
     error,
     refreshedAt,
+    refresh,
   } = useDownloadTasks();
+
+  async function removeDownloadTask(task: DownloadTask, deleteFiles: boolean) {
+    if (task.downloader_id == null || deletingTaskId != null) return;
+
+    setDeletingTaskId(task.id);
+    try {
+      const result = await deleteDownloadTask(task.downloader_id, task.info_hash, deleteFiles);
+      toast.success(
+        result.delete_files ? "种子任务和数据文件已删除" : "种子任务已删除，数据文件已保留",
+      );
+      setPendingDeleteTask(null);
+      refresh();
+    } catch (caught) {
+      toast.error((caught as Error).message || "删除种子任务失败");
+    } finally {
+      setDeletingTaskId(null);
+    }
+  }
 
   // 后台作业按“进行中优先、历史随后”排序，让历史自然归入所属分类。
   const orderedJobs = useMemo(() => {
@@ -195,7 +222,7 @@ export function TaskCenterView() {
 
         {visibleDownloads.length > 0 && (
           <TaskSection
-            title="下载与入库"
+            title="下载任务"
             icon={<DownloadIcon className="size-4" />}
             count={visibleDownloadGroups.length}
             description={`${visibleDownloads.length} 个资源；已识别内容按作品合并展示`}
@@ -206,6 +233,8 @@ export function TaskCenterView() {
                   key={group.key}
                   group={group}
                   ingestJobsByHash={ingestJobsByHash}
+                  deletingTaskId={deletingTaskId}
+                  onDelete={setPendingDeleteTask}
                 />
               ))}
             </div>
@@ -223,21 +252,91 @@ export function TaskCenterView() {
           </div>
         )}
 
-        {sources.length > 0 && (
-          <section className="mt-7 rounded-2xl border border-white/[0.07] bg-black/20 p-4 backdrop-blur-xl">
-            <div className="flex items-center gap-2">
-              <ServerIcon className="size-4 text-white/55" />
-              <h2 className="text-ui font-semibold text-white/80">下载器来源</h2>
-            </div>
-            <div className="mt-3 flex flex-wrap gap-2">
-              {sources.map((source) => (
-                <SourceChip key={source.id} source={source} />
-              ))}
-            </div>
-          </section>
-        )}
       </div>
+      {pendingDeleteTask && (
+        <DeleteDownloadTaskDialog
+          task={pendingDeleteTask}
+          busy={deletingTaskId === pendingDeleteTask.id}
+          onClose={() => {
+            if (deletingTaskId == null) setPendingDeleteTask(null);
+          }}
+          onConfirm={(deleteFiles) => void removeDownloadTask(pendingDeleteTask, deleteFiles)}
+        />
+      )}
     </div>
+  );
+}
+
+/** 删除任务的二次确认：安全默认只移除任务，是否删除数据文件由用户显式选择。 */
+function DeleteDownloadTaskDialog({
+  task,
+  busy,
+  onClose,
+  onConfirm,
+}: {
+  task: DownloadTask;
+  busy: boolean;
+  onClose: () => void;
+  onConfirm: (deleteFiles: boolean) => void;
+}) {
+  const [deleteFiles, setDeleteFiles] = useState(false);
+  const downloaderName = task.downloader_name || `下载器 ${task.downloader_id}`;
+
+  return (
+    <Modal open onClose={busy ? () => {} : onClose} label="删除种子任务" topmost>
+      <div className="p-6 max-md:p-5">
+        <h2 className="text-title-sm font-bold text-white">删除种子任务？</h2>
+        <p className="mt-2 text-sub leading-6 text-[var(--text-muted)]">
+          将从「{downloaderName}」停止并移除该任务。
+        </p>
+        <p className="mt-3 break-words rounded-xl border border-white/[0.08] bg-white/[0.035] px-3.5 py-3 text-sub leading-6 text-white/75">
+          {task.name || task.info_hash}
+        </p>
+        <label
+          className={`mt-4 flex cursor-pointer items-start gap-3 rounded-xl border px-3.5 py-3 transition ${
+            deleteFiles
+              ? "border-[#ff6b6b]/35 bg-[#ff6b6b]/[0.08]"
+              : "border-white/[0.08] bg-white/[0.025] hover:bg-white/[0.045]"
+          }`}
+        >
+          <input
+            type="checkbox"
+            checked={deleteFiles}
+            onChange={(event) => setDeleteFiles(event.target.checked)}
+            className="mt-1 size-4 shrink-0 accent-[#ff6b6b]"
+          />
+          <span className="min-w-0">
+            <span className="block text-ui font-semibold text-white/90">同时删除数据文件</span>
+            <span className="mt-0.5 block text-caption leading-5 text-white/50">
+              包括已下载和未完成的数据；若文件仍由下载器管理，即使已经入库也可能被删除，且无法恢复。
+            </span>
+          </span>
+        </label>
+        {task.source === "subscription" && (
+          <p className="mt-3 text-caption leading-5 text-amber-100/65">
+            关联订阅会暂时标记该任务缺失，并在后续巡检中重新寻找资源。
+          </p>
+        )}
+        <div className="mt-5 flex justify-end gap-2.5">
+          <button
+            type="button"
+            onClick={onClose}
+            disabled={busy}
+            className="rounded-lg border border-white/10 bg-white/[0.06] px-4 py-2 text-ui text-white/80 transition hover:bg-white/[0.1] disabled:opacity-40"
+          >
+            取消
+          </button>
+          <button
+            type="button"
+            onClick={() => onConfirm(deleteFiles)}
+            disabled={busy}
+            className="rounded-lg bg-red-500/85 px-4 py-2 text-ui font-medium text-white transition hover:bg-red-500 disabled:opacity-40"
+          >
+            {busy ? "正在删除…" : deleteFiles ? "删除任务和文件" : "仅删除任务"}
+          </button>
+        </div>
+      </div>
+    </Modal>
   );
 }
 
@@ -289,14 +388,45 @@ function TaskSection({
   );
 }
 
-const DOWNLOAD_STATE_META: Record<DownloadTask["state"], { label: string; color: string }> = {
-  downloading: { label: "下载中", color: "#7dd3fc" },
-  stalled: { label: "等待连接", color: "#f5c451" },
-  paused: { label: "已暂停", color: "#c4b5fd" },
-  completed: { label: "等待入库", color: "#86efac" },
-  error: { label: "下载异常", color: "#fca5a5" },
-  missing: { label: "任务缺失", color: "#fca5a5" },
-  unknown: { label: "状态未知", color: "#cbd5e1" },
+const DOWNLOAD_STATE_META: Record<
+  DownloadTask["state"],
+  { label: string; color: string; dot: string }
+> = {
+  downloading: {
+    label: "下载中",
+    color: "#7dd3fc",
+    dot: "animate-pulse bg-[#7dd3fc]",
+  },
+  stalled: {
+    label: "等待连接",
+    color: "#f5c451",
+    dot: "bg-[#fcd34d]",
+  },
+  paused: {
+    label: "已暂停",
+    color: "#c4b5fd",
+    dot: "bg-[#c4b5fd]",
+  },
+  completed: {
+    label: "等待入库",
+    color: "#86efac",
+    dot: "bg-[#86efac]",
+  },
+  error: {
+    label: "下载异常",
+    color: "#fca5a5",
+    dot: "bg-[#fca5a5]",
+  },
+  missing: {
+    label: "任务缺失",
+    color: "#fca5a5",
+    dot: "bg-[#fca5a5]",
+  },
+  unknown: {
+    label: "状态未知",
+    color: "#cbd5e1",
+    dot: "bg-white/40",
+  },
 };
 
 interface DownloadTaskGroup {
@@ -335,9 +465,13 @@ function groupDownloadTasks(tasks: DownloadTask[]): DownloadTaskGroup[] {
 function DownloadTaskGroupCard({
   group,
   ingestJobsByHash,
+  deletingTaskId,
+  onDelete,
 }: {
   group: DownloadTaskGroup;
   ingestJobsByHash: Map<string, JobView>;
+  deletingTaskId: string | null;
+  onDelete: (task: DownloadTask) => void;
 }) {
   if (group.mediaItemId == null) {
     const task = group.tasks[0];
@@ -345,6 +479,8 @@ function DownloadTaskGroupCard({
       <DownloadTaskCard
         task={task}
         ingestJob={ingestJobsByHash.get(task.info_hash.toLowerCase()) ?? null}
+        deleting={deletingTaskId === task.id}
+        onDelete={onDelete}
       />
     );
   }
@@ -353,51 +489,51 @@ function DownloadTaskGroupCard({
   const firstSubscription = group.tasks.flatMap((task) => task.subscriptions)[0];
   return (
     <article className="overflow-hidden rounded-2xl border border-white/[0.08] bg-[rgba(14,16,22,0.52)] backdrop-blur-xl">
-      <div className="flex gap-4 p-4 max-md:gap-3 max-md:p-3.5">
-        <div className="w-[76px] shrink-0 max-md:w-[58px]">
-          <div className="aspect-[2/3] overflow-hidden rounded-xl bg-[#141824] ring-1 ring-white/10">
+      {/* 影片身份集中在紧凑顶部，种子列表另起整行占满卡片宽度。海报不再
+          作为贯穿整组的左栏，长种子名、状态和操作按钮因此有完整横向空间。 */}
+      <div className="flex items-center gap-3.5 border-b border-white/[0.07] px-4 py-3 max-md:px-3.5">
+        <div className="w-10 shrink-0 max-md:w-9">
+          <div className="aspect-[2/3] overflow-hidden rounded-lg bg-[#141824] ring-1 ring-white/10">
             <PosterImage
               src={imageUrl(group.posterUrl)}
               alt={`${group.title}海报`}
               className="size-full"
               fallback={
                 <div className="flex size-full items-center justify-center bg-gradient-to-b from-white/[0.07] to-[#11141c] text-white/25">
-                  {isTv ? <TvIcon className="size-6" /> : <FilmIcon className="size-6" />}
+                  {isTv ? <TvIcon className="size-4" /> : <FilmIcon className="size-4" />}
                 </div>
               }
             />
           </div>
         </div>
         <div className="min-w-0 flex-1">
-          <div className="flex items-start justify-between gap-3">
-            <div className="min-w-0">
-              <h3 className="truncate text-ui font-semibold text-white/90">{group.title}</h3>
-              <p className="mt-1 text-caption text-white/40">
-                {isTv ? "剧集" : "电影"}
-                <span aria-hidden="true"> · </span>
-                {group.tasks.length} 个下载资源
-              </p>
-            </div>
-            {firstSubscription && (
-              <Link
-                href={`/subscriptions/${firstSubscription.id}` as Route}
-                className="shrink-0 rounded-lg border border-white/10 px-3 py-1.5 text-caption font-medium text-white/60 hover:bg-white/[0.06] hover:text-white max-md:hidden"
-              >
-                查看订阅
-              </Link>
-            )}
-          </div>
-          <div className="mt-3 space-y-2">
-            {group.tasks.map((task) => (
-              <DownloadTaskCard
-                key={task.id}
-                task={task}
-                ingestJob={ingestJobsByHash.get(task.info_hash.toLowerCase()) ?? null}
-                grouped
-              />
-            ))}
-          </div>
+          <h3 className="truncate text-ui font-semibold text-white/90">{group.title}</h3>
+          <p className="mt-0.5 text-caption text-white/40">
+            {isTv ? "剧集" : "电影"}
+            <span aria-hidden="true"> · </span>
+            {group.tasks.length} 个下载资源
+          </p>
         </div>
+        {firstSubscription && (
+          <Link
+            href={`/subscriptions/${firstSubscription.id}` as Route}
+            className="shrink-0 rounded-lg border border-white/10 px-3 py-1.5 text-caption font-medium text-white/60 hover:bg-white/[0.06] hover:text-white max-md:hidden"
+          >
+            查看订阅
+          </Link>
+        )}
+      </div>
+      <div className="space-y-2 p-3.5 max-md:p-3">
+        {group.tasks.map((task) => (
+          <DownloadTaskCard
+            key={task.id}
+            task={task}
+            ingestJob={ingestJobsByHash.get(task.info_hash.toLowerCase()) ?? null}
+            grouped
+            deleting={deletingTaskId === task.id}
+            onDelete={onDelete}
+          />
+        ))}
       </div>
     </article>
   );
@@ -407,10 +543,14 @@ function DownloadTaskCard({
   task,
   ingestJob,
   grouped = false,
+  deleting,
+  onDelete,
 }: {
   task: DownloadTask;
   ingestJob: JobView | null;
   grouped?: boolean;
+  deleting: boolean;
+  onDelete: (task: DownloadTask) => void;
 }) {
   const ingestActive =
     ingestJob !== null &&
@@ -418,9 +558,17 @@ function DownloadTaskCard({
   const ingestNeedsAttention =
     ingestJob !== null && ["blocked", "failed"].includes(ingestJob.status);
   const meta = ingestNeedsAttention
-    ? { label: "入库待处理", color: "#fca5a5" }
+    ? {
+        label: "入库待处理",
+        color: "#fca5a5",
+        dot: "bg-[#fca5a5]",
+      }
     : ingestActive
-      ? { label: "正在入库", color: "#86efac" }
+      ? {
+          label: "正在入库",
+          color: "#86efac",
+          dot: "animate-pulse bg-[#86efac]",
+        }
       : DOWNLOAD_STATE_META[task.state];
   const title = grouped
     ? task.name || task.media_title || task.info_hash
@@ -439,7 +587,10 @@ function DownloadTaskCard({
         ? null
         : Math.floor(ingestJob.progress.percent)
       : percent;
+  const progressLabel = ingestActive || ingestNeedsAttention ? "入库进度" : "下载进度";
   const firstSubscription = task.subscriptions[0];
+  const needsAttention =
+    ingestNeedsAttention || task.state === "error" || task.state === "missing";
 
   return (
     <article
@@ -449,41 +600,66 @@ function DownloadTaskCard({
           : "rounded-2xl border border-white/[0.08] bg-[rgba(14,16,22,0.5)] p-4 backdrop-blur-xl max-md:p-3.5"
       }
     >
-      <div className="flex items-start gap-3.5">
-        <span
-          className={`mt-1.5 size-2.5 shrink-0 rounded-full ${
-            task.state === "downloading" ? "animate-pulse" : ""
-          }`}
-          style={{ backgroundColor: meta.color }}
-        />
-        <div className="min-w-0 flex-1">
-          <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
-            <h3 className="min-w-0 truncate text-ui font-semibold text-white/90">{title}</h3>
-            <span
-              className="shrink-0 rounded-full px-2 py-0.5 text-micro font-semibold"
-              style={{ color: meta.color, backgroundColor: `${meta.color}1f` }}
+      <div className="min-w-0">
+        <div className="flex items-start justify-between gap-3">
+          <div className="flex min-w-0 flex-1 items-center gap-2.5">
+            <TaskStatusDot label={meta.label} dotClass={meta.dot} />
+            <h3
+              title={title}
+              className="min-w-0 truncate text-ui font-semibold leading-5 text-white/90"
             >
-              {meta.label}
-            </span>
-            <span className="shrink-0 text-caption text-white/40">{sourceLabel}</span>
+              {title}
+            </h3>
           </div>
-          {torrentName && (
-            <p className="mt-1 truncate text-sub text-[var(--text-muted)]">{torrentName}</p>
+          {task.downloader_id != null && (
+            <DownloadTaskActionsMenu task={task} deleting={deleting} onDelete={onDelete} />
           )}
-          <p className="mt-1 text-sub leading-5 text-[var(--text-muted)]">
+        </div>
+        <div
+          className={`mt-2.5 text-sub leading-5 ${
+            needsAttention
+              ? "rounded-xl border border-[#fca5a5]/15 bg-[#fca5a5]/[0.06] px-3 py-2.5 text-[#fecaca]"
+              : "text-white/60"
+          }`}
+        >
+          <p className="line-clamp-2 min-h-10 break-words">
+            {needsAttention && <span className="mr-1.5 font-semibold">需要处理：</span>}
+            {torrentName && <span>{torrentName} · </span>}
             {downloadTaskNote(task, percent, ingestJob)}
           </p>
-          <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-caption text-white/40">
-            <span>{task.downloader_name || "所有下载器均未找到"}</span>
-            {task.size_bytes != null && <span>{formatBytes(task.size_bytes)}</span>}
-            {task.dlspeed_bytes != null && task.dlspeed_bytes > 0 && (
-              <span>{formatBytes(task.dlspeed_bytes)}/s</span>
-            )}
-            {task.eta_seconds != null && <span>剩余约 {formatDuration(task.eta_seconds)}</span>}
-            {firstSubscription && <span>{formatUnits(firstSubscription.units)}</span>}
+        </div>
+        <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-caption text-white/40">
+          <span>{sourceLabel}</span>
+          <span>{task.downloader_name || "所有下载器均未找到"}</span>
+          {task.size_bytes != null && <span>{formatBytes(task.size_bytes)}</span>}
+          {task.dlspeed_bytes != null && task.dlspeed_bytes > 0 && (
+            <span>{formatBytes(task.dlspeed_bytes)}/s</span>
+          )}
+          {task.eta_seconds != null && <span>剩余约 {formatDuration(task.eta_seconds)}</span>}
+          {firstSubscription && <span>{formatUnits(firstSubscription.units)}</span>}
+        </div>
+      </div>
+      {displayPercent != null && task.state !== "missing" && (
+        <div className="mt-3">
+          <div className="mb-1.5 flex items-center justify-between gap-3 text-caption">
+            <span className="font-medium text-white/55">{progressLabel}</span>
+            <span className="tnum shrink-0 font-semibold text-white/65">
+              {Math.min(100, Math.max(0, displayPercent))}%
+            </span>
+          </div>
+          <div className="h-1.5 overflow-hidden rounded-full bg-white/[0.08]">
+            <div
+              className="h-full rounded-full transition-[width] duration-700"
+              style={{
+                width: `${Math.min(100, Math.max(displayPercent > 0 ? 1 : 0, displayPercent))}%`,
+                backgroundColor: meta.color,
+              }}
+            />
           </div>
         </div>
-        <div className="flex shrink-0 items-center gap-2 max-md:hidden">
+      )}
+      {(firstSubscription || ["error", "missing"].includes(task.state)) && (
+        <footer className="mt-3 flex flex-wrap items-center justify-end gap-2 border-t border-white/[0.06] pt-3">
           {firstSubscription && (
             <Link
               href={`/subscriptions/${firstSubscription.id}` as Route}
@@ -500,37 +676,36 @@ function DownloadTaskCard({
               检查下载器
             </Link>
           )}
-        </div>
-      </div>
-      {displayPercent != null && task.state !== "missing" && (
-        <div className="mt-3 h-1.5 overflow-hidden rounded-full bg-white/[0.08]">
-          <div
-            className="h-full rounded-full transition-[width] duration-700"
-            style={{ width: `${Math.min(100, Math.max(displayPercent > 0 ? 1 : 0, displayPercent))}%`, backgroundColor: meta.color }}
-          />
-        </div>
-      )}
-      {(firstSubscription || ["error", "missing"].includes(task.state)) && (
-        <div className="mt-3 hidden flex-wrap gap-2 max-md:flex">
-          {firstSubscription && (
-            <Link
-              href={`/subscriptions/${firstSubscription.id}` as Route}
-              className="rounded-lg border border-white/10 px-3 py-1.5 text-caption font-medium text-white/70"
-            >
-              查看订阅
-            </Link>
-          )}
-          {["error", "missing"].includes(task.state) && (
-            <Link
-              href={"/settings/downloaders" as Route}
-              className="rounded-lg border border-[#fca5a5]/25 px-3 py-1.5 text-caption font-medium text-[#fecaca]"
-            >
-              检查下载器
-            </Link>
-          )}
-        </div>
+        </footer>
       )}
     </article>
+  );
+}
+
+/** 下载任务的破坏性操作统一收进卡片右上角菜单，避免抢占状态展示空间。 */
+function DownloadTaskActionsMenu({
+  task,
+  deleting,
+  onDelete,
+}: {
+  task: DownloadTask;
+  deleting: boolean;
+  onDelete: (task: DownloadTask) => void;
+}) {
+  return (
+    <TaskActionsMenu
+      ariaLabel={`${task.name || task.info_hash}的更多操作`}
+      disabled={deleting}
+      items={[
+        {
+          id: "delete",
+          label: deleting ? "删除中…" : "删除任务",
+          onSelect: () => onDelete(task),
+          disabled: deleting,
+          tone: "danger",
+        },
+      ]}
+    />
   );
 }
 
@@ -565,20 +740,6 @@ function formatUnits(units: DownloadTask["subscriptions"][number]["units"]): str
       `S${String(unit.season_number).padStart(2, "0")}E${String(unit.episode_number).padStart(2, "0")}`,
   );
   return labels.length <= 3 ? labels.join("、") : `${labels.slice(0, 3).join("、")} 等 ${labels.length} 集`;
-}
-
-function SourceChip({ source }: { source: DownloadTaskSource }) {
-  const active = source.status === "active";
-  return (
-    <div
-      title={source.message || undefined}
-      className="flex items-center gap-2 rounded-full border border-white/[0.08] bg-white/[0.035] px-3 py-1.5 text-caption text-white/60"
-    >
-      <span className={`size-1.5 rounded-full ${active ? "bg-[#86efac]" : "bg-[#fca5a5]"}`} />
-      <span>{source.name}</span>
-      <span className="tnum text-white/35">{active ? `${source.task_count} 项` : source.status === "disabled" ? "已停用" : "异常"}</span>
-    </div>
-  );
 }
 
 function EmptyView({ view }: { view: TaskView }) {

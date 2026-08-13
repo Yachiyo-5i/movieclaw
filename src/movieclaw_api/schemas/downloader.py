@@ -145,6 +145,14 @@ class DownloadTaskListView(BaseModel):
     sources: list[DownloadTaskSourceView]
 
 
+class DownloadTaskDeleteView(BaseModel):
+    """删除下载器任务的结果。"""
+
+    downloader_id: int
+    info_hash: str
+    delete_files: bool
+
+
 class DownloaderPayload(BaseModel):
     """新增/更新下载器的请求体（更新时 id 走路径参数）。
 

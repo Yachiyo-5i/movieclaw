@@ -792,14 +792,30 @@ async def _ingest_entry(
     # 条目落账无作品归属，摘要行的作品去重自然不会把它算进任何一部
     item: MediaItem | None = None
     # 手动下载的 hash 锚只服务于这次在途导入：一旦文件已成功整理，和台账
-    # 一起提交删除。这样同一 torrent 将来删除后重下、或用户调整规则后重投，
-    # 不会被已完成任务的旧库选择永久劫持；失败/PENDING 时则保留供重试认领。
+    # 一起提交删除。删除依据是本次条目匹配到的全部 hash + 最终媒体身份，
+    # 不能只删“身份识别实际选中的那一行”：同一 hash 若先被订阅工单认领，
+    # 手动锚虽然没有参与识别，也已经随同一批文件完成了使命。
     manual_intent: ManualDownloadIntent | None = None
 
     async def conclude(status: IngestStatus, message: str, imported: int = 0) -> IngestEntry:
-        if status is IngestStatus.IMPORTED and manual_intent is not None:
-            await session.delete(manual_intent)
-            logger.info("手动下载身份锚已随成功入库消费：hash=%s", manual_intent.info_hash)
+        if status is IngestStatus.IMPORTED and item is not None and item.id is not None:
+            hashes = sorted({value.lower() for value in matched_hashes or [] if value})
+            if hashes:
+                intents = list(
+                    (
+                        await session.execute(
+                            select(ManualDownloadIntent).where(
+                                ManualDownloadIntent.info_hash.in_(hashes),  # type: ignore[union-attr]
+                                ManualDownloadIntent.media_item_id == item.id,
+                            )
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+                for intent in intents:
+                    await session.delete(intent)
+                    logger.info("手动下载身份锚已随成功入库消费：hash=%s", intent.info_hash)
         return await _save_record(
             session,
             dest_library,

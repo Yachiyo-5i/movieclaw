@@ -128,6 +128,26 @@ export function listDownloadTasks(init?: RequestInit): Promise<DownloadTaskSnaps
   return unwrap(request<ApiEnvelope<DownloadTaskSnapshot>>("/downloaders/tasks", init));
 }
 
+/**
+ * 从指定下载器移除一个种子任务。默认保留数据文件；只有确认弹窗中显式
+ * 选择后才传 deleteFiles=true，避免误删正在下载或做种的数据。
+ */
+export function deleteDownloadTask(
+  downloaderId: number,
+  infoHash: string,
+  deleteFiles = false,
+): Promise<{ downloader_id: number; info_hash: string; delete_files: boolean }> {
+  const query = deleteFiles ? "?delete_files=true" : "";
+  return unwrap(
+    request<
+      ApiEnvelope<{ downloader_id: number; info_hash: string; delete_files: boolean }>
+    >(
+      `/downloaders/${downloaderId}/torrents/${encodeURIComponent(infoHash)}${query}`,
+      { method: "DELETE" },
+    ),
+  );
+}
+
 /** 获取单个下载器详情（用于轮询连接测试进度）。 */
 export function getDownloader(id: number, init?: RequestInit): Promise<ConfiguredDownloader> {
   return unwrap(request<ApiEnvelope<ConfiguredDownloader>>(`/downloaders/${id}`, init));

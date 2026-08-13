@@ -53,6 +53,18 @@ class DownloaderSubmitError(DownloaderException):
         super().__init__(message, details=details)
 
 
+class DownloaderDeleteError(DownloaderException):
+    """删除下载任务失败（下载器拒绝操作或返回未知错误）。"""
+
+    def __init__(
+        self,
+        message: str = "删除下载任务失败",
+        *,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message, details=details)
+
+
 class TorrentParseError(DownloaderException):
     """种子文件或磁力链接解析失败（内容不是合法的 bencode / magnet 格式）。"""
 
