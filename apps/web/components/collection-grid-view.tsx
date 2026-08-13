@@ -7,8 +7,25 @@ import { SearchIcon } from "@/components/icons";
 import { PosterCard } from "@/components/poster-card";
 import { fetchDoubanCollection } from "@/lib/api/discover";
 import type { MediaItem } from "@/lib/media-types";
+import { useScrollRestoration } from "@/lib/use-scroll-restoration";
 
 const PAGE_SIZE = 50;
+const MAX_COLLECTION_VISIBLE_COUNTS = 32;
+const collectionVisibleCounts = new Map<string, number>();
+
+function getCollectionVisibleCount(collectionId: string) {
+  return collectionVisibleCounts.get(collectionId) ?? PAGE_SIZE;
+}
+
+function rememberCollectionVisibleCount(collectionId: string, count: number) {
+  collectionVisibleCounts.delete(collectionId);
+  collectionVisibleCounts.set(collectionId, count);
+  while (collectionVisibleCounts.size > MAX_COLLECTION_VISIBLE_COUNTS) {
+    const oldest = collectionVisibleCounts.keys().next().value;
+    if (oldest === undefined) break;
+    collectionVisibleCounts.delete(oldest);
+  }
+}
 
 /**
  * 豆瓣完整榜单落地页（「看全部」的目的地）：用纵向网格承载大量条目，
@@ -25,12 +42,27 @@ export function CollectionGridView({
   /** 榜单展示名，用于标题与返回导航 */
   title: string;
 }) {
+  const scrollRef = useScrollRestoration(`collection:${collectionId}`);
   const [items, setItems] = useState<MediaItem[] | null>(null);
   const [query, setQuery] = useState("");
   const [selectedGenres, setSelectedGenres] = useState<string[]>([]);
-  const [visibleCount, setVisibleCount] = useState(PAGE_SIZE);
+  const [visibleCount, setVisibleCount] = useState(() => getCollectionVisibleCount(collectionId));
   const [error, setError] = useState<string | null>(null);
   const loadMoreRef = useRef<HTMLDivElement>(null);
+  const previousCollectionId = useRef(collectionId);
+
+  useEffect(() => {
+    // 同一组件实例切换榜单时，先切换到新 key 的窗口；不要把旧榜单的数量
+    // 在这一轮 effect 中写进新 key。
+    if (previousCollectionId.current !== collectionId) {
+      previousCollectionId.current = collectionId;
+      setVisibleCount(getCollectionVisibleCount(collectionId));
+      setQuery("");
+      setSelectedGenres([]);
+      return;
+    }
+    rememberCollectionVisibleCount(collectionId, visibleCount);
+  }, [collectionId, visibleCount]);
 
   useEffect(() => {
     let cancelled = false;
@@ -119,7 +151,7 @@ export function CollectionGridView({
   };
 
   return (
-    <div className="scroll-thin scroll-safe flex-1 overflow-y-auto px-6 pb-12 max-md:px-4">
+    <div ref={scrollRef} className="scroll-thin scroll-safe flex-1 overflow-y-auto px-6 pb-12 max-md:px-4">
       {/* 顶栏：返回发现电影（保留豆瓣数据源视角）+ 吸顶榜单名；
           容器已有 px-6，用 -mx-6 让吸顶蒙版铺满整宽 */}
       <PageNav

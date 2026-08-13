@@ -170,7 +170,13 @@ export function PageNav({
             </button>
           )}
           {parent ? (
-            <Link href={parent.href as Route} aria-label={backLabel} title={backLabel} className={backClass}>
+            <Link
+              href={parent.href as Route}
+              scroll={false}
+              aria-label={backLabel}
+              title={backLabel}
+              className={backClass}
+            >
               <ChevronLeftIcon className="size-[18px] max-md:size-[22px]" />
             </Link>
           ) : (

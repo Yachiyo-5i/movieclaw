@@ -1,6 +1,6 @@
 "use client";
 
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
@@ -69,6 +69,12 @@ import { usePermissions } from "@/lib/permissions";
 import { useVisiblePolling } from "@/lib/use-visible-polling";
 import { useJobs } from "@/lib/jobs";
 import {
+  getLibraryDetailSnapshot,
+  setLibraryDetailSnapshot,
+  type LibraryDetailSnapshot,
+} from "@/lib/library-detail-snapshot";
+import { useScrollRestoration } from "@/lib/use-scroll-restoration";
+import {
   subscriptionProgressNote,
   subscriptionStatusMeta,
 } from "@/lib/subscription-ui";
@@ -97,35 +103,49 @@ function busyText(progress: ScanProgress | null): string {
  */
 /** 海报墙每次向服务端要的格数（首屏一批，滚到底再追加一批）。 */
 const WALL_PAGE_SIZE = 60;
+/** 后端单次分页的硬上限；轮询已加载窗口时按此上限分块请求。 */
+const WALL_API_PAGE_SIZE = 200;
 
 export function LibraryDetailView({ libraryId }: { libraryId: number }) {
+  const initialSnapshot = getLibraryDetailSnapshot(libraryId);
+  const restoredFromSnapshot = useRef(initialSnapshot !== undefined);
   const { canManageLibraries } = usePermissions();
   const { activeJobs } = useJobs();
+  const scrollRef = useScrollRestoration(`library:${libraryId}`, {
+    anchorAttribute: "data-library-item-id",
+  });
   const confirm = useConfirm();
-  const [libraries, setLibraries] = useState<MediaLibrary[] | null>(null);
-  const [items, setItems] = useState<LibraryItem[]>([]);
+  const [libraries, setLibraries] = useState<MediaLibrary[] | null>(initialSnapshot?.libraries ?? null);
+  const [items, setItems] = useState<LibraryItem[]>(initialSnapshot?.items ?? []);
   // 服务端还有没有下一页；滚动加载的哨兵据此决定是否继续观察
-  const [wallHasMore, setWallHasMore] = useState(false);
+  const [wallHasMore, setWallHasMore] = useState(initialSnapshot?.wallHasMore ?? false);
   // 本库全部条目 id：海报墙分页后这份名单仍要完整——「追踪中」要靠它把
   // 已入库的订阅剔掉，而已入库的那部可能在第 5 页上，光看当前页会误判
-  const [ownedIds, setOwnedIds] = useState<Set<number>>(() => new Set());
+  const [ownedIds, setOwnedIds] = useState<Set<number>>(
+    () => initialSnapshot?.ownedIds ?? new Set(),
+  );
   // A-Z 索引条的分档（按标题排序时才有意义）
-  const [wallIndex, setWallIndex] = useState<LibraryIndexEntry[]>([]);
+  const [wallIndex, setWallIndex] = useState<LibraryIndexEntry[]>(initialSnapshot?.wallIndex ?? []);
   // 当前窗口在整份排序里的起点：0 = 从头开始；点字母跳转后是该档的 offset。
   // 轮询要按这个起点重拉，否则每 3 秒把用户拽回墙首
-  const [wallStart, setWallStart] = useState(0);
-  const [unidentified, setUnidentified] = useState<UnidentifiedGroup[]>([]);
-  const [review, setReview] = useState<ReviewGroup[]>([]);
-  const [ignored, setIgnored] = useState<UnidentifiedGroup[]>([]);
-  const [missing, setMissing] = useState<MissingItem[]>([]);
-  const [subscriptions, setSubscriptions] = useState<Subscription[]>([]);
+  const [wallStart, setWallStart] = useState(initialSnapshot?.wallStart ?? 0);
+  const [unidentified, setUnidentified] = useState<UnidentifiedGroup[]>(initialSnapshot?.unidentified ?? []);
+  const [review, setReview] = useState<ReviewGroup[]>(initialSnapshot?.review ?? []);
+  const [ignored, setIgnored] = useState<UnidentifiedGroup[]>(initialSnapshot?.ignored ?? []);
+  const [missing, setMissing] = useState<MissingItem[]>(initialSnapshot?.missing ?? []);
+  const [subscriptions, setSubscriptions] = useState<Subscription[]>(initialSnapshot?.subscriptions ?? []);
   const [failed, setFailed] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const [editing, setEditing] = useState<MediaLibrary | null>(null);
   // 整理文件名对话框的目标库；null = 关闭
   const [organizeTarget, setOrganizeTarget] = useState<MediaLibrary | null>(null);
   // 整库元数据刷新进度（进行中每 3 秒轮询，结束自动刷新库存）
-  const [metaRefresh, setMetaRefresh] = useState<MetadataRefreshProgress | null>(null);
+  const [metaRefresh, setMetaRefresh] = useState<MetadataRefreshProgress | null>(
+    initialSnapshot?.metaRefresh ?? null,
+  );
+  // 删除/转移等详情页操作会把旧窗口标记为过期。先保留它供滚动锚点落脚，
+  // 后台对账成功后再清除标记；请求失败时下次返回仍会重试。
+  const [snapshotStale, setSnapshotStale] = useState(initialSnapshot?.stale ?? false);
   // 工单抽屉：从哪个胶囊点进来就落在哪个 tab；null = 关闭
   const [issueTab, setIssueTab] = useState<IssueTab | null>(null);
 
@@ -134,23 +154,73 @@ export function LibraryDetailView({ libraryId }: { libraryId: number }) {
   const reloadSeq = useRef(0);
   // 海报墙已加载的格数：轮询按这个数重拉第一页，用户滚到第几屏就刷新到第几屏
   // ——否则每轮轮询都把墙缩回首屏，正在看的位置被抽走
-  const wallLoaded = useRef(WALL_PAGE_SIZE);
+  const wallLoaded = useRef(initialSnapshot?.wallLoaded ?? WALL_PAGE_SIZE);
   // 当前排序（扫描补探阶段切到「待补探优先」）。放 ref 而不进依赖：reload
   // 每轮都读最新值，不必为切排序重建回调链
-  const wallSort = useRef<LibraryItemSort>("title");
+  const wallSort = useRef<LibraryItemSort>(initialSnapshot?.wallSort ?? "title");
   // 当前窗口起点的 ref 版：reload 每轮读它，不进依赖（同 wallSort）
-  const wallOffset = useRef(0);
+  const wallOffset = useRef(initialSnapshot?.wallOffset ?? 0);
+  const snapshotRef = useRef<LibraryDetailSnapshot | null>(null);
+  snapshotRef.current = libraries
+    ? {
+        libraries,
+        items,
+        wallHasMore,
+        ownedIds,
+        wallIndex,
+        wallStart,
+        unidentified,
+        review,
+        ignored,
+        missing,
+        subscriptions,
+        metaRefresh,
+        wallLoaded: wallLoaded.current,
+        wallSort: wallSort.current,
+        wallOffset: wallOffset.current,
+        stale: snapshotStale,
+      }
+    : null;
+
+  // 布局提交后就更新快照，路由切换的下一棵树可以在首帧直接读取它；不能只在
+  // 卸载 cleanup 中写入，因为新路由的首次 render 可能早于被动 effect 的 cleanup。
+  useLayoutEffect(() => {
+    if (snapshotRef.current) setLibraryDetailSnapshot(libraryId, snapshotRef.current);
+  }, [
+    ignored,
+    items,
+    libraries,
+    libraryId,
+    metaRefresh,
+    missing,
+    ownedIds,
+    review,
+    subscriptions,
+    snapshotStale,
+    unidentified,
+    wallHasMore,
+    wallIndex,
+    wallStart,
+  ]);
+
   const reload = useCallback(() => {
     const seq = ++reloadSeq.current;
     const wanted = wallLoaded.current;
     const from = wallOffset.current;
+    const itemPages = Array.from(
+      { length: Math.ceil(wanted / WALL_API_PAGE_SIZE) },
+      (_, page) => {
+        const offset = from + page * WALL_API_PAGE_SIZE;
+        return listLibraryItems(libraryId, {
+          sort: wallSort.current,
+          limit: Math.min(WALL_API_PAGE_SIZE, wanted - page * WALL_API_PAGE_SIZE),
+          offset,
+        });
+      },
+    );
     Promise.all([
       listLibraries(),
-      listLibraryItems(libraryId, {
-        sort: wallSort.current,
-        limit: wanted,
-        offset: from,
-      }).catch(() => []),
+      Promise.all(itemPages).then((pages) => pages.flat()),
       listLibraryItemIds(libraryId).catch(() => []),
       listLibraryItemIndex(libraryId).catch(() => []),
       canManageLibraries ? listUnidentified(libraryId).catch(() => []) : Promise.resolve([]),
@@ -161,6 +231,7 @@ export function LibraryDetailView({ libraryId }: { libraryId: number }) {
     ])
       .then(([libs, libraryItems, ids, index, unknown, reviewGroups, ignoredGroups, missingItems, subs]) => {
         if (seq !== reloadSeq.current) return;
+        setSnapshotStale(false);
         setFailed(false);
         // 轮询快照内容没变时复用旧引用：库存墙逐条目复用（配合 InventoryCell
         // 的 memo，只有真正变化的格子重渲染），其余列表整体复用。否则扫描期间
@@ -194,8 +265,13 @@ export function LibraryDetailView({ libraryId }: { libraryId: number }) {
   }, [canManageLibraries, libraryId]);
 
   useEffect(() => {
-    reload();
-  }, [reload]);
+    // 从详情页返回时，已加载分页窗口就在会话快照中。立刻重拉会先把墙缩成
+    // 首批 60 条，深处的滚动目标又会失去高度；之后仍由可见页轮询负责对账。
+    if (!restoredFromSnapshot.current || snapshotStale) {
+      restoredFromSnapshot.current = true;
+      reload();
+    }
+  }, [reload, snapshotStale]);
 
   // 海报墙滚到底时向服务端追加一页。并发闸门用 ref：哨兵在快速滚动中会
   // 连续触发几次，不挡住就是同一页被拉好几遍
@@ -203,9 +279,13 @@ export function LibraryDetailView({ libraryId }: { libraryId: number }) {
   const loadMore = useCallback(() => {
     if (loadingMore.current) return;
     loadingMore.current = true;
+    // 分页请求开始后作废正在路上的轮询响应；否则旧轮询可能先/后返回，
+    // 用较短的窗口覆盖刚追加的页面，把用户滚动到的内容又截回首批。
+    const requestSeq = ++reloadSeq.current;
     const offset = wallOffset.current + wallLoaded.current;
     listLibraryItems(libraryId, { sort: wallSort.current, limit: WALL_PAGE_SIZE, offset })
       .then((next) => {
+        if (requestSeq !== reloadSeq.current) return;
         wallLoaded.current += next.length;
         // 追加与轮询可能交叠着回来，同一条目被拿到两次——按 id 去重再拼
         setItems((current) => {
@@ -214,7 +294,9 @@ export function LibraryDetailView({ libraryId }: { libraryId: number }) {
         });
         setWallHasMore(next.length >= WALL_PAGE_SIZE);
       })
-      .catch(() => setWallHasMore(false))
+      .catch(() => {
+        if (requestSeq === reloadSeq.current) setWallHasMore(false);
+      })
       .finally(() => {
         loadingMore.current = false;
       });
@@ -504,7 +586,7 @@ export function LibraryDetailView({ libraryId }: { libraryId: number }) {
   ) : null;
 
   return (
-    <div className="scroll-thin scroll-safe flex-1 overflow-y-auto pb-10">
+    <div ref={scrollRef} className="scroll-thin scroll-safe flex-1 overflow-y-auto pb-10">
       {/* 顶栏：返回媒体库 + 吸顶库名 + 库操作 ⋯（无 pt——顶边与侧栏卡片顶边齐平） */}
       <PageNav
         items={[{ label: "媒体库", href: "/library" }, { label: library.name }]}
@@ -958,7 +1040,10 @@ const InventoryCell = memo(function InventoryCell({
   return (
     // content-visibility：视口外的格子跳过布局与绘制，大库海报墙的滚动/更新
     // 成本只与可见格数相关；intrinsic-size 占住尺寸，滚动条不跳
-    <div className="[contain-intrinsic-size:auto_270px] [content-visibility:auto]">
+    <div
+      data-library-item-id={item.media_item_id}
+      className="[contain-intrinsic-size:auto_270px] [content-visibility:auto]"
+    >
       {/* 后台正在处理的那一格自己点亮：进度面板/胶囊列的是总数或片名，
           海报墙上也要能一眼看到"正在弄这部"，否则用户得在两处之间对片名 */}
       <div className="relative">

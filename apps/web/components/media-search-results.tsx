@@ -12,6 +12,7 @@ import {
 } from "@/lib/api/discover";
 import { fetchMediaSearchSnapshot } from "@/lib/api/search";
 import { formatRelativeTime } from "@/lib/time";
+import { useScrollRestoration } from "@/lib/use-scroll-restoration";
 
 /**
  * 搜索结果页「影视」垂直：豆瓣 + TMDB 双来源搜索，上下两个分区展示。
@@ -46,6 +47,7 @@ export function MediaSearchResults({
   /** 切到「站点资源」垂直（空态/出错时的逃生入口） */
   onSwitchToTorrent?: () => void;
 }) {
+  const scrollRef = useScrollRestoration(`search:media:${keyword}:${snapshotId ?? "live"}`);
   // 每个来源各自三态：null = 加载中；[] = 无结果；error 非空 = 该分区失败
   const [douban, setDouban] = useState<MediaSearchItem[] | null>(null);
   const [doubanError, setDoubanError] = useState<string | null>(null);
@@ -148,7 +150,10 @@ export function MediaSearchResults({
         </div>
       </header>
 
-      <div className="scroll-thin scroll-safe relative min-h-0 flex-1 overflow-y-auto px-6 pb-6 max-md:px-4">
+      <div
+        ref={scrollRef}
+        className="scroll-thin scroll-safe relative min-h-0 flex-1 overflow-y-auto px-6 pb-6 max-md:px-4"
+      >
         {allEmpty ? (
           <MediaSearchEmpty
             title={anyError ? "影视搜索出错" : "没有找到相关影视条目"}

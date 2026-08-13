@@ -24,6 +24,7 @@ import {
 import { HttpError } from "@/lib/http";
 import { useMediaDetail } from "@/lib/media-detail";
 import { usePageChrome } from "@/lib/page-chrome";
+import { useScrollRestoration } from "@/lib/use-scroll-restoration";
 import { useIsMobile } from "@/lib/use-media-query";
 import { useTapGuard } from "@/lib/use-tap-guard";
 import type {
@@ -90,6 +91,7 @@ export function DiscoverView({
 }) {
   const router = useRouter();
   const cacheKey = `${mediaType}:${source}`;
+  const scrollRef = useScrollRestoration(`discover:${cacheKey}`);
   const [layout, setLayout] = useState<DiscoverLayoutData | null>(
     () => layoutCache.get(cacheKey) ?? null,
   );
@@ -227,7 +229,7 @@ export function DiscoverView({
     );
   }
   return (
-    <div className="scroll-thin scroll-safe flex-1 overflow-y-auto pb-10">
+    <div ref={scrollRef} className="scroll-thin scroll-safe flex-1 overflow-y-auto pb-10">
       {toolbar}
       {/* Hero 区：布局声明有 Hero 时先占位，数据到达后换成轮播；失败/无则收起 */}
       {layout.hasHero && hero === undefined && (

@@ -43,6 +43,7 @@ import { imageUrl } from "@/lib/image-proxy";
 import type { MediaItem, MediaType } from "@/lib/media-types";
 import { usePermissions } from "@/lib/permissions";
 import { useVisiblePolling } from "@/lib/use-visible-polling";
+import { useScrollRestoration } from "@/lib/use-scroll-restoration";
 
 /** 库类型 → 展示名与图标 */
 export const LIBRARY_KIND_META: Record<MediaType, { label: string; Icon: typeof FilmIcon }> = {
@@ -202,6 +203,7 @@ export function effectiveLibraryId(
  */
 export function LibraryView() {
   const { canManageLibraries } = usePermissions();
+  const scrollRef = useScrollRestoration("library");
   const [libraries, setLibraries] = useState<MediaLibrary[] | null>(null);
   const [itemsByLibrary, setItemsByLibrary] = useState<Map<number, LibraryItem[]>>(
     new Map(),
@@ -355,7 +357,7 @@ export function LibraryView() {
   );
 
   return (
-    <div className="scroll-thin scroll-safe flex-1 overflow-y-auto pb-10">
+    <div ref={scrollRef} className="scroll-thin scroll-safe flex-1 overflow-y-auto pb-10">
       <div className="flex items-start justify-between gap-4 px-6 pt-2 max-md:flex-col max-md:items-stretch max-md:gap-3 max-md:px-4">
         <div>
           <h2 className="text-on-image text-[26px] font-bold leading-tight tracking-[-0.02em] text-white max-md:text-[21px]">
@@ -594,6 +596,7 @@ function LibraryCard({
     <div className="group/lib relative">
       <Link
         href={`/library/${library.id}` as Route}
+        scroll={false}
         aria-label={`打开「${library.name}」`}
         className="block overflow-hidden rounded-2xl ring-1 ring-white/10 outline-none transition duration-300 hover:ring-white/35 focus-visible:ring-2 focus-visible:ring-[var(--accent-ring)]"
       >

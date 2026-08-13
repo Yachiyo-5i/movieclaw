@@ -11,6 +11,7 @@ import {
   type LibrarySearchGroup,
 } from "@/lib/api/libraries";
 import { imageUrl } from "@/lib/image-proxy";
+import { useScrollRestoration } from "@/lib/use-scroll-restoration";
 
 /**
  * 搜索结果页「媒体库」垂直：跨全部媒体库搜索已入库条目，按库分区展示。
@@ -30,6 +31,7 @@ export function LibrarySearchResults({
   /** 切到「影视」垂直（空态时的出口：库里没有 → 去找来） */
   onSwitchToMedia?: () => void;
 }) {
+  const scrollRef = useScrollRestoration(`search:library:${keyword}`);
   // null = 加载中；[] = 无结果；error 非空 = 请求失败
   const [groups, setGroups] = useState<LibrarySearchGroup[] | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -61,7 +63,10 @@ export function LibrarySearchResults({
         </h1>
       </header>
 
-      <div className="scroll-thin scroll-safe relative min-h-0 flex-1 overflow-y-auto px-6 pb-6 max-md:px-4">
+      <div
+        ref={scrollRef}
+        className="scroll-thin scroll-safe relative min-h-0 flex-1 overflow-y-auto px-6 pb-6 max-md:px-4"
+      >
         {groups === null && !error && <LibrarySearchSkeleton />}
         {(error || empty) && (
           <div className="flex flex-col items-center pt-24 text-center">

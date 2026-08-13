@@ -18,6 +18,7 @@ import {
   subscriptionStatusMeta,
 } from "@/lib/subscription-ui";
 import { useIsMobile } from "@/lib/use-media-query";
+import { useScrollRestoration } from "@/lib/use-scroll-restoration";
 
 /**
  * 订阅页：用户全部订阅的海报墙。
@@ -33,6 +34,7 @@ import { useIsMobile } from "@/lib/use-media-query";
  */
 export function SubscriptionsView() {
   const { canManageSubscriptions, canSubscribe } = usePermissions();
+  const scrollRef = useScrollRestoration("subscriptions");
   const [mediaType, setMediaType] = useState<"movie" | "tv">("movie");
   const { subscriptions, refresh } = useSubscribeEntry();
   const [failed, setFailed] = useState(false);
@@ -72,7 +74,7 @@ export function SubscriptionsView() {
   const visible = (subscriptions ?? []).filter((s) => s.media.kind === mediaType);
 
   return (
-    <div className="scroll-thin scroll-safe flex-1 overflow-y-auto pb-10">
+    <div ref={scrollRef} className="scroll-thin scroll-safe flex-1 overflow-y-auto pb-10">
       <div className="flex items-start justify-between gap-4 px-6 pt-2 max-md:px-4">
         <div>
           <h2 className="text-on-image text-[26px] font-bold leading-tight tracking-[-0.02em] text-white max-md:text-[21px]">

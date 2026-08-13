@@ -53,6 +53,7 @@ import { getDiscoveryReturnPath } from "@/lib/discovery-return-path";
 import { formatBytes } from "@/lib/format";
 import { resolveRequestUrl } from "@/lib/http";
 import { cachedImageUrl } from "@/lib/image-proxy";
+import { invalidateLibraryDetailSnapshot } from "@/lib/library-detail-snapshot";
 import { refreshItemConfirm } from "@/lib/library-confirm";
 import { usePermissions } from "@/lib/permissions";
 import { formatRelativeTime } from "@/lib/time";
@@ -111,6 +112,14 @@ export function LibraryItemDetailView({
   const [deleteFileTarget, setDeleteFileTarget] = useState<LibraryItemFile | null>(null);
   // 转移到其他库的弹窗（选库 → 预览 → 执行 → 进度 → 结论）
   const [transferOpen, setTransferOpen] = useState(false);
+
+  const handleTransferFinished = useCallback(
+    (targetLibraryId: number) => {
+      invalidateLibraryDetailSnapshot(libraryId);
+      invalidateLibraryDetailSnapshot(targetLibraryId);
+    },
+    [libraryId],
+  );
 
   const reload = useCallback(() => {
     setFailed(false);
@@ -438,7 +447,10 @@ export function LibraryItemDetailView({
         open={deleteOpen}
         detail={detail}
         onClose={() => setDeleteOpen(false)}
-        onDeleted={() => router.replace(`/library/${libraryId}` as Route)}
+        onDeleted={() => {
+          invalidateLibraryDetailSnapshot(libraryId);
+          router.replace(`/library/${libraryId}` as Route);
+        }}
         libraryId={libraryId}
       />}
 
@@ -449,7 +461,10 @@ export function LibraryItemDetailView({
         onClose={() => setDeleteFileTarget(null)}
         onDeleted={(deletedItem) => {
           setDeleteFileTarget(null);
-          if (deletedItem) router.replace(`/library/${libraryId}` as Route);
+          invalidateLibraryDetailSnapshot(libraryId);
+          if (deletedItem) {
+            router.replace(`/library/${libraryId}` as Route);
+          }
           else reload();
         }}
       />}
@@ -460,9 +475,10 @@ export function LibraryItemDetailView({
         libraryId={libraryId}
         sourceLibraryName={library?.name ?? null}
         onClose={() => setTransferOpen(false)}
-        onTransferred={(targetLibraryId) =>
-          router.replace(`/library/${targetLibraryId}/item/${mediaItemId}` as Route)
-        }
+        onFinished={handleTransferFinished}
+        onTransferred={(targetLibraryId) => {
+          router.replace(`/library/${targetLibraryId}/item/${mediaItemId}` as Route);
+        }}
       />}
 
       {canManageLibraries && <ReidentifyDialog
@@ -478,7 +494,10 @@ export function LibraryItemDetailView({
             reload();
           }
         }}
-        onApplied={() => setReidentifyDirty(true)}
+        onApplied={() => {
+          invalidateLibraryDetailSnapshot(libraryId);
+          setReidentifyDirty(true);
+        }}
       />}
 
       {canManageLibraries && <ArtworkPickerDialog
@@ -1410,6 +1429,7 @@ function TransferDialog({
   detail,
   libraryId,
   sourceLibraryName,
+  onFinished,
   onClose,
   onTransferred,
 }: {
@@ -1417,6 +1437,7 @@ function TransferDialog({
   detail: LibraryItemDetail;
   libraryId: number;
   sourceLibraryName: string | null;
+  onFinished: (targetLibraryId: number) => void;
   onClose: () => void;
   onTransferred: (targetLibraryId: number) => void;
 }) {
@@ -1464,11 +1485,16 @@ function TransferDialog({
     if (!open || !running) return;
     const timer = setInterval(() => {
       getTransferStatus(libraryId)
-        .then(setStatus)
+        .then((next) => {
+          setStatus(next);
+          if (!next.running && next.errors.length === 0 && next.target_library_id != null) {
+            onFinished(next.target_library_id);
+          }
+        })
         .catch(() => {});
     }, 1000);
     return () => clearInterval(timer);
-  }, [open, running, libraryId]);
+  }, [open, running, libraryId, onFinished]);
 
   const run = async () => {
     if (targetId == null) return;
@@ -1476,7 +1502,11 @@ function TransferDialog({
     setError(null);
     try {
       await transferLibraryItem(libraryId, detail.media_item_id, targetId);
-      setStatus(await getTransferStatus(libraryId));
+      const next = await getTransferStatus(libraryId);
+      setStatus(next);
+      if (!next.running && next.errors.length === 0 && next.target_library_id != null) {
+        onFinished(next.target_library_id);
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : "转移失败，请稍后重试");
     } finally {
