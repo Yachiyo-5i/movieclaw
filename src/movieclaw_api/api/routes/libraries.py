@@ -44,6 +44,8 @@ from movieclaw_api.schemas.library import (
     OrganizeSidecarView,
     OrganizeSkipView,
     OrganizeStartView,
+    PathReconcilePayload,
+    PathReconcilePreviewView,
     RedownloadPayload,
     RefreshActiveView,
     ReidentifyGroupView,
@@ -106,6 +108,7 @@ from movieclaw_api.services.library.scan import (
     enqueue_scan_job,
     last_scan,
     preview_reidentify,
+    preview_root_path_reconcile,
     reidentify_item,
     request_stop_scan,
     scan_progress,
@@ -234,6 +237,9 @@ def _last_scan_view(library_id: int) -> LastScanView | None:
         unidentified=summary.unidentified,
         marked_missing=summary.marked_missing,
         cleared_missing=summary.cleared_missing,
+        removed_root_marked_missing=summary.removed_root_marked_missing,
+        removed_root_cleared=summary.removed_root_cleared,
+        removed_root_conflicts=summary.removed_root_conflicts,
         deferred=summary.deferred,
         retried=summary.retried,
         cancelled=summary.cancelled,
@@ -259,6 +265,9 @@ def _job_last_scan_view(job: Job) -> LastScanView | None:
         unidentified=int(payload.get("unidentified") or 0),
         marked_missing=int(payload.get("marked_missing") or 0),
         cleared_missing=int(payload.get("cleared_missing") or 0),
+        removed_root_marked_missing=int(payload.get("removed_root_marked_missing") or 0),
+        removed_root_cleared=int(payload.get("removed_root_cleared") or 0),
+        removed_root_conflicts=int(payload.get("removed_root_conflicts") or 0),
         deferred=int(payload.get("deferred") or 0),
         retried=int(payload.get("retried") or 0),
         cancelled=job.status is JobStatus.CANCELLED or bool(payload.get("cancelled")),
@@ -1114,6 +1123,100 @@ async def start_scan(
         ),
         message=(
             f"已开始扫描「{library.name}」，可在任务中心继续观察"
+            if created.created
+            else f"「{library.name}」的扫描已在任务中心进行中"
+        ),
+    )
+
+
+def _normalise_reconcile_root(path: str) -> str:
+    """校验管理员修复入口的绝对根路径，保持与媒体库配置相同的尾斜杠语义。"""
+    cleaned = path.strip()
+    if not cleaned.startswith("/"):
+        raise BadRequestException(f"根路径必须是绝对路径：{path}")
+    return cleaned if cleaned == "/" else cleaned.rstrip("/")
+
+
+def _validated_reconcile_roots(
+    library,
+    payload: PathReconcilePayload,
+) -> tuple[str, str]:
+    """确保历史修复不会把仍在配置中的根误当成旧根，也不扫描任意目录。"""
+    old_root = _normalise_reconcile_root(payload.old_root)
+    new_root = _normalise_reconcile_root(payload.new_root)
+    current_roots = {_normalise_reconcile_root(root) for root in library.root_paths}
+    if old_root in current_roots:
+        raise BadRequestException("旧根路径仍在当前媒体库配置中，不能作为已移除根修复")
+    if new_root not in current_roots:
+        raise BadRequestException("目标根路径必须是当前媒体库已配置的根路径")
+    return old_root, new_root
+
+
+@router.post(
+    "/{library_id}/path-reconcile/preview",
+    response_model=ApiResponse[PathReconcilePreviewView],
+    summary="预览历史根路径迁移修复（只读，不扫描、不修改台账）",
+    operation_id="lib.path-reconcile-preview",
+    dependencies=[Depends(require_admin)],
+    # CLI 必须经精选层的「预览 → --yes」工作流，不能让生成命令绕过确认。
+    openapi_extra={"x-cli-hidden": True},
+)
+async def preview_path_reconcile(
+    library_id: int,
+    payload: PathReconcilePayload,
+    session: AsyncSession = Depends(get_session),
+) -> ApiResponse[PathReconcilePreviewView]:
+    """让管理员在执行历史台账收口前确认影响面；预览绝不操作磁盘或数据库。"""
+    service = LibraryConfigService(session)
+    library = await service.get(library_id)
+    old_root, new_root = _validated_reconcile_roots(library, payload)
+    preview = await preview_root_path_reconcile(
+        session, library, old_root=old_root, new_root=new_root
+    )
+    return ok(PathReconcilePreviewView(**preview.__dict__))
+
+
+@router.post(
+    "/{library_id}/path-reconcile",
+    response_model=ApiResponse[ScanResultView],
+    summary="执行历史根路径迁移修复（重新扫描新根并收口旧路径台账）",
+    operation_id="lib.path-reconcile-start",
+    dependencies=[Depends(require_admin)],
+    openapi_extra={
+        "x-cli-job": {"id_path": "job_id", "wait_op": "jobs.wait"},
+        "x-cli-hidden": True,
+    },
+    status_code=202,
+)
+async def start_path_reconcile(
+    library_id: int,
+    payload: PathReconcilePayload,
+    client_name: str | None = Header(default=None, alias="X-MovieClaw-Client"),
+    session: AsyncSession = Depends(get_session),
+) -> ApiResponse[ScanResultView]:
+    """通过持久化扫描作业执行修复，复用库锁且可在任务中心观察或停止。"""
+    service = LibraryConfigService(session)
+    library = await service.get(library_id)
+    old_root, new_root = _validated_reconcile_roots(library, payload)
+    await _assert_not_busy(session, library.name, library_id)
+    created = await enqueue_scan_job(
+        session,
+        library_id,
+        library.name,
+        origin=_job_origin(client_name),
+        reconcile_root_change=True,
+        previous_root_paths=[old_root],
+        reconcile_new_root_paths=[new_root],
+    )
+    return ok(
+        ScanResultView(
+            started=True,
+            message=f"已开始修复「{library.name}」的历史根路径台账",
+            job_id=created.job.id,
+            created=created.created,
+        ),
+        message=(
+            "已开始重新扫描并收口旧路径台账；仅修改数据库记录，不会删除磁盘文件"
             if created.created
             else f"「{library.name}」的扫描已在任务中心进行中"
         ),

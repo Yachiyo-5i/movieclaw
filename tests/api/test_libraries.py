@@ -213,6 +213,80 @@ def test_update_root_scan_receives_previous_roots(client, monkeypatch) -> None:
     ]
 
 
+def test_path_reconcile_preview_and_start_require_removed_and_current_roots(
+    client, monkeypatch
+) -> None:
+    """历史修复先只读预览，确认后才创建带旧/新根范围的扫描作业。"""
+    from movieclaw_api.api.routes import libraries as library_routes
+    from movieclaw_api.services.library.scan import RootPathReconcilePreview
+
+    library_id = _create(client, name="电影库", kind="movie", root="/media/movies")["id"]
+    preview_calls: list[tuple[int, str, str]] = []
+    enqueue_calls: list[tuple[int, str, dict]] = []
+
+    async def fake_preview(session, library, *, old_root: str, new_root: str):  # noqa: ANN001
+        del session
+        preview_calls.append((library.id, old_root, new_root))
+        return RootPathReconcilePreview(
+            library_id=library.id,
+            old_root=old_root,
+            new_root=new_root,
+            same_path_candidates=3,
+            safe_merges=2,
+            marked_missing=1,
+            old_rows_to_delete_from_ledger=2,
+        )
+
+    class Created:
+        created = True
+
+        class job:
+            id = "path-reconcile-job"
+
+    async def fake_enqueue(_session, library_id: int, library_name: str, **kwargs) -> Created:  # noqa: ANN003
+        enqueue_calls.append((library_id, library_name, kwargs))
+        return Created()
+
+    async def fake_assert_not_busy(_session, _library_name: str, _library_id: int) -> None:  # noqa: ANN001
+        # 建库会自动排入一条普通扫描；这里隔离它，专项只验证修复入口本身
+        # 会走同一个锁检查（生产中不会绕过）。
+        return None
+
+    monkeypatch.setattr(library_routes, "preview_root_path_reconcile", fake_preview)
+    monkeypatch.setattr(library_routes, "enqueue_scan_job", fake_enqueue)
+    monkeypatch.setattr(library_routes, "_assert_not_busy", fake_assert_not_busy)
+    payload = {"old_root": "/strm/movies/", "new_root": "/media/movies/"}
+
+    preview = client.post(f"/api/v1/libraries/{library_id}/path-reconcile/preview", json=payload)
+    assert preview.status_code == 200
+    assert preview.json()["data"]["safe_merges"] == 2
+    assert preview.json()["data"]["disk_files_to_delete"] == 0
+    assert preview_calls == [(library_id, "/strm/movies", "/media/movies")]
+
+    started = client.post(f"/api/v1/libraries/{library_id}/path-reconcile", json=payload)
+    assert started.status_code == 202
+    assert started.json()["data"]["job_id"] == "path-reconcile-job"
+    assert enqueue_calls == [
+        (
+            library_id,
+            "电影库",
+            {
+                "origin": "web",
+                "reconcile_root_change": True,
+                "previous_root_paths": ["/strm/movies"],
+                "reconcile_new_root_paths": ["/media/movies"],
+            },
+        )
+    ]
+
+    invalid = client.post(
+        f"/api/v1/libraries/{library_id}/path-reconcile/preview",
+        json={"old_root": "/media/movies", "new_root": "/media/movies"},
+    )
+    assert invalid.status_code == 400
+    assert "仍在当前媒体库配置" in invalid.json()["message"]
+
+
 def test_delete_default_hands_over_within_kind(client) -> None:
     tv_default = _create(client, name="剧集库", kind="tv", root="/media/tv")
     anime = _create(client, name="动漫库", kind="tv", root="/media/anime")
