@@ -471,7 +471,7 @@ async def test_manual_download_identity_claim_via_info_hash(db, tmp_path, monkey
 
 @pytest.mark.asyncio
 async def test_probe_gate_applies_per_file(db, tmp_path, monkeypatch):
-    """探测门禁逐文件生效：季包里残缺的单集被拦下，完整的集照常入库。"""
+    """季包部分探测失败：完整集照常入库，但条目保留 failed 供自动重试。"""
     root, watch = tmp_path / "tv", tmp_path / "watch"
     watch.mkdir()
     library_id = await _make_library(db, kind=MediaKind.TV, root=root)
@@ -498,9 +498,103 @@ async def test_probe_gate_applies_per_file(db, tmp_path, monkeypatch):
     assert not (season_dir / "测试剧集 (2024) - S01E02.mkv").exists()
     async with db.session() as session:
         record = (await session.execute(select(IngestEntry))).scalar_one()
-    assert record.status == IngestStatus.IMPORTED
+    assert record.status == IngestStatus.FAILED
     assert record.imported_count == 1
     assert "探测失败" in (record.message or "")
+
+
+@pytest.mark.asyncio
+async def test_partial_episode_parse_stays_pending(db, tmp_path, monkeypatch):
+    """季包部分解析失败不能冒充完整入库；已成功的文件仍保留且累计。"""
+    root, watch = tmp_path / "tv", tmp_path / "watch"
+    watch.mkdir()
+    library_id = await _make_library(db, kind=MediaKind.TV, root=root)
+    item = await _make_item(db, kind=MediaKind.TV, title="测试剧集", year=2024)
+    _stub_identify(monkeypatch, item)
+    monkeypatch.setattr(ingest_mod, "probe_media", lambda _path: _FAKE_SPEC)
+    monkeypatch.setattr(
+        ingest_mod,
+        "_unit",
+        lambda file, _entry: (1, 1) if file.stem == "ep1" else (1, 0),
+    )
+
+    entry = watch / "测试剧集 S01"
+    entry.mkdir()
+    (entry / "ep1.mkv").write_bytes(b"episode-1")
+    (entry / "ep2.mkv").write_bytes(b"episode-2")
+
+    await _sweep_twice(db, library_id, watch)
+
+    season_dir = root / "测试剧集 (2024)" / "Season 01"
+    assert (season_dir / "测试剧集 (2024) - S01E01.mkv").exists()
+    assert not (season_dir / "测试剧集 (2024) - S01E02.mkv").exists()
+    async with db.session() as session:
+        record = (await session.execute(select(IngestEntry))).scalar_one()
+    assert record.status == IngestStatus.PENDING
+    assert record.imported_count == 1
+    assert "硬链接 1 个文件" in (record.message or "")
+    assert "ep2.mkv」解析不出集号，未入库" in (record.message or "")
+
+
+@pytest.mark.asyncio
+async def test_upgrade_retries_legacy_partial_import_through_job(db, tmp_path, monkeypatch):
+    """旧版误标 imported 的部分入库记录在升级补扫后新建 Job，并补齐漏集。"""
+    root, watch = tmp_path / "tv", tmp_path / "watch"
+    watch.mkdir()
+    library_id = await _make_library(db, kind=MediaKind.TV, root=root)
+    await _make_rule(db, library_id=library_id, source=watch)
+    item = await _make_item(db, kind=MediaKind.TV, title="测试剧集", year=2024)
+    _stub_identify(monkeypatch, item)
+    monkeypatch.setattr(ingest_mod, "probe_media", lambda _path: _FAKE_SPEC)
+
+    parser_ready = False
+
+    def parse_unit(file, _entry):
+        if file.stem == "ep1" or parser_ready:
+            return 1, int(file.stem.removeprefix("ep"))
+        return 1, 0
+
+    async def no_assets(_media_item_id: int) -> None:
+        return None
+
+    monkeypatch.setattr(ingest_mod, "_unit", parse_unit)
+    monkeypatch.setattr("movieclaw_api.services.media_scrape.ensure_assets", no_assets)
+
+    entry = watch / "测试剧集 S01"
+    entry.mkdir()
+    (entry / "ep1.mkv").write_bytes(b"episode-1")
+    (entry / "ep2.mkv").write_bytes(b"episode-2")
+
+    # 先用当前语义制造“成功一集、漏一集”的真实台账，再改成旧版错误状态。
+    await _sweep_twice(db, library_id, watch)
+    async with db.session() as session:
+        record = (await session.execute(select(IngestEntry))).scalar_one()
+        assert record.status == IngestStatus.PENDING
+        record.status = IngestStatus.IMPORTED
+        await session.commit()
+
+    parser_ready = True
+    async with db.session() as session:
+        rule = (await session.execute(select(ImportWatch))).scalar_one()
+        library = await session.get(Library, library_id)
+        assert library is not None
+    await ingest_mod._sweep_dir(rule, library)
+    await ingest_mod._sweep_dir(rule, library)
+
+    async with db.session() as session:
+        job = (await session.execute(select(Job))).scalar_one()
+    assert job.handler_revision == ingest_mod._INGEST_HANDLER_REVISION
+    await jobs.init_job_dispatcher(max_parallel=1)
+    await _wait_job_status(job.id, JobStatus.SUCCEEDED)
+
+    season_dir = root / "测试剧集 (2024)" / "Season 01"
+    assert (season_dir / "测试剧集 (2024) - S01E01.mkv").exists()
+    assert (season_dir / "测试剧集 (2024) - S01E02.mkv").exists()
+    async with db.session() as session:
+        record = (await session.execute(select(IngestEntry))).scalar_one()
+    assert record.status == IngestStatus.IMPORTED
+    assert record.imported_count == 2
+    assert "解析不出" not in (record.message or "")
 
 
 @pytest.mark.asyncio
@@ -843,6 +937,75 @@ async def test_pending_ingest_claim_unblocks_same_job(db, tmp_path, monkeypatch)
     completed = await _wait_job_status(job.id, JobStatus.SUCCEEDED)
     assert completed.id == job.id
     assert (root / "认领后入库 (2026)" / "认领后入库 (2026).mkv").exists()
+
+
+@pytest.mark.asyncio
+async def test_upgrade_unblocks_old_revision_parser_gap_job(db, tmp_path, monkeypatch):
+    """旧处理器因季集解析挂起的 Job，升级后只唤醒原 Job，不制造重复任务。"""
+    root, watch = tmp_path / "tv", tmp_path / "watch"
+    watch.mkdir()
+    library_id = await _make_library(db, kind=MediaKind.TV, root=root)
+    await _make_rule(db, library_id=library_id, source=watch)
+    item = await _make_item(db, kind=MediaKind.TV, title="补偿剧集", year=2026)
+    _stub_identify(monkeypatch, item)
+    monkeypatch.setattr(ingest_mod, "probe_media", lambda _path: _FAKE_SPEC)
+
+    parser_ready = False
+
+    def parse_unit(file, _entry):
+        if file.stem == "ep1" or parser_ready:
+            return 1, int(file.stem.removeprefix("ep"))
+        return 1, 0
+
+    async def no_assets(_media_item_id: int) -> None:
+        return None
+
+    monkeypatch.setattr(ingest_mod, "_unit", parse_unit)
+    monkeypatch.setattr("movieclaw_api.services.media_scrape.ensure_assets", no_assets)
+
+    entry = watch / "补偿剧集 S01"
+    entry.mkdir()
+    (entry / "ep1.mkv").write_bytes(b"episode-1")
+    (entry / "ep2.mkv").write_bytes(b"episode-2")
+    async with db.session() as session:
+        rule = (await session.execute(select(ImportWatch))).scalar_one()
+        library = await session.get(Library, library_id)
+        assert library is not None
+    await ingest_mod._sweep_dir(rule, library)
+    await ingest_mod._sweep_dir(rule, library)
+
+    async with db.session() as session:
+        job = (await session.execute(select(Job))).scalar_one()
+    await jobs.init_job_dispatcher(max_parallel=1)
+    blocked = await _wait_job_status(job.id, JobStatus.BLOCKED)
+    assert blocked.error["code"] == "INGEST_EPISODE_PARSE_REQUIRED"
+
+    await ingest_mod._sweep_dir(rule, library)
+    async with db.session() as session:
+        unchanged = await session.get(Job, job.id)
+        assert unchanged is not None
+        assert unchanged.status == JobStatus.BLOCKED
+        assert unchanged.handler_revision == ingest_mod._INGEST_HANDLER_REVISION
+
+    # 模拟解析能力升级：旧 revision 的 blocked Job 应原地恢复；同一 revision
+    # 后续再扫只会短路，避免每次启动都重新跑一遍。
+    async with db.session() as session:
+        stored = await session.get(Job, job.id)
+        assert stored is not None
+        stored.handler_revision = "library.ingest.v1"
+        await session.commit()
+    parser_ready = True
+    await ingest_mod._sweep_dir(rule, library)
+    completed = await _wait_job_status(job.id, JobStatus.SUCCEEDED)
+    assert completed.id == job.id
+
+    async with db.session() as session:
+        all_jobs = list((await session.execute(select(Job))).scalars())
+        record = (await session.execute(select(IngestEntry))).scalar_one()
+    assert len(all_jobs) == 1
+    assert record.status == IngestStatus.IMPORTED
+    assert record.imported_count == 2
+    assert (root / "补偿剧集 (2026)" / "Season 01" / "补偿剧集 (2026) - S01E02.mkv").exists()
 
 
 @pytest.mark.asyncio
