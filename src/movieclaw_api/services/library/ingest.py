@@ -41,8 +41,10 @@
   驱动的重试有意义，小时级退避 + 告警；告警按**源目录聚合**成一条
   （"某目录 N 个条目失败"），逐条目刷红灯在存量场景是灾难；
 - **部分入库不冒充完成**：季包只要还有文件因季集解析失败而跳过，就保留
-  pending；只要还有探测/搬运故障，就保留 failed。升级后的首轮补扫会自动
-  重试旧版误标成 imported 的同类记录，正常完成记录仍按指纹短路；
+  pending；只要还有探测/搬运故障，就保留 failed。升级（代码或 NER 模型
+  任一半，见 _ingest_handler_revision）后的首轮补扫会自动重试旧版误标成
+  imported 的同类记录，正常完成记录仍按指纹短路；有过成功搬运的自定义
+  目录记录不自动补偿（重复上传风险，见 _parser_gap_auto_retry）；
 - 识别顺序：订阅工单认领（info_hash）→ NFO 身份声明（第三方整理过的
   内容常自带 tmdbid，与扫描器同一解析器）→ 名称解析 + TMDB 收敛。
 
@@ -144,6 +146,7 @@ from movieclaw_db.models.scheduled_task import TriggerType
 from movieclaw_db.repositories.library_file_repo import LibraryFileRepository
 from movieclaw_db.repositories.library_repo import LibraryRepository
 from movieclaw_enrich import enrich
+from movieclaw_enrich.inference import model_release_tag
 from movieclaw_media.models import MediaKind
 from movieclaw_scheduler.registry import register_task
 
@@ -168,6 +171,20 @@ _INGEST_COPY_CHUNK_BYTES = 64 * 1024 * 1024
 # Job 处理逻辑修订号不仅用于审计，也作为“升级后是否值得自动重试”的边界。
 # 修改季集解析/部分入库收口逻辑时必须递增；同一修订内的待处理条目不反复重跑。
 _INGEST_HANDLER_REVISION = "library.ingest.v3"
+
+
+def _ingest_handler_revision() -> str:
+    """当前入库处理能力的完整修订号：代码修订 + NER 模型版本。
+
+    季集解析能力一半在代码、一半在独立发布的 NER 模型（设置页可单独一键
+    更新模型，tag 形如 torrent-ner-vN）——只有两者拼在一起才能回答"这条
+    记录值不值得再试一次"。只用代码常量会漏掉纯模型升级：用户先装新镜像
+    （补偿机会当场消耗、任务重新 blocked）再更新模型时就永远不会重试了。
+    模型更新必须全量重启才生效，读到的 tag 在进程生命周期内不变。
+    """
+    tag = model_release_tag()
+    return f"{_INGEST_HANDLER_REVISION}+{tag}" if tag else _INGEST_HANDLER_REVISION
+
 
 # v0.10.0 以前，季包只要成功搬运一个文件就会被记成 imported，即使 message
 # 已明确写着其余文件因季集号解析失败而未入库。保留稳定中文片段用于识别这类
@@ -208,6 +225,21 @@ class IngestSourceChanged(Exception):
 def _has_parser_gap(record: IngestEntry | None) -> bool:
     """台账是否仍有因季集解析失败而未入库的文件。"""
     return bool(record and any(marker in (record.message or "") for marker in _PARSER_GAP_MARKERS))
+
+
+def _parser_gap_auto_retry(rule: ImportWatch, record: IngestEntry | None) -> bool:
+    """升级补偿能否自动重跑该记录（区别于用户主动重试）。
+
+    库目标靠落点文件天然幂等（同内容已在库的搬运会静默短路），可放心自动
+    重跑；自定义目录（中转）无法按落点去重——此前搬运过、已被外部工具
+    消费（上传后删除）但尚未回流入库的文件会被重新搬进中转、重复上传。
+    因此有过成功搬运的中转记录不自动补偿（保持升级前的状态，用户改名/
+    恢复时自行触发重跑）；从未搬运过文件的中转记录没有这个风险，照常补偿。
+    """
+    if not _has_parser_gap(record):
+        return False
+    assert record is not None
+    return rule.target_path is None or not record.imported_count
 
 
 @dataclass
@@ -429,7 +461,7 @@ async def enqueue_ingest_job(
         resources=resources,
         dedupe_key=_ingest_dedupe_key(str(entry)),
         conflict_policy="return_existing",
-        handler_revision=_INGEST_HANDLER_REVISION,
+        handler_revision=_ingest_handler_revision(),
         # 下载落地后的环境故障按小时退避；给足一天自动自愈窗口，超过后
         # 明确失败等待用户处理，不能无限占住活跃任务。
         max_attempts=24,
@@ -889,6 +921,60 @@ async def _deferred_flipped(prefix: str) -> bool:
     return False
 
 
+async def _maybe_wake_blocked_job(
+    session,
+    entry: Path,
+    record: IngestEntry | None,
+    job,
+    parser_retry: bool,
+) -> None:
+    """blocked 任务等的是人，也等两种系统输入变化，各自到来时原地唤醒：
+
+    1. **解析能力升级**（代码或 NER 模型任一半更新，见 _ingest_handler_revision）：
+       同一修订号只唤醒一次，避免每轮巡检/每次重启反复消耗 NAS IO；
+    2. **条目内容变化**（用户换上修好的文件 / 季包补了新集）：blocked 前
+       落账的指纹与当前快照不一致即唤醒——任务化之前这类记录靠指纹对比
+       自动重入库，blocked 挡在快照之前会把这条承诺变成空话。
+       唤醒只是重新入队，任务自己会重新走完成检测（下载中标记/静默窗口/
+       下载器状态），不会复制在途文件。
+
+    快照成本与任务化之前巡检对待处理记录的树遍历相当，且只发生在本就被
+    事件/兜底触发的巡检里，不新增主动扫描。
+    """
+    if parser_retry and job.handler_revision != _ingest_handler_revision():
+        # 旧处理器因季集解析能力不足而 blocked：新能力只自动唤醒一次。
+        job.handler_revision = _ingest_handler_revision()
+        await jobs.retry_job(
+            session,
+            job,
+            actor_kind="system",
+            actor_name="MovieClaw 升级补偿",
+            origin="system",
+        )
+        logger.info("升级后重新尝试部分入库条目：%s（job=%s）", entry.name, job.id)
+        return
+    if "ready_files" in (job.input_data or {}):
+        # 文件级批次作业的输入钉死了白名单，其 ready: 指纹与全树指纹永不
+        # 相等——按指纹对比唤醒只会让它反复按旧白名单重跑再挂起（无限
+        # 唤醒）。批次挂起的解锁只走上面的解析能力升级或人工处理。
+        return
+    snap = await asyncio.to_thread(_snapshot, entry)
+    blocked_fingerprint = (
+        record.fingerprint
+        if record is not None
+        else str(job.input_data.get("detected_fingerprint") or "")
+    )
+    if blocked_fingerprint and snap.fingerprint != blocked_fingerprint:
+        await jobs.retry_job(
+            session,
+            job,
+            actor_kind="system",
+            actor_name="监听导入巡检",
+            origin="system",
+        )
+        logger.info("监听条目内容变化，重新唤醒等待中的任务：%s（job=%s）", entry.name, job.id)
+
+
 async def _process_entry(
     rule: ImportWatch,
     library: Library | None,
@@ -950,26 +1036,12 @@ async def _process_entry(
             _failed_retry.pop(path_str, None)  # 失败后被人工忽略：不再退避重试
             return  # 用户拍板（或存量基线）永久忽略：指纹变化也不复活，恢复走接口
         latest_job = None if execute_inline else await _latest_ingest_job(session, path_str)
-        parser_retry = _has_parser_gap(record)
+        parser_retry = _parser_gap_auto_retry(rule, record)
         if latest_job is not None and latest_job.status in ACTIVE_JOB_STATUSES:
-            if (
-                parser_retry
-                and latest_job.status == JobStatus.BLOCKED
-                and latest_job.handler_revision != _INGEST_HANDLER_REVISION
-            ):
-                # 旧处理器因季集解析能力不足而 blocked：新版本只自动唤醒一次。
-                # 同修订号不重跑，避免每轮巡检/每次重启反复消耗 NAS IO。
-                latest_job.handler_revision = _INGEST_HANDLER_REVISION
-                await jobs.retry_job(
-                    session,
-                    latest_job,
-                    actor_kind="system",
-                    actor_name="MovieClaw 升级补偿",
-                    origin="system",
-                )
-                logger.info("升级后重新尝试部分入库条目：%s（job=%s）", entry.name, latest_job.id)
-            # Job 已接管后不再反复遍历条目树；运行、等待重试与待人工认领
-            # 都以统一状态机为事实源，巡检只负责发现新的内容变化。
+            if latest_job.status == JobStatus.BLOCKED:
+                await _maybe_wake_blocked_job(session, entry, record, latest_job, parser_retry)
+            # Job 已接管后不再反复遍历条目树（blocked 例外，见唤醒助手）；
+            # 运行、等待重试与待人工认领都以统一状态机为事实源。
             _stability.pop(path_str, None)
             if partial_batch is None:
                 _deferred.pop(path_str, None)
@@ -1004,14 +1076,17 @@ async def _process_entry(
         if record is not None and record.fingerprint == snap.fingerprint:
             if record.status != IngestStatus.FAILED and not parser_retry:
                 return  # 已处理且没变化（pending 等的是人工拍板，不是时间）
-            if parser_retry:
+            if record.status == IngestStatus.FAILED:
+                elapsed = (utcnow() - record.attempted_at).total_seconds()
+                if elapsed < FAILED_RETRY_SECONDS:
+                    # 环境故障退避中。进程重启会丢失失败重试表——在此按已过的
+                    # 退避时间补记，保证退避到点仍有第三唤醒源接得住
+                    _failed_retry.setdefault(path_str, time.monotonic() - elapsed)
+                    return
+            elif parser_retry:
+                # 只在真正决定重跑时说话：FAILED 记录本来就按小时退避重试，
+                # 不属于升级补偿，不能让退避中的新记录每轮巡检都刷这条日志
                 logger.info("升级后重新检查旧版部分入库记录：%s", entry.name)
-            elapsed = (utcnow() - record.attempted_at).total_seconds()
-            if record.status == IngestStatus.FAILED and elapsed < FAILED_RETRY_SECONDS:
-                # 环境故障退避中。进程重启会丢失失败重试表——在此按已过的
-                # 退避时间补记，保证退避到点仍有第三唤醒源接得住
-                _failed_retry.setdefault(path_str, time.monotonic() - elapsed)
-                return
 
         if verdict == "complete" or partial_batch is not None:
             # 下载器确认完成：整种或单文件证据都跳过静默窗口，立即处理。
@@ -1513,9 +1588,15 @@ async def _ingest_entry(
         return await conclude(status, message, imported)
     elif notes:
         # 一个文件都没进：环境故障退避重试；纯解析问题进待处理等人拍板/改名
-        return await conclude(
-            IngestStatus.FAILED if env_error else IngestStatus.PENDING, "；".join(notes)
-        )
+        message = "；".join(notes)
+        if record is not None and record.imported_count:
+            # 重跑零新增（此前搬运过的文件都在原位被幂等短路，不计数）时
+            # 不能丢掉已入库事实：message 是台账里唯一的人读摘要，只剩失败
+            # 说明会让用户误以为整个条目一无所成
+            message = (
+                f"已识别为《{item.title}》，此前已入库 {record.imported_count} 个文件；{message}"
+            )
+        return await conclude(IngestStatus.FAILED if env_error else IngestStatus.PENDING, message)
     elif skipped_owned:
         # 自定义目录条目的全部单元都已回流入库：链路闭环完成，不再搬运
         return await conclude(IngestStatus.IMPORTED, f"《{item.title}》的内容已在媒体库，无需整理")
@@ -2158,7 +2239,9 @@ async def _execute_ingest_job(
             }
         if record is not None and record.fingerprint == snap.fingerprint:
             await _attach_ingest_entry_resource(context, record)
-            parser_retry = _has_parser_gap(record)
+            # 中转记录的补偿限制见 _parser_gap_auto_retry；被限制的记录在此
+            # 照旧短路/挂起，等用户改名或恢复时以新指纹走完整重跑
+            parser_retry = _parser_gap_auto_retry(rule, record)
             if record.status in {IngestStatus.IMPORTED, IngestStatus.SKIPPED} and not parser_retry:
                 return {
                     "message": record.message or "监听条目已处理",
@@ -2170,13 +2253,16 @@ async def _execute_ingest_job(
                 and record.claimed_tmdb_id is None
                 and not parser_retry
             ):
+                parser_gap = _has_parser_gap(record)
                 raise jobs.JobBlocked(
                     record.message or "无法自动识别该条目，请到监听导入清单认领",
-                    code="INGEST_IDENTITY_REQUIRED",
+                    code="INGEST_EPISODE_PARSE_REQUIRED"
+                    if parser_gap
+                    else "INGEST_IDENTITY_REQUIRED",
                     actions=[
                         {
                             "type": "open_settings",
-                            "label": "去监听导入认领",
+                            "label": "查看监听导入" if parser_gap else "去监听导入认领",
                             "target": "import-watch",
                         }
                     ],

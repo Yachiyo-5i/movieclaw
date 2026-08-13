@@ -54,6 +54,21 @@ _NUMERIC_FIELDS = {"YEAR", "SEASON", "EPISODE", "EPISODE_TOTAL"}
 _RANGE_GAP_RE = re.compile(r"[\s\-~至到]{1,2}[SsEePp]{0,2}")
 
 
+def model_release_tag() -> str | None:
+    """当前生效 NER 模型的 Release tag（如 ``torrent-ner-v2``）。
+
+    读模型目录里的 ``.release-tag`` 记录（镜像构建与应用内模型更新都会写入）；
+    老部署没有该文件时返回 None。模型更新必须全量重启才生效，因此进程
+    生命周期内该值不变，调用方可放心当常量使用。
+    """
+    model_dir = Path(os.environ.get("MOVIECLAW_NER_DIR", "data/models/torrent-ner"))
+    try:
+        tag = (model_dir / ".release-tag").read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return tag or None
+
+
 def _normalize_spans(spans: list[tuple], texts: tuple[str, str]) -> list[tuple]:
     """号码类 span 的规范化：修复模型把一个号码表达切碎的两种形态。
 
