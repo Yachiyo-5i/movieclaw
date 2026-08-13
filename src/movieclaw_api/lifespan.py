@@ -108,10 +108,11 @@ def build_lifespan(settings: Settings):
 
         await rebuild_agent_session_index()
         # 扩充属性重算：提取器升级（ENRICH_VERSION +1）后，把存量种子行按新
-        # 逻辑重算——纯本地推导秒级完成，失败不阻断启动（内部自吞异常）
-        from movieclaw_api.services.enrich_backfill import reenrich_stale_torrents
+        # 逻辑重算。enrich 含 NER 推理，大库重算可达分钟级——排成后台任务，
+        # 不占启动就绪窗口（硬约束与并发权衡见 enrich_backfill 模块注释）
+        from movieclaw_api.services.enrich_backfill import start_enrich_backfill
 
-        await reenrich_stale_torrents()
+        start_enrich_backfill()
         # 旧版更新提醒清场：更新提醒曾写进「待处理事项」，现已改为侧栏常驻徽标，
         # 存量告警行再无任何路径去消退它，会永远挂在告警面板上（见函数注释）
         from movieclaw_api.services.app_update import (
@@ -220,6 +221,10 @@ def build_lifespan(settings: Settings):
             await close_job_dispatcher()
             # 先停止 Agent，避免它在下游 HTTP 客户端和数据库开始释放后继续工作。
             await close_agent_run_registry()
+            # 取消后台的扩充属性重算（须在数据库释放前；已提交批次保留，下次续算）
+            from movieclaw_api.services.enrich_backfill import close_enrich_backfill
+
+            await close_enrich_backfill()
             if settings.scheduler_enabled:
                 from movieclaw_api.services.app_update import close_startup_check
 
