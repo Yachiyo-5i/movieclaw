@@ -107,3 +107,32 @@ async def test_backfill_reenriches_stale_rows(db):
 
     # 幂等：再跑一遍没有可重算的行
     assert await reenrich_stale_torrents() == 0
+
+
+async def test_backfill_offloads_enrich_to_worker_thread(db, monkeypatch):
+    """重算的模型推理必须在工作线程执行——enrich 含同步 NER 推理，大库重算
+    在事件循环里跑会长时间卡住健康检查（重算已改为启动后的后台任务）。"""
+    import threading
+
+    import movieclaw_api.services.enrich_backfill as backfill
+
+    caller_thread = threading.get_ident()
+    worker_threads: list[int] = []
+    real_enrich = backfill.enrich
+
+    def spy_enrich(title, subtitle="", category=None):
+        worker_threads.append(threading.get_ident())
+        return real_enrich(title, subtitle, category)
+
+    monkeypatch.setattr(backfill, "enrich", spy_enrich)
+
+    async with db.session() as session:
+        session.add(SiteTorrent(
+            site_id="demo", torrent_id="stale1", source=TorrentSource.LIST,
+            title="Dune.2021.1080p.BluRay.x265-WiKi",
+        ))
+        await session.commit()
+
+    assert await reenrich_stale_torrents() == 1
+    assert worker_threads
+    assert all(thread_id != caller_thread for thread_id in worker_threads)
