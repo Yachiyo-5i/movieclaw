@@ -86,6 +86,7 @@ export function useMediaDetail(): MediaDetailNav {
           source === "douban"
             ? (`/media/douban/${item.id}` as Route)
             : (`/media/${item.type}/${item.id}` as Route),
+          { scroll: false },
         );
       },
       close() {

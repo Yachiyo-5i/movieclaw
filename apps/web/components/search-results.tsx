@@ -27,6 +27,7 @@ import { getSubscription, grabForSubscription } from "@/lib/api/subscriptions";
 import { cachedImageUrl } from "@/lib/image-proxy";
 import { usePermissions } from "@/lib/permissions";
 import { formatDateTime, formatRelativeTime } from "@/lib/time";
+import { useScrollRestoration } from "@/lib/use-scroll-restoration";
 
 /**
  * 搜索结果页（主内容区）——消费 SSE 流式搜索，结果渐进渲染。
@@ -617,6 +618,9 @@ function collectEntities(items: TorrentHit[]): Map<string, EntityGroup> {
 }
 
 export function SearchResults({ query, onResearch, grabForSubscriptionId }: SearchResultsProps) {
+  const scrollRef = useScrollRestoration(
+    `search:torrent:${query.keyword}:${query.scope.label ?? "all"}:${query.scope.categories.join(",")}:${query.scope.siteIds.join(",")}:${query.snapshotId ?? "live"}`,
+  );
   const [phase, setPhase] = useState<Phase>("connecting");
   // 手动选种模式：拉一次订阅标题供横幅与按钮提示；订阅不存在则静默退出该模式
   const [grabTarget, setGrabTarget] = useState<{ id: number; title: string } | null>(null);
@@ -1056,7 +1060,10 @@ export function SearchResults({ query, onResearch, grabForSubscriptionId }: Sear
       </header>
 
       {/* 主体：结果随 site_result 事件渐进出现，首批结果到达前保持骨架屏 */}
-      <div className="scroll-thin scroll-safe relative z-0 min-h-0 flex-1 overflow-y-auto px-6 pb-6 max-md:px-4">
+      <div
+        ref={scrollRef}
+        className="scroll-thin scroll-safe relative z-0 min-h-0 flex-1 overflow-y-auto px-6 pb-6 max-md:px-4"
+      >
         {streaming && items.length === 0 && (
           <SkeletonList siteCount={siteProgress.length} />
         )}

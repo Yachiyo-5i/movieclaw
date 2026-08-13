@@ -164,6 +164,7 @@ export function PosterCardVisual({
     return (
       <Link
         href={href}
+        scroll={false}
         ref={rootRef as React.Ref<HTMLAnchorElement>}
         {...tapGuard}
         onClick={onLinkClick}
