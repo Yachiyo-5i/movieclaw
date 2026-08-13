@@ -172,6 +172,31 @@ def test_search_rejects_invalid_category(client: TestClient) -> None:
     assert r.status_code == 422
 
 
+async def test_search_offloads_enrichment_to_worker_thread(monkeypatch) -> None:
+    """单站结果的扩充必须在工作线程执行——enrich 含同步 NER 推理，在事件循环
+    里内联算会卡住 SSE 流、健康检查与其它并发请求（口径与种子同步侧一致）。"""
+    import threading
+
+    caller_thread = threading.get_ident()
+    worker_threads: list[int] = []
+    real_enrich = site_search.enrich
+
+    def spy_enrich(title, subtitle="", category=None):
+        worker_threads.append(threading.get_ident())
+        return real_enrich(title, subtitle, category)
+
+    monkeypatch.setattr(site_search, "enrich", spy_enrich)
+    fake_sites = {"mteam": _FakeSite(items=[_item("m1", "沙丘"), _item("m2", "沙丘2")])}
+    monkeypatch.setattr(site_search, "get_site_access", lambda: _FakeManager(fake_sites))
+
+    hits, status = await site_search._search_one(_Cred("mteam"), SearchQuery(keyword="沙丘"))
+
+    assert status.error is None
+    assert len(hits) == 2
+    assert worker_threads
+    assert all(thread_id != caller_thread for thread_id in worker_threads)
+
+
 def test_search_items_carry_enriched_attrs(client: TestClient, monkeypatch) -> None:
     """搜索结果的每条种子都带数据扩充层产出的结构化属性（端到端）。"""
     rich_item = TorrentListItem(
