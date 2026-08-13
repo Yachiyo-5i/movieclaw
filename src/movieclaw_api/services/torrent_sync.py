@@ -20,6 +20,7 @@ per-site 的自适应节奏藏在 ``SiteSyncCursor`` 里，对调度器透明。
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime
 
@@ -117,7 +118,7 @@ def _to_observation(
         upload_volume_factor=item.upload_volume_factor if trust_volatile else None,
         free_deadline=item.free_deadline,
         hit_and_run=item.hit_and_run,
-        # 扩充属性在入库前算好（纯本地正则，微秒级）。exclude_defaults 只存
+        # 扩充属性在入库前算好（本地正则 + NER 推理）。exclude_defaults 只存
         # 真提取到的字段——没提取到任何字段时是 {}，与"从未扩充"（NULL）可区分
         attrs=enrich(item.title, item.subtitle, category_value).model_dump(
             mode="json", exclude_defaults=True
@@ -125,6 +126,15 @@ def _to_observation(
         enrich_version=ENRICH_VERSION,
         detail_url=item.detail_url,
         download_url=item.download_url,
+    )
+
+
+async def _to_observations(
+    site_id: str, items: list[TorrentListItem], *, trust_volatile: bool
+) -> list[TorrentObservation]:
+    """在线程池完成整页扩充，避免同步 NER 推理阻塞 API 事件循环。"""
+    return await asyncio.to_thread(
+        lambda: [_to_observation(site_id, item, trust_volatile=trust_volatile) for item in items]
     )
 
 
@@ -217,7 +227,7 @@ async def _fetch_pages(site, site_id: str, *, is_first_sync: bool):
                 site_id,
                 page_num,
             )
-        observations.extend(_to_observation(site_id, it, trust_volatile=trust) for it in items)
+        observations.extend(await _to_observations(site_id, items, trust_volatile=trust))
 
         if page_num == 1:
             first_page_all_new = not reached_known and len(ids) > 0
