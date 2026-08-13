@@ -28,7 +28,9 @@ PTTIME_PROFILE_HTML = """<!DOCTYPE html>
     <tr>
       <td class="bottom clearfix" align="left">
         <span class="medium left">嗨,
-          <a  href="userdetails.php?id=12345" class='PowerUser_Name'><b>fixture_user</b></a><b title='发布者：0级'>🎈</b>[UID=12345][(小学)Power User][<a href="userdetails.php?id=12345" class="fcb PowerUser">个人中心</a>]
+          <a  href="userdetails.php?id=12345" class='PowerUser_Name'><b>fixture_user</b></a>
+          <b title='发布者：0级'>🎈</b>[UID=12345][(小学)Power User]
+          [<a href="userdetails.php?id=12345" class="fcb PowerUser">个人中心</a>]
           [<a href="logout.php"><b>退出</b></a>]
           <span>[<a href="bookmarks.php?inclbookmarked=1&amp;incldead=0">收藏</a>]</span>
           <span>[<a href="myrss.php">RSS下载筐</a>]</span>
@@ -46,7 +48,8 @@ PTTIME_PROFILE_HTML = """<!DOCTYPE html>
             <font title="当前下载" class="fcr">⬇</font>3</span>
           <span class='mr5'>可连接：<font color="green">是</font></span>
           <span class='mr5'><font>魔力值(0魔力/小时)</font>
-            [<a href="mybonus.php" class="fcb">使用&amp;说明</a>]: 987654.3[<a href="attendance.php?type=sign&amp;uid=12345" class="fcb">签到领魔力</a>]</span>
+            [<a href="mybonus.php" class="fcb">使用&amp;说明</a>]: 987654.3
+            [<a href="attendance.php?type=sign&amp;uid=12345" class="fcb">签到领魔力</a>]</span>
         </div>
       </td>
     </tr>
