@@ -232,7 +232,17 @@ def covered_units(
         return w.air_date <= published
 
     if match.is_complete_series:
-        return [w for w in open_units.values() if _airable(w, require_dated=True)]
+        # 全集包不承诺特别篇（season 0 的具体集）：市面上的"全集/合集"几乎
+        # 从不收录 SP/短剧集，赌它包含的代价是工单挂上一个永远等不来的种子
+        # （真实教训：绝命毒师全集包 62 个文件全是 S01-S05 正剧，S00 工单
+        # 以 grabbed 卡死"等待入库"）。特别篇只信显式声明——标题写明 S00/SP
+        # 时走 episodes / pack_seasons 通道覆盖。电影单元 (0, 0) 不受影响。
+        return [
+            w
+            for w in open_units.values()
+            if not (w.season_number == 0 and w.episode_number > 0)
+            and _airable(w, require_dated=True)
+        ]
     result = [
         w
         for key, w in open_units.items()
