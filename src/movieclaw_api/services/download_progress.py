@@ -14,6 +14,11 @@
   落进了 movieclaw 不可达的位置（映射缺失/卷未挂载/用户在下载器里
   移动了文件）——记一条中文告警活动（去重只记一次），不退回重找
   （数据真实存在，重找只会重复下载到同一个黑洞）；
+- 种子已完成且落点可见 → **内容核验**：工单承诺的集数不在种子文件
+  清单里（而清单明确认得出其他集数）→ 缺失部分退回重新找资源——
+  全集/整季包的声明覆盖与物理内容不符时（真实案例：全集包被判定
+  覆盖特别篇，实际一个 SP 文件都没有），工单不能挂在永远等不来的
+  种子上，库存对账扫多少轮都关不掉它；
 - 其余情况（下载中/已完成且落点可见待入库）不做任何事。
 
 失败语义沿用：每组独立处理，单组失败不拖垮整轮，中文活动可回放。
@@ -23,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from datetime import timedelta
 from pathlib import Path
 
@@ -30,6 +36,7 @@ from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
+from movieclaw_api.services.subscription import units_text
 from movieclaw_api.services.system_notice import resolve_notices, upsert_notice
 from movieclaw_db.engine import get_database
 from movieclaw_db.models import (
@@ -48,6 +55,7 @@ from movieclaw_db.models.system_notice import NoticeSeverity
 from movieclaw_db.repositories import SubscriptionRepository
 from movieclaw_db.repositories.downloader_repo import DownloaderRepository
 from movieclaw_downloader import DownloaderConfig, TorrentStatus, create_downloader
+from movieclaw_media.models import MediaKind
 from movieclaw_scheduler.registry import register_task
 
 logger = logging.getLogger("movieclaw_api.download_progress")
@@ -76,7 +84,8 @@ _IN_FLIGHT = (WantedStatus.GRABBED, WantedStatus.DOWNLOADED)
     interval_seconds=PROGRESS_TICK_SECONDS,
     description=(
         "照看订阅在途投递的种子：被手动删除或长期卡死的工单退回重新找资源；"
-        "已完成的核验落点，movieclaw 看不到文件时在时间线告警。"
+        "已完成的核验落点与内容——movieclaw 看不到文件时在时间线告警，"
+        "种子内容缺少承诺的集数时把缺失部分退回重新找资源。"
         "下载完成后的入库由监听导入/库扫描完成，工单由库存对账关闭。"
     ),
 )
@@ -227,10 +236,13 @@ async def _rescue_group(
             return
 
         if status.completed:
-            # 已完成：核验落点（movieclaw 侧看不到内容 → 告警活动），
-            # 搬运仍归监听导入/库扫描，工单仍归库存对账
+            # 已完成：先核验落点（movieclaw 侧看不到内容 → 告警活动），落点
+            # 可见再核验内容（承诺的集数不在文件清单里 → 缺失部分退回重找）。
+            # 搬运仍归监听导入/库扫描，清单里存在的集数仍归库存对账关单
             assert downloader_row is not None  # found 非 None 时二者同源
-            await _verify_landing(session, repo, rows, info_hash, downloader_row, status)
+            landed = await _verify_landing(session, repo, rows, info_hash, downloader_row, status)
+            if landed:
+                await _verify_content(session, repo, item, rows, info_hash, status)
             return
 
         logger.debug("《%s》的种子 %s：下载中", item.title, info_hash)
@@ -247,7 +259,7 @@ async def _verify_landing(
     info_hash: str,
     downloader: DownloaderClient,
     status,
-) -> None:
+) -> bool:
     """核验已完成种子的落点：movieclaw 侧看不到内容则记告警活动（去重）。
 
     判定：下载器上报的实际保存目录反向过路径映射翻译回 movieclaw 视角，
@@ -255,18 +267,21 @@ async def _verify_landing(
     文件落在 movieclaw 不可达的位置——映射缺失/卷未挂载/被人工移动，
     监听导入和库扫描永远等不到它，必须把问题亮到时间线上。
     不退回重找：数据真实存在，重找只会重复下载到同一个黑洞。
+
+    返回落点是否可见——只有确认可见（True）才有资格进入后续的内容核验；
+    宽限期内或证据不全一律返回 False（本轮不判，不代表落点有问题）。
     """
     from movieclaw_api.services.torrent_submit import translate_to_local
 
     # 宽限期内不判：刚完成的种子可能还在归位（qB 临时目录搬移等）
     threshold = utcnow() - timedelta(minutes=_LANDING_GRACE_MINUTES)
     if any((w.grabbed_at or w.updated_at) > threshold for w in rows):
-        return
+        return False
 
     local_dir = translate_to_local(status.save_path, downloader.path_mappings)
     root = status.files[0].path.split("/")[0] if status.files else status.name
     if not local_dir or not root:
-        return
+        return False
     if (Path(local_dir) / root).exists():
         # 落点可见，等监听导入/库扫描接管即可；此前若报过"看不到"（映射
         # 刚修好/卷刚挂上），问题已消失，红灯就地熄灭
@@ -274,7 +289,7 @@ async def _verify_landing(
             session,
             dedupe_key=f"subscription.landing:{rows[0].subscription_id}:{info_hash}",
         )
-        return
+        return True
 
     message = (
         f"「{status.name}」已下载完成，但 movieclaw 在 {local_dir} 看不到它——"
@@ -310,7 +325,7 @@ async def _verify_landing(
     for activity in existing:
         payload = activity.payload or {}
         if payload.get("info_hash") == info_hash and payload.get("reason") == "path_unreachable":
-            return
+            return False
 
     await repo.add_activity(
         SubscriptionActivity(
@@ -332,11 +347,83 @@ async def _verify_landing(
         local_dir,
         status.save_path,
     )
+    return False
 
 
-async def subscription_download_snapshot(
-    session: AsyncSession, subscription_id: int
-) -> list[dict]:
+# 种子内文件的季集声明：场景命名 SxxEyy。第二组抓整段集号串——连写
+# （E05E06）与区间简写（E05-E08）都收进来，展开规则见 _observed_units。
+# 裸数字段必须有分隔符引导（防止把 E05.1080p 的技术串吞进集号）
+_FILE_UNIT_RE = re.compile(r"[Ss](\d{1,2})((?:[Ee]\d{1,4})(?:(?:\s*[-~&+]\s*[Ee]?|[Ee])\d{1,4})*)")
+_FILE_EP_RE = re.compile(r"\d{1,4}")
+
+
+def _observed_units(files) -> set[tuple[int, int]]:
+    """种子文件清单里能认出的 (季, 集) 集合。
+
+    只认场景命名的 SxxEyy 高置信声明；恰好两个递增集号视为区间展开
+    （E05-E08 → 5..8，连写 E05E06 展开结果与列举一致），其余按列举。
+    季集识别的完整口径在库扫描侧（NER 模型），这里刻意不复用——救援
+    巡检要在无模型环境同样工作，而轻量正则的漏认只会让判定更保守
+    （认不出 → 不动），不会造成误退。
+    """
+    observed: set[tuple[int, int]] = set()
+    for file in files:
+        for match in _FILE_UNIT_RE.finditer(file.path):
+            season = int(match.group(1))
+            numbers = [int(n) for n in _FILE_EP_RE.findall(match.group(2))]
+            if len(numbers) == 2 and numbers[0] < numbers[1] <= numbers[0] + 200:
+                numbers = list(range(numbers[0], numbers[1] + 1))
+            observed.update((season, episode) for episode in numbers)
+    return observed
+
+
+async def _verify_content(
+    session: AsyncSession,
+    repo: SubscriptionRepository,
+    item: MediaItem,
+    rows: list[WantedItem],
+    info_hash: str,
+    status: TorrentStatus,
+) -> None:
+    """核验已完成种子的内容：承诺的集数不在文件清单里 → 缺失部分退回重找。
+
+    库存对账只认领真实存在的文件——种子里根本没有的集，扫多少轮都不会
+    入库，工单会以 grabbed 永远挂着，任务中心那条"等待入库"永不消失
+    （真实案例：全集包被判定覆盖特别篇 7 集，62 个文件全是正剧）。
+
+    判定刻意保守，证据不足一律不动：
+    - 电影不判（单元没有集号语义）；
+    - 文件清单为空（旧适配器不上报）不判；
+    - 清单里一个集数都认不出（原盘目录/非常规命名）不判——只有清单
+      "明确认得出集数、且明确没有这一集"时才断言缺失；
+    - 只退回缺失的工单，清单里存在的集数继续等对账正常关单。
+    """
+    if MediaKind(item.kind) is MediaKind.MOVIE:
+        return
+    if not status.files:
+        return
+    observed = _observed_units(status.files)
+    if not observed:
+        return
+    missing = [w for w in rows if (w.season_number, w.episode_number) not in observed]
+    if not missing:
+        return
+    await _requeue(
+        session,
+        repo,
+        item,
+        missing,
+        info_hash,
+        message=(
+            f"「{status.name}」已下载完成，但内容里没有 {units_text(missing)} 对应的"
+            f"文件（声明的覆盖范围与实际内容不符），这部分退回重新寻找资源；"
+            "种子内实际存在的集数不受影响，照常入库"
+        ),
+        reason="content_missing",
+    )
+
+
+async def subscription_download_snapshot(session: AsyncSession, subscription_id: int) -> list[dict]:
     """订阅详情页的实时下载进度快照。
 
     把该订阅的在途工单按种子分组，逐个到可用下载器里查当前状态（速度/ETA/
