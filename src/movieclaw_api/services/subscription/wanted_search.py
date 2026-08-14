@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import logging
 
+from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
@@ -25,6 +26,7 @@ from movieclaw_api.services.subscription.matching import (
     backoff_delay,
     evaluate_and_dispatch,
 )
+from movieclaw_api.services.subscription.release_forecast import refresh_release_forecasts
 from movieclaw_db.engine import get_database
 from movieclaw_db.models import (
     ActivityType,
@@ -131,6 +133,7 @@ async def _due_media_groups(session: AsyncSession) -> list[int]:
         .join(Subscription, WantedItem.subscription_id == Subscription.id)  # type: ignore[arg-type]
         .where(
             WantedItem.status == WantedStatus.WANTED,
+            WantedItem.in_scope.is_(True),  # type: ignore[attr-defined]
             WantedItem.next_search_at.isnot(None),  # type: ignore[union-attr]
             WantedItem.next_search_at <= now,  # type: ignore[operator]
             Subscription.status == SubscriptionStatus.ACTIVE,
@@ -206,6 +209,9 @@ async def _search_one_media(media_id: int) -> None:
         # 结果沉淀进公共缓存（source=SEARCH），再回读 ORM 行进共享管道
         persisted = await _persist_hits(session, hits)
         summary = await evaluate_and_dispatch(session, persisted, source="主动搜索")
+        # 搜索回填的历史单集也属于有效发布时间观测，可帮助同剧后续集从 E2
+        # 开始形成预测；限定当前条目，避免一次主动搜索触发无关全量重算。
+        await refresh_release_forecasts(session, media_item_ids={media_id})
 
         # 仍未满足的到期工单：计一次尝试并按退避曲线排下次
         postponed = await _postpone_open_wanted(session, media_id, delay=None, count_attempt=True)
@@ -307,19 +313,32 @@ async def _postpone_open_wanted(
         select(WantedItem).where(
             WantedItem.media_item_id == media_id,
             WantedItem.status == WantedStatus.WANTED,
+            WantedItem.in_scope.is_(True),  # type: ignore[attr-defined]
             WantedItem.next_search_at.isnot(None),  # type: ignore[union-attr]
             WantedItem.next_search_at <= now,  # type: ignore[operator]
         )
     )
     rows = list(result.scalars().all())
+    postponed = 0
     for wanted in rows:
         if count_attempt:
-            wanted.next_search_at = now + backoff_delay(wanted.search_attempts)
-            wanted.search_attempts += 1
-            wanted.last_search_at = now
+            values = {
+                "next_search_at": now + backoff_delay(wanted.search_attempts),
+                "search_attempts": wanted.search_attempts + 1,
+                "last_search_at": now,
+                "updated_at": now,
+            }
         else:
-            wanted.next_search_at = now + delay
-        wanted.updated_at = now
-        session.add(wanted)
+            values = {"next_search_at": now + delay, "updated_at": now}
+        updated = await session.execute(
+            update(WantedItem)
+            .where(
+                WantedItem.id == wanted.id,
+                WantedItem.status == WantedStatus.WANTED,
+                WantedItem.in_scope.is_(True),  # type: ignore[attr-defined]
+            )
+            .values(**values)
+        )
+        postponed += int(updated.rowcount or 0)
     await session.commit()
-    return len(rows)
+    return postponed

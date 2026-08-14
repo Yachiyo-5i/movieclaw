@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import UTC, datetime
 
 from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -20,9 +21,12 @@ from sqlmodel import select
 from movieclaw_api.core.config import get_settings
 from movieclaw_db.models import (
     ActivityType,
+    DownloadAttemptStatus,
     MediaItem,
+    SiteTorrent,
     Subscription,
     SubscriptionActivity,
+    SubscriptionDownloadAttempt,
     WantedItem,
     WantedStatus,
     utcnow,
@@ -31,6 +35,14 @@ from movieclaw_db.repositories import SubscriptionRepository
 from movieclaw_matcher import RuleVerdict, TorrentCandidate
 
 logger = logging.getLogger("movieclaw_api.download_dispatch")
+
+
+def _utc_text(value: datetime | None) -> str | None:
+    """把数据库 naive UTC / 接口 aware 时间统一冻结为带偏移 ISO 文本。"""
+    if value is None:
+        return None
+    value = value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
+    return value.isoformat()
 
 
 async def dispatch(
@@ -57,6 +69,7 @@ async def dispatch(
     repo = SubscriptionRepository(session)
     assert subscription.id is not None
     dry_run = get_settings().subscription_dispatch_dry_run
+    submitted_info_hash: str | None = None
     units_label = units_text(claimed)
     spec_text = _describe(candidate)
 
@@ -100,7 +113,7 @@ async def dispatch(
 
     if not dry_run:
         try:
-            submit_result = await _submit_real(
+            submit_result, downloader_row = await _submit_real(
                 session,
                 candidate,
                 save_path=dispatch_dir,
@@ -138,13 +151,124 @@ async def dispatch(
         # 记录 infohash：完成轮询任务据此追踪下载进度并触发入库整理
         if submit_result.info_hash:
             now = utcnow()
+            normalized_hash = submit_result.info_hash.lower()
+            submitted_info_hash = normalized_hash
             for wanted in claimed:
                 await session.execute(
                     update(WantedItem)
-                    .where(WantedItem.id == wanted.id)
-                    .values(info_hash=submit_result.info_hash, updated_at=now)
+                    .where(
+                        WantedItem.id == wanted.id,
+                        WantedItem.status == WantedStatus.GRABBED,
+                    )
+                    .values(info_hash=normalized_hash, updated_at=now)
                 )
+            # 网络提交期间用户可能刚好取消季订阅。infohash 仍要写入以保存真实
+            # 投递历史，但只有仍在范围内的目标才能让尝试保持 active。
+            active_targets = list(
+                (
+                    await session.execute(
+                        select(WantedItem).where(
+                            WantedItem.subscription_id == subscription.id,
+                            WantedItem.info_hash == normalized_hash,
+                            WantedItem.in_scope.is_(True),  # type: ignore[attr-defined]
+                            WantedItem.status.in_(  # type: ignore[attr-defined]
+                                (WantedStatus.GRABBED, WantedStatus.DOWNLOADED)
+                            ),
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            existing_attempt = (
+                await session.execute(
+                    select(SubscriptionDownloadAttempt).where(
+                        SubscriptionDownloadAttempt.subscription_id == subscription.id,
+                        SubscriptionDownloadAttempt.info_hash == normalized_hash,
+                    )
+                )
+            ).scalar_one_or_none()
+            values = {
+                "downloader_id": downloader_row.id,
+                "site_id": candidate.site_id,
+                "torrent_id": candidate.torrent_id,
+                "torrent_title": candidate.title,
+                "units": [[w.season_number, w.episode_number] for w in claimed],
+                "quality": candidate.attrs.model_dump(exclude_defaults=True),
+                "hit_and_run": candidate.hit_and_run,
+                "owned_by_movieclaw": not submit_result.already_exists,
+                "status": (
+                    DownloadAttemptStatus.ACTIVE
+                    if active_targets
+                    else DownloadAttemptStatus.CANCELLED
+                ),
+                "baseline_completed_bytes": 0 if not submit_result.already_exists else None,
+                "last_completed_bytes": 0 if not submit_result.already_exists else None,
+                "baseline_downloaded_bytes": 0 if not submit_result.already_exists else None,
+                "last_downloaded_bytes": 0 if not submit_result.already_exists else None,
+                "last_progress_at": now,
+                "stalled_notified_at": None,
+                "missing_observations": 0,
+                "next_search_at": None,
+                "cleanup_note": (
+                    None
+                    if active_targets
+                    else "网络投递完成前关联单元已退出订阅范围；保留下载器任务"
+                ),
+                "updated_at": now,
+            }
+            if existing_attempt is None:
+                session.add(
+                    SubscriptionDownloadAttempt(
+                        subscription_id=subscription.id,
+                        info_hash=normalized_hash,
+                        **values,
+                    )
+                )
+            else:
+                existing_units = {
+                    (int(unit[0]), int(unit[1]))
+                    for unit in existing_attempt.units
+                    if isinstance(unit, list) and len(unit) == 2
+                }
+                existing_units.update(
+                    (wanted.season_number, wanted.episode_number) for wanted in claimed
+                )
+                values["units"] = [[season, episode] for season, episode in sorted(existing_units)]
+                # 同一 hash 是同一份内容的续用，不抹掉首次投递时已经证明的
+                # 所有权/来源/品质历史；旧字段缺失时才用本次更完整的证据回填。
+                values["owned_by_movieclaw"] = (
+                    existing_attempt.owned_by_movieclaw or not submit_result.already_exists
+                )
+                if existing_attempt.site_id:
+                    values["site_id"] = existing_attempt.site_id
+                    values["torrent_id"] = existing_attempt.torrent_id
+                    values["torrent_title"] = existing_attempt.torrent_title
+                if existing_attempt.quality:
+                    values["quality"] = existing_attempt.quality
+                if existing_attempt.hit_and_run is not None:
+                    values["hit_and_run"] = existing_attempt.hit_and_run
+                for key, value in values.items():
+                    setattr(existing_attempt, key, value)
+                session.add(existing_attempt)
             await session.commit()
+
+    # 活动是投递事实的永久台账：这里把资源发布→首次索引→提交下载器的时间链
+    # 一并冻结。不能只在详情页临时查 site_torrent——用户移除站点会清索引，
+    # 历史耗时仍应保留。手动选种不落索引，first_seen_at 合理为空。
+    torrent_row = (
+        await session.execute(
+            select(SiteTorrent).where(
+                SiteTorrent.site_id == candidate.site_id,
+                SiteTorrent.torrent_id == candidate.torrent_id,
+            )
+        )
+    ).scalar_one_or_none()
+    resource_publish_time = candidate.publish_time or (
+        torrent_row.publish_time if torrent_row is not None else None
+    )
+    resource_first_seen_at = torrent_row.created_at if torrent_row is not None else None
+    submitted_at = utcnow()
 
     mode = "【模拟投递】" if dry_run else ""
     logger.info(
@@ -174,7 +298,11 @@ async def dispatch(
                 "score": verdict.score,
                 "source": source,
                 "dry_run": dry_run,
+                "info_hash": submitted_info_hash,
                 "units": [[w.season_number, w.episode_number] for w in claimed],
+                "resource_publish_time": _utc_text(resource_publish_time),
+                "resource_first_seen_at": _utc_text(resource_first_seen_at),
+                "submitted_at": _utc_text(submitted_at),
                 "library_id": library.id if library else None,
                 "save_path": decision.entry_dir,
                 "staging_path": staging,
@@ -337,7 +465,11 @@ async def _claim(session: AsyncSession, wanted_rows: list[WantedItem]) -> list[W
     for wanted in wanted_rows:
         result = await session.execute(
             update(WantedItem)
-            .where(WantedItem.id == wanted.id, WantedItem.status == WantedStatus.WANTED)
+            .where(
+                WantedItem.id == wanted.id,
+                WantedItem.status == WantedStatus.WANTED,
+                WantedItem.in_scope.is_(True),  # type: ignore[attr-defined]
+            )
             .values(status=WantedStatus.GRABBED, grabbed_at=now, updated_at=now)
         )
         if result.rowcount:
@@ -352,11 +484,31 @@ async def _rollback_claim(session: AsyncSession, claimed: list[WantedItem], *, r
     for wanted in claimed:
         await session.execute(
             update(WantedItem)
-            .where(WantedItem.id == wanted.id, WantedItem.status == WantedStatus.GRABBED)
+            .where(
+                WantedItem.id == wanted.id,
+                WantedItem.status == WantedStatus.GRABBED,
+                WantedItem.in_scope.is_(True),  # type: ignore[attr-defined]
+            )
             .values(
                 status=WantedStatus.WANTED,
                 grabbed_at=None,
                 next_search_at=now + retry_delay,
+                updated_at=now,
+            )
+        )
+        # 网络失败期间若用户取消了该范围，认领仍应回滚，但不能留下一个会在
+        # 重新勾选前触发的退避时间。历史没有真实投递，所以回到 wanted 合理。
+        await session.execute(
+            update(WantedItem)
+            .where(
+                WantedItem.id == wanted.id,
+                WantedItem.status == WantedStatus.GRABBED,
+                WantedItem.in_scope.is_(False),  # type: ignore[attr-defined]
+            )
+            .values(
+                status=WantedStatus.WANTED,
+                grabbed_at=None,
+                next_search_at=None,
                 updated_at=now,
             )
         )
@@ -379,7 +531,7 @@ async def _submit_real(
     """
     from movieclaw_api.services.torrent_submit import submit_torrent
 
-    result, _row = await submit_torrent(
+    result, row = await submit_torrent(
         session,
         site_id=candidate.site_id,
         download_url=candidate.download_url,
@@ -387,7 +539,7 @@ async def _submit_real(
         save_path=save_path,
         subtitle=subtitle,
     )
-    return result
+    return result, row
 
 
 def _describe(candidate: TorrentCandidate) -> str:

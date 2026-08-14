@@ -1,6 +1,6 @@
 "use client";
 
-import { cloneElement, isValidElement, useRef, useState } from "react";
+import { cloneElement, isValidElement, useRef, useState, type Ref } from "react";
 import {
   arrow,
   autoUpdate,
@@ -12,9 +12,11 @@ import {
   shift,
   useDismiss,
   useFloating,
+  useClick,
   useFocus,
   useHover,
   useInteractions,
+  useMergeRefs,
   useRole,
   useTransitionStyles,
   type Placement,
@@ -36,12 +38,15 @@ export function Tooltip({
   children,
   placement = "top",
   maxWidth = 380,
+  openOnClick = false,
 }: {
   content: React.ReactNode;
   /** 触发元素：必须是可接收 ref 的单个元素（原生标签即可） */
   children: React.ReactElement<Record<string, unknown>>;
   placement?: Placement;
   maxWidth?: number;
+  /** 触屏或需显式点按的提示可开启；默认仍只响应悬停与键盘聚焦。 */
+  openOnClick?: boolean;
 }) {
   const [open, setOpen] = useState(false);
   const arrowRef = useRef<SVGSVGElement | null>(null);
@@ -56,6 +61,7 @@ export function Tooltip({
 
   const { getReferenceProps, getFloatingProps } = useInteractions([
     useHover(context, { move: false, delay: { open: 250 }, handleClose: safePolygon() }),
+    useClick(context, { enabled: openOnClick }),
     useFocus(context),
     useDismiss(context),
     useRole(context, { role: "tooltip" }),
@@ -66,11 +72,15 @@ export function Tooltip({
     initial: { opacity: 0, transform: "translateY(3px) scale(0.98)" },
   });
 
+  const childRef = isValidElement(children)
+    ? (children.props as { ref?: Ref<Element> }).ref
+    : undefined;
+  const referenceRef = useMergeRefs<Element>([refs.setReference, childRef]);
   if (!isValidElement(children)) return children;
 
   return (
     <>
-      {cloneElement(children, getReferenceProps({ ref: refs.setReference, ...children.props }))}
+      {cloneElement(children, getReferenceProps({ ...children.props, ref: referenceRef }))}
       {isMounted && (
         <FloatingPortal>
           <div

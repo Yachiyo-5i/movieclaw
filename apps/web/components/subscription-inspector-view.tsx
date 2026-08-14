@@ -5,8 +5,16 @@ import type { Route } from "next";
 import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
+import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
+
 import { useConfirm, useToast } from "@/components/feedback";
-import { ArrowLeftIcon } from "@/components/icons";
+import {
+  ArrowLeftIcon,
+  FilmIcon,
+  MoreIcon,
+  RefreshIcon,
+  SearchIcon,
+} from "@/components/icons";
 import { Modal } from "@/components/modal";
 import { PageNav } from "@/components/page-nav";
 import { usePageTitle } from "@/lib/use-page-title";
@@ -21,6 +29,7 @@ import {
   listRuleSets,
   listSubscriptionActivities,
   searchMissingSubscriptionResources,
+  setSubscriptionFollowFuture,
   setSubscriptionTrackingState,
   unsubscribeFromSubscription,
   updateSubscription,
@@ -28,14 +37,13 @@ import {
   type SubscriptionActivity,
   type SubscriptionDetail,
   type SubscriptionDownload,
+  type ResourceTiming,
   type WantedItem,
 } from "@/lib/api/subscriptions";
 import { formatBytes, formatDuration } from "@/lib/format";
 import { cachedImageUrl } from "@/lib/image-proxy";
-import {
-  subscriptionProgressNote,
-  subscriptionStatusMeta,
-} from "@/lib/subscription-ui";
+import { shouldShowResourceTiming } from "@/lib/resource-timing";
+import { subscriptionStatusMeta } from "@/lib/subscription-ui";
 import { formatDateTime, formatRelativeTime } from "@/lib/time";
 import { useVisiblePolling } from "@/lib/use-visible-polling";
 import { usePermissions } from "@/lib/permissions";
@@ -44,9 +52,9 @@ import { usePermissions } from "@/lib/permissions";
  * 订阅详情分析页（/subscriptions/[id]）：订阅透明化的落点。
  *
  * 页面结构（与影片详情页同一套视觉语言）：
- *   1. Hero 氛围横幅 —— 海报重度模糊铺底产出该片专属底色（订阅接口无宽幅
- *      剧照，模糊海报是永远可用的兜底），上面放海报 / 标题 / 状态与参数徽片，
- *      底部一条「已入库 / 下载中 / 缺口」三段式进度条，操作按钮收右上；
+ *   1. Hero 氛围横幅 —— 海报低透明度取色产出该片专属底色（订阅接口无宽幅
+ *      剧照，海报是永远可用的兜底），上面按状态 / 海报身份 / 配置参数 /
+ *      收录进度 / 操作区纵向组织；移动端配置与操作跨满海报下方；
  *   2. 标签页主体 —— 「追踪明细」与「活动记录」性质不同（一个是可变的状态
  *      快照，一个是只增的事件流水），不再左右分栏互相挤压，改为胶囊标签
  *      切换、各占全宽：
@@ -68,6 +76,7 @@ export function SubscriptionInspectorView({ id }: { id: number }) {
   const [busy, setBusy] = useState(false);
   const [switchingRule, setSwitchingRule] = useState(false);
   const [adjusting, setAdjusting] = useState(false);
+  const [managing, setManaging] = useState(false);
   const [tab, setTab] = useState<"wanted" | "activity">("wanted");
   const toast = useToast();
 
@@ -165,14 +174,43 @@ export function SubscriptionInspectorView({ id }: { id: number }) {
   const poster = detail.media.poster_url ? cachedImageUrl(detail.media.poster_url) : null;
 
   const togglePause = async () => {
+    const resuming = detail.status === "paused";
+    const ok = await confirm({
+      title: resuming
+        ? `恢复《${detail.media.title}》的订阅追踪？`
+        : `暂停《${detail.media.title}》的订阅追踪？`,
+      description: resuming
+        ? "恢复后会继续搜索缺失资源，并按当前规则自动投递符合条件的结果。"
+        : "暂停后不会继续搜索或投递资源；已经提交的下载不受影响，可随时恢复。",
+      confirmLabel: resuming ? "恢复追踪" : "暂停追踪",
+      cancelLabel: "返回",
+    });
+    if (!ok) return;
     setBusy(true);
     try {
       await setSubscriptionTrackingState(
         detail.id,
-        detail.status === "paused" ? "active" : "paused",
+        resuming ? "active" : "paused",
       );
+      toast.success(resuming ? "已恢复订阅追踪" : "已暂停订阅追踪");
       reload();
       refreshSubscriptions();
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  /** 持续追新是可逆的单一状态动作，详情页直接切换，不再打开批量调整弹窗。 */
+  const toggleFollowFuture = async () => {
+    const enabling = !detail.follow_future;
+    setBusy(true);
+    try {
+      await setSubscriptionFollowFuture(detail.id, enabling);
+      toast.success(enabling ? "已启用持续追新" : "已禁用持续追新");
+      reload();
+      refreshSubscriptions();
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "设置持续追新失败，请稍后重试");
     } finally {
       setBusy(false);
     }
@@ -181,6 +219,14 @@ export function SubscriptionInspectorView({ id }: { id: number }) {
   // 立即搜索：缺口跳过冷却重新排队。后端对"暂停中/没有可搜缺口"给可读错误，
   // 原样进 toast——按钮不做前置禁用判断，语义由唯一实现（服务端）说了算
   const searchNow = async () => {
+    const ok = await confirm({
+      title: `立即搜索《${detail.media.title}》的缺失资源？`,
+      description:
+        "将跳过当前搜索冷却，重新搜索已经可以搜索的缺口。命中当前规则组的资源可能会自动提交下载。",
+      confirmLabel: "立即搜索",
+      cancelLabel: "返回",
+    });
+    if (!ok) return;
     setBusy(true);
     try {
       const { reset_count } = await searchMissingSubscriptionResources(detail.id);
@@ -196,7 +242,9 @@ export function SubscriptionInspectorView({ id }: { id: number }) {
   const remove = async () => {
     const ok = await confirm({
       title: `取消订阅《${detail.media.title}》？`,
-      description: "已下载的内容不受影响。",
+      description: isAdmin
+        ? "将停止追踪剩余内容；已经下载或入库的文件不会被删除。"
+        : "将取消你的订阅关注；已经下载或入库的文件不会被删除。",
       confirmLabel: "取消订阅",
       cancelLabel: "先不",
       tone: "danger",
@@ -220,132 +268,162 @@ export function SubscriptionInspectorView({ id }: { id: number }) {
         items={[{ label: "我的订阅", href: "/subscriptions" }, { label: detail.media.title }]}
         className="-mx-6 max-md:-mx-4"
       />
-      {/* —— 1. Hero 氛围横幅：模糊海报铺底 + 订阅摘要 —— */}
-      <div className="relative overflow-hidden rounded-2xl bg-[#10131b] shadow-[0_24px_70px_-18px_rgba(0,0,0,0.62)] ring-1 ring-white/10">
+      {/* —— 1. 订阅摘要卡：状态、身份、配置、进度、操作自上而下形成单一路径。
+          海报仍提供条目辨识与轻量氛围，但背景只低透明度取色，不再压过正文。
+          PageNav 已占一行导航高度，摘要卡再按一级页基线留出桌面 28px / 移动端
+          16px 的内容间距，避免重卡片贴住顶栏。 —— */}
+      <section className="relative mt-7 overflow-hidden rounded-2xl bg-[#0d111b] shadow-[0_24px_70px_-18px_rgba(0,0,0,0.58)] ring-1 ring-white/10 max-md:mt-4">
         {poster && (
           <PosterImage
             src={poster}
             alt=""
-            className="absolute inset-0 size-full scale-125 object-cover blur-3xl brightness-[0.55] saturate-[1.2]"
+            className="absolute inset-0 size-full scale-110 object-cover opacity-25 blur-3xl brightness-[0.42] saturate-[0.9]"
           />
         )}
-        {/* 左深右浅的横向渐变：左侧文字区压暗保可读，右侧透出氛围色 */}
-        <div className="absolute inset-0 bg-gradient-to-r from-[rgba(7,9,14,0.82)] via-[rgba(7,9,14,0.58)] to-[rgba(7,9,14,0.36)]" />
+        <div className="absolute inset-0 bg-gradient-to-r from-[rgba(7,10,17,0.97)] via-[rgba(9,13,22,0.91)] to-[rgba(10,14,23,0.84)]" />
 
-        <div className="relative z-10 flex flex-wrap items-start gap-5 p-6 max-md:gap-4 max-md:p-4">
-          {poster && (
-            <Link
-              href={`/media/${detail.media.kind}/${detail.media.tmdb_id}`}
-              className="block w-[104px] shrink-0 overflow-hidden rounded-lg shadow-[0_16px_40px_rgba(0,0,0,0.5)] ring-1 ring-white/15"
-            >
+        {/* 卡片眉头只回答两件事：订阅类型与当前状态。进度挪到主体单独表达，
+            不再把“追踪中 · 缺几集 · 已入库几集”揉成一条长句。 */}
+        <div className="relative z-10 flex items-center justify-between gap-4 px-6 pt-5 max-md:px-4 max-md:pt-4">
+          <p className="text-caption font-semibold tracking-[0.2em] text-[var(--accent-2)]">
+            {isMovie ? "电影订阅" : "剧集订阅"}
+          </p>
+          <span className="flex shrink-0 items-center gap-2 text-sub text-white/65">
+            <span
+              className="size-1.5 rounded-full shadow-[0_0_0_4px_rgba(255,255,255,0.05)]"
+              style={{ backgroundColor: meta.color }}
+            />
+            {meta.label}
+          </span>
+        </div>
+
+        <div className="relative z-10 grid grid-cols-[112px_minmax(0,1fr)] gap-5 px-6 pb-6 pt-4 max-md:grid-cols-[80px_minmax(0,1fr)] max-md:gap-4 max-md:px-4 max-md:pb-4 max-md:pt-3">
+          <Link
+            href={`/media/${detail.media.kind}/${detail.media.tmdb_id}`}
+            aria-label={`查看《${detail.media.title}》详情`}
+            className="block w-28 shrink-0 self-start overflow-hidden rounded-xl bg-white/[0.05] shadow-[0_16px_40px_rgba(0,0,0,0.45)] ring-1 ring-white/15 max-md:w-20 max-md:rounded-lg"
+          >
+            {poster ? (
               <PosterImage
                 src={poster}
                 alt={`${detail.media.title} 海报`}
                 className="aspect-[2/3] w-full object-cover"
               />
-            </Link>
-          )}
-
-          <div className="min-w-0 flex-1">
-            <p className="text-caption font-semibold tracking-[0.22em] text-[var(--accent-2)]">
-              {isMovie ? "电影订阅" : "剧集订阅"}
-            </p>
-            <h1 className="mt-1.5 flex flex-wrap items-baseline gap-2.5 text-[26px] font-bold leading-tight tracking-[-0.02em] text-white max-md:text-[20px]">
-              <Link
-                href={`/media/${detail.media.kind}/${detail.media.tmdb_id}`}
-                className="truncate hover:underline"
-              >
-                {detail.media.title}
-              </Link>
-              <span className="tnum shrink-0 text-body font-normal text-white/50">
-                {detail.media.year ?? ""}
+            ) : (
+              <span className="flex aspect-[2/3] flex-col items-center justify-center gap-2 text-caption text-white/35">
+                <FilmIcon className="size-6" />
+                暂无海报
               </span>
-            </h1>
+            )}
+          </Link>
 
-            <p className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-sub text-white/70">
-              <span className="flex items-center gap-1.5">
-                <span className="size-1.5 rounded-full" style={{ backgroundColor: meta.color }} />
-                {meta.label} · {subscriptionProgressNote(detail)}
-              </span>
-              <span className="text-white/45">订阅于 {formatDateTime(detail.created_at)}</span>
-            </p>
-
-            {/* 参数徽片：我订了什么 */}
-            <div className="mt-3.5 flex flex-wrap gap-2">
-              {!isMovie && (
-                <ParamChip>
-                  {detail.selected_seasons.length > 0
-                    ? `勾选第 ${detail.selected_seasons.join("、")} 季`
-                    : "未勾选季"}
-                </ParamChip>
-              )}
-              {!isMovie && <ParamChip>持续追新 {detail.follow_future ? "开" : "关"}</ParamChip>}
-              {/* 规则组徽片可点击换组：删除被引用规则组前"先把订阅改到其他组"的
-                  唯一 Web 入口，也是新建规则组后应用到已有订阅的路 */}
-              {canManageSubscriptions && <button
-                type="button"
-                onClick={() => setSwitchingRule(true)}
-                title="更换本订阅使用的规则组"
-                className="rounded-full bg-white/[0.09] px-2.5 py-1 text-caption text-white/75 backdrop-blur-sm transition hover:bg-white/[0.18] hover:text-white"
-              >
-                规则组「{ruleSetName}」<span className="ml-0.5 text-white/50">更换 ›</span>
-              </button>}
-              {/* 调整订阅：季选择/追新/入库库（后端 diff 重算工单，无需取消重订） */}
-              {canSubscribe && <button
-                type="button"
-                onClick={() => setAdjusting(true)}
-                title={isMovie ? "更换入库目标库" : "修改季选择、持续追新或入库目标库"}
-                className="rounded-full bg-white/[0.09] px-2.5 py-1 text-caption text-white/75 backdrop-blur-sm transition hover:bg-white/[0.18] hover:text-white"
-              >
-                调整订阅<span className="ml-0.5 text-white/50">›</span>
-              </button>}
+          {/* display:contents 让移动端的配置、进度和按钮跨满海报下方；桌面端
+              恢复为普通纵向内容列，操作区自然沉到右下，不再形成第三列。 */}
+          <div className="contents md:flex md:min-w-0 md:flex-col">
+            <div className="min-w-0 self-center md:self-auto">
+              <h1 className="flex min-w-0 items-baseline gap-2.5 text-[26px] font-bold leading-tight tracking-[-0.02em] text-white max-md:text-[20px]">
+                <Link
+                  href={`/media/${detail.media.kind}/${detail.media.tmdb_id}`}
+                  className="min-w-0 truncate hover:underline"
+                >
+                  {detail.media.title}
+                </Link>
+                <span className="tnum shrink-0 text-body font-normal text-white/45">
+                  {detail.media.year ?? ""}
+                </span>
+              </h1>
+              <p className="mt-2 flex flex-wrap gap-x-2 gap-y-1 text-sub text-white/55">
+                {detail.media.original_title &&
+                  detail.media.original_title !== detail.media.title && (
+                    <span className="truncate">{detail.media.original_title}</span>
+                  )}
+                <span className="shrink-0">订阅于 {formatDateTime(detail.created_at)}</span>
+              </p>
             </div>
 
-            <ProgressStrip progress={detail.progress} />
-          </div>
-
-          <div className="flex shrink-0 flex-wrap gap-2.5 pt-0.5 max-md:w-full">
-            {/* 缺口存在且未暂停时才有意义；其余情况后端会给可读错误，按钮直接隐藏更干净 */}
-            {canSubscribe && detail.progress.wanted > 0 && detail.status !== "paused" && (
-              <button
-                type="button"
-                disabled={busy}
-                onClick={() => void searchNow()}
-                className="btn-accent h-9 rounded-full px-4 text-sub font-semibold disabled:opacity-40"
-              >
-                立即搜索
-              </button>
-            )}
-            {canSubscribe && canSearch && detail.progress.wanted > 0 && (
-              <Link
-                href={
-                  `/search?q=${encodeURIComponent(detail.media.title)}&for_sub=${detail.id}` as Route
+            {/* 配置不再做成一排同款胶囊，而是稳定的 label/value 信息列。
+                每列保持可扫读；超长季列表或规则名只在值行截断。 */}
+            <div className="mt-4 grid grid-cols-[repeat(auto-fit,minmax(80px,1fr))] gap-3 border-y border-white/[0.08] py-3 max-md:col-span-2 max-md:mt-1">
+              <SubscriptionFact
+                label="收录范围"
+                value={
+                  isMovie
+                    ? "正片"
+                    : detail.selected_seasons.length > 0
+                      ? `第 ${detail.selected_seasons.join("、")} 季`
+                      : "未勾选季"
                 }
-                className="btn-glass h-9 bg-white/10 px-4 text-sub font-medium backdrop-blur-md"
-                title="到站点资源搜索里挑一条种子，直接投给本订阅（跳过规则组限制）"
-              >
-                手动选种
-              </Link>
-            )}
-            {canSubscribe && <button
-              type="button"
-              disabled={busy || detail.status === "completed"}
-              onClick={togglePause}
-              className="btn-glass h-9 bg-white/10 px-4 text-sub font-medium backdrop-blur-md disabled:opacity-40"
-            >
-              {detail.status === "paused" ? "恢复追踪" : "暂停"}
-            </button>}
-            {canSubscribe && <button
-              type="button"
-              disabled={busy}
-              onClick={remove}
-              className="h-9 rounded-full border border-red-400/30 bg-red-500/10 px-4 text-sub font-medium text-red-200 transition hover:bg-red-500/20 disabled:opacity-40"
-            >
-              取消订阅
-            </button>}
+              />
+              {!isMovie && (
+                <SubscriptionFact
+                  label="持续追新"
+                  value={detail.follow_future ? "已开启" : "已关闭"}
+                />
+              )}
+              {canManageSubscriptions && <SubscriptionFact label="规则组" value={ruleSetName} />}
+            </div>
+
+            <ProgressStrip progress={detail.progress} unitLabel={isMovie ? "部" : "集"} />
+
+            {/* 一套 DOM 同时服务桌面与移动端：桌面右对齐、移动端等宽单行。
+                只有“更多”的承载物因交互范式不同分为下拉菜单与底部抽屉。 */}
+            <div className="mt-auto flex flex-wrap justify-end gap-2 pt-4 max-md:col-span-2 max-md:grid max-md:grid-flow-col max-md:auto-cols-fr max-md:pt-3">
+              {/* 缺口存在且未暂停时才有意义；其余情况后端会给可读错误，按钮直接隐藏更干净 */}
+              {canSubscribe && detail.progress.wanted > 0 && detail.status !== "paused" && (
+                <button
+                  type="button"
+                  disabled={busy}
+                  onClick={() => void searchNow()}
+                  className="btn-accent inline-flex h-10 min-w-0 items-center justify-center gap-1.5 rounded-full px-4 text-sub font-semibold disabled:opacity-40 max-md:h-11 max-md:px-2"
+                >
+                  <RefreshIcon className="size-4 shrink-0" />
+                  <span className="whitespace-nowrap">立即搜索</span>
+                </button>
+              )}
+              {canSubscribe && canSearch && detail.progress.wanted > 0 && (
+                <Link
+                  href={
+                    `/search?q=${encodeURIComponent(detail.media.title)}&for_sub=${detail.id}` as Route
+                  }
+                  className="btn-glass inline-flex h-10 min-w-0 items-center justify-center gap-1.5 border border-white/10 bg-white/[0.05] px-4 text-sub font-medium backdrop-blur-md max-md:h-11 max-md:px-2"
+                  title="到站点资源搜索里挑一条种子，直接投给本订阅（跳过规则组限制）"
+                >
+                  <SearchIcon className="size-4 shrink-0" />
+                  <span className="whitespace-nowrap">手动选种</span>
+                </Link>
+              )}
+              {(canSubscribe || canManageSubscriptions) && (
+                <>
+                  <span className="max-md:hidden">
+                    <SubscriptionManageMenu
+                      busy={busy}
+                      paused={detail.status === "paused"}
+                      completed={detail.status === "completed"}
+                      canSubscribe={canSubscribe}
+                      canManageSubscriptions={canManageSubscriptions}
+                      followFuture={isMovie ? null : detail.follow_future}
+                      onAdjust={() => setAdjusting(true)}
+                      onToggleFollowFuture={() => void toggleFollowFuture()}
+                      onSwitchRule={() => setSwitchingRule(true)}
+                      onTogglePause={() => void togglePause()}
+                      onRemove={() => void remove()}
+                    />
+                  </span>
+                  <button
+                    type="button"
+                    disabled={busy}
+                    onClick={() => setManaging(true)}
+                    className="hidden h-11 min-w-0 items-center justify-center gap-1.5 rounded-full bg-white/[0.035] px-2 text-sub font-medium text-white/65 transition hover:bg-white/[0.09] hover:text-white disabled:opacity-40 max-md:flex"
+                  >
+                    <MoreIcon className="size-4 shrink-0" />
+                    <span className="whitespace-nowrap">更多</span>
+                  </button>
+                </>
+              )}
+            </div>
           </div>
         </div>
-      </div>
+      </section>
 
       {/* —— 2. 标签页：状态快照与事件流水分页各占全宽 —— */}
       <div className="text-on-image mt-7 flex items-center gap-1.5">
@@ -377,6 +455,39 @@ export function SubscriptionInspectorView({ id }: { id: number }) {
         )}
       </div>
 
+      {(canSubscribe || canManageSubscriptions) && managing && (
+        <SubscriptionManageSheet
+          open
+          busy={busy}
+          paused={detail.status === "paused"}
+          completed={detail.status === "completed"}
+          canSubscribe={canSubscribe}
+          canManageSubscriptions={canManageSubscriptions}
+          followFuture={isMovie ? null : detail.follow_future}
+          onClose={() => setManaging(false)}
+          onAdjust={() => {
+            setManaging(false);
+            setAdjusting(true);
+          }}
+          onToggleFollowFuture={() => {
+            setManaging(false);
+            void toggleFollowFuture();
+          }}
+          onSwitchRule={() => {
+            setManaging(false);
+            setSwitchingRule(true);
+          }}
+          onTogglePause={() => {
+            setManaging(false);
+            void togglePause();
+          }}
+          onRemove={() => {
+            setManaging(false);
+            void remove();
+          }}
+        />
+      )}
+
       {canSubscribe && adjusting && (
         <SubscriptionAdjustDialog
           detail={detail}
@@ -402,6 +513,187 @@ export function SubscriptionInspectorView({ id }: { id: number }) {
         />
       )}
     </div>
+  );
+}
+
+interface SubscriptionManageActionsProps {
+  busy: boolean;
+  paused: boolean;
+  completed: boolean;
+  canSubscribe: boolean;
+  canManageSubscriptions: boolean;
+  /** null 表示电影订阅，不展示没有业务语义的追新动作。 */
+  followFuture: boolean | null;
+  onAdjust: () => void;
+  onToggleFollowFuture: () => void;
+  onSwitchRule: () => void;
+  onTogglePause: () => void;
+  onRemove: () => void;
+}
+
+/** 桌面端管理菜单：Portal 与碰撞检测交给 Radix，避免 Hero 的 overflow-hidden
+ * 裁掉菜单；资源操作留在外面，配置、状态和危险操作按频率收进这里。 */
+function SubscriptionManageMenu({
+  busy,
+  paused,
+  completed,
+  canSubscribe,
+  canManageSubscriptions,
+  followFuture,
+  onAdjust,
+  onToggleFollowFuture,
+  onSwitchRule,
+  onTogglePause,
+  onRemove,
+}: SubscriptionManageActionsProps) {
+  const itemClass =
+    "glass-row nav-item cursor-pointer px-3 py-2 text-ui font-medium outline-none " +
+    "data-[highlighted]:!bg-[var(--glass-fill-hover)] data-[highlighted]:!text-[var(--text)] " +
+    "data-[disabled]:pointer-events-none data-[disabled]:opacity-40";
+
+  return (
+    <DropdownMenu.Root>
+      <DropdownMenu.Trigger asChild>
+        <button
+          type="button"
+          disabled={busy}
+          className="inline-flex h-9 items-center gap-1.5 rounded-full px-3 text-sub font-medium text-white/65 transition hover:bg-white/[0.08] hover:text-white data-[state=open]:bg-white/[0.1] data-[state=open]:text-white disabled:opacity-40"
+        >
+          <MoreIcon className="size-4" />
+          更多
+        </button>
+      </DropdownMenu.Trigger>
+      <DropdownMenu.Portal>
+        <DropdownMenu.Content
+          align="end"
+          sideOffset={6}
+          collisionPadding={12}
+          className="menu-surface z-50 min-w-[10.5rem] !rounded-xl p-1"
+        >
+          {canSubscribe && (
+            <DropdownMenu.Item onSelect={onAdjust} className={itemClass}>
+              调整订阅…
+            </DropdownMenu.Item>
+          )}
+          {canSubscribe && followFuture !== null && (
+            <DropdownMenu.Item
+              onSelect={onToggleFollowFuture}
+              disabled={busy}
+              className={itemClass}
+            >
+              {followFuture ? "禁用持续追新" : "启用持续追新"}
+            </DropdownMenu.Item>
+          )}
+          {canManageSubscriptions && (
+            <DropdownMenu.Item onSelect={onSwitchRule} className={itemClass}>
+              更换规则组…
+            </DropdownMenu.Item>
+          )}
+          {canSubscribe && (
+            <DropdownMenu.Item
+              onSelect={onTogglePause}
+              disabled={busy || completed}
+              className={itemClass}
+            >
+              {paused ? "恢复追踪" : "暂停追踪"}
+            </DropdownMenu.Item>
+          )}
+          {canSubscribe && <DropdownMenu.Separator className="my-1 h-px bg-white/[0.07]" />}
+          {canSubscribe && (
+            <DropdownMenu.Item
+              onSelect={onRemove}
+              disabled={busy}
+              className={`${itemClass} !text-[#ff8b8b] data-[highlighted]:!bg-[#ff6b6b]/10`}
+            >
+              取消订阅
+            </DropdownMenu.Item>
+          )}
+        </DropdownMenu.Content>
+      </DropdownMenu.Portal>
+    </DropdownMenu.Root>
+  );
+}
+
+/** 移动端管理动作使用底部抽屉：每一行都是完整触控目标，危险操作与普通配置
+ * 之间用分隔线断开；具体动作的二次确认仍由调用方统一负责。 */
+function SubscriptionManageSheet({
+  open,
+  busy,
+  paused,
+  completed,
+  canSubscribe,
+  canManageSubscriptions,
+  followFuture,
+  onClose,
+  onAdjust,
+  onToggleFollowFuture,
+  onSwitchRule,
+  onTogglePause,
+  onRemove,
+}: SubscriptionManageActionsProps & { open: boolean; onClose: () => void }) {
+  const rowClass =
+    "flex min-h-12 w-full items-center justify-between gap-3 px-4 py-3 text-left text-ui " +
+    "font-medium text-white/85 transition hover:bg-white/[0.07] disabled:opacity-40";
+
+  return (
+    <Modal open={open} onClose={onClose} label="管理订阅">
+      <div className="p-4 pt-3">
+        <div aria-hidden className="mx-auto mb-3 h-1 w-10 rounded-full bg-white/20" />
+        <h2 className="px-2 text-title-sm font-bold text-white">管理订阅</h2>
+        <div className="mt-3 overflow-hidden rounded-xl bg-white/[0.035]">
+          {canSubscribe && (
+            <button type="button" onClick={onAdjust} className={rowClass}>
+              <span>调整订阅</span>
+              <span aria-hidden className="text-white/35">›</span>
+            </button>
+          )}
+          {canSubscribe && followFuture !== null && (
+            <button
+              type="button"
+              disabled={busy}
+              onClick={onToggleFollowFuture}
+              className={rowClass}
+            >
+              <span>{followFuture ? "禁用持续追新" : "启用持续追新"}</span>
+            </button>
+          )}
+          {canManageSubscriptions && (
+            <button type="button" onClick={onSwitchRule} className={rowClass}>
+              <span>更换规则组</span>
+              <span aria-hidden className="text-white/35">›</span>
+            </button>
+          )}
+          {canSubscribe && (
+            <button
+              type="button"
+              disabled={busy || completed}
+              onClick={onTogglePause}
+              className={rowClass}
+            >
+              <span>{paused ? "恢复追踪" : "暂停追踪"}</span>
+              <span aria-hidden className="text-white/35">›</span>
+            </button>
+          )}
+          {canSubscribe && (
+            <button
+              type="button"
+              disabled={busy}
+              onClick={onRemove}
+              className={`${rowClass} border-t border-white/[0.07] !text-[#ff8b8b] hover:!bg-[#ff6b6b]/10`}
+            >
+              <span>取消订阅</span>
+            </button>
+          )}
+        </div>
+        <button
+          type="button"
+          onClick={onClose}
+          className="btn-glass mt-3 h-11 w-full text-ui font-medium"
+        >
+          关闭
+        </button>
+      </div>
+    </Modal>
   );
 }
 
@@ -505,27 +797,44 @@ function RuleSetSwitchDialog({
   );
 }
 
-/** Hero 里的参数徽片：无边框纯填充胶囊（全站「无线框」原则）。 */
-function ParamChip({ children }: { children: React.ReactNode }) {
+/** 订阅配置的一列：label 负责稳定定位，value 承载当前值。
+ * 不再用一串同形胶囊表达不同维度，避免用户把只读信息误认成按钮。 */
+function SubscriptionFact({ label, value }: { label: string; value: string }) {
   return (
-    <span className="rounded-full bg-white/[0.09] px-2.5 py-1 text-caption text-white/75 backdrop-blur-sm">
-      {children}
-    </span>
+    <div className="min-w-0">
+      <p className="text-caption text-white/40">{label}</p>
+      <p className="mt-1 truncate text-sub font-medium text-white/85" title={value}>
+        {value}
+      </p>
+    </div>
   );
 }
 
-/** 三段式进度条：绿=已入库（终态）、蓝=下载中（在途）、底轨=缺口。 */
+/** 三段式收录进度：绿=已入库、蓝=下载/待入库、底轨=仍缺失。
+ * 数字图例与颜色同时表达状态，不让色觉成为理解进度的唯一通道。 */
 function ProgressStrip({
   progress,
+  unitLabel,
 }: {
   progress: SubscriptionDetail["progress"];
+  unitLabel: "部" | "集";
 }) {
   const { total, wanted, grabbed, downloaded, imported } = progress;
   const denom = Math.max(total, 1);
   const inPipeline = grabbed + downloaded;
   return (
-    <div className="mt-4">
-      <div className="flex h-1.5 w-full max-w-[420px] overflow-hidden rounded-full bg-white/[0.12]">
+    <div className="mt-4 max-md:col-span-2 max-md:mt-1">
+      <div className="flex items-center justify-between gap-4 text-sub">
+        <span className="font-semibold text-white/85">收录进度</span>
+        <span className="tnum shrink-0 text-white/55">
+          {imported} / {total} {unitLabel}
+        </span>
+      </div>
+      <div
+        role="img"
+        aria-label={`共 ${total} ${unitLabel}，已入库 ${imported}，下载中 ${inPipeline}，缺失 ${wanted}`}
+        className="mt-2 flex h-1.5 w-full overflow-hidden rounded-full bg-white/[0.12]"
+      >
         <div
           className="bg-[#4ade80]"
           style={{ width: `${(imported / denom) * 100}%` }}
@@ -535,12 +844,21 @@ function ProgressStrip({
           style={{ width: `${(inPipeline / denom) * 100}%` }}
         />
       </div>
-      <p className="tnum mt-2 text-sub text-white/55">
-        共 {total} 项 · 缺 {wanted}
-        {inPipeline > 0 && ` · 下载中 ${inPipeline}`}
-        {imported > 0 && ` · 已入库 ${imported}`}
-      </p>
+      <div className="tnum mt-2 flex flex-wrap items-center gap-x-4 gap-y-1.5 text-caption text-white/45">
+        <ProgressLegend color="#4ade80" label={`已入库 ${imported}`} />
+        <ProgressLegend color="#6aa7ff" label={`下载中 ${inPipeline}`} />
+        <ProgressLegend color="rgba(255,255,255,0.2)" label={`缺失 ${wanted}`} />
+      </div>
     </div>
+  );
+}
+
+function ProgressLegend({ color, label }: { color: string; label: string }) {
+  return (
+    <span className="flex items-center gap-1.5">
+      <span className="size-1.5 rounded-full" style={{ backgroundColor: color }} />
+      {label}
+    </span>
   );
 }
 
@@ -583,12 +901,14 @@ function activityColor(type: SubscriptionActivity["type"]): string {
     case "completed":
     case "downloaded":
     case "imported":
+    case "replacement_promoted":
       return "#4ade80";
     case "match_rejected":
     case "dispatch_failed":
     case "import_failed":
       return "#f87171";
     case "paused":
+    case "download_stalled":
       return "#f5c451";
     default:
       return "#6aa7ff";
@@ -715,9 +1035,10 @@ function WantedRow({
   /** 该工单锚定种子的实时下载快照（仅在途工单有，5s 轮询更新） */
   download?: SubscriptionDownload;
 }) {
-  const { label, color, note } = wantedPresentation(w);
+  const { label, color, note: statusNote } = wantedPresentation(w);
   // 已提交下载且拿到了实时快照：说明行升级为进度行（进度条 + 速度/ETA）
   const live = w.status === "grabbed" || w.status === "downloaded" ? download : undefined;
+  const timingNote = resourceTimingNote(w.resource_timing, w.status === "wanted");
   return (
     /* 移动端：顶部对齐 + 更紧的间距——说明文案在窄屏允许折行（见下方 md:truncate），
        折行后徽标要与文案首行齐平，而不是吊在两行的正中 */
@@ -734,9 +1055,16 @@ function WantedRow({
         </span>
         {/* 桌面端一行截断（列表要能快速扫读）；移动端改为折行——窄屏截断后只剩
             半个日期（「将于 202…」），信息量归零，不如让它占两行把话说完 */}
-        <span className="tnum min-w-0 flex-1 text-sub leading-5 text-[var(--text-muted)] md:truncate">
-          {live ? downloadNote(live) : note}
-        </span>
+        <div className="tnum min-w-0 flex-1 leading-5">
+          <span className="block text-sub text-[var(--text-muted)] md:truncate">
+            {live ? downloadNote(live) : statusNote}
+          </span>
+          {timingNote && (
+            <span className="mt-0.5 block text-caption text-[var(--text-faint)]">
+              {timingNote}
+            </span>
+          )}
+        </div>
         {!live && w.search_attempts > 0 && (
           <span className="tnum shrink-0 text-caption text-[var(--text-faint)]">
             已搜索 {w.search_attempts} 次
@@ -781,6 +1109,32 @@ function downloadNote(d: SubscriptionDownload): string {
   return parts.filter(Boolean).join(" · ");
 }
 
+/** 资源时间链 → 用户能直接感知的“隔了多久才拉到”。 */
+function resourceTimingNote(timing: ResourceTiming | null, previous: boolean): string | null {
+  if (!timing || !shouldShowResourceTiming(timing.publish_to_submit_seconds)) return null;
+  const delay = (seconds: number) =>
+    seconds < 60 ? "不到 1 分钟" : formatDuration(seconds);
+  const prefix = `${previous ? "上次 · " : ""}${timing.dry_run ? "模拟 · " : ""}${timing.site_id}：`;
+  if (
+    timing.publish_to_seen_seconds != null &&
+    timing.seen_to_submit_seconds != null &&
+    timing.publish_to_submit_seconds != null
+  ) {
+    return (
+      `${prefix}资源发布后 ${delay(timing.publish_to_seen_seconds)}进入索引，` +
+      `${delay(timing.seen_to_submit_seconds)}后提交下载器` +
+      `（总耗时 ${delay(timing.publish_to_submit_seconds)}）`
+    );
+  }
+  if (timing.publish_to_submit_seconds != null) {
+    return `${prefix}资源发布后 ${delay(timing.publish_to_submit_seconds)}提交下载器`;
+  }
+  if (timing.seen_to_submit_seconds != null) {
+    return `${prefix}进入索引后 ${delay(timing.seen_to_submit_seconds)}提交下载器`;
+  }
+  return null;
+}
+
 function wantedPresentation(w: WantedItem): { label: string; color: string; note: string } {
   if (w.status === "imported") {
     return { label: "已入库", color: "#4ade80", note: `入库于 ${formatDateTime(w.imported_at)}` };
@@ -811,7 +1165,27 @@ function wantedPresentation(w: WantedItem): { label: string; color: string; note
     };
   }
   const due = new Date(w.next_search_at);
-  if (w.air_date && new Date(w.air_date) > new Date()) {
+  const now = new Date();
+  const forecast = w.release_forecast;
+  if (
+    w.air_date &&
+    forecast?.version === 1 &&
+    forecast.target_air_date === w.air_date &&
+    forecast.confidence !== "volatile" &&
+    forecast.sites.length > 0 &&
+    new Date(forecast.window_end) >= now
+  ) {
+    const sites = forecast.sites
+      .slice(0, 2)
+      .map((site) => site.site_id)
+      .join("、");
+    return {
+      label: "预测窗口",
+      color: "#f5c451",
+      note: `预计 ${formatDateTime(forecast.window_start)} ～ ${formatDateTime(forecast.window_end)}，重点探测 ${sites}`,
+    };
+  }
+  if (w.air_date && new Date(w.air_date) > now) {
     return {
       label: "待播出",
       color: "#f5c451",

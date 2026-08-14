@@ -3,8 +3,9 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Literal
 
-from pydantic import BaseModel, Field, field_serializer, field_validator, model_validator
+from pydantic import Field, field_serializer, field_validator, model_validator
 
+from movieclaw_api.schemas.base import BaseModel
 from movieclaw_db.models.downloader_client import ClientType, DownloaderClient
 from movieclaw_db.models.site_credential import ConfigStatus
 
@@ -107,7 +108,7 @@ class DownloadTaskView(BaseModel):
     """任务中心使用的下载器实时快照。
 
     下载器仍是下载状态的事实源；这里只在请求时汇总快照，并通过 infohash
-    关联订阅工单或手动下载意图，不把下载进度复制进本地数据库。
+    关联订阅工单、换源心跳或手动下载意图，不把实时下载进度复制进本地数据库。
     """
 
     id: str = Field(description="稳定前端键：下载器 ID + infohash；缺失任务用 missing 前缀")
@@ -120,13 +121,35 @@ class DownloadTaskView(BaseModel):
     size_bytes: int | None = None
     dlspeed_bytes: int | None = None
     eta_seconds: int | None = None
-    state: Literal["downloading", "stalled", "paused", "completed", "error", "missing", "unknown"]
+    state: Literal[
+        "downloading",
+        "stalled",
+        "queued",
+        "paused",
+        "checking",
+        "completed",
+        "error",
+        "missing",
+        "unknown",
+    ]
     source: Literal["subscription", "manual", "external"]
     media_item_id: int | None = None
     media_title: str | None = None
     media_kind: str | None = None
     poster_url: str | None = None
     subscriptions: list[DownloadTaskSubscriptionView] = Field(default_factory=list)
+    rescue_state: Literal[
+        "active",
+        "replacement_pending",
+        "trial",
+        "cleanup_pending",
+        "retained",
+        "completed",
+    ] | None = None
+    no_progress_seconds: int | None = Field(default=None, ge=0)
+    can_replace: bool = False
+    replacement_due_at: datetime | None = None
+    rescue_message: str | None = None
 
 
 class DownloadTaskSourceView(BaseModel):
@@ -151,6 +174,14 @@ class DownloadTaskDeleteView(BaseModel):
     downloader_id: int
     info_hash: str
     delete_files: bool
+
+
+class DownloadTaskReplaceView(BaseModel):
+    """用户立即换种请求的受理结果。"""
+
+    downloader_id: int
+    info_hash: str
+    attempt_id: int
 
 
 class DownloaderPayload(BaseModel):

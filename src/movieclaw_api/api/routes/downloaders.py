@@ -13,6 +13,7 @@ from movieclaw_api.schemas.downloader import (
     DownloadSubmitView,
     DownloadTaskDeleteView,
     DownloadTaskListView,
+    DownloadTaskReplaceView,
     DownloadTaskSourceView,
     DownloadTaskView,
     ManualDownloadCandidateView,
@@ -277,6 +278,44 @@ async def list_download_tasks(
             items=[DownloadTaskView(**item) for item in snapshot["items"]],
             sources=[DownloadTaskSourceView(**source) for source in snapshot["sources"]],
         )
+    )
+
+
+@router.post(
+    "/{downloader_id}/torrents/{info_hash}/replace",
+    response_model=ApiResponse[DownloadTaskReplaceView],
+    summary="立即为无进度的订阅任务寻找同品质替代源",
+    operation_id="dl.torrent.replace",
+    openapi_extra={"x-cli-hidden": True},
+)
+async def replace_stalled_subscription_download(
+    background_tasks: BackgroundTasks,
+    downloader_id: int,
+    info_hash: str = Path(
+        min_length=40,
+        max_length=64,
+        pattern=r"^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$",
+        description="BT v1（40 位）或 v2（64 位）infohash",
+    ),
+    session: AsyncSession = Depends(get_session),
+) -> ApiResponse[DownloadTaskReplaceView]:
+    """任务中心手动抢跑；请求立即返回，真实跨站搜索在后台执行。"""
+    from movieclaw_api.services.subscription import request_replacement, run_replacement_search
+
+    normalized_hash = info_hash.lower()
+    attempt_id = await request_replacement(
+        session,
+        downloader_id=downloader_id,
+        info_hash=normalized_hash,
+    )
+    background_tasks.add_task(run_replacement_search, attempt_id, force=True)
+    return ok(
+        DownloadTaskReplaceView(
+            downloader_id=downloader_id,
+            info_hash=normalized_hash,
+            attempt_id=attempt_id,
+        ),
+        message="已开始跨站寻找同品质替代源；旧任务会保留到新源产生真实进度",
     )
 
 

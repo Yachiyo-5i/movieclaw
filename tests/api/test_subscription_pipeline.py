@@ -7,7 +7,8 @@
 
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timedelta
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -15,6 +16,7 @@ import pytest_asyncio
 from sqlmodel import select
 
 from movieclaw_api.core.config import get_settings
+from movieclaw_api.schemas.subscription import ResourceTimingView
 from movieclaw_api.services.media_library import MediaLibraryService
 from movieclaw_api.services.rule_sets import RuleSetService
 from movieclaw_api.services.subscription import SubscriptionService
@@ -25,14 +27,17 @@ from movieclaw_api.settings.store import init_setting_store, reset_setting_store
 from movieclaw_db.engine import dispose_db, get_database, init_db
 from movieclaw_db.migrations import run_migrations
 from movieclaw_db.models import (
+    DownloadAttemptStatus,
     SiteTorrent,
     SubscriptionActivity,
+    SubscriptionDownloadAttempt,
     TorrentSource,
     WantedItem,
     WantedStatus,
 )
 from movieclaw_db.models.base import utcnow
 from movieclaw_db.repositories.library_repo import LibraryRepository
+from movieclaw_downloader.models import SubmitResult
 from movieclaw_enrich.models import TorrentAttrs
 from movieclaw_matcher import RuleVerdict, TorrentCandidate
 from movieclaw_media.models import MediaKind
@@ -174,11 +179,18 @@ async def test_watermark_skips_history_then_follows_new_torrents(db) -> None:
         )
 
     await process_new_torrents()  # 首跑：只初始化水位
+    published_at = utcnow() - timedelta(minutes=8)
     async with db.session() as session:
         wanted = await _wanted_map(session, sub.id)
         assert all(w.status == WantedStatus.WANTED for w in wanted.values())
 
-        await _insert_torrent(session, "new1", "Test Show S01 2160p WEB-DL 新种子", _S1_PACK_ATTRS)
+        await _insert_torrent(
+            session,
+            "new1",
+            "Test Show S01 2160p WEB-DL 新种子",
+            _S1_PACK_ATTRS,
+            publish_time=published_at,
+        )
 
     await process_new_torrents()  # 二跑：跟随到新种子并投递
     async with db.session() as session:
@@ -192,6 +204,42 @@ async def test_watermark_skips_history_then_follows_new_torrents(db) -> None:
         assert "模拟投递" in grabbed[0].message
         assert grabbed[0].payload["dry_run"] is True
         assert sorted(grabbed[0].payload["units"]) == [[1, 1], [1, 2]]
+        assert datetime.fromisoformat(grabbed[0].payload["resource_publish_time"]).replace(
+            tzinfo=None
+        ) == published_at
+        first_seen = datetime.fromisoformat(
+            grabbed[0].payload["resource_first_seen_at"]
+        ).replace(tzinfo=None)
+        submitted = datetime.fromisoformat(grabbed[0].payload["submitted_at"]).replace(
+            tzinfo=None
+        )
+        assert published_at <= first_seen <= submitted
+
+        # 一个整季包只落一条活动，但详情映射到它覆盖的每个工单；用户逐集都能
+        # 看到同一份资源发布→索引→提交耗时。
+        timings = await _service(session).resource_timings(sub.id)
+        assert set(timings) >= {(1, 1), (1, 2)}
+        assert timings[(1, 1)] == timings[(1, 2)]
+        assert timings[(1, 1)]["publish_time"] == published_at
+        timing_view = ResourceTimingView.from_snapshot(timings[(1, 1)])
+        assert timing_view is not None
+        assert timing_view.publish_to_seen_seconds is not None
+        assert timing_view.seen_to_submit_seconds is not None
+        summed = timing_view.publish_to_seen_seconds + timing_view.seen_to_submit_seconds
+        assert abs(timing_view.publish_to_submit_seconds - summed) <= 1
+
+        # 上线前的活动没有冻结键：仍可凭 site/torrent 从现存索引回补。
+        grabbed[0].payload = {
+            key: value
+            for key, value in grabbed[0].payload.items()
+            if key
+            not in {"resource_publish_time", "resource_first_seen_at", "submitted_at"}
+        }
+        session.add(grabbed[0])
+        await session.commit()
+        legacy_timings = await _service(session).resource_timings(sub.id)
+        assert legacy_timings[(1, 1)]["publish_time"] == published_at
+        assert legacy_timings[(1, 1)]["first_seen_at"] == first_seen
 
     await process_new_torrents()  # 三跑：水位已推进，幂等无副作用
     async with db.session() as session:
@@ -347,6 +395,191 @@ async def test_dispatch_claim_race_second_caller_loses(db) -> None:
             source="测试",
         )
     assert first is True and second is False
+
+
+async def test_real_dispatch_reusing_hash_merges_units_and_freezes_hash_in_activity(
+    db, monkeypatch
+) -> None:
+    """同一种子后续认领新增单元时累计覆盖范围，活动保存精确 infohash。"""
+    from importlib import import_module
+
+    dispatch_mod = import_module("movieclaw_api.services.subscription.dispatch")
+
+    monkeypatch.setenv("SUBSCRIPTION_DISPATCH_DRY_RUN", "false")
+    get_settings.cache_clear()
+
+    async def submit_same_hash(*args, **kwargs):
+        return (
+            SubmitResult(info_hash="a" * 40, name="Test Show S01", already_exists=False),
+            SimpleNamespace(id=None),
+        )
+
+    monkeypatch.setattr(dispatch_mod, "_submit_real", submit_same_hash)
+    async with db.session() as session:
+        sub = await _service(session).create(MediaKind.TV, 200, selected_seasons=[1])
+        wanted = await _wanted_map(session, sub.id)
+        item = (await _service(session).detail(sub.id))[1]
+        candidate = TorrentCandidate(
+            site_id="testsite",
+            torrent_id="same-hash",
+            title="Test Show S01 2160p WEB-DL",
+            subtitle="",
+            attrs=TorrentAttrs.model_validate(_S1_PACK_ATTRS),
+        )
+        verdict = RuleVerdict(accepted=True, score=1)
+
+        assert await dispatch(
+            session,
+            subscription=sub,
+            item=item,
+            wanted_rows=[wanted[(1, 1)]],
+            candidate=candidate,
+            verdict=verdict,
+            source="测试",
+        )
+        assert await dispatch(
+            session,
+            subscription=sub,
+            item=item,
+            wanted_rows=[wanted[(1, 2)]],
+            candidate=candidate,
+            verdict=verdict,
+            source="测试",
+        )
+
+        attempt = (
+            await session.execute(
+                select(SubscriptionDownloadAttempt).where(
+                    SubscriptionDownloadAttempt.subscription_id == sub.id
+                )
+            )
+        ).scalar_one()
+        assert sorted(attempt.units) == [[1, 1], [1, 2]]
+        grabbed = [
+            activity
+            for activity in await _activities(session, sub.id)
+            if activity.type == "grabbed"
+        ]
+        assert [activity.payload["info_hash"] for activity in grabbed] == ["a" * 40, "a" * 40]
+
+
+async def test_real_dispatch_rechecks_scope_after_network_submit(db, monkeypatch) -> None:
+    """取消订阅与网络提交撞车时保留真实 hash，但尝试必须直接停止，不能救援。"""
+    from importlib import import_module
+
+    dispatch_mod = import_module("movieclaw_api.services.subscription.dispatch")
+    monkeypatch.setenv("SUBSCRIPTION_DISPATCH_DRY_RUN", "false")
+    get_settings.cache_clear()
+
+    async def submit_after_scope_removed(*args, **kwargs):
+        async with db.session() as concurrent:
+            rows = list(
+                (
+                    await concurrent.execute(
+                        select(WantedItem).where(WantedItem.status == WantedStatus.GRABBED)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            for row in rows:
+                row.in_scope = False
+                concurrent.add(row)
+            await concurrent.commit()
+        return (
+            SubmitResult(info_hash="b" * 40, name="Concurrent.S01", already_exists=False),
+            SimpleNamespace(id=None),
+        )
+
+    monkeypatch.setattr(dispatch_mod, "_submit_real", submit_after_scope_removed)
+    async with db.session() as session:
+        sub = await _service(session).create(MediaKind.TV, 200, selected_seasons=[1])
+        wanted = await _wanted_map(session, sub.id)
+        item = (await _service(session).detail(sub.id))[1]
+        candidate = TorrentCandidate(
+            site_id="testsite",
+            torrent_id="scope-race",
+            title="Test Show S01E01 2160p WEB-DL",
+            subtitle="",
+            attrs=TorrentAttrs.model_validate(
+                {**_S1_PACK_ATTRS, "episodes": [1], "complete": None}
+            ),
+        )
+
+        assert await dispatch(
+            session,
+            subscription=sub,
+            item=item,
+            wanted_rows=[wanted[(1, 1)]],
+            candidate=candidate,
+            verdict=RuleVerdict(accepted=True, score=1),
+            source="并发测试",
+        )
+        await session.refresh(wanted[(1, 1)])
+        attempt = (
+            await session.execute(
+                select(SubscriptionDownloadAttempt).where(
+                    SubscriptionDownloadAttempt.subscription_id == sub.id
+                )
+            )
+        ).scalar_one()
+
+        assert wanted[(1, 1)].info_hash == "b" * 40
+        assert wanted[(1, 1)].in_scope is False
+        assert attempt.status == DownloadAttemptStatus.CANCELLED
+        assert attempt.next_search_at is None
+
+
+async def test_failed_dispatch_does_not_restore_backoff_after_scope_cancel(
+    db, monkeypatch
+) -> None:
+    """投递失败与取消撞车时回滚认领，但退出范围的工单不能重新排搜索。"""
+    from importlib import import_module
+
+    dispatch_mod = import_module("movieclaw_api.services.subscription.dispatch")
+    monkeypatch.setenv("SUBSCRIPTION_DISPATCH_DRY_RUN", "false")
+    get_settings.cache_clear()
+
+    async def fail_after_scope_removed(*args, **kwargs):
+        async with db.session() as concurrent:
+            row = (
+                await concurrent.execute(
+                    select(WantedItem).where(WantedItem.status == WantedStatus.GRABBED)
+                )
+            ).scalar_one()
+            row.in_scope = False
+            concurrent.add(row)
+            await concurrent.commit()
+        raise RuntimeError("模拟下载器拒绝")
+
+    monkeypatch.setattr(dispatch_mod, "_submit_real", fail_after_scope_removed)
+    async with db.session() as session:
+        sub = await _service(session).create(MediaKind.TV, 200, selected_seasons=[1])
+        wanted = await _wanted_map(session, sub.id)
+        item = (await _service(session).detail(sub.id))[1]
+        candidate = TorrentCandidate(
+            site_id="testsite",
+            torrent_id="failed-scope-race",
+            title="Test Show S01E01 2160p WEB-DL",
+            subtitle="",
+            attrs=TorrentAttrs.model_validate(
+                {**_S1_PACK_ATTRS, "episodes": [1], "complete": None}
+            ),
+        )
+
+        assert not await dispatch(
+            session,
+            subscription=sub,
+            item=item,
+            wanted_rows=[wanted[(1, 1)]],
+            candidate=candidate,
+            verdict=RuleVerdict(accepted=True, score=1),
+            source="失败并发测试",
+        )
+        await session.refresh(wanted[(1, 1)])
+        assert wanted[(1, 1)].in_scope is False
+        assert wanted[(1, 1)].status == WantedStatus.WANTED
+        assert wanted[(1, 1)].next_search_at is None
 
 
 async def test_pack_covers_only_aired_by_publish_time(db) -> None:

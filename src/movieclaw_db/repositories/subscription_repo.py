@@ -7,7 +7,7 @@ from sqlmodel import select
 from movieclaw_db.models.base import utcnow
 from movieclaw_db.models.rule_set import RuleSet
 from movieclaw_db.models.subscription import Subscription, SubscriptionFollower, WantedItem
-from movieclaw_db.models.subscription_activity import SubscriptionActivity
+from movieclaw_db.models.subscription_activity import ActivityType, SubscriptionActivity
 
 
 class RuleSetRepository:
@@ -178,11 +178,15 @@ class SubscriptionRepository:
     # 工单
     # ------------------------------------------------------------------
 
-    async def list_wanted(self, subscription_id: int) -> list[WantedItem]:
+    async def list_wanted(
+        self, subscription_id: int, *, in_scope_only: bool = False
+    ) -> list[WantedItem]:
+        """列出工单；默认含退出范围的历史行，面向当前业务视图时显式过滤。"""
+        query = select(WantedItem).where(WantedItem.subscription_id == subscription_id)
+        if in_scope_only:
+            query = query.where(WantedItem.in_scope.is_(True))  # type: ignore[attr-defined]
         result = await self._session.execute(
-            select(WantedItem)
-            .where(WantedItem.subscription_id == subscription_id)
-            .order_by(WantedItem.season_number, WantedItem.episode_number)
+            query.order_by(WantedItem.season_number, WantedItem.episode_number)
         )
         return list(result.scalars().all())
 
@@ -218,6 +222,24 @@ class SubscriptionRepository:
         )
         return list(result.scalars().all())
 
+    async def list_grabbed_activities(
+        self, subscription_id: int
+    ) -> list[SubscriptionActivity]:
+        """返回全部成功投递活动（最新在前），供每集资源耗时回放。
+
+        不能复用时间线默认的 100 条上限：长篇剧的早期集也需要一直显示当时
+        从资源发布到被系统拉取的耗时。
+        """
+        result = await self._session.execute(
+            select(SubscriptionActivity)
+            .where(
+                SubscriptionActivity.subscription_id == subscription_id,
+                SubscriptionActivity.type == ActivityType.GRABBED,
+            )
+            .order_by(SubscriptionActivity.id.desc())  # type: ignore[attr-defined]
+        )
+        return list(result.scalars().all())
+
     async def count_wanted_by_status(
         self, subscription_ids: list[int]
     ) -> dict[int, dict[str, int]]:
@@ -226,7 +248,10 @@ class SubscriptionRepository:
             return {}
         result = await self._session.execute(
             select(WantedItem.subscription_id, WantedItem.status, func.count())
-            .where(WantedItem.subscription_id.in_(subscription_ids))  # type: ignore[attr-defined]
+            .where(
+                WantedItem.subscription_id.in_(subscription_ids),  # type: ignore[attr-defined]
+                WantedItem.in_scope.is_(True),  # type: ignore[attr-defined]
+            )
             .group_by(WantedItem.subscription_id, WantedItem.status)
         )
         counts: dict[int, dict[str, int]] = {}

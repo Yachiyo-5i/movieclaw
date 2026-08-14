@@ -214,3 +214,51 @@ class TestListTorrents:
         assert rows[0].dlspeed_bytes == 2048
         assert rows[0].eta_seconds == 60
         assert rows[0].state == "downloading"
+
+
+class TestGetTorrent:
+    async def test_file_snapshot_keeps_completed_bytes_and_selection(self):
+        fake = FakeTrClient()
+        fake.store[TORRENT_HASH] = SimpleNamespace(
+            hash_string=TORRENT_HASH,
+            name="Partial.Show",
+            percent_done=0.5,
+            download_dir="/downloads/tv",
+            fields={
+                "eta": 60,
+                "sizeWhenDone": 300,
+                "rateDownload": 100,
+                "status": 4,
+                "haveValid": 0,
+                "haveUnchecked": 150,
+                "downloadedEver": 80,
+            },
+            get_files=lambda: [
+                SimpleNamespace(
+                    name="Partial.Show/ep1.mkv",
+                    size=100,
+                    completed=100,
+                    selected=True,
+                ),
+                SimpleNamespace(
+                    name="Partial.Show/ep2.mkv",
+                    size=200,
+                    completed=50,
+                    selected=True,
+                ),
+                SimpleNamespace(
+                    name="Partial.Show/sample.mkv",
+                    size=20,
+                    completed=0,
+                    selected=False,
+                ),
+            ],
+        )
+
+        status = await make_downloader(fake).get_torrent(TORRENT_HASH)
+
+        assert status is not None
+        assert status.completed_bytes == 150
+        assert status.downloaded_bytes == 80
+        assert [file.completed_bytes for file in status.files] == [100, 50, 0]
+        assert [file.selected for file in status.files] == [True, True, False]

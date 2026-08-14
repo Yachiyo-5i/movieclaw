@@ -32,6 +32,7 @@ from movieclaw_api.schemas.subscription import (
     SubscriptionCreateView,
     SubscriptionDetailView,
     SubscriptionDownloadView,
+    SubscriptionFollowFuturePayload,
     SubscriptionTargetPreviewPayload,
     SubscriptionTrackingState,
     SubscriptionTrackingStatePayload,
@@ -238,9 +239,12 @@ async def create_subscription(
     )
     assert subscription.id is not None
     sub, item, wanted = await service.detail(subscription.id)
+    resource_timings = await service.resource_timings(subscription.id)
     return ok(
         SubscriptionCreateView(
-            subscription=SubscriptionDetailView.from_detail(sub, item, wanted),
+            subscription=SubscriptionDetailView.from_detail(
+                sub, item, wanted, resource_timings
+            ),
             download_routing=download_routing,
         ),
         message="已加入订阅，正在搜索缺失资源",
@@ -320,7 +324,8 @@ async def get_subscription(
 ) -> ApiResponse[SubscriptionDetailView]:
     service = _service(session)
     sub, item, wanted = await service.detail(subscription_id)
-    return ok(SubscriptionDetailView.from_detail(sub, item, wanted))
+    resource_timings = await service.resource_timings(subscription_id)
+    return ok(SubscriptionDetailView.from_detail(sub, item, wanted, resource_timings))
 
 
 @router.get(
@@ -390,7 +395,11 @@ async def update_subscription(
         library_id=payload.library_id if "library_id" in payload.model_fields_set else ...,
     )
     sub, item, wanted = await service.detail(subscription_id)
-    return ok(SubscriptionDetailView.from_detail(sub, item, wanted), message="订阅已调整")
+    resource_timings = await service.resource_timings(subscription_id)
+    return ok(
+        SubscriptionDetailView.from_detail(sub, item, wanted, resource_timings),
+        message="订阅已调整",
+    )
 
 
 @router.post(
@@ -470,8 +479,12 @@ async def _set_tracking_state(
     paused = state is SubscriptionTrackingState.PAUSED
     await service.set_paused(subscription_id, paused)
     sub, item, wanted = await service.detail(subscription_id)
+    resource_timings = await service.resource_timings(subscription_id)
     message = "已暂停，资源匹配与搜索将跳过该订阅" if paused else "已恢复追踪"
-    return ok(SubscriptionDetailView.from_detail(sub, item, wanted), message=message)
+    return ok(
+        SubscriptionDetailView.from_detail(sub, item, wanted, resource_timings),
+        message=message,
+    )
 
 
 @router.patch(
@@ -491,6 +504,33 @@ async def set_subscription_tracking_state(
         state=payload.state,
         principal=principal,
         session=session,
+    )
+
+
+@router.patch(
+    "/{subscription_id}/follow-future",
+    response_model=ApiResponse[SubscriptionDetailView],
+    summary="启用或禁用一条剧集订阅的持续追新",
+    operation_id="subscriptions.set-follow-future",
+)
+async def set_subscription_follow_future(
+    subscription_id: int,
+    payload: SubscriptionFollowFuturePayload,
+    principal: Principal = Depends(require_subscribe_capability),
+    session: AsyncSession = Depends(get_session),
+) -> ApiResponse[SubscriptionDetailView]:
+    """详情页直接操作入口；电影订阅没有持续追新语义。"""
+    service = _service(session)
+    await service.assert_can_manage(
+        subscription_id, None if principal.is_admin else principal.member_id
+    )
+    await service.set_follow_future(subscription_id, payload.enabled)
+    sub, item, wanted = await service.detail(subscription_id)
+    resource_timings = await service.resource_timings(subscription_id)
+    message = "已启用持续追新" if payload.enabled else "已禁用持续追新"
+    return ok(
+        SubscriptionDetailView.from_detail(sub, item, wanted, resource_timings),
+        message=message,
     )
 
 

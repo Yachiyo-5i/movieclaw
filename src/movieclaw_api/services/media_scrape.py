@@ -125,7 +125,11 @@ async def scrape_media_item(
 
 async def _scrape(media_item_id: int, *, force: bool, on_phase: PhaseHook = None) -> bool:
     from movieclaw_api.services.media_discover import get_tmdb_client
-    from movieclaw_api.services.subscription import expected_units, recompute_subscription_status
+    from movieclaw_api.services.subscription import (
+        expected_units,
+        recompute_subscription_status,
+        refresh_release_forecasts,
+    )
 
     def _phase(text: str) -> None:
         if on_phase is not None:
@@ -172,6 +176,9 @@ async def _scrape(media_item_id: int, *, force: bool, on_phase: PhaseHook = None
             )
             await _grow_and_sync(session, subscription, item, expected, known_keys)
             await recompute_subscription_status(session, subscription, item)
+            # 新集出现或 air_date 改档后立即重建目标快照。快照内带 target_air_date，
+            # 即使本次刷新中断，读取端也不会使用旧档期的预测。
+            await refresh_release_forecasts(session, media_item_ids={media_item_id})
 
     _phase("下载图片")
     await download_item_assets(media_item_id, force=force)

@@ -1,7 +1,8 @@
 """订阅域子包的边界守护测试。
 
 规则：包外（src/movieclaw_api 下、subscription 包之外）不允许直接 import
-子包内部模块（core/matching/dispatch/wanted_search/wanted_fulfillment/health），
+子包内部模块（core/matching/dispatch/wanted_search/wanted_fulfillment/health/
+release_forecast/replacement），
 只能从 ``movieclaw_api.services.subscription`` 公共接口导入。守住目录边界，
 防止环形依赖以"再捅一个内部模块"的方式复发。
 """
@@ -14,7 +15,7 @@ _SRC = Path(__file__).resolve().parents[2] / "src" / "movieclaw_api"
 _PACKAGE = _SRC / "services" / "subscription"
 _INTERNAL = re.compile(
     r"movieclaw_api\.services\.subscription\."
-    r"(core|matching|dispatch|wanted_search|wanted_fulfillment|health)\b"
+    r"(core|matching|dispatch|wanted_search|wanted_fulfillment|health|release_forecast|replacement)\b"
 )
 
 

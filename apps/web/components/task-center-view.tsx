@@ -4,38 +4,69 @@ import { useMemo, useState } from "react";
 
 import type { Route } from "next";
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 
-import { JobCard, TaskActionsMenu, TaskStatusDot } from "@/components/job-center";
+import {
+  JOB_STATUS_LABELS,
+  JOB_TYPE_LABELS,
+  JobCard,
+  TaskActionsMenu,
+  TaskStatusDot,
+} from "@/components/job-center";
 import { useToast } from "@/components/feedback";
 import {
+  ChevronRightIcon,
+  CheckIcon,
   ClockIcon,
-  DownloadIcon,
   FilmIcon,
   InfoIcon,
   TvIcon,
+  XIcon,
 } from "@/components/icons";
 import { Modal } from "@/components/modal";
+import { OverflowText } from "@/components/overflow-text";
 import { PosterImage } from "@/components/poster-image";
 import {
   deleteDownloadTask,
+  replaceDownloadTask,
   type DownloadTask,
   type DownloadTaskSource,
 } from "@/lib/api/downloaders";
 import { useDownloadTasks } from "@/lib/download-tasks";
 import { formatBytes, formatDuration } from "@/lib/format";
 import { imageUrl } from "@/lib/image-proxy";
-import type { JobView } from "@/lib/api/jobs";
+import { summarizeEpisodeUnits } from "@/lib/episode-units";
+import {
+  buildIngestHistoryDetail,
+  type IngestHistoryDetail,
+} from "@/lib/ingest-history";
+import { shouldOfferInlineReplacement } from "@/lib/download-task-actions";
+import { cancelJob, retryJob, type JobStatus, type JobView } from "@/lib/api/jobs";
 import { useJobs } from "@/lib/jobs";
-import { formatRelativeTime } from "@/lib/time";
+import {
+  formatClockTime,
+  formatRelativeTime,
+  formatTimelineDayLabel,
+  timelineDayKey,
+} from "@/lib/time";
 
-type TaskView = "all" | "jobs" | "downloads";
+type TaskView = "all" | "attention" | "active" | "history";
 
-const ATTENTION_JOB_STATUSES = new Set(["blocked", "failed"]);
+const ATTENTION_JOB_STATUSES = new Set<JobStatus>(["blocked", "failed"]);
+const ACTIVE_FEED_JOB_STATUSES = new Set<JobStatus>([
+  "queued",
+  "running",
+  "retry_wait",
+  "cancelling",
+  "waiting",
+]);
+const HISTORY_JOB_STATUSES = new Set<JobStatus>(["succeeded", "cancelled"]);
 
 const VIEW_LABELS: { id: TaskView; label: string }[] = [
   { id: "all", label: "全部" },
-  { id: "jobs", label: "后台作业" },
-  { id: "downloads", label: "下载任务" },
+  { id: "attention", label: "需要处理" },
+  { id: "active", label: "进行中" },
+  { id: "history", label: "已结束" },
 ];
 
 /**
@@ -46,13 +77,15 @@ const VIEW_LABELS: { id: TaskView; label: string }[] = [
 export function TaskCenterView() {
   const [view, setView] = useState<TaskView>("all");
   const [deletingTaskId, setDeletingTaskId] = useState<string | null>(null);
+  const [replacingTaskId, setReplacingTaskId] = useState<string | null>(null);
+  const [cancellingJobId, setCancellingJobId] = useState<string | null>(null);
+  const [retryingJobId, setRetryingJobId] = useState<string | null>(null);
   const [pendingDeleteTask, setPendingDeleteTask] = useState<DownloadTask | null>(null);
   const toast = useToast();
-  const { jobs, activeJobs } = useJobs();
+  const { jobs, upsert } = useJobs();
   const {
     tasks: downloadTasks,
     sources,
-    attentionTasks,
     loading,
     error,
     refreshedAt,
@@ -77,18 +110,63 @@ export function TaskCenterView() {
     }
   }
 
-  // 后台作业按“进行中优先、历史随后”排序，让历史自然归入所属分类。
-  const orderedJobs = useMemo(() => {
-    const activeJobIds = new Set(activeJobs.map((job) => job.id));
-    return [...activeJobs, ...jobs.filter((job) => !activeJobIds.has(job.id))];
-  }, [activeJobs, jobs]);
+  async function replaceStalledTask(task: DownloadTask) {
+    if (task.downloader_id == null || replacingTaskId != null) return;
+    setReplacingTaskId(task.id);
+    try {
+      await replaceDownloadTask(task.downloader_id, task.info_hash);
+      toast.success("已开始寻找同品质替代源；旧任务会保留到新源产生真实进度");
+      refresh();
+    } catch (caught) {
+      toast.error((caught as Error).message || "立即换种失败");
+    } finally {
+      setReplacingTaskId(null);
+    }
+  }
+
+  async function cancelBackgroundJob(job: JobView) {
+    if (cancellingJobId != null) return;
+    setCancellingJobId(job.id);
+    try {
+      upsert(await cancelJob(job.id));
+      toast.success("已提交取消请求");
+    } catch (caught) {
+      toast.error((caught as Error).message || "取消任务失败");
+    } finally {
+      setCancellingJobId(null);
+    }
+  }
+
+  async function retryHistoricalJob(job: JobView) {
+    if (retryingJobId != null) return;
+    setRetryingJobId(job.id);
+    try {
+      upsert(await retryJob(job.id));
+      toast.success("任务已重新加入队列");
+    } catch (caught) {
+      toast.error((caught as Error).message || "重新执行失败");
+    } finally {
+      setRetryingJobId(null);
+    }
+  }
+
+  // 页面按“是否需要用户行动”组织，而不是按底层执行器分类。每个分区内部
+  // 仍沿用 Provider 的更新时间倒序，保留实时刷新时最重要的任务在前。
   const attentionJobs = useMemo(
     () => jobs.filter((job) => ATTENTION_JOB_STATUSES.has(job.status)),
     [jobs],
   );
+  const activeFeedJobs = useMemo(
+    () => jobs.filter((job) => ACTIVE_FEED_JOB_STATUSES.has(job.status)),
+    [jobs],
+  );
+  const historicalJobs = useMemo(
+    () => jobs.filter((job) => HISTORY_JOB_STATUSES.has(job.status)),
+    [jobs],
+  );
   const ingestJobsByHash = useMemo(() => {
     const linked = new Map<string, JobView>();
-    for (const job of orderedJobs) {
+    for (const job of jobs) {
       if (job.job_type !== "library.ingest") continue;
       for (const resource of job.resources) {
         if (resource.resource_type === "download" && !linked.has(resource.resource_id)) {
@@ -97,20 +175,56 @@ export function TaskCenterView() {
       }
     }
     return linked;
-  }, [orderedJobs]);
-  const visibleJobs = view === "all" || view === "jobs" ? orderedJobs : [];
-  const visibleDownloads = useMemo(
-    () => (view === "all" || view === "downloads" ? downloadTasks : []),
-    [downloadTasks, view],
+  }, [jobs]);
+  const downloadGroups = useMemo(() => groupDownloadTasks(downloadTasks), [downloadTasks]);
+  const attentionDownloadGroups = useMemo(
+    () => downloadGroups.filter((group) => downloadGroupNeedsAttention(group, ingestJobsByHash)),
+    [downloadGroups, ingestJobsByHash],
   );
-  const visibleDownloadGroups = useMemo(
-    () => groupDownloadTasks(visibleDownloads),
-    [visibleDownloads],
+  const activeDownloadGroups = useMemo(
+    () => downloadGroups.filter((group) => !downloadGroupNeedsAttention(group, ingestJobsByHash)),
+    [downloadGroups, ingestJobsByHash],
   );
-  const activeTotal = activeJobs.length + downloadTasks.length;
-  const attentionTotal = attentionJobs.length + attentionTasks.length;
+  const linkedIngestJobIds = useMemo(
+    () =>
+      new Set(
+        downloadTasks
+          .map((task) => ingestJobsByHash.get(task.info_hash.toLowerCase())?.id)
+          .filter((jobId): jobId is string => jobId != null),
+      ),
+    [downloadTasks, ingestJobsByHash],
+  );
+  // 已经串进下载生命周期的 ingest Job 不再作为第二张独立卡重复出现。
+  const standaloneAttentionJobs = useMemo(
+    () => attentionJobs.filter((job) => !linkedIngestJobIds.has(job.id)),
+    [attentionJobs, linkedIngestJobIds],
+  );
+  const standaloneActiveJobs = useMemo(
+    () => activeFeedJobs.filter((job) => !linkedIngestJobIds.has(job.id)),
+    [activeFeedJobs, linkedIngestJobIds],
+  );
+  const standaloneHistoricalJobs = useMemo(
+    () => historicalJobs.filter((job) => !linkedIngestJobIds.has(job.id)),
+    [historicalJobs, linkedIngestJobIds],
+  );
+  const attentionTotal = attentionDownloadGroups.length + standaloneAttentionJobs.length;
+  const activeTotal = activeDownloadGroups.length + standaloneActiveJobs.length;
+  const showAttention = view === "all" || view === "attention";
+  const showActive = view === "all" || view === "active";
+  const showHistory = view === "all" || view === "history";
+  const hasContentBeforeHistory =
+    (showAttention && attentionTotal > 0) || (showActive && activeTotal > 0);
+  const visibleCount =
+    (showAttention ? attentionTotal : 0) +
+    (showActive ? activeTotal : 0) +
+    (showHistory ? standaloneHistoricalJobs.length : 0);
   const failedSources = sources.filter((source) => source.status !== "active");
   const healthySourceCount = sources.length - failedSources.length;
+  const viewCounts: Partial<Record<TaskView, number>> = {
+    attention: attentionTotal,
+    active: activeTotal,
+    history: standaloneHistoricalJobs.length,
+  };
 
   return (
     <div className="scroll-thin scroll-safe h-full overflow-y-auto pb-10">
@@ -124,36 +238,32 @@ export function TaskCenterView() {
               </h1>
             </div>
             <p className="text-on-image mt-1.5 max-w-2xl text-ui leading-6 text-[var(--text-muted)]">
-              在一个页面观察 MovieClaw 后台作业、下载器实时任务和订阅投递进度。
+              观察下载、入库和后台作业的完整过程，需要处理的任务会优先出现。
             </p>
           </div>
         </header>
 
         <div className="mt-4 flex min-h-10 flex-wrap items-center gap-x-3 gap-y-2 border-y border-white/[0.06] py-2.5 text-caption text-[var(--text-muted)]">
-          <span className="flex items-center gap-2">
+          <span
+            className={`flex items-center gap-2 ${
+              failedSources.length > 0 || error ? "text-amber-200/80" : "text-white/50"
+            }`}
+          >
             <span
-              className={`size-1.5 rounded-full ${activeTotal > 0 ? "bg-[#7dd3fc]" : "bg-white/25"}`}
+              className={`size-1.5 rounded-full ${
+                failedSources.length > 0 || error
+                  ? "bg-[#fcd34d]"
+                  : loading && refreshedAt == null
+                    ? "animate-pulse bg-[#7dd3fc]"
+                    : "bg-[#86efac]"
+              }`}
             />
-            {activeTotal > 0 ? (
-              <span>
-                <span className="tnum font-semibold text-white/80">{activeTotal}</span> 个进行中
-              </span>
-            ) : (
-              "当前无进行中任务"
-            )}
+            {failedSources.length > 0 || error
+              ? "自动更新部分异常"
+              : loading && refreshedAt == null
+                ? "正在同步任务"
+                : "自动更新正常"}
           </span>
-          <span aria-hidden="true" className="h-3 w-px bg-white/10" />
-          {attentionTotal > 0 ? (
-            <span className="flex items-center gap-1.5 text-[#fca5a5]">
-              <span className="size-1.5 rounded-full bg-[#fca5a5]" />
-              <span className="tnum font-semibold">{attentionTotal}</span> 个需要处理
-            </span>
-          ) : (
-            <span className="flex items-center gap-1.5 text-white/45">
-              <span className="size-1.5 rounded-full bg-[#86efac]" />
-              无需处理
-            </span>
-          )}
           {sources.length > 0 && (
             <>
               <span aria-hidden="true" className="h-3 w-px bg-white/10" />
@@ -183,14 +293,9 @@ export function TaskCenterView() {
                 }`}
               >
                 {item.label}
-                {item.id === "jobs" && activeJobs.length > 0 && (
+                {item.id !== "all" && (viewCounts[item.id] ?? 0) > 0 && (
                   <span className="tnum ml-1.5 text-caption text-white/45">
-                    {activeJobs.length}
-                  </span>
-                )}
-                {item.id === "downloads" && downloadTasks.length > 0 && (
-                  <span className="tnum ml-1.5 text-caption text-white/45">
-                    {downloadTasks.length}
+                    {viewCounts[item.id]}
                   </span>
                 )}
               </button>
@@ -205,47 +310,74 @@ export function TaskCenterView() {
           </p>
         </div>
 
-        {visibleJobs.length > 0 && (
-          <TaskSection
-            title="后台作业"
-            icon={<ClockIcon className="size-4" />}
-            count={visibleJobs.length}
-            description="来自网页、CLI、Agent 与调度器；进行中优先，完成、失败和取消记录随后"
-          >
-            <div className="space-y-2.5">
-              {visibleJobs.map((job) => (
-                <JobCard key={job.id} job={job} onNavigate={() => undefined} />
-              ))}
-            </div>
-          </TaskSection>
+        {showAttention && attentionTotal > 0 && (
+          <TaskAttentionSection count={attentionTotal}>
+            {attentionDownloadGroups.map((group) => (
+              <DownloadTaskGroupCard
+                key={group.key}
+                group={group}
+                ingestJobsByHash={ingestJobsByHash}
+                deletingTaskId={deletingTaskId}
+                replacingTaskId={replacingTaskId}
+                onDelete={setPendingDeleteTask}
+                onReplace={(task) => void replaceStalledTask(task)}
+              />
+            ))}
+            {standaloneAttentionJobs.map((job) => (
+              <JobCard key={job.id} job={job} onNavigate={() => undefined} />
+            ))}
+          </TaskAttentionSection>
         )}
 
-        {visibleDownloads.length > 0 && (
-          <TaskSection
-            title="下载任务"
-            icon={<DownloadIcon className="size-4" />}
-            count={visibleDownloadGroups.length}
-            description={`${visibleDownloads.length} 个资源；已识别内容按作品合并展示`}
-          >
-            <div className="space-y-2.5">
-              {visibleDownloadGroups.map((group) => (
-                <DownloadTaskGroupCard
-                  key={group.key}
+        {showActive && activeTotal > 0 && (
+          <TaskTimelineSection title="现在" count={activeTotal}>
+            {activeDownloadGroups.map((group) => (
+              <TaskTimelineItem
+                key={group.key}
+                time="实时"
+                label={`${group.title}的实时状态`}
+                tone={downloadGroupTimelineTone(group, ingestJobsByHash)}
+              >
+                <DownloadTaskGroupFeed
                   group={group}
                   ingestJobsByHash={ingestJobsByHash}
                   deletingTaskId={deletingTaskId}
+                  replacingTaskId={replacingTaskId}
                   onDelete={setPendingDeleteTask}
+                  onReplace={(task) => void replaceStalledTask(task)}
                 />
-              ))}
-            </div>
-          </TaskSection>
+              </TaskTimelineItem>
+            ))}
+            {standaloneActiveJobs.map((job) => (
+              <TaskTimelineItem
+                key={job.id}
+                time={formatClockTime(job.created_at)}
+                label={`${job.subject || job.job_type}的发起时间`}
+                tone={jobTimelineTone(job)}
+              >
+                <ActiveJobFeedItem
+                  job={job}
+                  cancelling={cancellingJobId === job.id}
+                  onCancel={() => void cancelBackgroundJob(job)}
+                />
+              </TaskTimelineItem>
+            ))}
+          </TaskTimelineSection>
         )}
 
-        {visibleJobs.length === 0 && visibleDownloads.length === 0 && !loading && (
-          <EmptyView view={view} />
+        {showHistory && standaloneHistoricalJobs.length > 0 && (
+          <TaskHistorySection
+            jobs={standaloneHistoricalJobs}
+            initiallyOpen={view === "history"}
+            separated={hasContentBeforeHistory}
+            retryingJobId={retryingJobId}
+            onRetry={(job) => void retryHistoricalJob(job)}
+          />
         )}
 
-        {loading && visibleJobs.length === 0 && visibleDownloads.length === 0 && (
+        {visibleCount === 0 && !loading && <EmptyView view={view} />}
+
+        {loading && visibleCount === 0 && (
           <div className="flex items-center justify-center gap-2.5 py-20 text-ui text-[var(--text-muted)]">
             <span className="size-4 animate-spin rounded-full border-2 border-white/20 border-t-white/70" />
             正在汇总任务…
@@ -314,7 +446,7 @@ function DeleteDownloadTaskDialog({
         </label>
         {task.source === "subscription" && (
           <p className="mt-3 text-caption leading-5 text-amber-100/65">
-            关联订阅会暂时标记该任务缺失，并在后续巡检中重新寻找资源。
+            关联订阅会保留原工单身份；巡检确认任务无进度后会按换源策略寻找替代源。
           </p>
         )}
         <div className="mt-5 flex justify-end gap-2.5">
@@ -360,38 +492,445 @@ function SourceWarning({ sources, error }: { sources: DownloadTaskSource[]; erro
   );
 }
 
-function TaskSection({
-  title,
-  description,
+/** 需要用户行动的任务脱离普通时间流置顶，避免失败记录被持续刷新的进度淹没。 */
+function TaskAttentionSection({
   count,
-  icon,
   children,
 }: {
-  title: string;
-  description: string;
   count: number;
-  icon: React.ReactNode;
   children: React.ReactNode;
 }) {
   return (
-    <section className="mt-6">
-      <div className="mb-3 flex items-end gap-2">
-        <span className="mb-0.5 text-[#b9e8ff]">{icon}</span>
-        <h2 className="text-title-sm font-semibold text-white/90">{title}</h2>
-        <span className="tnum text-caption text-white/40">{count}</span>
-        <p className="ml-2 min-w-0 truncate text-caption text-[var(--text-faint)] max-md:hidden">
-          {description}
-        </p>
+    <section className="mt-6" aria-labelledby="attention-tasks-title">
+      <div className="mb-3 flex items-center gap-2.5">
+        <span className="size-2 rounded-full bg-[#fca5a5] ring-4 ring-[#fca5a5]/10" />
+        <h2 id="attention-tasks-title" className="text-ui font-semibold text-[#fecaca]">
+          需要你处理
+        </h2>
+        <span className="tnum rounded-full bg-[#fca5a5]/10 px-2 py-0.5 text-caption text-[#fca5a5]">
+          {count}
+        </span>
       </div>
-      {children}
+      <div className="space-y-2.5 rounded-2xl border border-[#fca5a5]/20 bg-[#fca5a5]/[0.035] p-3.5 max-md:p-3">
+        {children}
+      </div>
     </section>
   );
 }
 
-const DOWNLOAD_STATE_META: Record<
-  DownloadTask["state"],
-  { label: string; color: string; dot: string }
-> = {
+/**
+ * 统一时间线只负责排列视图，不合并领域状态。下载卡仍读取下载器快照，JobCard
+ * 仍读取 Job；时间轴仅把它们放入同一条用户可扫描的阅读路径。
+ */
+function TaskTimelineSection({
+  title,
+  count,
+  children,
+}: {
+  title: string;
+  count: number;
+  children: React.ReactNode;
+}) {
+  return (
+    <section className="mt-7" aria-labelledby="active-tasks-title">
+      <div className="mb-3 flex items-center gap-3">
+        <h2 id="active-tasks-title" className="text-ui font-semibold text-white/65">
+          {title}
+        </h2>
+        <span className="tnum text-caption text-white/30">{count}</span>
+        <span aria-hidden="true" className="h-px min-w-8 flex-1 bg-white/[0.09]" />
+      </div>
+      <div>{children}</div>
+    </section>
+  );
+}
+
+function TaskTimelineItem({
+  time,
+  label,
+  tone = "active",
+  children,
+}: {
+  time: string;
+  label: string;
+  tone?: "active" | "waiting" | "success" | "cancelled";
+  children: React.ReactNode;
+}) {
+  const completed = tone === "success" || tone === "cancelled";
+  const dotClass =
+    tone === "waiting"
+      ? "bg-[#fcd34d] ring-[#fcd34d]/25"
+      : tone === "success"
+        ? "bg-[#86efac] text-[#07120b] ring-[#86efac]/20"
+        : tone === "cancelled"
+          ? "bg-white/20 text-white/60 ring-white/10"
+          : "bg-[#7dd3fc] ring-[#7dd3fc]/30";
+  return (
+    <div className="grid grid-cols-[3.75rem_1.5rem_minmax(0,1fr)] gap-x-2 last:[&_[data-timeline-line]]:hidden max-md:grid-cols-[1.25rem_minmax(0,1fr)] max-md:gap-x-2.5">
+      <span
+        aria-label={label}
+        className="tnum pt-2.5 text-right text-caption text-white/35 max-md:hidden"
+      >
+        {time}
+      </span>
+      <span className="relative flex self-stretch justify-center" aria-hidden="true">
+        <span
+          className={`absolute top-[0.7rem] z-10 flex items-center justify-center rounded-full border-2 border-[#0b0f17] ring-2 ${
+            completed ? "size-4" : "mt-0.5 size-2.5"
+          } ${dotClass}`}
+        >
+          {tone === "success" && <CheckIcon className="size-2.5" />}
+          {tone === "cancelled" && <XIcon className="size-2.5" />}
+        </span>
+        <span
+          data-timeline-line
+          className="absolute bottom-0 top-[1.65rem] w-px bg-white/[0.12]"
+        />
+      </span>
+      <div className="min-w-0 pb-4">
+        <p className="tnum mb-1 hidden text-caption text-white/35 max-md:block">{time}</p>
+        {children}
+      </div>
+    </div>
+  );
+}
+
+function jobTimelineTone(job: JobView): "active" | "waiting" {
+  return job.status === "running" ? "active" : "waiting";
+}
+
+const ACTIVE_JOB_ACTIONS: Record<string, string> = {
+  "subtitle.generate": "正在生成字幕",
+  "library.scan": "正在扫描",
+  "library.metadata.refresh": "正在刷新媒体库元数据",
+  "media.metadata.refresh": "正在刷新元数据",
+  "library.organize": "正在整理文件",
+  "library.transfer": "正在转移文件",
+  "library.ingest": "正在入库",
+};
+
+const COMPLETED_JOB_ACTIONS: Record<string, string> = {
+  "subtitle.generate": "字幕生成",
+  "library.scan": "扫描",
+  "library.metadata.refresh": "元数据刷新",
+  "media.metadata.refresh": "元数据刷新",
+  "library.organize": "文件整理",
+  "library.transfer": "文件转移",
+  "library.ingest": "入库",
+};
+
+function jobDetailString(job: JobView, key: string): string | null {
+  const detail = job.progress.details[key] ?? job.input_data[key];
+  return typeof detail === "string" && detail ? detail : null;
+}
+
+function jobDetailNumber(job: JobView, key: string): number | null {
+  const detail = job.progress.details[key];
+  return typeof detail === "number" && Number.isFinite(detail) ? detail : null;
+}
+
+/** Feed 主标题优先使用执行结果确认过的作品名，避免把长 release 名当业务标题。 */
+function jobFeedIdentity(job: JobView): string | null {
+  const quotedTitle = job.progress.message.match(/《([^》]+)》/)?.[1] ?? null;
+  const title =
+    quotedTitle ||
+    jobDetailString(job, "media_title") ||
+    jobDetailString(job, "title") ||
+    job.subject;
+  if (!title) return null;
+  if (/^[《「].+[》」]$/.test(title)) return title;
+  if (job.job_type === "library.scan") return `「${title}」`;
+  if (
+    job.job_type === "library.ingest" ||
+    job.job_type === "subtitle.generate" ||
+    job.job_type.includes("metadata.refresh")
+  ) {
+    return `《${title}》`;
+  }
+  return title;
+}
+
+function jobProgressAmount(job: JobView): string | null {
+  const { current, total } = job.progress;
+  if (current == null || total == null) return null;
+  if (job.job_type === "library.ingest") {
+    return `已处理 ${formatBytes(current)} / ${formatBytes(total)}`;
+  }
+  const unit =
+    job.job_type === "subtitle.generate"
+      ? "个分块"
+      : job.job_type === "library.scan"
+        ? "个文件"
+        : job.job_type.includes("metadata.refresh")
+          ? "个条目"
+          : "项";
+  return `已处理 ${current} / ${total} ${unit}`;
+}
+
+function jobOriginLabel(job: JobView): string {
+  const origin =
+    job.origin === "cli"
+      ? "CLI 发起"
+      : job.origin === "agent"
+        ? "Agent 发起"
+        : job.origin === "scheduler" || job.origin === "system"
+          ? "系统自动"
+          : "网页发起";
+  return job.actor_name ? `${origin} · ${job.actor_name}` : origin;
+}
+
+function activeJobStatus(job: JobView): string {
+  if (job.status === "running") {
+    return ACTIVE_JOB_ACTIONS[job.job_type] || "正在处理";
+  }
+  return JOB_STATUS_LABELS[job.status] || job.status;
+}
+
+function historicalJobTitle(job: JobView): string {
+  const identity = jobFeedIdentity(job);
+  const action = COMPLETED_JOB_ACTIONS[job.job_type];
+  const result = job.status === "cancelled" ? "已取消" : "完成";
+  if (identity && action) return `${identity}${action}${result}`;
+  return `${identity || JOB_TYPE_LABELS[job.job_type] || job.job_type}${result}`;
+}
+
+function historicalJobSummary(job: JobView): string {
+  if (job.job_type === "library.scan") {
+    const identified = jobDetailNumber(job, "identified");
+    const unidentified = jobDetailNumber(job, "unidentified");
+    const parts = [
+      identified != null ? `识别 ${identified} 个` : null,
+      unidentified != null ? `待识别 ${unidentified} 个` : null,
+    ].filter((item): item is string => item != null);
+    if (parts.length > 0) return parts.join(" · ");
+  }
+  return job.progress.message || (job.status === "cancelled" ? "任务已取消" : "任务已完成");
+}
+
+function ActiveJobFeedItem({
+  job,
+  cancelling,
+  onCancel,
+}: {
+  job: JobView;
+  cancelling: boolean;
+  onCancel: () => void;
+}) {
+  const percent = job.progress.percent;
+  const amount = jobProgressAmount(job);
+  const cancellable = job.status !== "cancelling";
+  const title = jobFeedIdentity(job) || JOB_TYPE_LABELS[job.job_type] || job.job_type;
+  return (
+    <article className="min-w-0 py-1.5">
+      <div className="flex min-w-0 items-start justify-between gap-3">
+        <div className="min-w-0 flex-1">
+          <h3 className="text-ui font-semibold leading-5 text-white/90">
+            <OverflowText>{title}</OverflowText>
+          </h3>
+          <p className="mt-1 flex flex-wrap items-center gap-x-1.5 text-sub text-white/60">
+            <span className="font-medium text-white/70">{activeJobStatus(job)}</span>
+            {percent != null && (
+              <>
+                <span aria-hidden="true" className="text-white/25">·</span>
+                <span className="tnum">{Math.round(percent)}%</span>
+              </>
+            )}
+          </p>
+        </div>
+        {cancellable && (
+          <button
+            type="button"
+            onClick={onCancel}
+            disabled={cancelling}
+            className="shrink-0 rounded-lg px-2.5 py-1.5 text-caption font-medium text-white/45 transition hover:bg-white/[0.06] hover:text-white/75 disabled:cursor-wait disabled:opacity-45"
+          >
+            {cancelling ? "正在取消…" : "取消任务"}
+          </button>
+        )}
+      </div>
+      {job.progress.message && (
+        <OverflowText lines={2} className="mt-1.5 text-caption leading-5 text-white/42">
+          {job.progress.message}
+        </OverflowText>
+      )}
+      {(percent != null || job.status === "running") && (
+        <div className="mt-2.5 h-1.5 overflow-hidden rounded-full bg-white/[0.07]">
+          <div
+            className={`h-full rounded-full bg-[#7dd3fc] transition-[width] duration-700 ${
+              percent == null ? "w-1/3 animate-pulse opacity-65" : ""
+            }`}
+            style={
+              percent == null
+                ? undefined
+                : { width: `${Math.min(100, Math.max(percent > 0 ? 1 : 0, percent))}%` }
+            }
+          />
+        </div>
+      )}
+      {amount && <p className="tnum mt-1.5 text-caption text-white/38">{amount}</p>}
+      <p className="mt-2 text-caption text-white/30">
+        {jobOriginLabel(job)}
+        <span aria-hidden="true"> · </span>
+        {job.started_at ? `${formatClockTime(job.started_at)} 开始` : `${formatClockTime(job.created_at)} 发起`}
+      </p>
+    </article>
+  );
+}
+
+interface HistoryDayGroup {
+  key: string;
+  label: string;
+  jobs: JobView[];
+}
+
+function groupHistoricalJobs(jobs: JobView[]): HistoryDayGroup[] {
+  const groups = new Map<string, HistoryDayGroup>();
+  for (const job of jobs) {
+    const timestamp = job.finished_at || job.created_at;
+    const key = timelineDayKey(timestamp);
+    const existing = groups.get(key);
+    if (existing) {
+      existing.jobs.push(job);
+    } else {
+      groups.set(key, { key, label: formatTimelineDayLabel(timestamp), jobs: [job] });
+    }
+  }
+  return [...groups.values()];
+}
+
+function HistoricalJobFeedItem({
+  job,
+  retrying,
+  onRetry,
+}: {
+  job: JobView;
+  retrying: boolean;
+  onRetry: () => void;
+}) {
+  const ingestDetail = buildIngestHistoryDetail(job);
+  return (
+    <article className="group/history min-w-0 py-1.5">
+      <div className="flex min-w-0 items-start gap-3">
+        <div className="min-w-0 flex-1">
+          <h3 className="text-ui font-medium leading-5 text-white/78">
+            <OverflowText>{historicalJobTitle(job)}</OverflowText>
+          </h3>
+          <OverflowText lines={2} className="mt-1 text-caption leading-5 text-white/40">
+            {ingestDetail?.summary ?? historicalJobSummary(job)}
+          </OverflowText>
+          {ingestDetail && <IngestHistoryFiles detail={ingestDetail} />}
+        </div>
+        {job.status === "cancelled" && (
+          <button
+            type="button"
+            onClick={onRetry}
+            disabled={retrying}
+            className="shrink-0 rounded-lg px-2.5 py-1.5 text-caption font-medium text-white/35 transition hover:bg-white/[0.05] hover:text-white/65 disabled:cursor-wait disabled:opacity-40"
+          >
+            {retrying ? "重新执行中…" : "重新执行"}
+          </button>
+        )}
+      </div>
+    </article>
+  );
+}
+
+/** 入库历史默认只占一行，需要核对时再展开真实文件名与目标媒体库。 */
+function IngestHistoryFiles({ detail }: { detail: IngestHistoryDetail }) {
+  if (detail.fileGroups.length === 0 && detail.context == null) return null;
+  const fileCount = detail.fileGroups.reduce((total, group) => total + group.files.length, 0);
+  return (
+    <details className="group/files mt-1.5 max-w-full text-caption">
+      <summary className="flex w-fit max-w-full cursor-pointer list-none items-center gap-1.5 rounded-md py-1 pr-1 text-white/32 transition hover:text-white/60 [&::-webkit-details-marker]:hidden">
+        <ChevronRightIcon className="size-3.5 shrink-0 transition-transform group-open/files:rotate-90" />
+        <span>查看文件明细</span>
+        {fileCount > 0 && <span className="tnum text-white/22">{fileCount} 个</span>}
+      </summary>
+      <div className="mt-1.5 hidden rounded-lg border border-white/[0.06] bg-white/[0.025] px-3 py-2.5 group-open/files:block">
+        {detail.context && <p className="mb-2 text-white/38">{detail.context}</p>}
+        <div className="space-y-2.5">
+          {detail.fileGroups.map((group) => (
+            <section key={group.label} aria-label={group.label}>
+              <p className="mb-1 text-micro font-medium text-white/35">
+                {group.label} · {group.files.length} 个
+              </p>
+              <ul className="space-y-1 text-white/52">
+                {group.files.map((file) => (
+                  <li key={file} title={file} className="break-all leading-5">
+                    {file}
+                  </li>
+                ))}
+              </ul>
+            </section>
+          ))}
+        </div>
+      </div>
+    </details>
+  );
+}
+
+/** 历史按本地日期拆成轻量 Feed，首组默认展开，避免完成卡片占满纵向空间。 */
+function TaskHistorySection({
+  jobs,
+  initiallyOpen,
+  separated,
+  retryingJobId,
+  onRetry,
+}: {
+  jobs: JobView[];
+  initiallyOpen: boolean;
+  separated: boolean;
+  retryingJobId: string | null;
+  onRetry: (job: JobView) => void;
+}) {
+  const groups = groupHistoricalJobs(jobs);
+  return (
+    <section
+      className={separated ? "mt-6 border-t border-white/[0.1]" : "mt-3"}
+      aria-label="历史任务"
+    >
+      {groups.map((group, index) => (
+        <details
+          key={group.key}
+          open={initiallyOpen || index === 0 || undefined}
+          className="group border-b border-white/[0.07] py-3.5 last:border-b-0"
+        >
+          <summary className="flex cursor-pointer list-none items-center gap-2 rounded-lg py-1 text-ui text-white/55 transition hover:text-white/80 [&::-webkit-details-marker]:hidden">
+            <span className="font-semibold">{group.label}</span>
+            <span className="tnum text-caption text-white/30">{group.jobs.length} 项</span>
+            <span className="ml-auto text-caption text-white/30 group-open:hidden">展开</span>
+            <span className="ml-auto hidden text-caption text-white/30 group-open:inline">收起</span>
+            <ChevronRightIcon className="size-4 transition-transform group-open:rotate-90" />
+          </summary>
+          <div className="mt-3">
+            {group.jobs.map((job) => (
+              <TaskTimelineItem
+                key={job.id}
+                time={formatClockTime(job.finished_at || job.created_at)}
+                label={`${historicalJobTitle(job)}的完成时间`}
+                tone={job.status === "succeeded" ? "success" : "cancelled"}
+              >
+                <HistoricalJobFeedItem
+                  job={job}
+                  retrying={retryingJobId === job.id}
+                  onRetry={() => onRetry(job)}
+                />
+              </TaskTimelineItem>
+            ))}
+          </div>
+        </details>
+      ))}
+    </section>
+  );
+}
+
+interface TaskStateMeta {
+  label: string;
+  color: string;
+  dot: string;
+}
+
+const DOWNLOAD_STATE_META: Record<DownloadTask["state"], TaskStateMeta> = {
   downloading: {
     label: "下载中",
     color: "#7dd3fc",
@@ -406,6 +945,16 @@ const DOWNLOAD_STATE_META: Record<
     label: "已暂停",
     color: "#c4b5fd",
     dot: "bg-[#c4b5fd]",
+  },
+  queued: {
+    label: "排队中",
+    color: "#cbd5e1",
+    dot: "bg-white/40",
+  },
+  checking: {
+    label: "校验中",
+    color: "#c4b5fd",
+    dot: "animate-pulse bg-[#c4b5fd]",
   },
   completed: {
     label: "等待入库",
@@ -427,6 +976,18 @@ const DOWNLOAD_STATE_META: Record<
     color: "#cbd5e1",
     dot: "bg-white/40",
   },
+};
+
+const INGEST_STATE_META: Record<JobStatus, TaskStateMeta> = {
+  queued: { label: "等待入库", color: "#cbd5e1", dot: "bg-white/40" },
+  running: { label: "正在入库", color: "#86efac", dot: "animate-pulse bg-[#86efac]" },
+  retry_wait: { label: "等待重试", color: "#fcd34d", dot: "bg-[#fcd34d]" },
+  cancelling: { label: "正在停止", color: "#fcd34d", dot: "bg-[#fcd34d]" },
+  waiting: { label: "等待条件", color: "#cbd5e1", dot: "bg-white/40" },
+  blocked: { label: "入库待处理", color: "#fca5a5", dot: "bg-[#fca5a5]" },
+  succeeded: { label: "入库完成", color: "#86efac", dot: "bg-[#86efac]" },
+  failed: { label: "入库待处理", color: "#fca5a5", dot: "bg-[#fca5a5]" },
+  cancelled: { label: "入库已取消", color: "#c4b5fd", dot: "bg-[#c4b5fd]" },
 };
 
 interface DownloadTaskGroup {
@@ -462,16 +1023,231 @@ function groupDownloadTasks(tasks: DownloadTask[]): DownloadTaskGroup[] {
   return [...groups.values()];
 }
 
-function DownloadTaskGroupCard({
+function downloadGroupNeedsAttention(
+  group: DownloadTaskGroup,
+  ingestJobsByHash: Map<string, JobView>,
+): boolean {
+  return group.tasks.some((task) => {
+    const ingestJob = ingestJobsByHash.get(task.info_hash.toLowerCase());
+    return (
+      task.can_replace ||
+      task.state === "error" ||
+      task.state === "missing" ||
+      (ingestJob != null && ATTENTION_JOB_STATUSES.has(ingestJob.status))
+    );
+  });
+}
+
+function downloadGroupTimelineTone(
+  group: DownloadTaskGroup,
+  ingestJobsByHash: Map<string, JobView>,
+): "active" | "waiting" {
+  const executing = group.tasks.some((task) => {
+    const ingestJob = ingestJobsByHash.get(task.info_hash.toLowerCase());
+    return ingestJob?.status === "running" || ["downloading", "checking"].includes(task.state);
+  });
+  return executing ? "active" : "waiting";
+}
+
+/** “现在”区域使用过程行，不再把下载卡片原样塞进时间轴。 */
+function DownloadTaskGroupFeed({
   group,
   ingestJobsByHash,
   deletingTaskId,
+  replacingTaskId,
   onDelete,
+  onReplace,
 }: {
   group: DownloadTaskGroup;
   ingestJobsByHash: Map<string, JobView>;
   deletingTaskId: string | null;
+  replacingTaskId: string | null;
   onDelete: (task: DownloadTask) => void;
+  onReplace: (task: DownloadTask) => void;
+}) {
+  const grouped = group.mediaItemId != null;
+  const firstSubscription = group.tasks.flatMap((task) => task.subscriptions)[0];
+  return (
+    <article className="min-w-0 py-1.5">
+      {grouped && (
+        <div className="mb-2 flex min-w-0 items-start justify-between gap-3">
+          <div className="min-w-0 flex-1">
+            <h3 className="text-ui font-semibold leading-5 text-white/90">
+              <OverflowText>{group.title}</OverflowText>
+            </h3>
+            <p className="mt-1 text-caption text-white/35">
+              {group.kind === "tv" ? "剧集" : "电影"}
+              <span aria-hidden="true"> · </span>
+              {group.tasks.length} 个下载资源
+            </p>
+          </div>
+          {firstSubscription && (
+            <Link
+              href={`/subscriptions/${firstSubscription.id}` as Route}
+              className="shrink-0 rounded-lg px-2.5 py-1.5 text-caption font-medium text-white/40 transition hover:bg-white/[0.06] hover:text-white/70"
+            >
+              查看订阅
+            </Link>
+          )}
+        </div>
+      )}
+      <div
+        className={
+          grouped
+            ? "divide-y divide-white/[0.06] border-l border-white/[0.1] pl-3.5"
+            : ""
+        }
+      >
+        {group.tasks.map((task) => (
+          <DownloadTaskFeedItem
+            key={task.id}
+            task={task}
+            ingestJob={ingestJobsByHash.get(task.info_hash.toLowerCase()) ?? null}
+            grouped={grouped}
+            deleting={deletingTaskId === task.id}
+            replacing={replacingTaskId === task.id}
+            onDelete={onDelete}
+            onReplace={onReplace}
+          />
+        ))}
+      </div>
+    </article>
+  );
+}
+
+function DownloadTaskFeedItem({
+  task,
+  ingestJob,
+  grouped,
+  deleting,
+  replacing,
+  onDelete,
+  onReplace,
+}: {
+  task: DownloadTask;
+  ingestJob: JobView | null;
+  grouped: boolean;
+  deleting: boolean;
+  replacing: boolean;
+  onDelete: (task: DownloadTask) => void;
+  onReplace: (task: DownloadTask) => void;
+}) {
+  const ingestOwnsState = ingestJob != null && ingestJob.status !== "cancelled";
+  const meta = ingestOwnsState ? INGEST_STATE_META[ingestJob.status] : DOWNLOAD_STATE_META[task.state];
+  const downloadPercent = task.progress == null ? null : Math.floor(task.progress * 100);
+  const percent = ingestOwnsState
+    ? ingestJob.progress.percent == null
+      ? null
+      : Math.floor(ingestJob.progress.percent)
+    : downloadPercent;
+  const title = grouped
+    ? task.name || task.media_title || task.info_hash
+    : task.media_title || task.name || task.info_hash;
+  const sourceLabel =
+    task.source === "subscription"
+      ? "订阅投递"
+      : task.source === "manual"
+        ? "手动下载"
+        : "下载器任务";
+  const note = downloadTaskNote(task, ingestJob);
+  const showReplace = shouldOfferInlineReplacement(task);
+  const firstSubscription = task.subscriptions[0];
+
+  return (
+    <div className={grouped ? "py-2.5 first:pt-1 last:pb-1" : ""}>
+      <div className="flex min-w-0 items-start justify-between gap-3">
+        <div className="min-w-0 flex-1">
+          <h3 className={`${grouped ? "text-sub" : "text-ui"} font-semibold leading-5 text-white/88`}>
+            <OverflowText>{title}</OverflowText>
+          </h3>
+          <p className="mt-1 flex flex-wrap items-center gap-x-1.5 text-caption">
+            <span className="font-medium" style={{ color: meta.color }}>
+              {meta.label}
+            </span>
+            {percent != null && (
+              <>
+                <span aria-hidden="true" className="text-white/25">·</span>
+                <span className="tnum text-white/55">{Math.min(100, Math.max(0, percent))}%</span>
+              </>
+            )}
+            {!ingestOwnsState && task.state === "downloading" && task.dlspeed_bytes != null && task.dlspeed_bytes > 0 && (
+              <>
+                <span aria-hidden="true" className="text-white/25">·</span>
+                <span className="tnum text-white/42">↓ {formatBytes(task.dlspeed_bytes)}/s</span>
+              </>
+            )}
+          </p>
+        </div>
+        {(firstSubscription || task.downloader_id != null) && (
+          <DownloadTaskActionsMenu
+            task={task}
+            deleting={deleting}
+            replacing={replacing}
+            onDelete={onDelete}
+          />
+        )}
+      </div>
+      {note && (
+        <OverflowText lines={2} className="mt-1.5 text-caption leading-5 text-white/42">
+          {note}
+        </OverflowText>
+      )}
+      {percent != null && task.state !== "missing" && (
+        <div className="mt-2.5 h-1.5 overflow-hidden rounded-full bg-white/[0.07]">
+          <div
+            className="h-full rounded-full transition-[width] duration-700"
+            style={{
+              width: `${Math.min(100, Math.max(percent > 0 ? 1 : 0, percent))}%`,
+              backgroundColor: meta.color,
+            }}
+          />
+        </div>
+      )}
+      <div className="mt-1.5 flex flex-wrap items-center gap-x-2.5 gap-y-1 text-caption text-white/32">
+        <span>{sourceLabel}</span>
+        <span>{task.downloader_name || "下载器未找到"}</span>
+        {task.size_bytes != null && <span>{formatBytes(task.size_bytes)}</span>}
+        {!ingestOwnsState && task.eta_seconds != null && (
+          <span>剩余约 {formatDuration(task.eta_seconds)}</span>
+        )}
+      </div>
+      {firstSubscription && (
+        <div className="mt-2 flex flex-wrap items-center gap-x-2 gap-y-1 text-caption">
+          <span className="text-white/30">
+            {firstSubscription.media_kind === "tv" ? "覆盖剧集" : "下载内容"}
+          </span>
+          <EpisodeUnitsLabel units={firstSubscription.units} />
+        </div>
+      )}
+      <DownloadLifecycle task={task} ingestJob={ingestJob} variant="feed" />
+      {showReplace && (
+        <button
+          type="button"
+          onClick={() => onReplace(task)}
+          disabled={replacing}
+          className="mt-2 rounded-lg border border-[#fca5a5]/25 bg-[#fca5a5]/[0.07] px-2.5 py-1.5 text-caption font-semibold text-[#fee2e2] transition hover:bg-[#fca5a5]/[0.13] disabled:cursor-wait disabled:opacity-50"
+        >
+          {replacing ? "正在换种…" : "立即换种"}
+        </button>
+      )}
+    </div>
+  );
+}
+
+function DownloadTaskGroupCard({
+  group,
+  ingestJobsByHash,
+  deletingTaskId,
+  replacingTaskId,
+  onDelete,
+  onReplace,
+}: {
+  group: DownloadTaskGroup;
+  ingestJobsByHash: Map<string, JobView>;
+  deletingTaskId: string | null;
+  replacingTaskId: string | null;
+  onDelete: (task: DownloadTask) => void;
+  onReplace: (task: DownloadTask) => void;
 }) {
   if (group.mediaItemId == null) {
     const task = group.tasks[0];
@@ -480,7 +1256,9 @@ function DownloadTaskGroupCard({
         task={task}
         ingestJob={ingestJobsByHash.get(task.info_hash.toLowerCase()) ?? null}
         deleting={deletingTaskId === task.id}
+        replacing={replacingTaskId === task.id}
         onDelete={onDelete}
+        onReplace={onReplace}
       />
     );
   }
@@ -507,7 +1285,9 @@ function DownloadTaskGroupCard({
           </div>
         </div>
         <div className="min-w-0 flex-1">
-          <h3 className="truncate text-ui font-semibold text-white/90">{group.title}</h3>
+          <h3 className="min-w-0 text-ui font-semibold text-white/90">
+            <OverflowText>{group.title}</OverflowText>
+          </h3>
           <p className="mt-0.5 text-caption text-white/40">
             {isTv ? "剧集" : "电影"}
             <span aria-hidden="true"> · </span>
@@ -517,7 +1297,7 @@ function DownloadTaskGroupCard({
         {firstSubscription && (
           <Link
             href={`/subscriptions/${firstSubscription.id}` as Route}
-            className="shrink-0 rounded-lg border border-white/10 px-3 py-1.5 text-caption font-medium text-white/60 hover:bg-white/[0.06] hover:text-white max-md:hidden"
+            className="shrink-0 rounded-lg border border-white/10 px-3 py-1.5 text-caption font-medium text-white/60 transition hover:bg-white/[0.06] hover:text-white"
           >
             查看订阅
           </Link>
@@ -531,7 +1311,9 @@ function DownloadTaskGroupCard({
             ingestJob={ingestJobsByHash.get(task.info_hash.toLowerCase()) ?? null}
             grouped
             deleting={deletingTaskId === task.id}
+            replacing={replacingTaskId === task.id}
             onDelete={onDelete}
+            onReplace={onReplace}
           />
         ))}
       </div>
@@ -544,32 +1326,24 @@ function DownloadTaskCard({
   ingestJob,
   grouped = false,
   deleting,
+  replacing,
   onDelete,
+  onReplace,
 }: {
   task: DownloadTask;
   ingestJob: JobView | null;
   grouped?: boolean;
   deleting: boolean;
+  replacing: boolean;
   onDelete: (task: DownloadTask) => void;
+  onReplace: (task: DownloadTask) => void;
 }) {
-  const ingestActive =
-    ingestJob !== null &&
-    ["queued", "running", "retry_wait", "cancelling", "waiting"].includes(ingestJob.status);
   const ingestNeedsAttention =
     ingestJob !== null && ["blocked", "failed"].includes(ingestJob.status);
-  const meta = ingestNeedsAttention
-    ? {
-        label: "入库待处理",
-        color: "#fca5a5",
-        dot: "bg-[#fca5a5]",
-      }
-    : ingestActive
-      ? {
-          label: "正在入库",
-          color: "#86efac",
-          dot: "animate-pulse bg-[#86efac]",
-        }
-      : DOWNLOAD_STATE_META[task.state];
+  const ingestOwnsCardState = ingestJob !== null && ingestJob.status !== "cancelled";
+  const meta = ingestOwnsCardState
+    ? INGEST_STATE_META[ingestJob.status]
+    : DOWNLOAD_STATE_META[task.state];
   const title = grouped
     ? task.name || task.media_title || task.info_hash
     : task.media_title || task.name || task.info_hash;
@@ -581,16 +1355,18 @@ function DownloadTaskCard({
         ? "手动下载"
         : "下载器任务";
   const percent = task.progress == null ? null : Math.floor(task.progress * 100);
-  const displayPercent =
-    ingestActive || ingestNeedsAttention
-      ? ingestJob?.progress.percent == null
-        ? null
-        : Math.floor(ingestJob.progress.percent)
-      : percent;
-  const progressLabel = ingestActive || ingestNeedsAttention ? "入库进度" : "下载进度";
+  const displayPercent = ingestOwnsCardState
+    ? ingestJob?.progress.percent == null
+      ? null
+      : Math.floor(ingestJob.progress.percent)
+    : percent;
+  const progressLabel = ingestOwnsCardState ? "入库进度" : "下载进度";
   const firstSubscription = task.subscriptions[0];
+  const showInlineReplace = shouldOfferInlineReplacement(task);
   const needsAttention =
-    ingestNeedsAttention || task.state === "error" || task.state === "missing";
+    ingestNeedsAttention || task.state === "error" || task.state === "missing" || task.can_replace;
+  const taskNote = downloadTaskNote(task, ingestJob);
+  const showDownloadRuntime = !ingestOwnsCardState && task.state === "downloading";
 
   return (
     <article
@@ -604,45 +1380,101 @@ function DownloadTaskCard({
         <div className="flex items-start justify-between gap-3">
           <div className="flex min-w-0 flex-1 items-center gap-2.5">
             <TaskStatusDot label={meta.label} dotClass={meta.dot} />
-            <h3
-              title={title}
-              className="min-w-0 truncate text-ui font-semibold leading-5 text-white/90"
-            >
-              {title}
+            <h3 className="min-w-0 text-ui font-semibold leading-5 text-white/90">
+              <OverflowText>{title}</OverflowText>
             </h3>
           </div>
-          {task.downloader_id != null && (
-            <DownloadTaskActionsMenu task={task} deleting={deleting} onDelete={onDelete} />
+          {(firstSubscription || task.downloader_id != null) && (
+            <DownloadTaskActionsMenu
+              task={task}
+              deleting={deleting}
+              replacing={replacing}
+              onDelete={onDelete}
+            />
           )}
         </div>
-        <div
-          className={`mt-2.5 text-sub leading-5 ${
-            needsAttention
-              ? "rounded-xl border border-[#fca5a5]/15 bg-[#fca5a5]/[0.06] px-3 py-2.5 text-[#fecaca]"
-              : "text-white/60"
-          }`}
-        >
-          <p className="line-clamp-2 min-h-10 break-words">
-            {needsAttention && <span className="mr-1.5 font-semibold">需要处理：</span>}
-            {torrentName && <span>{torrentName} · </span>}
-            {downloadTaskNote(task, percent, ingestJob)}
-          </p>
-        </div>
-        <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-caption text-white/40">
+        {(torrentName || taskNote) && (
+          <div
+            className={`mt-2.5 text-sub leading-5 ${
+              needsAttention
+                ? "rounded-xl border border-[#fca5a5]/15 bg-[#fca5a5]/[0.06] px-3 py-2.5 text-[#fecaca]"
+                : "text-white/60"
+            }`}
+          >
+            <div className="flex min-w-0 flex-wrap items-center gap-x-2.5 gap-y-2">
+              <div className="min-w-0 flex-1 basis-[28rem]">
+                <OverflowText
+                  lines={2}
+                  className="break-words"
+                  tooltipContent={
+                    <span className="whitespace-pre-wrap break-words [overflow-wrap:anywhere]">
+                      {needsAttention && <span className="mr-1.5 font-semibold">需要处理：</span>}
+                      {torrentName && <span>{torrentName}</span>}
+                      {torrentName && taskNote && <span aria-hidden="true"> · </span>}
+                      {taskNote}
+                    </span>
+                  }
+                >
+                  {needsAttention && <span className="mr-1.5 font-semibold">需要处理：</span>}
+                  {torrentName && <span>{torrentName}</span>}
+                  {torrentName && taskNote && <span aria-hidden="true"> · </span>}
+                  {taskNote}
+                </OverflowText>
+              </div>
+              {showInlineReplace && (
+                <button
+                  type="button"
+                  onClick={() => onReplace(task)}
+                  disabled={replacing}
+                  className="shrink-0 rounded-lg border border-[#fca5a5]/30 bg-[#fca5a5]/[0.1] px-3 py-1.5 text-caption font-semibold text-[#fee2e2] transition hover:border-[#fca5a5]/45 hover:bg-[#fca5a5]/[0.16] disabled:cursor-wait disabled:opacity-55"
+                >
+                  {replacing ? "正在换种…" : "立即换种"}
+                </button>
+              )}
+            </div>
+          </div>
+        )}
+        {firstSubscription && (
+          <div className="mt-2.5 flex flex-wrap items-start gap-x-2 gap-y-1.5 text-caption">
+            <span className="shrink-0 py-1 text-white/35">
+              {firstSubscription.media_kind === "tv" ? "覆盖剧集" : "下载内容"}
+            </span>
+            <EpisodeUnitsLabel units={firstSubscription.units} />
+          </div>
+        )}
+        <div className="mt-2.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-caption text-white/40">
           <span>{sourceLabel}</span>
           <span>{task.downloader_name || "所有下载器均未找到"}</span>
           {task.size_bytes != null && <span>{formatBytes(task.size_bytes)}</span>}
-          {task.dlspeed_bytes != null && task.dlspeed_bytes > 0 && (
-            <span>{formatBytes(task.dlspeed_bytes)}/s</span>
-          )}
-          {task.eta_seconds != null && <span>剩余约 {formatDuration(task.eta_seconds)}</span>}
-          {firstSubscription && <span>{formatUnits(firstSubscription.units)}</span>}
         </div>
       </div>
       {displayPercent != null && task.state !== "missing" && (
         <div className="mt-3">
-          <div className="mb-1.5 flex items-center justify-between gap-3 text-caption">
-            <span className="font-medium text-white/55">{progressLabel}</span>
+          <div className="mb-1.5 grid grid-cols-[minmax(0,1fr)_auto] items-start gap-x-3 text-caption">
+            <div className="flex min-w-0 flex-wrap items-center gap-x-1.5 gap-y-0.5">
+              <span className="font-medium text-white/55">{progressLabel}</span>
+              {showDownloadRuntime && task.dlspeed_bytes != null && task.dlspeed_bytes > 0 && (
+                <>
+                  <span aria-hidden="true" className="text-white/25">
+                    ·
+                  </span>
+                  <span className="tnum text-white/45">
+                    <span aria-hidden="true">↓ </span>
+                    {formatBytes(task.dlspeed_bytes)}/s
+                  </span>
+                </>
+              )}
+              {showDownloadRuntime && task.eta_seconds != null && (
+                <>
+                  <span aria-hidden="true" className="text-white/25">
+                    ·
+                  </span>
+                  <span className="text-white/45">
+                    剩余约 {formatDuration(task.eta_seconds)}
+                  </span>
+                </>
+              )}
+            </div>
             <span className="tnum shrink-0 font-semibold text-white/65">
               {Math.min(100, Math.max(0, displayPercent))}%
             </span>
@@ -658,16 +1490,9 @@ function DownloadTaskCard({
           </div>
         </div>
       )}
-      {(firstSubscription || ["error", "missing"].includes(task.state)) && (
+      <DownloadLifecycle task={task} ingestJob={ingestJob} />
+      {["error", "missing"].includes(task.state) && (
         <footer className="mt-3 flex flex-wrap items-center justify-end gap-2 border-t border-white/[0.06] pt-3">
-          {firstSubscription && (
-            <Link
-              href={`/subscriptions/${firstSubscription.id}` as Route}
-              className="rounded-lg border border-white/10 px-3 py-1.5 text-caption font-medium text-white/65 hover:bg-white/[0.06] hover:text-white"
-            >
-              查看订阅
-            </Link>
-          )}
           {["error", "missing"].includes(task.state) && (
             <Link
               href={"/settings/downloaders" as Route}
@@ -682,28 +1507,206 @@ function DownloadTaskCard({
   );
 }
 
-/** 下载任务的破坏性操作统一收进卡片右上角菜单，避免抢占状态展示空间。 */
+type LifecycleTone = "done" | "current" | "waiting" | "attention" | "future";
+
+interface LifecycleStep {
+  label: string;
+  detail: string;
+  tone: LifecycleTone;
+}
+
+const LIFECYCLE_DOT_STYLE: Record<LifecycleTone, string> = {
+  done: "bg-[#86efac]",
+  current: "animate-pulse bg-[#7dd3fc] ring-2 ring-[#7dd3fc]/15",
+  waiting: "bg-[#fcd34d] ring-2 ring-[#fcd34d]/10",
+  attention: "bg-[#fca5a5] ring-2 ring-[#fca5a5]/15",
+  future: "border border-white/25",
+};
+
+const LIFECYCLE_LABEL_STYLE: Record<LifecycleTone, string> = {
+  done: "text-white/60",
+  current: "text-[#b9e8ff]",
+  waiting: "text-amber-100/70",
+  attention: "text-[#fecaca]",
+  future: "text-white/30",
+};
+
+const LIFECYCLE_DETAIL_STYLE: Record<LifecycleTone, string> = {
+  done: "text-white/30",
+  current: "text-white/30",
+  waiting: "text-amber-100/40",
+  attention: "text-[#fca5a5]/70",
+  future: "text-white/30",
+};
+
+/**
+ * 把下载器状态与关联入库 Job 投影成同一条业务过程。这里不生成新状态：每一步
+ * 都能回溯到下载快照或 Job，因此刷新、重试与回退仍由原领域负责。
+ */
+function DownloadLifecycle({
+  task,
+  ingestJob,
+  variant = "card",
+}: {
+  task: DownloadTask;
+  ingestJob: JobView | null;
+  variant?: "card" | "feed";
+}) {
+  const downloaded = task.state === "completed" || ingestJob != null;
+  const downloadAttention = task.state === "error" || task.state === "missing";
+  const downloadWaiting = ["stalled", "paused", "queued", "unknown"].includes(task.state);
+  const percent = task.progress == null ? null : Math.floor(task.progress * 100);
+  const source = task.downloader_name || "下载器";
+  let downloadStep: LifecycleStep;
+  if (downloadAttention) {
+    downloadStep = {
+      label: DOWNLOAD_STATE_META[task.state].label,
+      detail: task.state === "missing" ? "等待恢复关联" : "等待下载器恢复",
+      tone: "attention",
+    };
+  } else if (downloaded) {
+    downloadStep = {
+      label: "下载完成",
+      detail: task.size_bytes == null ? "文件已就绪" : formatBytes(task.size_bytes),
+      tone: "done",
+    };
+  } else {
+    downloadStep = {
+      label: DOWNLOAD_STATE_META[task.state].label,
+      detail: percent == null ? "读取实时进度" : `${percent}%`,
+      tone: downloadWaiting ? "waiting" : "current",
+    };
+  }
+
+  let ingestStep: LifecycleStep;
+  if (ingestJob && ATTENTION_JOB_STATUSES.has(ingestJob.status)) {
+    ingestStep = {
+      label: "入库待处理",
+      detail: ingestJob.error?.message || ingestJob.progress.message,
+      tone: "attention",
+    };
+  } else if (ingestJob?.status === "running") {
+    ingestStep = {
+      label: "正在入库",
+      detail: ingestJob.progress.message,
+      tone: "current",
+    };
+  } else if (ingestJob && ACTIVE_FEED_JOB_STATUSES.has(ingestJob.status)) {
+    ingestStep = {
+      label: INGEST_STATE_META[ingestJob.status].label,
+      detail: ingestJob.progress.message,
+      tone: "waiting",
+    };
+  } else if (ingestJob?.status === "succeeded") {
+    ingestStep = {
+      label: "入库完成",
+      detail: ingestJob.progress.message,
+      tone: "done",
+    };
+  } else if (ingestJob?.status === "cancelled") {
+    ingestStep = {
+      label: "入库已取消",
+      detail: "等待重新处理",
+      tone: "waiting",
+    };
+  } else {
+    ingestStep = {
+      label: downloaded ? "等待入库" : "等待下载完成",
+      detail: "下一步",
+      tone: "future",
+    };
+  }
+
+  const steps: LifecycleStep[] = [
+    { label: "已投递", detail: source, tone: "done" },
+    downloadStep,
+    ingestStep,
+  ];
+  const feed = variant === "feed";
+
+  return (
+    <ol
+      aria-label="任务完整过程"
+      className={
+        feed
+          ? "mt-3 space-y-1.5"
+          : "mt-3 grid grid-cols-3 gap-2 border-t border-white/[0.06] pt-3 max-md:grid-cols-1"
+      }
+    >
+      {steps.map((step, index) => (
+        <li
+          key={`${step.label}:${step.detail}`}
+          className="relative flex min-w-0 items-start gap-2"
+        >
+          {index < steps.length - 1 && (
+            <span
+              aria-hidden="true"
+              className={`absolute bottom-[-0.5rem] left-[0.21875rem] top-3 w-px bg-white/[0.1] ${
+                feed ? "block" : "hidden max-md:block"
+              }`}
+            />
+          )}
+          <span
+            aria-hidden="true"
+            className={`mt-1.5 size-2 shrink-0 rounded-full ${LIFECYCLE_DOT_STYLE[step.tone]}`}
+          />
+          <span className={feed ? "flex min-w-0 flex-wrap items-baseline gap-x-2" : "min-w-0"}>
+            <span className={`text-caption font-medium ${LIFECYCLE_LABEL_STYLE[step.tone]}`}>
+              {step.label}
+            </span>
+            <OverflowText
+              lines={step.tone === "attention" ? 2 : 1}
+              className={`${feed ? "text-caption" : "mt-0.5 text-micro"} ${LIFECYCLE_DETAIL_STYLE[step.tone]}`}
+            >
+              {step.detail}
+            </OverflowText>
+          </span>
+        </li>
+      ))}
+    </ol>
+  );
+}
+
+/** 查看订阅与删除仍收进右上角菜单；需要处理的换种动作跟随提示就近展示。 */
 function DownloadTaskActionsMenu({
   task,
   deleting,
+  replacing,
   onDelete,
 }: {
   task: DownloadTask;
   deleting: boolean;
+  replacing: boolean;
   onDelete: (task: DownloadTask) => void;
 }) {
+  const router = useRouter();
+  const firstSubscription = task.subscriptions[0];
   return (
     <TaskActionsMenu
       ariaLabel={`${task.name || task.info_hash}的更多操作`}
-      disabled={deleting}
+      disabled={deleting || replacing}
       items={[
-        {
-          id: "delete",
-          label: deleting ? "删除中…" : "删除任务",
-          onSelect: () => onDelete(task),
-          disabled: deleting,
-          tone: "danger",
-        },
+        ...(firstSubscription
+          ? [
+              {
+                id: "subscription",
+                label: "查看订阅",
+                onSelect: () =>
+                  router.push(`/subscriptions/${firstSubscription.id}` as Route),
+              },
+            ]
+          : []),
+        ...(task.downloader_id != null
+          ? [
+              {
+                id: "delete",
+                label: deleting ? "删除中…" : "删除任务",
+                onSelect: () => onDelete(task),
+                disabled: deleting,
+                tone: "danger" as const,
+              },
+            ]
+          : []),
       ]}
     />
   );
@@ -711,9 +1714,14 @@ function DownloadTaskActionsMenu({
 
 function downloadTaskNote(
   task: DownloadTask,
-  percent: number | null,
   ingestJob: JobView | null,
-): string {
+): string | null {
+  if (ingestJob?.status === "succeeded") {
+    return "入库已完成，等待任务中心同步收尾";
+  }
+  if (ingestJob?.status === "cancelled") {
+    return "上次入库已取消，等待重新处理";
+  }
   if (ingestJob && ["blocked", "failed"].includes(ingestJob.status)) {
     return ingestJob.error?.message ?? ingestJob.progress.message;
   }
@@ -721,32 +1729,88 @@ function downloadTaskNote(
     ingestJob &&
     ["queued", "running", "retry_wait", "cancelling", "waiting"].includes(ingestJob.status)
   ) {
-    const ingestPercent = ingestJob.progress.percent;
-    return `${ingestJob.progress.message}${ingestPercent != null ? ` · ${Math.round(ingestPercent)}%` : ""}`;
+    return ingestJob.progress.message;
   }
+  if (task.rescue_message) return task.rescue_message;
   if (task.state === "missing") return "已投递记录仍在，但下载器中找不到对应任务";
   if (task.state === "completed") return "下载已完成，等待监听导入或媒体库扫描收尾";
-  if (task.state === "error") return `${percent ?? 0}% · 下载器报告任务异常`;
-  if (task.state === "paused") return `${percent ?? 0}% · 已在下载器中暂停`;
-  if (task.state === "stalled") return `${percent ?? 0}% · 暂无可用连接，等待继续下载`;
-  if (task.state === "unknown") return `${percent ?? 0}% · 下载器未返回可识别的状态`;
-  return `${percent ?? 0}% · 正在下载`;
+  if (task.state === "error") return "下载器报告任务异常";
+  if (task.state === "paused") return "已在下载器中暂停";
+  if (task.state === "queued") return "下载器正在排队，暂停无进度计时";
+  if (task.state === "checking") return "下载器正在校验数据，暂停无进度计时";
+  if (task.state === "stalled") return "暂无可用连接，等待继续下载";
+  if (task.state === "unknown") return "下载器未返回可识别的状态";
+  return null;
 }
 
-function formatUnits(units: DownloadTask["subscriptions"][number]["units"]): string {
-  if (units.some((unit) => unit.season_number === 0 && unit.episode_number === 0)) return "正片";
-  const labels = units.map(
-    (unit) =>
-      `S${String(unit.season_number).padStart(2, "0")}E${String(unit.episode_number).padStart(2, "0")}`,
+/**
+ * 多集资源默认显示连续区间，点击后按季查看完整集号。原生 details 保留了
+ * 键盘与读屏交互，也不会为了这块纯展示状态引入额外 React 状态。
+ */
+function EpisodeUnitsLabel({
+  units,
+}: {
+  units: DownloadTask["subscriptions"][number]["units"];
+}) {
+  const summary = summarizeEpisodeUnits(units);
+  if (!summary) return null;
+  if (summary.kind === "movie" || summary.episodeCount <= 1) {
+    return <span className="tnum">{summary.label}</span>;
+  }
+
+  return (
+    <details className="group min-w-0 max-w-full open:basis-full open:w-full">
+      <summary
+        aria-label={`覆盖 ${summary.episodeCount} 集：${summary.fullLabel}。展开查看全部集号`}
+        className="flex w-fit max-w-full cursor-pointer list-none items-center gap-1.5 rounded-md border border-[#7dd3fc]/20 bg-[#7dd3fc]/[0.07] px-2 py-1 text-[#b9e8ff] transition-colors hover:bg-[#7dd3fc]/[0.11] [&::-webkit-details-marker]:hidden"
+      >
+        <OverflowText
+          focusable={false}
+          placement="top-start"
+          className="tnum"
+          tooltipContent={
+            <span className="tnum break-words [overflow-wrap:anywhere]">{summary.fullLabel}</span>
+          }
+        >
+          {summary.label}
+        </OverflowText>
+        <ChevronRightIcon className="size-3 shrink-0 rotate-90 transition-transform group-open:-rotate-90" />
+      </summary>
+      <div className="mt-2 max-w-xl space-y-2.5 rounded-xl border border-white/[0.07] bg-white/[0.035] px-3 py-2.5">
+        {summary.seasons.map((season) => (
+          <div key={season.seasonNumber}>
+            <div className="mb-1.5 flex items-center gap-2 font-medium text-white/65">
+              <span className="tnum">S{String(season.seasonNumber).padStart(2, "0")}</span>
+              <span className="font-normal text-white/35">共 {season.episodes.length} 集</span>
+            </div>
+            <div className="flex flex-wrap gap-1.5">
+              {season.episodes.map((episode) => (
+                <span
+                  key={episode}
+                  className="tnum rounded-md bg-white/[0.055] px-1.5 py-0.5 text-micro text-white/60"
+                >
+                  E{String(episode).padStart(2, "0")}
+                </span>
+              ))}
+            </div>
+          </div>
+        ))}
+        {summary.seasons.length > 1 && (
+          <p className="border-t border-white/[0.06] pt-2 text-right text-micro text-white/35">
+            合计 {summary.episodeCount} 集
+          </p>
+        )}
+      </div>
+    </details>
   );
-  return labels.length <= 3 ? labels.join("、") : `${labels.slice(0, 3).join("、")} 等 ${labels.length} 集`;
 }
 
 function EmptyView({ view }: { view: TaskView }) {
   const copy: Record<TaskView, { title: string; note: string }> = {
     all: { title: "当前没有任务", note: "新的后台作业或下载任务会自动出现在这里。" },
-    jobs: { title: "还没有后台作业", note: "后台作业及其历史记录会统一显示在这里。" },
-    downloads: { title: "当前没有下载任务", note: "下载器中的未完成任务会自动汇总到这里。" },
+    attention: { title: "当前无需处理", note: "异常或需要确认的任务会优先出现在这里。" },
+    active: { title: "当前没有进行中的任务", note: "新任务启动后会自动进入实时过程。" },
+    history: { title: "还没有历史记录", note: "完成和取消的后台作业会保留在这里。" },
   };
   return (
     <div className="mt-8 rounded-2xl border border-white/[0.07] bg-black/20 px-6 py-16 text-center backdrop-blur-xl">

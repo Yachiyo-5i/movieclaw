@@ -14,12 +14,14 @@ import re as _re
 import time
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
+from datetime import datetime
 from pathlib import Path
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
 from movieclaw_api.exceptions import AppException, BadRequestException, NotFoundException
+from movieclaw_api.schemas.base import utc_isoformat
 from movieclaw_api.services import jobs
 from movieclaw_api.services.library.subtitles import discover_external_subtitles
 from movieclaw_api.services.subtitle_gen import extract, pgs, source, sync, translate, validate
@@ -878,6 +880,7 @@ def _job_progress(state: GenState) -> dict[str, object]:
 
 
 def _result_payload(result: GenResult) -> dict[str, object]:
+    finished_at = result.finished_at
     return {
         "ok": result.ok,
         "message": result.message,
@@ -885,11 +888,9 @@ def _result_payload(result: GenResult) -> dict[str, object]:
         "report": asdict(result.report) if result.report is not None else None,
         "sync_score": result.sync_score,
         "source_desc": result.source_desc,
-        "finished_at": (
-            result.finished_at.isoformat()
-            if hasattr(result.finished_at, "isoformat")
-            else result.finished_at
-        ),
+        "finished_at": utc_isoformat(finished_at)
+        if isinstance(finished_at, datetime)
+        else finished_at,
     }
 
 

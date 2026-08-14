@@ -2,8 +2,9 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from pydantic import BaseModel, Field, field_serializer, field_validator
+from pydantic import Field, field_serializer, field_validator
 
+from movieclaw_api.schemas.base import BaseModel
 from movieclaw_db.models.llm_provider import LlmProvider
 from movieclaw_db.models.site_credential import ConfigStatus
 from movieclaw_llm.models import ModelInfo, ProviderPreset

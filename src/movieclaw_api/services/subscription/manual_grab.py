@@ -35,7 +35,6 @@ from movieclaw_db.models import (
     SubscriptionStatus,
     WantedItem,
     WantedStatus,
-    utcnow,
 )
 from movieclaw_enrich import enrich
 from movieclaw_enrich.models import TorrentAttrs
@@ -74,7 +73,10 @@ async def grab_manual(
     （与 dl.submit 拿 download_url 的信任模型一致——调用方本就是管理员）。
     """
     from movieclaw_api.services.subscription.dispatch import dispatch
-    from movieclaw_api.services.subscription.matching import covered_units
+    from movieclaw_api.services.subscription.matching import (
+        covered_units,
+        publish_calendar_date,
+    )
 
     subscription = await session.get(Subscription, subscription_id)
     if subscription is None:
@@ -91,6 +93,7 @@ async def grab_manual(
                 select(WantedItem).where(
                     WantedItem.subscription_id == subscription_id,
                     WantedItem.status == WantedStatus.WANTED,
+                    WantedItem.in_scope.is_(True),  # type: ignore[attr-defined]
                 )
             )
         )
@@ -149,7 +152,7 @@ async def grab_manual(
             "可改用「一键下载」手动选择保存目录"
         )
 
-    published = publish_time.date() if publish_time is not None else utcnow().date()
+    published = publish_calendar_date(publish_time)
     covered = covered_units(match, open_wanted, published=published)
     if not covered:
         gap_text = "、".join(

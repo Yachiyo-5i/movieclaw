@@ -55,13 +55,13 @@ export interface SidebarProps {
   flat?: boolean;
 }
 
-/** 主导航：新任务 / 媒体库 / 订阅 + 探索项，合并成一列扁平列表。
- *  「新任务」是 Agent 入口（管理员专属，成员侧隐藏——后端也会 403）。 */
+/** 主导航：新会话 / 媒体库 / 探索项 / 订阅，合并成一列扁平列表。
+ *  「新会话」是 Agent 入口（管理员专属，成员侧隐藏——后端也会 403）。 */
 const mainNavItems = [
-  { id: "new", label: "新任务", icon: PlusIcon },
+  { id: "new", label: "新会话", icon: PlusIcon },
   { id: "library", label: "媒体库", icon: LayersIcon },
-  { id: "subscriptions", label: "我的订阅", icon: BookmarkIcon },
   ...exploreItems,
+  { id: "subscriptions", label: "我的订阅", icon: BookmarkIcon },
 ];
 
 const memberNavItems = mainNavItems.filter((item) => item.id !== "new");
@@ -84,7 +84,7 @@ export function Sidebar({
   // 基底为 LiquidGlassCard 同款材质；设置页拖动滑杆时经预览草稿实时生效。
   const { prefs } = useUiPrefs();
   const glass = sidebarGlass(prefs.sidebar);
-  // 成员形态做减法：隐藏 Agent 入口（新任务）与「最近会话」组；
+  // 成员形态做减法：隐藏 Agent 入口（新会话）与「最近会话」组；
   // 这是界面裁剪，安全边界在后端 require_admin
   const { session } = useSession();
   const { canSearch, canSubscribe } = usePermissions();
@@ -96,7 +96,7 @@ export function Sidebar({
     <>
       {/* 品牌头部。展开：完整字标 + 开合/搜索图标横排；折叠：独立徽标、开合、搜索竖排居中。
           开合按钮与搜索共用同一套图标按钮样式（⌘K 在两种形态下均可唤起搜索）。
-          两种形态的 logo 都是「回首页」入口，等同于点击导航里的「新任务」。 */}
+          两种形态的 logo 都是「回首页」入口，等同于点击导航里的「新会话」。 */}
       {collapsed ? (
         <div className="flex flex-col items-center gap-2 px-3 pb-3 pt-5">
           <BrandHome onSelect={onSelect} homeId={isMember ? "library" : "new"}>
@@ -203,7 +203,7 @@ export function Sidebar({
 
 /** 头部的侧栏开合按钮：与搜索触发器同款的方形图标按钮 */
 /**
- * 品牌 logo 的「回首页」外壳：点击等同于选中导航里的「新任务」（id: new），
+ * 品牌 logo 的「回首页」外壳：点击等同于选中导航里的「新会话」（id: new），
  * 展开态包字标、折叠态包徽标，两处共用同一交互与 hover 反馈。
  */
 function BrandHome({
@@ -212,7 +212,7 @@ function BrandHome({
   children,
 }: {
   onSelect: (id: string) => void;
-  /** 「回首页」的落点：管理员是新任务页，成员是媒体库（成员没有 Agent 入口） */
+  /** 「回首页」的落点：管理员是新会话页，成员是媒体库（成员没有 Agent 入口） */
   homeId: string;
   children: ReactNode;
 }) {
@@ -311,7 +311,7 @@ function RecentSessions({
     });
   };
 
-  /** 彻底删除会话（二次确认）；删的是当前打开的会话时回到新任务页。 */
+  /** 彻底删除会话（二次确认）；删的是当前打开的会话时回到新会话页。 */
   const handleDelete = async (id: string, title: string) => {
     const ok = await confirm({
       title: `彻底删除会话「${title}」？`,
@@ -339,7 +339,7 @@ function RecentSessions({
         >
           {conversations.length === 0 ? (
             <p className="px-2.5 py-1 text-caption leading-5 text-[var(--text-faint)]">
-              还没有会话，从「新任务」开始。
+              还没有会话，从「新会话」开始。
             </p>
           ) : (
             conversations.map((c) => (

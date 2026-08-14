@@ -3,8 +3,9 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Literal
 
-from pydantic import BaseModel, Field, field_serializer, field_validator
+from pydantic import Field, field_serializer, field_validator
 
+from movieclaw_api.schemas.base import BaseModel
 from movieclaw_db.models import AgentSession
 from movieclaw_db.repositories.agent_session_repo import is_running
 

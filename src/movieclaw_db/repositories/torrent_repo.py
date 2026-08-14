@@ -11,7 +11,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 
 from pydantic import BaseModel, field_validator, model_validator
 from sqlalchemy import func
@@ -113,20 +113,29 @@ class TorrentObservation(BaseModel):
             return None
         return v
 
+    @field_validator("publish_time")
+    @classmethod
+    def _normalize_publish_time(cls, value: datetime | None) -> datetime | None:
+        """持久层只接受 naive UTC；带 offset 的上游值先正确换算再去时区。"""
+        if value is not None and value.tzinfo is not None:
+            return value.astimezone(UTC).replace(tzinfo=None)
+        return value
+
     @model_validator(mode="after")
     def _normalize_free_deadline(self) -> TorrentObservation:
         """归一促销截止时间中的哨兵/过期值。
 
         - ``datetime.max``：tracker 层用它表示「长期免费无明确截止」，不应把 9999 年
           写进库，归一为 None（配合 is_free 表达「免费但无截止」）。
-        - 朴素/带时区混用：本项目库内统一 naive UTC，这里剥掉 tzinfo 以免比较报错。
+        - 朴素/带时区混用：本项目库内统一 naive UTC，带时区值先换算 UTC 再去 tzinfo。
         """
         dl = self.free_deadline
         if dl is not None:
-            if dl.tzinfo is not None:
-                dl = dl.replace(tzinfo=None)
-            if dl >= datetime.max.replace(microsecond=0):
+            # 先识别年份哨兵，避免 datetime.max 跨时区换算发生溢出。
+            if dl.year >= datetime.max.year:
                 dl = None
+            elif dl.tzinfo is not None:
+                dl = dl.astimezone(UTC).replace(tzinfo=None)
             self.free_deadline = dl
         return self
 
@@ -435,6 +444,9 @@ class TorrentRepository:
             cursor.newest_publish_time is None or newest_publish_time > cursor.newest_publish_time
         ):
             cursor.newest_publish_time = newest_publish_time
+        # ID 与发布时间分开维护：个别站点一度解析不到发布时间时，成功同步也必须
+        # 留下“已经建立过基线”的身份游标，避免永久被误判为首刷。
+        if newest_torrent_id is not None:
             cursor.newest_torrent_id = newest_torrent_id
         cursor.last_new_count = new_count
         cursor.last_full_page = full_page

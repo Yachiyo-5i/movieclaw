@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import abc
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from movieclaw_tracker.auth import AuthManager
+from movieclaw_tracker.datetime_utils import DEFAULT_SITE_TIMEZONE, to_naive_utc
 from movieclaw_tracker.http import HttpClient
 from movieclaw_tracker.models import (
     AuthResult,
@@ -30,6 +33,7 @@ class BaseSite(abc.ABC):
         client: HttpClient,
         auth_manager: AuthManager,
         web_base_url: str | None = None,
+        timezone: str = DEFAULT_SITE_TIMEZONE,
     ) -> None:
         self.site_id = site_id
         self.base_url = base_url.rstrip("/")
@@ -39,6 +43,10 @@ class BaseSite(abc.ABC):
         self.web_base_url = (web_base_url or base_url).rstrip("/")
         self.client = client
         self.auth_manager = auth_manager
+        # 页面/API 返回的 naive 时间先按站点本地时区解释，再统一存 naive UTC。
+        # 默认覆盖当前全部内置站点；海外站可在 YAML 顶层单独声明 timezone。
+        self.timezone = timezone
+        self._timezone = ZoneInfo(timezone)
 
     # -- 认证（非 abstract，委托给 AuthManager 处理） -----------------------
 
@@ -102,3 +110,7 @@ class BaseSite(abc.ABC):
         if self.web_base_url != self.base_url and url.startswith(self.web_base_url):
             return self.base_url + url[len(self.web_base_url):]
         return url
+
+    def _to_utc(self, value: datetime) -> datetime:
+        """按本站时间契约把时间归一为数据库使用的 naive UTC。"""
+        return to_naive_utc(value, self._timezone)

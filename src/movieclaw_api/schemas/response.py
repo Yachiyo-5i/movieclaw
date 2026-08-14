@@ -1,6 +1,8 @@
 from typing import Any, Generic, TypeVar
 
-from pydantic import BaseModel, Field
+from pydantic import Field
+
+from movieclaw_api.schemas.base import BaseModel
 
 T = TypeVar("T")
 

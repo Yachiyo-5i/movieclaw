@@ -16,8 +16,10 @@
 完成检测（本功能的核心难点——下载开始时目录结构就已建立）：
 0. **下载器权威信号优先**：条目名能匹配到已配置下载器中的种子
    （比对种子名与落盘根名——**按名称匹配免疫容器路径映射**，save_path
-   两侧视角不同不可靠）时，以下载器报告的完成状态为准：未完成就等，
-   完成即处理、无需静默窗口——这是暂停种子误判的根治手段；
+   两侧视角不同不可靠）时，以下载器报告的完成状态为准：整种完成即处理；
+   整种未完成时按单文件完成字节数构造安全白名单，已完成且没有其他种子仍在
+   写同一路径的文件先入库，其余继续等待——这是暂停种子误判与同目录长尾
+   阻塞的共同解法；
    匹配不到（网盘/浏览器等非种子来源）或下载器不可达时退回启发式：
 1. **进行中标记排除**：条目树内存在下载器的未完成标记文件
    （qBittorrent ``.!qB`` / aria2 ``.aria2`` / 浏览器 ``.crdownload`` 等）
@@ -60,9 +62,9 @@
   自检/兜底回来看），按最近到期时间挂一次性自检，全部落定即归零；
 - 下载器状态轮询：被权威信号判为「未完成」的条目记入挂起表——完成的
   一瞬 fs 事件已停、下载器 API 又慢半拍（最后分片校验完 progress 才翻 1，
-  概览另有短缓存），事件路径必然错过这次翻转。自检对挂起条目先做纯 API
-  核对（不碰磁盘，暂停的种子可无限期挂着不扰磁盘休眠），翻转成完成才
-  巡检入库；
+  概览另有短缓存），事件路径必然错过这次翻转。自检先用 API 核对；只有
+  下载器给出新的单文件完成证据时才 stat 这些候选文件并触发分批入库，暂停
+  的种子仍可无限期挂着而不反复扫描目录；
 - 唯一的主动扫：目录**初次纳入监听**时补扫该目录一次——监听建立之前
   完成的下载（停机期间/目录刚就绪/刚加进配置）不会再产生事件，只有
   这一次能接住；之后该目录全靠事件驱动；
@@ -100,7 +102,7 @@ import shutil
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import NamedTuple
 from uuid import uuid4
 
@@ -151,7 +153,8 @@ logger = logging.getLogger("movieclaw_api.library_ingest")
 FALLBACK_SWEEP_SECONDS = 3600
 # 静默窗口：指纹连续稳定 5 分钟才认为下载落定（写入中 mtime 持续变化）
 QUIET_SECONDS = 300
-# 挂起条目（下载器报未完成）的状态轮询节奏：纯 API 核对，不产生磁盘 IO
+# 挂起条目（下载器报未完成）的状态轮询节奏：优先 API 核对，只有出现新的
+# 单文件完成候选时才 stat 对应文件，不扫描整棵目录
 DEFERRED_POLL_SECONDS = 300
 # 失败条目的重试退避：指纹没变化时每小时才重试一次（避免反复打 TMDB）
 FAILED_RETRY_SECONDS = 3600
@@ -163,7 +166,7 @@ _INGEST_COPY_CHUNK_BYTES = 64 * 1024 * 1024
 
 # Job 处理逻辑修订号不仅用于审计，也作为“升级后是否值得自动重试”的边界。
 # 修改季集解析/部分入库收口逻辑时必须递增；同一修订内的待处理条目不反复重跑。
-_INGEST_HANDLER_REVISION = "library.ingest.v2"
+_INGEST_HANDLER_REVISION = "library.ingest.v3"
 
 # v0.10.0 以前，季包只要成功搬运一个文件就会被记成 imported，即使 message
 # 已明确写着其余文件因季集号解析失败而未入库。保留稳定中文片段用于识别这类
@@ -210,10 +213,27 @@ def _has_parser_gap(record: IngestEntry | None) -> bool:
 class _EntrySnapshot:
     """条目的一次快照：指纹 + 完成检测所需的观察结果。"""
 
-    fingerprint: str  # 总大小:文件数:最大mtime
+    fingerprint: str  # 整树为大小/数量/mtime；文件批次为相对路径版本哈希
     has_marker: bool  # 树内存在下载中标记文件
     has_disc: bool  # 树内存在原盘结构（BDMV/VIDEO_TS）
     videos: list[Path] = field(default_factory=list)  # 可入库的视频文件
+
+
+@dataclass(frozen=True)
+class _ReadyDownloadFile:
+    """下载器确认可安全入库的单个视频及其来源证据。"""
+
+    relative_path: str
+    size_bytes: int
+    info_hashes: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class _DownloadFileBatch:
+    """同目录仍在下载时可先行处理的一批文件。"""
+
+    files: tuple[_ReadyDownloadFile, ...]
+    consumable_hashes: tuple[str, ...]
 
 
 def _snapshot(entry: Path) -> _EntrySnapshot:
@@ -266,6 +286,65 @@ def _snapshot(entry: Path) -> _EntrySnapshot:
     )
 
 
+def _entry_file(entry: Path, relative_path: str) -> Path | None:
+    """把持久化相对路径安全还原到监听条目内，拒绝绝对路径与 ``..``。"""
+    if relative_path == ".":
+        return entry if entry.is_file() else None
+    relative = PurePosixPath(relative_path.replace("\\", "/"))
+    if relative.is_absolute() or not relative.parts or ".." in relative.parts:
+        return None
+    return entry.joinpath(*relative.parts)
+
+
+def _relative_entry_file(entry: Path, file: Path) -> str | None:
+    """把下载器映射后的文件路径收敛成条目内相对路径。"""
+    entry_path = Path(os.path.normpath(str(entry)))
+    file_path = Path(os.path.normpath(str(file)))
+    if entry.is_file():
+        return "." if file_path == entry_path else None
+    try:
+        relative = file_path.relative_to(entry_path)
+    except ValueError:
+        return None
+    return relative.as_posix() if relative.parts else None
+
+
+def _snapshot_ready_files(
+    entry: Path, ready_files: list[_ReadyDownloadFile]
+) -> _EntrySnapshot:
+    """只对下载器放行的文件取快照，目录内其他写入不再阻塞本批作业。"""
+    fingerprint_parts: list[str] = []
+    videos: list[Path] = []
+    for ready in ready_files:
+        file = _entry_file(entry, ready.relative_path)
+        if file is None or not file.is_file():
+            raise IngestSourceChanged(f"已完成文件已不存在：{ready.relative_path}")
+        try:
+            stat = file.stat()
+        except OSError as exc:
+            raise IngestSourceChanged(f"无法读取已完成文件：{file.name}") from exc
+        if stat.st_size != ready.size_bytes:
+            raise IngestSourceChanged(f"已完成文件大小发生变化：{file.name}")
+        lower = file.name.lower()
+        if any(lower.endswith(marker) for marker in IN_PROGRESS_MARKERS):
+            raise IngestSourceChanged(f"文件仍带下载中标记：{file.name}")
+        if file.suffix.lower() not in VIDEO_EXTS or any(
+            marker in lower for marker in _IGNORE_MARKERS
+        ):
+            continue
+        fingerprint_parts.append(
+            f"{ready.relative_path}\0{stat.st_size}\0{stat.st_mtime_ns}"
+        )
+        videos.append(file)
+    fingerprint = hashlib.sha256("\n".join(fingerprint_parts).encode()).hexdigest()
+    return _EntrySnapshot(
+        fingerprint=f"ready:{fingerprint}",
+        has_marker=False,
+        has_disc=False,
+        videos=sorted(videos),
+    )
+
+
 def _ingest_path_id(entry_path: str) -> str:
     """把绝对路径收敛成稳定、无敏感目录信息的资源 id。"""
     return hashlib.sha256(entry_path.encode("utf-8")).hexdigest()
@@ -299,6 +378,9 @@ async def enqueue_ingest_job(
     snap: _EntrySnapshot,
     *,
     matched_hashes: list[str] | None,
+    ready_files: tuple[_ReadyDownloadFile, ...] | None = None,
+    consumable_hashes: tuple[str, ...] | None = None,
+    keep_deferred: bool = False,
     record: IngestEntry | None = None,
     origin: str = "system",
 ) -> jobs.CreateJobResult:
@@ -321,16 +403,28 @@ async def enqueue_ingest_job(
         resources.append(jobs.ResourceRef("ingest_entry", record.id, relation="context"))
     resources.extend(jobs.ResourceRef("download", value, relation="source") for value in hashes)
     total_bytes = sum(path.stat().st_size for path in snap.videos if path.exists())
+    input_data: dict[str, object] = {
+        "rule_id": rule.id,
+        "entry_path": str(entry),
+        "detected_fingerprint": snap.fingerprint,
+        "info_hashes": hashes,
+    }
+    if ready_files is not None:
+        input_data["ready_files"] = [
+            {
+                "path": ready.relative_path,
+                "size_bytes": ready.size_bytes,
+                "info_hashes": list(ready.info_hashes),
+            }
+            for ready in ready_files
+        ]
+        input_data["consume_info_hashes"] = list(consumable_hashes or ())
+        input_data["keep_deferred"] = keep_deferred
     return await jobs.create_job(
         session,
         job_type="library.ingest",
         subject=entry.name,
-        input_data={
-            "rule_id": rule.id,
-            "entry_path": str(entry),
-            "detected_fingerprint": snap.fingerprint,
-            "info_hashes": hashes,
-        },
+        input_data=input_data,
         resources=resources,
         dedupe_key=_ingest_dedupe_key(str(entry)),
         conflict_policy="return_existing",
@@ -637,12 +731,132 @@ def _torrent_verdict(matches: list) -> str | None:
     return "complete" if all(b.completed for b in matches) else "downloading"
 
 
+async def _matched_torrent_statuses(matches: list) -> list[tuple[object, object]] | None:
+    """补查同名种子的文件状态；任一详情缺失时返回 None，调用方保守等待。"""
+    from movieclaw_api.services.download_progress import _query_torrent, _usable_downloaders
+
+    if any(not brief.info_hash for brief in matches):
+        return None  # 没有 hash 的轻量记录无法形成可复核的文件证据
+    hashes = sorted({str(brief.info_hash).lower() for brief in matches if brief.info_hash})
+    if len(hashes) != len(matches):
+        return None  # 重复 hash 的概览不应产生互相矛盾的文件写入证据
+    db = get_database()
+    async with db.session() as session:
+        downloaders = await _usable_downloaders(session)
+    if not downloaders:
+        return None
+    details: list[tuple[object, object]] = []
+    for info_hash in hashes:
+        found = await _query_torrent(info_hash, downloaders)
+        if found is None:
+            return None
+        details.append(found)
+    return details
+
+
+def _torrent_file_source(downloader, status, torrent_file) -> Path | None:  # noqa: ANN001
+    """把下载器文件路径翻译到 MovieClaw 视角；异常相对路径直接拒绝。"""
+    from movieclaw_api.services.torrent_submit import translate_to_local
+
+    local_dir = translate_to_local(status.save_path, downloader.path_mappings)
+    if not local_dir:
+        return None
+    relative = PurePosixPath(str(torrent_file.path).replace("\\", "/"))
+    if relative.is_absolute() or not relative.parts or ".." in relative.parts:
+        return None
+    return Path(local_dir).joinpath(*relative.parts)
+
+
+def _torrent_file_completed(status, torrent_file) -> bool:  # noqa: ANN001
+    """只认下载器完成字节；旧适配器缺字段时仅整种完成可兜底。"""
+    if status.completed:
+        return True
+    completed_bytes = torrent_file.completed_bytes
+    return completed_bytes is not None and completed_bytes >= torrent_file.size_bytes
+
+
+async def _completed_file_batch(entry: Path, matches: list) -> _DownloadFileBatch:
+    """计算同目录下载中的安全文件交集。
+
+    一个路径可能被多个同名种子引用；只有所有仍会写它的任务都确认该文件
+    完成，并且磁盘大小与每份下载器证据一致，才进入本批。详情读取失败时
+    返回空批，继续沿用原来的整目录等待语义。
+    """
+    details = await _matched_torrent_statuses(matches)
+    if not details:
+        return _DownloadFileBatch(files=(), consumable_hashes=())
+
+    writers: dict[str, list[tuple[object, object]]] = {}
+    video_paths_by_hash: dict[str, set[str]] = {}
+    status_by_hash: dict[str, object] = {}
+    for downloader, status in details:
+        info_hash = str(status.info_hash).lower()
+        status_by_hash[info_hash] = status
+        mapped_selected = 0
+        for torrent_file in status.files:
+            if not torrent_file.selected:
+                continue
+            source = _torrent_file_source(downloader, status, torrent_file)
+            if source is None:
+                continue
+            relative = _relative_entry_file(entry, source)
+            if relative is None:
+                continue
+            mapped_selected += 1
+            lower = source.name.lower()
+            if source.suffix.lower() not in VIDEO_EXTS or any(
+                marker in lower for marker in _IGNORE_MARKERS
+            ):
+                continue
+            writers.setdefault(relative, []).append((status, torrent_file))
+            video_paths_by_hash.setdefault(info_hash, set()).add(relative)
+        # 同名未完成种子存在、却无法还原它在本条目内写哪些文件时，不能证明
+        # 任何路径与它不重叠，整批保守等待。
+        if not status.completed and mapped_selected == 0:
+            return _DownloadFileBatch(files=(), consumable_hashes=())
+
+    ready: list[_ReadyDownloadFile] = []
+    for relative, references in sorted(writers.items()):
+        source = _entry_file(entry, relative)
+        if source is None or not source.is_file():
+            continue
+        try:
+            actual_size = source.stat().st_size
+        except OSError:
+            continue
+        expected_sizes = {int(file.size_bytes) for _status, file in references}
+        if len(expected_sizes) != 1 or actual_size not in expected_sizes:
+            continue
+        if not all(_torrent_file_completed(status, file) for status, file in references):
+            continue
+        ready.append(
+            _ReadyDownloadFile(
+                relative_path=relative,
+                size_bytes=actual_size,
+                info_hashes=tuple(
+                    sorted({str(status.info_hash).lower() for status, _file in references})
+                ),
+            )
+        )
+
+    ready_paths = {file.relative_path for file in ready}
+    consumable = tuple(
+        sorted(
+            info_hash
+            for info_hash, paths in video_paths_by_hash.items()
+            if status_by_hash[info_hash].completed and paths and paths <= ready_paths
+        )
+    )
+    return _DownloadFileBatch(files=tuple(ready), consumable_hashes=consumable)
+
+
 async def _deferred_flipped(prefix: str) -> bool:
-    """挂起条目（下载器报未完成）是否值得重新巡检。纯 API 核对，零磁盘 IO。
+    """挂起条目是否出现整种完成或新的单文件安全批次。
 
     任一条目的种子翻转成完成、或从下载器消失（用户删了任务 → 退回启发式
     检测）、或下载器整体不可达（权威信号缺席 → 同样退回启发式）都算翻转
-    ——巡检自会走完整判定链得出结论，这里只回答"要不要去巡检"。
+    ——巡检自会走完整判定链得出结论。仍在下载时只补查下载器文件状态并
+    stat 已被确认完成的少量文件；与台账指纹不同才唤醒完整巡检。
     """
     paths = [p for p in _deferred if p.startswith(prefix)]
     if not paths:
@@ -650,9 +864,28 @@ async def _deferred_flipped(prefix: str) -> bool:
     briefs = await _downloader_briefs()
     if briefs is None:
         return True
-    return any(
-        _torrent_verdict(_match_briefs(Path(p).name, briefs)) != "downloading" for p in paths
-    )
+    db = get_database()
+    for path in paths:
+        entry = Path(path)
+        matches = _match_briefs(entry.name, briefs)
+        if _torrent_verdict(matches) != "downloading":
+            return True
+        batch = await _completed_file_batch(entry, matches)
+        if not batch.files:
+            continue
+        try:
+            snap = await asyncio.to_thread(_snapshot_ready_files, entry, list(batch.files))
+        except IngestSourceChanged:
+            continue
+        async with db.session() as session:
+            record = (
+                await session.execute(
+                    select(IngestEntry).where(IngestEntry.entry_path == path)
+                )
+            ).scalar_one_or_none()
+        if record is None or record.fingerprint != snap.fingerprint:
+            return True
+    return False
 
 
 async def _process_entry(
@@ -666,13 +899,16 @@ async def _process_entry(
 ) -> None:
     path_str = str(entry)
     # 权威信号优先：能匹配到下载器种子时以下载器状态为准。报未完成的条目
-    # 记入挂起表后返回（不做磁盘快照，状态轮询期间零磁盘 IO）——绝不能
+    # 先尝试按文件完成证据拆出安全批次；没有可放行文件时只记入挂起表，
+    # 状态轮询期间不做目录全树快照——绝不能
     # 一忘了之：下载完成的一瞬 fs 事件已经停了，下载器 API 又常慢半拍
     # （最后分片校验完 progress 才翻 1，概览另有短缓存），此处若不留痕，
     # 事件/自检/兜底三条触发路径会同时失灵，条目无限期卡住且无告警
     # （线上实证 bug）。挂起表由状态轮询自检 + 兜底巡检共同照看
     matches = _match_briefs(entry.name, briefs)
     verdict = _torrent_verdict(matches)
+    partial_batch: _DownloadFileBatch | None = None
+    snap: _EntrySnapshot | None = None
     if verdict == "downloading":
         _stability.pop(path_str, None)
         if path_str not in _deferred:
@@ -682,8 +918,24 @@ async def _process_entry(
                 entry.name,
                 DEFERRED_POLL_SECONDS,
             )
-        return
-    _deferred.pop(path_str, None)
+        partial_batch = await _completed_file_batch(entry, matches)
+        if not partial_batch.files:
+            return
+        try:
+            snap = await asyncio.to_thread(
+                _snapshot_ready_files, entry, list(partial_batch.files)
+            )
+        except IngestSourceChanged:
+            return
+        if not snap.videos:
+            return
+        logger.info(
+            "「%s」仍有下载写入，先处理 %d 个已完成且路径无冲突的文件",
+            entry.name,
+            len(snap.videos),
+        )
+    else:
+        _deferred.pop(path_str, None)
 
     db = get_database()
     async with db.session() as session:
@@ -718,11 +970,13 @@ async def _process_entry(
             # Job 已接管后不再反复遍历条目树；运行、等待重试与待人工认领
             # 都以统一状态机为事实源，巡检只负责发现新的内容变化。
             _stability.pop(path_str, None)
-            _deferred.pop(path_str, None)
+            if partial_batch is None:
+                _deferred.pop(path_str, None)
             _failed_retry.pop(path_str, None)
             return
 
-        snap = await asyncio.to_thread(_snapshot, entry)
+        if snap is None:
+            snap = await asyncio.to_thread(_snapshot, entry)
         if latest_job is not None and latest_job.status in {
             JobStatus.CANCELLED,
             JobStatus.FAILED,
@@ -758,8 +1012,8 @@ async def _process_entry(
                 _failed_retry.setdefault(path_str, time.monotonic() - elapsed)
                 return
 
-        if verdict == "complete":
-            # 下载器确认完成：跳过静默窗口，立即处理
+        if verdict == "complete" or partial_batch is not None:
+            # 下载器确认完成：整种或单文件证据都跳过静默窗口，立即处理。
             _stability.pop(path_str, None)
         else:
             # 启发式兜底（非种子来源/下载器不可用）：
@@ -772,7 +1026,20 @@ async def _process_entry(
             if now - previous[1] < QUIET_SECONDS:
                 return
 
-        matched_hashes = [b.info_hash for b in matches if b.info_hash]
+        matched_hashes = (
+            sorted(
+                {
+                    info_hash
+                    for ready in partial_batch.files
+                    for info_hash in ready.info_hashes
+                }
+            )
+            if partial_batch is not None
+            else [b.info_hash for b in matches if b.info_hash]
+        )
+        consumable_hashes = (
+            list(partial_batch.consumable_hashes) if partial_batch is not None else None
+        )
         if execute_inline:
             await _ingest_entry(
                 session,
@@ -783,7 +1050,10 @@ async def _process_entry(
                 snap,
                 record,
                 matched_hashes,
+                consumable_hashes,
             )
+            if partial_batch is not None:
+                _deferred[path_str] = time.monotonic()
             return
         created = await enqueue_ingest_job(
             session,
@@ -791,10 +1061,18 @@ async def _process_entry(
             entry,
             snap,
             matched_hashes=matched_hashes,
+            ready_files=partial_batch.files if partial_batch is not None else None,
+            consumable_hashes=(
+                partial_batch.consumable_hashes if partial_batch is not None else None
+            ),
+            keep_deferred=partial_batch is not None,
             record=record,
         )
         _stability.pop(path_str, None)
-        _deferred.pop(path_str, None)
+        if partial_batch is None:
+            _deferred.pop(path_str, None)
+        else:
+            _deferred[path_str] = time.monotonic()
         _failed_retry.pop(path_str, None)
         if created.created:
             logger.info("监听条目已进入后台作业：%s（job=%s）", entry.name, created.job.id)
@@ -814,6 +1092,7 @@ async def _ingest_entry(
     snap: _EntrySnapshot,
     record: IngestEntry | None,
     matched_hashes: list[str] | None = None,
+    consumable_hashes: list[str] | None = None,
     forced_item: MediaItem | None = None,
     job_context: jobs.JobContext | None = None,
 ) -> IngestEntry:
@@ -832,10 +1111,14 @@ async def _ingest_entry(
     # 不能只删“身份识别实际选中的那一行”：同一 hash 若先被订阅工单认领，
     # 手动锚虽然没有参与识别，也已经随同一批文件完成了使命。
     manual_intent: ManualDownloadIntent | None = None
+    # 只保存本次作业实际新增的条目内相对文件名，供任务中心展示本轮成果；
+    # 已在库而跳过的旧文件不计入，也不暴露监听目录或媒体库的绝对路径。
+    imported_files: list[str] = []
 
     async def conclude(status: IngestStatus, message: str, imported: int = 0) -> IngestEntry:
         if status is IngestStatus.IMPORTED and item is not None and item.id is not None:
-            hashes = sorted({value.lower() for value in matched_hashes or [] if value})
+            source_hashes = matched_hashes if consumable_hashes is None else consumable_hashes
+            hashes = sorted({value.lower() for value in source_hashes or [] if value})
             if hashes:
                 intents = list(
                     (
@@ -852,7 +1135,7 @@ async def _ingest_entry(
                 for intent in intents:
                     await session.delete(intent)
                     logger.info("手动下载身份锚已随成功入库消费：hash=%s", intent.info_hash)
-        return await _save_record(
+        saved = await _save_record(
             session,
             dest_library,
             str(entry),
@@ -864,6 +1147,27 @@ async def _ingest_entry(
             item,
             schedule_retry=job_context is None,
         )
+        if (
+            status is IngestStatus.IMPORTED
+            and job_context is not None
+            and imported_files
+        ):
+            await job_context.update_progress(
+                mode="determinate",
+                phase="finalizing",
+                message=message,
+                percent=100.0,
+                phase_index=4,
+                phase_count=4,
+                details={
+                    "entry_name": entry.name,
+                    "rule_id": rule.id,
+                    "media_item_id": item.id if item is not None else None,
+                    "library_id": dest_library.id if dest_library is not None else None,
+                    "imported_files": list(dict.fromkeys(imported_files)),
+                },
+            )
+        return saved
 
     if snap.has_disc:
         return await conclude(
@@ -1109,6 +1413,8 @@ async def _ingest_entry(
         completed_bytes += file.stat().st_size
         if final is None:
             continue  # 同一内容已在目标（重复处理/增量重扫），静默幂等
+        relative_name = _relative_entry_file(entry, file)
+        imported_files.append(file.name if relative_name in {None, "."} else relative_name)
         if staging is not None:
             # 自定义目录：文件是"过客"，搬到位即完成，不写库台账
             imported += 1
@@ -1219,7 +1525,7 @@ async def _wanted_identity(session, info_hashes: list[str]) -> tuple[MediaItem |
     """
     if not info_hashes:
         return None, None
-    from movieclaw_db.models import Subscription, WantedItem
+    from movieclaw_db.models import Subscription, SubscriptionDownloadAttempt, WantedItem
 
     result = await session.execute(
         select(MediaItem, Subscription.library_id)
@@ -1228,6 +1534,19 @@ async def _wanted_identity(session, info_hashes: list[str]) -> tuple[MediaItem |
         .where(WantedItem.info_hash.in_(info_hashes))  # type: ignore[union-attr]
     )
     row = result.first()
+    if row is None:
+        # 自动换源后 wanted 只指向新主源；旧源可能因 H&R/用户所有权被保留，
+        # 它之后若自行完成仍应继承原订阅身份，而不是退回模糊的文件名识别。
+        result = await session.execute(
+            select(MediaItem, Subscription.library_id)
+            .join(Subscription, MediaItem.id == Subscription.media_item_id)  # type: ignore[arg-type]
+            .join(
+                SubscriptionDownloadAttempt,
+                SubscriptionDownloadAttempt.subscription_id == Subscription.id,  # type: ignore[arg-type]
+            )
+            .where(SubscriptionDownloadAttempt.info_hash.in_(info_hashes))  # type: ignore[union-attr]
+        )
+        row = result.first()
     if row is None:
         return None, None
     item, library_id = row
@@ -1672,8 +1991,40 @@ async def _ensure_job_snapshot_stable(
     )
 
 
-@jobs.register_job_handler("library.ingest")
-async def _run_ingest_job(
+def _ready_files_from_input(value: object) -> list[_ReadyDownloadFile]:
+    """解析持久化文件白名单；坏路径交后续安全还原拒绝，不静默扩权。"""
+    if not isinstance(value, list):
+        return []
+    ready: list[_ReadyDownloadFile] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        path = item.get("path")
+        size = item.get("size_bytes")
+        if not isinstance(path, str) or not isinstance(size, int) or size < 0:
+            continue
+        hashes = item.get("info_hashes")
+        ready.append(
+            _ReadyDownloadFile(
+                relative_path=path,
+                size_bytes=size,
+                info_hashes=tuple(
+                    sorted(
+                        {
+                            str(info_hash).lower()
+                            for info_hash in hashes
+                            if isinstance(info_hash, str) and info_hash
+                        }
+                    )
+                )
+                if isinstance(hashes, list)
+                else (),
+            )
+        )
+    return ready
+
+
+async def _execute_ingest_job(
     context: jobs.JobContext, input_data: dict[str, object]
 ) -> dict[str, object]:
     """监听入库 Job：重新核对磁盘现场后执行，领域台账作为幂等检查点。
@@ -1687,6 +2038,18 @@ async def _run_ingest_job(
     stored_hashes = [
         str(value).lower()
         for value in input_data.get("info_hashes", [])
+        if isinstance(value, str) and value
+    ]
+    file_scoped = "ready_files" in input_data
+    ready_files = _ready_files_from_input(input_data.get("ready_files"))
+    if file_scoped and not ready_files:
+        raise jobs.JobFailed(
+            "文件级入库白名单无效，已停止以避免扩大处理范围",
+            code="INGEST_READY_FILES_INVALID",
+        )
+    consume_hashes = [
+        str(value).lower()
+        for value in input_data.get("consume_info_hashes", [])
         if isinstance(value, str) and value
     ]
     db = get_database()
@@ -1726,13 +2089,33 @@ async def _run_ingest_job(
     )
     briefs = await _downloader_briefs()
     matches = _match_briefs(entry.name, briefs)
-    if _torrent_verdict(matches) == "downloading":
+    verdict = _torrent_verdict(matches)
+    if file_scoped and verdict == "downloading":
+        current_batch = await _completed_file_batch(entry, matches)
+        current_ready = {
+            (ready.relative_path, ready.size_bytes) for ready in current_batch.files
+        }
+        if any(
+            (ready.relative_path, ready.size_bytes) not in current_ready for ready in ready_files
+        ):
+            raise jobs.JobRetry(
+                "已完成文件的下载器证据发生变化，稍后重新核对",
+                delay_seconds=DEFERRED_POLL_SECONDS,
+            )
+    elif verdict == "downloading":
         raise jobs.JobRetry(
             "下载器仍在写入该条目，稍后继续检查",
             delay_seconds=DEFERRED_POLL_SECONDS,
         )
-    snap = await asyncio.to_thread(_snapshot, entry)
-    if snap.has_marker:
+    try:
+        snap = (
+            await asyncio.to_thread(_snapshot_ready_files, entry, ready_files)
+            if file_scoped
+            else await asyncio.to_thread(_snapshot, entry)
+        )
+    except IngestSourceChanged as exc:
+        raise jobs.JobRetry(str(exc), delay_seconds=30) from exc
+    if not file_scoped and snap.has_marker:
         raise jobs.JobRetry(
             "条目仍有下载中标记，稍后继续检查",
             delay_seconds=DEFERRED_POLL_SECONDS,
@@ -1744,7 +2127,11 @@ async def _run_ingest_job(
         rule_id=rule_id,
         entry_name=entry.name,
     )
-    current_hashes = [brief.info_hash.lower() for brief in matches if brief.info_hash]
+    current_hashes = (
+        []
+        if file_scoped
+        else [brief.info_hash.lower() for brief in matches if brief.info_hash]
+    )
     matched_hashes = sorted(set(stored_hashes) | set(current_hashes))
 
     async with db.session() as session:
@@ -1794,6 +2181,7 @@ async def _run_ingest_job(
                 snap,
                 record,
                 matched_hashes,
+                consume_hashes if file_scoped else None,
                 job_context=context,
             )
         except IngestSourceChanged as exc:
@@ -1835,6 +2223,19 @@ async def _run_ingest_job(
         "imported_count": record.imported_count,
         "media_item_id": record.media_item_id,
     }
+
+
+@jobs.register_job_handler("library.ingest")
+async def _run_ingest_job(
+    context: jobs.JobContext, input_data: dict[str, object]
+) -> dict[str, object]:
+    """执行持久化入库；分批作业结束后继续轮询同目录剩余下载。"""
+    entry = Path(str(input_data["entry_path"]))
+    try:
+        return await _execute_ingest_job(context, input_data)
+    finally:
+        if bool(input_data.get("keep_deferred")) and entry.exists():
+            _deferred[str(entry)] = time.monotonic()
 
 
 # ---------------------------------------------------------------------------
@@ -2106,7 +2507,7 @@ class IngestWatcher:
     事件，事件停止即静默的开端；没有下载活动时零开销，NAS 磁盘可以休眠。
     静默窗口的"到点检查"没有事件会叫醒——每轮巡检后若仍有条目在等静默
     或在挂起表里等下载器完成，挂一个一次性自检任务（前者按最近到期时间，
-    后者按固定轮询节奏且醒来先纯 API 核对、不碰磁盘），全部落定后归零。
+    后者按固定轮询节奏且醒来先通过 API 核对文件进度），全部落定后归零。
     """
 
     def __init__(self) -> None:
@@ -2270,7 +2671,8 @@ class IngestWatcher:
         """仍有条目在等静默窗口、等下载器状态翻转或等失败退避时，挂一次性自检。
 
         三个唤醒源：静默窗口按最近到期时间挂；挂起条目按固定节奏轮询——
-        自检醒来先纯 API 核对状态（见 _recheck_later），不打扰磁盘休眠；
+        自检醒来先通过 API 核对状态（见 _recheck_later），仅在出现新的单文件
+        完成候选时 stat 对应文件，不扫描整棵目录；
         **失败条目按退避到期时间挂**——失败结论落账时静默表/挂起表都已弹出
         该条目、fs 事件也不会再来（下载早已结束），没有这第三个源就没人
         回来重试。取三者中最近的到期时间挂一次即可（自检收尾会重挂）。
@@ -2309,8 +2711,8 @@ class IngestWatcher:
             if path.startswith(prefix)
         )
         if not failed_due and not any(path.startswith(prefix) for path in _stability):
-            # 只剩挂起条目：先纯 API 核对（零磁盘 IO）。种子仍未完成就只
-            # 重挂下一轮——暂停的种子可以无限期挂着，NAS 磁盘照常休眠
+            # 只剩挂起条目：先通过 API 核对。没有新的单文件完成证据就只
+            # 重挂下一轮；有候选时也只 stat 候选，不扫描整棵目录
             try:
                 flipped = await _deferred_flipped(prefix)
             except Exception:  # noqa: BLE001 -- 核对失败就去巡检，交给巡检的降级链

@@ -18,11 +18,11 @@ from pathlib import Path
 
 from fastapi import APIRouter, Query
 from fastapi import Path as PathParam
-from pydantic import BaseModel
 
 from movieclaw_api.core.config import get_settings
 from movieclaw_api.core.logging import LOG_FILE_PATTERN, log_file_path
 from movieclaw_api.exceptions import NotFoundException
+from movieclaw_api.schemas.base import BaseModel
 from movieclaw_api.schemas.response import ApiResponse, ok
 
 router = APIRouter(prefix="/system/logs", tags=["system"])

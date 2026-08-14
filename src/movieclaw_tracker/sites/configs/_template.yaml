@@ -31,6 +31,10 @@ framework: nexusphp            # 框架类型: nexusphp | api
 # 不设置则用全局默认值（3.0s）。对站点越保守越好；走官方 API 的站可适当放宽。
 # min_request_interval: 3.0
 
+# 可选：站点页面/API 返回的 naive 时间所属 IANA 时区。
+# 当前内置站点统一默认 Asia/Shanghai；海外站点按实际情况覆盖。
+# timezone: Asia/Shanghai
+
 # 仅列出需要覆盖的选择器（会合并到框架默认值上）
 # 常用可覆盖项：
 #   torrent_hr_css: "img.hitandrun"   # H&R 考核标记；各站类名不同，逐站确认后再配，

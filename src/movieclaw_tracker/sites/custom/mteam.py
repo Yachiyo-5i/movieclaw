@@ -33,6 +33,7 @@ import re
 from typing import Any
 
 from movieclaw_tracker.base import BaseSite
+from movieclaw_tracker.datetime_utils import DEFAULT_SITE_TIMEZONE
 from movieclaw_tracker.exceptions import TrackerParseError
 from movieclaw_tracker.models import (
     SearchQuery,
@@ -103,6 +104,7 @@ class MTeamSite(BaseSite):
         auth_manager: Any,
         web_base_url: str | None = None,
         category_map: dict[TorrentCategory, list[str]] | None = None,
+        timezone: str = DEFAULT_SITE_TIMEZONE,
     ) -> None:
         super().__init__(
             site_id=site_id,
@@ -110,6 +112,7 @@ class MTeamSite(BaseSite):
             client=client,
             auth_manager=auth_manager,
             web_base_url=web_base_url,
+            timezone=timezone,
         )
         # 正向映射：应用级一级分类 → 站点分类 ID 列表（用于搜索时下发过滤条件）
         self._category_map: dict[TorrentCategory, list[str]] = category_map or {}
@@ -167,7 +170,7 @@ class MTeamSite(BaseSite):
         if not text:
             return None
         try:
-            return datetime.datetime.strptime(text, _DATETIME_FMT)
+            return self._to_utc(datetime.datetime.strptime(text, _DATETIME_FMT))
         except (ValueError, TypeError):
             return None
 
@@ -183,10 +186,9 @@ class MTeamSite(BaseSite):
             download_factor = _DISCOUNT_MAP.get(discount, 1.0)
             upload_factor = 2.0 if discount in _UPLOAD_2X_DISCOUNTS else 1.0
 
-            # 促销截止时间：优先用接口给的精确时间；无时间但确有折扣则视为长期有效
+            # 无截止时间的促销由折扣系数表达，deadline 保持 None，避免 9999 年哨兵
+            # 进入 API/数据库后参与时区换算或日期比较。
             free_deadline = self._parse_datetime(status.get("discountEndTime"))
-            if free_deadline is None and download_factor < 1.0:
-                free_deadline = datetime.datetime.max
 
             # 大小：M-Team 以字节字符串返回
             size_bytes = int(t.get("size") or 0)
@@ -353,8 +355,6 @@ class MTeamSite(BaseSite):
         download_factor = _DISCOUNT_MAP.get(discount, 1.0)
         upload_factor = 2.0 if discount in _UPLOAD_2X_DISCOUNTS else 1.0
         free_deadline = self._parse_datetime(status.get("discountEndTime"))
-        if free_deadline is None and download_factor < 1.0:
-            free_deadline = datetime.datetime.max
 
         size_bytes = int(data.get("size") or 0)
         site_cate_id = str(data.get("category")) if data.get("category") is not None else None

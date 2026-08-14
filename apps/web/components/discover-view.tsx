@@ -206,14 +206,14 @@ export function DiscoverView({
   }, [isMobile, setTopBarActions, source, switchSource]);
 
   const toolbar = isMobile ? null : (
-    <div className="sticky top-0 z-20 flex items-center justify-end px-6 py-3">
+    <div className="sticky top-0 z-20 flex items-center justify-end px-6 pb-3 pt-7">
       <SourceSwitcher value={source} onChange={switchSource} />
     </div>
   );
 
   if (error) {
     return (
-      <div className="flex flex-1 flex-col">
+      <div className="flex flex-1 flex-col max-md:pt-4">
         {toolbar}
         <DiscoverError error={error} onRetry={() => setReloadKey((k) => k + 1)} />
       </div>
@@ -221,14 +221,17 @@ export function DiscoverView({
   }
   if (!page) {
     return (
-      <div className="flex flex-1 flex-col">
+      <div className="flex flex-1 flex-col max-md:pt-4">
         {toolbar}
         <DiscoverSkeleton />
       </div>
     );
   }
   return (
-    <div ref={scrollRef} className="scroll-thin scroll-safe flex-1 overflow-y-auto pb-10">
+    <div
+      ref={scrollRef}
+      className="scroll-thin scroll-safe flex-1 overflow-y-auto pb-10 max-md:pt-4"
+    >
       {toolbar}
       {/* Hero 区：展示清单声明 Hero 时先占位，数据到达后换成轮播。 */}
       {page.sections.some((section) => section.presentation === "hero") && hero === undefined && (

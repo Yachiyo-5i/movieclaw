@@ -12,6 +12,7 @@ import {
   MoreIcon,
 } from "@/components/icons";
 import { useLlmCapability } from "@/components/llm-gate";
+import { OverflowText } from "@/components/overflow-text";
 import { useAgentConversations } from "@/lib/agent-conversations";
 import { cancelJob, retryJob, type JobStatus, type JobView } from "@/lib/api/jobs";
 import { useDownloadTasks } from "@/lib/download-tasks";
@@ -118,6 +119,12 @@ function detailNumber(details: Record<string, unknown>, key: string): number | n
 function detailString(details: Record<string, unknown>, key: string): string | null {
   const value = details[key];
   return typeof value === "string" && value ? value : null;
+}
+
+function detailStrings(details: Record<string, unknown>, key: string): string[] {
+  const value = details[key];
+  if (!Array.isArray(value)) return [];
+  return value.filter((item): item is string => typeof item === "string" && item.length > 0);
 }
 
 function detailCount(details: Record<string, unknown>, key: string): number {
@@ -371,6 +378,10 @@ export function JobCard({ job, onNavigate }: { job: JobView; onNavigate: () => v
   const percent = job.progress.percent;
   const statusStyle = STATUS_STYLE[job.status];
   const details = jobDetailItems(job);
+  const importedFiles =
+    job.job_type === "library.ingest"
+      ? detailStrings(job.progress.details, "imported_files")
+      : [];
   const hasDomainAlert = details.some((item) => item.alert);
   const subtitleUsage = subtitleUsageSummary(job);
   const compact =
@@ -391,7 +402,8 @@ export function JobCard({ job, onNavigate }: { job: JobView; onNavigate: () => v
     job.progress.phase_index != null && job.progress.phase_count != null
       ? `${job.progress.phase_index}/${job.progress.phase_count}`
       : null;
-  const title = job.subject || JOB_TYPE_LABELS[job.job_type] || job.job_type;
+  const jobTypeLabel = JOB_TYPE_LABELS[job.job_type] || job.job_type;
+  const title = job.subject || jobTypeLabel;
   const completedSubtitleLanguage =
     job.status === "succeeded" ? subtitleLanguageLabel(job) : null;
   const completedLibraryScan =
@@ -480,14 +492,19 @@ export function JobCard({ job, onNavigate }: { job: JobView; onNavigate: () => v
 
   return (
     <article
-      className={`overflow-hidden rounded-2xl border bg-[rgba(14,16,22,0.52)] ${cardBorder} ${compact ? "px-4 py-3" : "p-4"}`}
+      className={`overflow-hidden rounded-2xl border bg-[rgba(14,16,22,0.52)] ${cardBorder} ${compact ? "px-3.5 py-2.5" : "p-4"}`}
     >
       <div className="min-w-0">
         <div className="flex items-start justify-between gap-3">
           <div className="flex min-w-0 flex-1 items-center gap-2.5">
             <StatusDot status={job.status} />
-            <h3 title={title} className="min-w-0 truncate text-ui font-semibold leading-5 text-white/90">
-              {title}
+            {job.subject && (
+              <span className="shrink-0 rounded-md border border-white/[0.08] bg-white/[0.045] px-1.5 py-0.5 text-micro font-medium text-white/55">
+                {jobTypeLabel}
+              </span>
+            )}
+            <h3 className="min-w-0 text-ui font-semibold leading-5 text-white/90">
+              <OverflowText>{title}</OverflowText>
             </h3>
           </div>
           {menuItems.length > 0 && (
@@ -500,7 +517,7 @@ export function JobCard({ job, onNavigate }: { job: JobView; onNavigate: () => v
         </div>
 
         <div
-          className={`mt-2.5 text-sub leading-5 ${
+          className={`${compact ? "mt-1 text-caption leading-5" : "mt-2.5 text-sub leading-5"} ${
             attention
               ? "rounded-xl border border-[#fca5a5]/15 bg-[#fca5a5]/[0.06] px-3 py-2.5 text-[#fecaca]"
               : compact
@@ -508,21 +525,34 @@ export function JobCard({ job, onNavigate }: { job: JobView; onNavigate: () => v
                 : "text-white/60"
           }`}
         >
-          <p className="line-clamp-2 min-h-10 break-words">
+          <OverflowText
+            lines={compact ? 1 : 2}
+            className={compact ? "break-words" : "min-h-10 break-words"}
+            tooltipContent={
+              <span className="whitespace-pre-wrap break-words [overflow-wrap:anywhere]">
+                {attention && <span className="mr-1.5 font-semibold">需要处理：</span>}
+                {summaryMessage}
+              </span>
+            }
+          >
             {attention && <span className="mr-1.5 font-semibold">需要处理：</span>}
             {summaryMessage}
-          </p>
+          </OverflowText>
         </div>
 
-          {!compact &&
-            !completedLibraryScan &&
-            (percent != null || executing || job.status === "retry_wait") && (
+        {importedFiles.length > 0 && (
+          <IngestImportedFiles files={importedFiles} />
+        )}
+
+        {!compact &&
+          !completedLibraryScan &&
+          (percent != null || executing || job.status === "retry_wait") && (
             <div className="mt-3">
               <div className="mb-1.5 flex items-center justify-between gap-3 text-caption">
-                <span className="min-w-0 truncate font-medium text-white/60">
+                <OverflowText className="font-medium text-white/60">
                   {phase}
                   {phaseStep && <span className="ml-1.5 text-white/30">阶段 {phaseStep}</span>}
-                </span>
+                </OverflowText>
                 <span className="tnum shrink-0 text-white/50">
                   {percent != null
                     ? `${Math.round(percent)}%`
@@ -559,80 +589,110 @@ export function JobCard({ job, onNavigate }: { job: JobView; onNavigate: () => v
                 </p>
               )}
             </div>
-          )}
+        )}
 
-          {!compact && details.length > 0 && (
-            <div className="mt-3 flex flex-wrap gap-1.5">
-              {details.map((item) => (
-                <span
-                  key={item.label}
-                  className={`max-w-full truncate rounded-md border px-2 py-1 text-caption ${
-                    item.alert
-                      ? "border-amber-300/15 bg-amber-300/[0.05] text-amber-100/75"
-                      : "border-white/[0.07] bg-white/[0.035] text-white/45"
-                  }`}
-                >
-                  {item.label}
-                </span>
-              ))}
-            </div>
-          )}
-
-          {subtitleUsage && (
-            <div className="mt-3 border-t border-white/[0.06] pt-2.5">
-              <button
-                type="button"
-                aria-expanded={usageExpanded}
-                onClick={() => setUsageExpanded((expanded) => !expanded)}
-                className="flex w-full items-center justify-between gap-3 rounded-lg px-1 py-1 text-caption text-white/50 transition hover:text-white/75"
+        {!compact && details.length > 0 && (
+          <div className="mt-3 flex flex-wrap gap-1.5">
+            {details.map((item) => (
+              <span
+                key={item.label}
+                className={`min-w-0 max-w-full rounded-md border px-2 py-1 text-caption ${
+                  item.alert
+                    ? "border-amber-300/15 bg-amber-300/[0.05] text-amber-100/75"
+                    : "border-white/[0.07] bg-white/[0.035] text-white/45"
+                }`}
               >
-                <span className="flex items-center gap-1.5 font-medium">
-                  <ChevronRightIcon
-                    className={`size-3.5 transition-transform ${usageExpanded ? "rotate-90" : ""}`}
-                  />
-                  {usageExpanded ? "收起模型消耗" : "查看模型消耗"}
-                </span>
-                <span className="tnum truncate text-white/35">
-                  {formatInteger(subtitleUsage.totalTokens)} Token · {subtitleUsage.requests} 次请求
-                </span>
-              </button>
-              {usageExpanded && (
-                <div className="mt-2.5 rounded-xl border border-white/[0.07] bg-black/15 p-3">
-                  <div className="grid grid-cols-4 gap-3 max-md:grid-cols-2">
-                    <UsageMetric label="总 Token" value={formatInteger(subtitleUsage.totalTokens)} />
-                    <UsageMetric label="输入" value={formatInteger(subtitleUsage.promptTokens)} />
-                    <UsageMetric label="输出" value={formatInteger(subtitleUsage.completionTokens)} />
-                    <UsageMetric label="输入缓存" value={formatInteger(subtitleUsage.cacheReadTokens)} />
-                  </div>
-                  <p className="mt-3 flex flex-wrap gap-x-3 gap-y-1 border-t border-white/[0.06] pt-2.5 text-caption text-white/35">
-                    {job.provider_ref && <span>{job.provider_ref}</span>}
-                    <span>{subtitleUsage.requests} 次模型请求</span>
-                    {subtitleUsage.failedRequests > 0 && (
-                      <span className="text-amber-200/70">
-                        {subtitleUsage.failedRequests} 次失败
-                      </span>
-                    )}
-                    <span>累计响应 {formatModelDuration(subtitleUsage.totalDurationMs)}</span>
-                    <span>最慢一次 {formatModelDuration(subtitleUsage.maxDurationMs)}</span>
-                  </p>
-                </div>
-              )}
-            </div>
-          )}
+                <OverflowText>{item.label}</OverflowText>
+              </span>
+            ))}
+          </div>
+        )}
 
-          {actionError && (
-            <p className="mt-2 text-caption leading-5 text-[#ff9f9f]">{actionError}</p>
-          )}
+        {subtitleUsage && (
+          <div className="mt-3 border-t border-white/[0.06] pt-2.5">
+            <button
+              type="button"
+              aria-expanded={usageExpanded}
+              onClick={() => setUsageExpanded((expanded) => !expanded)}
+              className="flex w-full items-center justify-between gap-3 rounded-lg px-1 py-1 text-caption text-white/50 transition hover:text-white/75"
+            >
+              <span className="flex items-center gap-1.5 font-medium">
+                <ChevronRightIcon
+                  className={`size-3.5 transition-transform ${usageExpanded ? "rotate-90" : ""}`}
+                />
+                {usageExpanded ? "收起模型消耗" : "查看模型消耗"}
+              </span>
+              <OverflowText focusable={false} className="tnum text-right text-white/35">
+                {formatInteger(subtitleUsage.totalTokens)} Token · {subtitleUsage.requests} 次请求
+              </OverflowText>
+            </button>
+            {usageExpanded && (
+              <div className="mt-2.5 rounded-xl border border-white/[0.07] bg-black/15 p-3">
+                <div className="grid grid-cols-4 gap-3 max-md:grid-cols-2">
+                  <UsageMetric label="总 Token" value={formatInteger(subtitleUsage.totalTokens)} />
+                  <UsageMetric label="输入" value={formatInteger(subtitleUsage.promptTokens)} />
+                  <UsageMetric label="输出" value={formatInteger(subtitleUsage.completionTokens)} />
+                  <UsageMetric label="输入缓存" value={formatInteger(subtitleUsage.cacheReadTokens)} />
+                </div>
+                <p className="mt-3 flex flex-wrap gap-x-3 gap-y-1 border-t border-white/[0.06] pt-2.5 text-caption text-white/35">
+                  {job.provider_ref && <span>{job.provider_ref}</span>}
+                  <span>{subtitleUsage.requests} 次模型请求</span>
+                  {subtitleUsage.failedRequests > 0 && (
+                    <span className="text-amber-200/70">
+                      {subtitleUsage.failedRequests} 次失败
+                    </span>
+                  )}
+                  <span>累计响应 {formatModelDuration(subtitleUsage.totalDurationMs)}</span>
+                  <span>最慢一次 {formatModelDuration(subtitleUsage.maxDurationMs)}</span>
+                </p>
+              </div>
+            )}
+          </div>
+        )}
+
+        {actionError && (
+          <p className="mt-2 text-caption leading-5 text-[#ff9f9f]">{actionError}</p>
+        )}
       </div>
-      <footer className="mt-3 flex flex-wrap items-center gap-2">
-        <p
-          title={`${originLabel(job)} · ${formatDateTime(job.created_at)}`}
-          className="min-w-0 truncate text-micro text-white/25"
+      <footer className={`${compact ? "mt-1.5" : "mt-3"} flex flex-wrap items-center gap-2`}>
+        <OverflowText
+          alwaysShowTooltip
+          tooltipContent={`${originLabel(job)} · ${formatDateTime(job.created_at)}`}
+          className="text-micro text-white/25"
         >
           {originLabel(job)} · {formatRelativeTime(job.created_at)}
-        </p>
+        </OverflowText>
       </footer>
     </article>
+  );
+}
+
+/** 本次作业实际新增的文件：单文件直接展示，多文件保留首项并允许展开核对。 */
+function IngestImportedFiles({ files }: { files: string[] }) {
+  if (files.length === 1) {
+    return (
+      <p className="mt-2.5 flex min-w-0 items-center gap-2 rounded-lg border border-white/[0.07] bg-white/[0.03] px-3 py-2 text-caption">
+        <span className="shrink-0 text-white/40">本次新增文件</span>
+        <OverflowText className="font-medium text-white/65">{files[0]}</OverflowText>
+      </p>
+    );
+  }
+
+  return (
+    <details className="group mt-2.5 rounded-lg border border-white/[0.07] bg-white/[0.03]">
+      <summary className="flex cursor-pointer list-none items-center gap-2 px-3 py-2 text-caption [&::-webkit-details-marker]:hidden">
+        <ChevronRightIcon className="size-3.5 shrink-0 transition-transform group-open:rotate-90" />
+        <span className="shrink-0 text-white/40">本次新增 {files.length} 个文件</span>
+        <OverflowText className="font-medium text-white/65">{files[0]}</OverflowText>
+      </summary>
+      <ul className="space-y-1 border-t border-white/[0.06] px-3 py-2.5 text-caption text-white/55">
+        {files.map((file) => (
+          <li key={file} title={file} className="break-all">
+            {file}
+          </li>
+        ))}
+      </ul>
+    </details>
   );
 }
 

@@ -122,7 +122,12 @@ _SSE_BODY = (
                     "size_bytes": 20_000_000_000,
                     "free": True,
                     "download_url": "https://a/dl/1",
-                    "attrs": {"resolution": "2160p", "titles_zh": ["沙丘"], "year": 2021},
+                    "attrs": {
+                        "media_type": "movie",
+                        "resolution": "2160p",
+                        "titles_zh": ["沙丘"],
+                        "year": 2021,
+                    },
                 },
                 {
                     "site_id": "a",
@@ -133,7 +138,12 @@ _SSE_BODY = (
                     "size_bytes": 8_000_000_000,
                     "free": False,
                     "download_url": "https://a/dl/2",
-                    "attrs": {"resolution": "1080p", "titles_zh": ["沙丘"], "year": 2021},
+                    "attrs": {
+                        "media_type": "movie",
+                        "resolution": "1080p",
+                        "titles_zh": ["沙丘"],
+                        "year": 2021,
+                    },
                 },
             ],
         },
@@ -145,11 +155,30 @@ _SSE_BODY = (
 )
 
 
-def _search_transport(calls: list[dict]):
+def _search_transport(calls: list[dict], *, target: dict | None = None):
+    if target is None:
+        target = {
+            "status": "ready",
+            "tmdb_id": 438631,
+            "candidates": [],
+            "library_id": 7,
+            "library_name": "电影库",
+            "mode": "watch",
+            "path": "/download/电影",
+            "staging_path": None,
+            "route_matched": False,
+            "route_reason": "入库到默认库「电影库」",
+            "ok": True,
+            "warning": None,
+        }
     return _transport(
         {
             ("GET", "/api/v1/search/torrents/stream"): httpx.Response(
                 200, content=_SSE_BODY.encode(), headers={"content-type": "text/event-stream"}
+            ),
+            ("POST", "/api/v1/downloaders/resolve-target"): httpx.Response(
+                200,
+                json=_envelope(target, message="已识别资源并预演自动入库目录"),
             ),
             ("POST", "/api/v1/downloaders/submit"): httpx.Response(
                 200,
@@ -183,10 +212,164 @@ def test_search_aggregates_and_snapshots_then_download_by_row(run_cli, tmp_path)
     calls.clear()
     code, out, err = run_cli(["download", "1", "-o", "json"], _search_transport(calls))
     assert code == 0, err
-    submitted = json.loads(calls[-1]["body"])
+    assert [call["path"] for call in calls] == [
+        "/api/v1/downloaders/resolve-target",
+        "/api/v1/downloaders/submit",
+    ]
+    resolved = json.loads(calls[0]["body"])
+    assert resolved == {
+        "kind": "movie",
+        "title": "沙丘",
+        "year": 2021,
+        "subtitle": None,
+    }
+    submitted = json.loads(calls[1]["body"])
     assert submitted["download_url"] == "https://a/dl/2"  # 行号 1 = 排序后的 1080p
     assert submitted["title"] == "沙丘" and submitted["year"] == 2021
+    assert submitted["auto_route"] is True
+    assert submitted["media_kind"] == "movie" and submitted["tmdb_id"] == 438631
+    assert "智能入库" in err
     assert "已提交到「qb」" in err
+
+
+def test_download_ambiguous_returns_candidates_without_submitting(run_cli) -> None:
+    calls: list[dict] = []
+    run_cli(["search", "沙丘", "-o", "json"], _search_transport(calls))
+    calls.clear()
+    target = {
+        "status": "ambiguous",
+        "tmdb_id": None,
+        "candidates": [
+            {"tmdb_id": 11, "title": "沙丘", "year": 2021, "episode_count": None},
+            {"tmdb_id": 12, "title": "沙丘", "year": 1984, "episode_count": None},
+        ],
+        "library_id": None,
+        "library_name": None,
+        "mode": None,
+        "path": None,
+        "staging_path": None,
+        "route_matched": None,
+        "route_reason": None,
+        "ok": False,
+        "warning": None,
+    }
+
+    code, out, err = run_cli(
+        ["download", "1", "-o", "json"],
+        _search_transport(calls, target=target),
+    )
+
+    assert code == 7
+    assert json.loads(out)["candidates"][0]["tmdb_id"] == 11
+    assert [call["path"] for call in calls] == ["/api/v1/downloaders/resolve-target"]
+    assert "--tmdb-id" in err and "未提交下载" in err
+
+
+def test_download_tmdb_id_is_sent_to_preflight_before_submit(run_cli) -> None:
+    calls: list[dict] = []
+    run_cli(["search", "沙丘", "-o", "json"], _search_transport(calls))
+    calls.clear()
+
+    code, _out, err = run_cli(
+        ["download", "1", "--tmdb-id", "12", "-o", "json"],
+        _search_transport(calls),
+    )
+
+    assert code == 0, err
+    assert json.loads(calls[0]["body"])["selected_tmdb_id"] == 12
+    assert json.loads(calls[1]["body"])["tmdb_id"] == 438631
+
+
+def test_download_unroutable_target_fails_closed(run_cli) -> None:
+    calls: list[dict] = []
+    run_cli(["search", "沙丘", "-o", "json"], _search_transport(calls))
+    calls.clear()
+    target = {
+        "status": "ready",
+        "tmdb_id": 438631,
+        "candidates": [],
+        "library_id": 7,
+        "library_name": "电影库",
+        "mode": "watch",
+        "path": "/download/电影",
+        "staging_path": None,
+        "route_matched": False,
+        "route_reason": "入库到默认库「电影库」",
+        "ok": False,
+        "warning": "目录不在下载器的路径映射覆盖范围内",
+    }
+
+    code, out, err = run_cli(
+        ["download", "1", "-o", "json"],
+        _search_transport(calls, target=target),
+    )
+
+    assert code == 1 and out == ""
+    assert [call["path"] for call in calls] == ["/api/v1/downloaders/resolve-target"]
+    assert "路径映射" in err and "--downloader-default" in err
+
+
+def test_download_without_complete_identity_fails_before_preflight(run_cli) -> None:
+    from movieclaw_cli.overlay.search_cmds import load_snapshot, save_snapshot
+
+    calls: list[dict] = []
+    run_cli(["search", "沙丘", "-o", "json"], _search_transport(calls))
+    snapshot = load_snapshot()
+    assert snapshot is not None
+    snapshot["items"][0]["attrs"].pop("media_type")
+    save_snapshot(snapshot["server"], snapshot["keyword"], snapshot["items"])
+    calls.clear()
+
+    code, out, err = run_cli(
+        ["download", "1", "-o", "json"],
+        _search_transport(calls),
+    )
+
+    assert code == 1 and out == ""
+    assert calls == []
+    assert "缺少可靠的媒体类型" in err and "--downloader-default" in err
+
+
+@pytest.mark.parametrize(
+    ("args", "expected"),
+    [
+        (["--library", "7"], {"library_id": 7}),
+        (["--save-path", "/download/临时"], {"save_path": "/download/临时"}),
+        (["--downloader-default"], {}),
+    ],
+)
+def test_download_explicit_target_skips_smart_preflight(run_cli, args, expected) -> None:
+    calls: list[dict] = []
+    run_cli(["search", "沙丘", "-o", "json"], _search_transport(calls))
+    calls.clear()
+
+    code, _out, err = run_cli(
+        ["download", "1", *args, "-o", "json"],
+        _search_transport(calls),
+    )
+
+    assert code == 0, err
+    assert [call["path"] for call in calls] == ["/api/v1/downloaders/submit"]
+    submitted = json.loads(calls[0]["body"])
+    assert "auto_route" not in submitted
+    for key, value in expected.items():
+        assert submitted[key] == value
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["1", "--library", "7", "--save-path", "/download/临时"],
+        ["1", "--library", "7", "--downloader-default"],
+        ["1", "--tmdb-id", "12", "--downloader-default"],
+        ["1", "--tmdb-id", "12", "--library", "7"],
+    ],
+)
+def test_download_rejects_conflicting_route_options(run_cli, args) -> None:
+    calls: list[dict] = []
+    code, out, err = run_cli(["download", *args], _search_transport(calls))
+    assert code == 2 and out == "" and calls == []
+    assert "不能" in err or "只能" in err
 
 
 def test_search_resolution_filter(run_cli) -> None:

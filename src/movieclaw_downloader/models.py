@@ -85,6 +85,11 @@ class TorrentFile(BaseModel):
 
     path: str
     size_bytes: int
+    # 单文件完成字节数是分批入库的权威证据。None 表示旧适配器没有提供，
+    # 调用方只能退回整种子 completed，不能按磁盘大小猜测（下载器可能预分配）。
+    completed_bytes: int | None = None
+    # 未选中的文件不会被下载器写入，也不应阻塞同目录其他已完成文件。
+    selected: bool = True
 
 
 class TorrentBrief(BaseModel):
@@ -103,6 +108,8 @@ class TorrentBrief(BaseModel):
     # 下列字段仍来自下载器的同一批列表结果，不会额外逐任务请求。监听导入只
     # 消费上面的身份字段；任务中心则用这些可选快照展示进度、速度与 ETA。
     progress: float | None = None
+    # 已完成字节用于订阅救援的持久心跳；比瞬时速度更能证明任务确实前进。
+    completed_bytes: int | None = None
     size_bytes: int | None = None
     dlspeed_bytes: int | None = None
     eta_seconds: int | None = None
@@ -125,6 +132,11 @@ class TorrentStatus(BaseModel):
     name: str
     # 下载进度 0.0 ~ 1.0；completed = 全部数据已落盘（做种/完成态）
     progress: float
+    # 当前已完成字节。救援巡检只比较它是否增长，不用瞬时速度猜死活。
+    completed_bytes: int | None = None
+    # 下载器累计从网络接收的字节。与 completed_bytes 不同，本地校验、复用旧
+    # 文件不会增加它；替代源只用该计数证明“新种确实能从 peer 下载”。
+    downloaded_bytes: int | None = None
     completed: bool
     save_path: str
     files: list[TorrentFile] = Field(default_factory=list)
@@ -134,6 +146,7 @@ class TorrentStatus(BaseModel):
     dlspeed_bytes: int | None = None
     # 预计剩余秒数；下载器认为无法估算（无速度/已完成）时为 None
     eta_seconds: int | None = None
-    # 归一化状态词表：downloading / stalled / paused / completed / error / unknown。
+    # 归一化状态词表：downloading / stalled / queued / paused / checking /
+    # completed / error / unknown。
     # 各适配器把自家状态收敛到这几个词，前端据此定色与文案
     state: str = "unknown"

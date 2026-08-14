@@ -15,7 +15,7 @@
  */
 
 import Link from "next/link";
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { FolderIcon } from "@/components/icons";
 import { Modal } from "@/components/modal";
@@ -161,8 +161,8 @@ export function DownloadTargetDialog({
   onSubmitted: (result: DownloadSubmitResult) => void;
 }) {
   if (!request) return null;
-  // 以 request 为 key 强制内容组件重新挂载：每次打开都从全新 state（loading=true）
-  // 开始，避免默认选中 effect 读到上一次的旧数据抢先选中错误项
+  // 以 request 为 key 强制内容组件重新挂载：每次打开都从全新状态开始，
+  // 避免默认选中 effect 读到上一次的旧数据抢先选中错误项。
   return (
     <DialogContent
       key={`${request.site_id}:${request.download_url}`}
@@ -182,75 +182,144 @@ function DialogContent({
   onClose: () => void;
   onSubmitted: (result: DownloadSubmitResult) => void;
 }) {
+  const [rememberedTarget] = useState<RememberedTarget | null>(() =>
+    readRememberedTarget(request),
+  );
+  const revealOtherInitially =
+    request.identity === null ||
+    (rememberedTarget !== null && rememberedTarget.kind !== "smart");
   // 可用（启用 + 验证通过）的全部下载器：≥2 台时出现下载器选择
   const [downloaders, setDownloaders] = useState<ConfiguredDownloader[]>([]);
-  const [downloaderId, setDownloaderId] = useState<number | null>(null);
+  const [downloaderId, setDownloaderId] = useState<number | null>(
+    rememberedTarget?.kind === "smart" ? rememberedTarget.downloaderId : null,
+  );
   const [manualTarget, setManualTarget] = useState<ManualDownloadTarget | null>(null);
   const [selectedCandidateId, setSelectedCandidateId] = useState<number | null>(null);
-  const [loading, setLoading] = useState(true);
+  const [showOtherTargets, setShowOtherTargets] = useState(revealOtherInitially);
+  const [downloadersLoaded, setDownloadersLoaded] = useState(false);
+  const [loadingDownloaders, setLoadingDownloaders] = useState(false);
+  const [loadingTarget, setLoadingTarget] = useState(request.identity !== null);
   const [selected, setSelected] = useState<string | null>(null);
   // 记住选择：默认勾选态跟随已有记忆（勾着提交=保存/刷新，取消勾选提交=清除）
-  const [remember, setRemember] = useState<boolean>(() => readRememberedTarget(request) !== null);
+  const [remember, setRemember] = useState<boolean>(rememberedTarget !== null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // 下载器切换/候选确认都可能重发预检，只允许最后一次请求更新界面。
+  const targetRequestId = useRef(0);
 
-  // 挂载时先拉取下载器清单，再用最终选中的下载器预检。路径映射是下载器
-  // 级配置，不能并行预检默认台后却把种子交给另一台。
-  // 智能入库不再先选类型默认库；只有标题收敛成唯一 TMDB 身份后，才按
-  // 收藏范围选库并复用对应的监听导入目录。
+  // 默认路径只做智能预检，不拉下载器配置；只有用户展开“其他保存位置”或
+  // 智能识别失败时才加载下载器与路径映射，减少每次点下载的固定请求成本。
   useEffect(() => {
     let cancelled = false;
+    const requestId = ++targetRequestId.current;
     const identity = request.identity;
     setSelectedCandidateId(null);
-    void listDownloaders()
-      .catch(() => [] as ConfiguredDownloader[])
-      .then(async (rows) => {
-        if (cancelled) return;
-        const usable = rows.filter((d) => d.usable);
-        const remembered = readRememberedTarget(request);
-        const fallback = usable.find((d) => d.is_default) ?? usable[0] ?? null;
-        const rememberedRow =
-          remembered?.downloaderId != null
-            ? usable.find((d) => d.id === remembered.downloaderId)
-            : undefined;
-        const selectedDownloaderId = (rememberedRow ?? fallback)?.id ?? null;
-        const target = identity
-          ? await resolveManualDownloadTarget({
-              kind: identity.kind,
-              title: identity.title,
-              year: identity.year,
-              subtitle: request.subtitle,
-              downloader_id: selectedDownloaderId,
-            }).catch(() => null)
-          : null;
-        if (cancelled) return;
-        setDownloaders(usable);
-        setDownloaderId(selectedDownloaderId);
-        setManualTarget(target);
-        setLoading(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [request]);
+    if (!identity) {
+      setLoadingTarget(false);
+      setShowOtherTargets(true);
+      return () => {
+        cancelled = true;
+        targetRequestId.current += 1;
+      };
+    }
 
-  /** 用当前下载器和（如有）用户确认的歧义候选重跑预检。 */
-  const reloadManualTarget = (nextDownloaderId: number | null, tmdbId: number | null) => {
-    const identity = request.identity;
-    if (!identity) return;
-    setLoading(true);
+    setLoadingTarget(true);
     void resolveManualDownloadTarget({
       kind: identity.kind,
       title: identity.title,
       year: identity.year,
       subtitle: request.subtitle,
-      downloader_id: nextDownloaderId,
-      selected_tmdb_id: tmdbId,
+      downloader_id: rememberedTarget?.kind === "smart" ? rememberedTarget.downloaderId : null,
     })
-      .then(setManualTarget)
-      .catch(() => setManualTarget(null))
-      .finally(() => setLoading(false));
-  };
+      .then((target) => {
+        if (cancelled || requestId !== targetRequestId.current) return;
+        setManualTarget(target);
+        if (target.status !== "ready" || !target.ok) setShowOtherTargets(true);
+      })
+      .catch(() => {
+        if (cancelled || requestId !== targetRequestId.current) return;
+        setManualTarget(null);
+        setShowOtherTargets(true);
+      })
+      .finally(() => {
+        if (!cancelled && requestId === targetRequestId.current) setLoadingTarget(false);
+      });
+    return () => {
+      cancelled = true;
+      targetRequestId.current += 1;
+    };
+  }, [rememberedTarget, request]);
+
+  /** 用当前下载器和（如有）用户确认的歧义候选重跑预检。 */
+  const reloadManualTarget = useCallback(
+    (nextDownloaderId: number | null, tmdbId: number | null) => {
+      const identity = request.identity;
+      if (!identity) return;
+      const requestId = ++targetRequestId.current;
+      setLoadingTarget(true);
+      setManualTarget(null);
+      void resolveManualDownloadTarget({
+        kind: identity.kind,
+        title: identity.title,
+        year: identity.year,
+        subtitle: request.subtitle,
+        downloader_id: nextDownloaderId,
+        selected_tmdb_id: tmdbId,
+      })
+        .then((target) => {
+          if (requestId === targetRequestId.current) setManualTarget(target);
+        })
+        .catch(() => {
+          if (requestId === targetRequestId.current) setManualTarget(null);
+        })
+        .finally(() => {
+          if (requestId === targetRequestId.current) setLoadingTarget(false);
+        });
+    },
+    [request],
+  );
+
+  // “其他保存位置”展开后才读取下载器配置；加载完成后若最终选中的不是
+  // 初始预检使用的下载器，再补一次预检以保持路径映射口径一致。
+  useEffect(() => {
+    if (!showOtherTargets || downloadersLoaded) return;
+    let cancelled = false;
+    setLoadingDownloaders(true);
+    void listDownloaders()
+      .then((rows) => rows.filter((d) => d.usable))
+      .catch(() => [] as ConfiguredDownloader[])
+      .then((usable) => {
+        if (cancelled) return;
+        const current = usable.find((d) => d.id === downloaderId);
+        const remembered =
+          rememberedTarget?.downloaderId != null
+            ? usable.find((d) => d.id === rememberedTarget.downloaderId)
+            : undefined;
+        const selectedDownloader =
+          current ?? remembered ?? usable.find((d) => d.is_default) ?? usable[0] ?? null;
+        const selectedDownloaderId = selectedDownloader?.id ?? null;
+        const preflightDownloaderId =
+          selectedDownloader && !selectedDownloader.is_default ? selectedDownloader.id : null;
+        setDownloaders(usable);
+        setDownloaderId(selectedDownloaderId);
+        setDownloadersLoaded(true);
+        setLoadingDownloaders(false);
+        if (request.identity && preflightDownloaderId !== downloaderId) {
+          reloadManualTarget(preflightDownloaderId, selectedCandidateId);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    downloaderId,
+    downloadersLoaded,
+    reloadManualTarget,
+    rememberedTarget,
+    request.identity,
+    selectedCandidateId,
+    showOtherTargets,
+  ]);
 
   const downloader = useMemo(
     () => downloaders.find((d) => d.id === downloaderId) ?? null,
@@ -284,36 +353,40 @@ function DialogContent({
         warning: null,
       });
     }
-    const seen = new Set<string>();
-    const dirs: { path: string; source: string }[] = [];
-    if (downloader?.save_path) dirs.push({ path: downloader.save_path, source: "默认保存目录" });
-    for (const m of downloader?.path_mappings ?? []) {
-      if (!seen.has(m.local) && m.local !== downloader?.save_path) {
-        dirs.push({ path: m.local, source: "路径映射" });
+    if (showOtherTargets) {
+      const seen = new Set<string>();
+      const dirs: { path: string; source: string }[] = [];
+      if (downloader?.save_path) {
+        dirs.push({ path: downloader.save_path, source: "默认保存目录" });
       }
-      seen.add(m.local);
-    }
-    for (const dir of dirs) {
-      const remote = toRemoteView(dir.path, downloader?.path_mappings ?? null);
+      for (const m of downloader?.path_mappings ?? []) {
+        if (!seen.has(m.local) && m.local !== downloader?.save_path) {
+          dirs.push({ path: m.local, source: "路径映射" });
+        }
+        seen.add(m.local);
+      }
+      for (const dir of dirs) {
+        const remote = toRemoteView(dir.path, downloader?.path_mappings ?? null);
+        result.push({
+          key: `dir:${dir.path}`,
+          kind: "dir",
+          savePath: dir.path,
+          label: dir.path,
+          detail: remote !== dir.path ? `下载器视角：${remote}（${dir.source}）` : dir.source,
+          warning: null,
+        });
+      }
       result.push({
-        key: `dir:${dir.path}`,
-        kind: "dir",
-        savePath: dir.path,
-        label: dir.path,
-        detail: remote !== dir.path ? `下载器视角：${remote}（${dir.source}）` : dir.source,
+        key: "default",
+        kind: "default",
+        savePath: null,
+        label: "下载器默认目录",
+        detail: "不指定路径，由下载器按自身设置决定；movieclaw 不会自动整理入库",
         warning: null,
       });
     }
-    result.push({
-      key: "default",
-      kind: "default",
-      savePath: null,
-      label: "下载器默认目录",
-      detail: "不指定路径，由下载器按自身设置决定；movieclaw 不会自动整理入库",
-      warning: null,
-    });
     return result;
-  }, [request, manualTarget, downloader]);
+  }, [request, manualTarget, downloader, showOtherTargets]);
 
   // 换下载器后目录候选整组换血：选中的目录项若已不存在，退回未选中让下方
   // 默认选中逻辑重新挑一个
@@ -323,7 +396,7 @@ function DialogContent({
 
   // 默认选中：已记住的目标 > 智能入库可用且预检通过 > 第一个目录 > 下载器默认
   useEffect(() => {
-    if (loading || options.length === 0 || selected !== null) return;
+    if (options.length === 0 || selected !== null) return;
     const remembered = readRememberedTarget(request);
     if (remembered) {
       const match = options.find((o) =>
@@ -336,11 +409,14 @@ function DialogContent({
         return;
       }
     }
+    // 没有记忆时等两边都返回再自动选择，避免目录先到就抢选、随后智能结果
+    // 出现却无法成为默认；等待期间用户仍可手动点已显示的目录立即提交。
+    if (loadingTarget || (showOtherTargets && !downloadersLoaded)) return;
     const smart = options.find((o) => o.kind === "smart");
     if (smart && !smart.warning) setSelected(smart.key);
     // 智能入库不可用或有警示时，回落到第一个非智能项（目录 > 下载器默认）
     else setSelected((options.find((o) => o.kind !== "smart") ?? options[0]).key);
-  }, [loading, options, selected, request]);
+  }, [downloadersLoaded, loadingTarget, options, selected, request, showOtherTargets]);
 
   const submit = () => {
     const option = options.find((o) => o.key === selected);
@@ -349,8 +425,11 @@ function DialogContent({
     setError(null);
     const identity = request.identity;
     // 只在非默认下载器时显式带 downloader_id：默认台走后端原有语义
-    const pickedDownloaderId =
-      downloader && !downloader.is_default ? downloader.id : null;
+    const pickedDownloaderId = downloader
+      ? downloader.is_default
+        ? null
+        : downloader.id
+      : downloaderId;
     void submitTorrentDownload({
       site_id: request.site_id,
       download_url: request.download_url,
@@ -393,14 +472,13 @@ function DialogContent({
             </p>
           )}
 
-          {loading ? (
-            <div className="space-y-2">
-              <div className="h-[52px] animate-pulse rounded-xl bg-white/[0.04]" />
-              <div className="h-[52px] animate-pulse rounded-xl bg-white/[0.04]" />
-            </div>
-          ) : (
-            <div className="space-y-2">
-              {request.identity && manualTarget && manualTarget.status !== "ready" && (
+          <div className="space-y-2">
+              {loadingTarget && request.identity && (
+                <div className="flex h-[52px] items-center rounded-xl border border-white/[0.06] bg-white/[0.03] px-3.5 text-caption text-[var(--text-faint)]">
+                  正在识别影视条目并预演智能入库…
+                </div>
+              )}
+              {!loadingTarget && request.identity && manualTarget && manualTarget.status !== "ready" && (
                 <p className="rounded-lg border border-amber-400/20 bg-amber-500/10 px-3.5 py-2.5 text-caption leading-relaxed text-amber-100">
                   {manualTarget.status === "ambiguous"
                     ? "识别到多个可能条目。请确认正确条目后，系统会继续预演自动入库目录。"
@@ -426,7 +504,7 @@ function DialogContent({
                   ))}
                 </div>
               )}
-              {request.identity && manualTarget === null && (
+              {!loadingTarget && request.identity && manualTarget === null && (
                 <p className="rounded-lg border border-amber-400/20 bg-amber-500/10 px-3.5 py-2.5 text-caption leading-relaxed text-amber-100">
                   自动识别暂不可用；为避免投错库请手选保存目录后再下载。
                 </p>
@@ -435,6 +513,18 @@ function DialogContent({
                 <p className="rounded-lg border border-amber-400/20 bg-amber-500/10 px-3.5 py-2.5 text-caption leading-relaxed text-amber-100">
                   已识别资源，但当前不能自动入库：{manualTarget.warning ?? "请检查媒体库和监听导入配置。"}
                 </p>
+              )}
+              {!showOtherTargets && (
+                <button
+                  type="button"
+                  onClick={() => setShowOtherTargets(true)}
+                  className="w-full rounded-xl border border-dashed border-white/[0.1] px-3.5 py-2.5 text-left text-ui text-[var(--text-muted)] transition-colors hover:border-white/20 hover:bg-white/[0.03] hover:text-white/90"
+                >
+                  其他保存位置
+                </button>
+              )}
+              {showOtherTargets && loadingDownloaders && (
+                <div className="h-[52px] animate-pulse rounded-xl bg-white/[0.04]" />
               )}
               {options.map((option) => (
                 <button
@@ -463,10 +553,9 @@ function DialogContent({
                 </button>
               ))}
             </div>
-          )}
 
           {/* 下载器分流：≥2 台可用才出现（单台用户界面零变化），默认预选默认台 */}
-          {downloaders.length >= 2 && (
+          {showOtherTargets && downloaders.length >= 2 && (
             <div className="flex items-center gap-2.5">
               <span className="shrink-0 text-sub text-[var(--text-muted)]">下载器</span>
               <select
@@ -500,13 +589,18 @@ function DialogContent({
             记住本次选择，下次点「下载」直接提交（按电影/剧集分别记忆）
           </label>
 
-          <p className="text-caption leading-relaxed text-[var(--text-faint)]">
-            movieclaw 与下载器不在同一容器/主机、看到的路径不同？到
-            <Link href="/settings/downloaders" className="mx-0.5 text-[var(--accent)] hover:underline">
-              设置 → 下载器
-            </Link>
-            配置路径映射，提交时会自动翻译成下载器视角。
-          </p>
+          {showOtherTargets && (
+            <p className="text-caption leading-relaxed text-[var(--text-faint)]">
+              movieclaw 与下载器不在同一容器/主机、看到的路径不同？到
+              <Link
+                href="/settings/downloaders"
+                className="mx-0.5 text-[var(--accent)] hover:underline"
+              >
+                设置 → 下载器
+              </Link>
+              配置路径映射，提交时会自动翻译成下载器视角。
+            </p>
+          )}
 
           <div className="flex justify-end gap-3 pt-1">
             <button type="button" onClick={onClose} className="btn-glass h-9 px-4 text-ui font-medium">
@@ -515,7 +609,7 @@ function DialogContent({
             <button
               type="button"
               onClick={submit}
-              disabled={busy || loading || selected === null}
+              disabled={busy || selected === null}
               className="btn-accent h-9 rounded-full px-5 text-ui font-semibold disabled:opacity-40"
             >
               {busy ? "提交中…" : "确认下载"}

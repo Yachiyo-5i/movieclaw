@@ -524,6 +524,7 @@ _MEMBER_ALLOWLIST = {
     ("DELETE", "/api/v1/subscriptions/{subscription_id}/following"),
     ("GET", "/api/v1/subscriptions/{subscription_id}/activities"),
     ("PATCH", "/api/v1/subscriptions/{subscription_id}/tracking-state"),
+    ("PATCH", "/api/v1/subscriptions/{subscription_id}/follow-future"),
     ("POST", "/api/v1/subscriptions/{subscription_id}/missing-resource-searches"),
 }
 

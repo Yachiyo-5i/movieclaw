@@ -20,11 +20,18 @@ def client(tmp_path, monkeypatch):
     # 每个测试用独立临时 SQLite 库
     monkeypatch.setenv("DATABASE_URL", f"sqlite+aiosqlite:///{tmp_path / 'test.db'}")
     monkeypatch.setenv("SECRET_KEY_FILE", str(tmp_path / ".secret_key"))
+    monkeypatch.setenv("SCHEDULER_ENABLED", "false")
     get_settings.cache_clear()
 
     from movieclaw_api.api.deps import require_login
+    from movieclaw_api.api.routes import libraries as library_routes
     from movieclaw_api.app import create_app
     from movieclaw_api.services.auth import Principal
+
+    async def skip_initial_scan(*_args, **_kwargs) -> None:  # noqa: ANN002, ANN003
+        """配置接口用例不执行异步扫描；扫描与持久作业由各自专项测试覆盖。"""
+
+    monkeypatch.setattr(library_routes, "enqueue_scan_job", skip_initial_scan)
 
     app = create_app()
     # 本文件只测媒体库业务，登录鉴权用依赖覆盖绕过（鉴权本身在 test_auth 覆盖）
@@ -152,7 +159,7 @@ def test_root_overlap_update_excludes_self(client) -> None:
         f"/api/v1/libraries/{lib['id']}",
         json={"name": "综艺", "kind": "tv", "root_paths": ["/media/综艺剧集", "/mnt/综艺"]},
     )
-    assert r.status_code == 200
+    assert r.status_code == 200, r.text
     # 改成盖住别的库的根：拒绝
     r = client.put(
         f"/api/v1/libraries/{lib['id']}",
@@ -293,7 +300,8 @@ def test_delete_default_hands_over_within_kind(client) -> None:
     tv_default = _create(client, name="剧集库", kind="tv", root="/media/tv")
     anime = _create(client, name="动漫库", kind="tv", root="/media/anime")
     assert tv_default["is_default"] is True and anime["is_default"] is False
-    assert client.delete(f"/api/v1/libraries/{tv_default['id']}").status_code == 200
+    deleted = client.delete(f"/api/v1/libraries/{tv_default['id']}")
+    assert deleted.status_code == 200, deleted.text
     rows = client.get("/api/v1/libraries", params={"kind": "tv"}).json()["data"]
     assert [x["id"] for x in rows] == [anime["id"]]
     assert rows[0]["is_default"] is True  # 默认交接给同 kind 剩下的库

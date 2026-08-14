@@ -10,8 +10,9 @@ from datetime import UTC, date, datetime
 from enum import StrEnum
 from typing import Literal
 
-from pydantic import BaseModel, Field, field_serializer
+from pydantic import Field, field_serializer
 
+from movieclaw_api.schemas.base import BaseModel
 from movieclaw_db.models import (
     MediaItem,
     MediaSeason,
@@ -251,6 +252,12 @@ class SubscriptionTrackingStatePayload(BaseModel):
     )
 
 
+class SubscriptionFollowFuturePayload(BaseModel):
+    """持续追新是详情页上的独立动作，不与选季等批量调整耦合。"""
+
+    enabled: bool = Field(description="是否持续追踪之后播出的新集与新一季")
+
+
 class DownloadUnitView(BaseModel):
     """追踪单元（电影为 0/0）——下载快照与手动选种结果共用。"""
 
@@ -350,6 +357,57 @@ class SubscriptionView(BaseModel):
         )
 
 
+def _elapsed_seconds(start: datetime | None, end: datetime | None) -> int | None:
+    """计算非负整秒耗时；站点时间异常时不向用户展示误导性的负数。"""
+    if start is None or end is None or end < start:
+        return None
+    return round((end - start).total_seconds())
+
+
+class ResourceTimingView(BaseModel):
+    """一集最近一次成功投递所使用资源的发布→发现→提交时间链。"""
+
+    site_id: str
+    torrent_id: str
+    publish_time: datetime | None
+    first_seen_at: datetime | None
+    submitted_at: datetime
+    publish_to_seen_seconds: int | None
+    seen_to_submit_seconds: int | None
+    publish_to_submit_seconds: int | None
+    dry_run: bool = False
+
+    @field_serializer("publish_time", "first_seen_at", "submitted_at")
+    def _serialize_utc(self, value: datetime | None) -> str | None:
+        return _iso_utc(value)
+
+    @classmethod
+    def from_snapshot(cls, snapshot: dict[str, object]) -> ResourceTimingView | None:
+        publish_time = snapshot.get("publish_time")
+        first_seen_at = snapshot.get("first_seen_at")
+        submitted_at = snapshot.get("submitted_at")
+        if not isinstance(publish_time, datetime):
+            publish_time = None
+        if not isinstance(first_seen_at, datetime):
+            first_seen_at = None
+        if not isinstance(submitted_at, datetime):
+            return None
+        # 既没有发布时间也没有首次发现时间时无法回答“隔了多久”，不返回空壳。
+        if publish_time is None and first_seen_at is None:
+            return None
+        return cls(
+            site_id=str(snapshot["site_id"]),
+            torrent_id=str(snapshot["torrent_id"]),
+            publish_time=publish_time,
+            first_seen_at=first_seen_at,
+            submitted_at=submitted_at,
+            publish_to_seen_seconds=_elapsed_seconds(publish_time, first_seen_at),
+            seen_to_submit_seconds=_elapsed_seconds(first_seen_at, submitted_at),
+            publish_to_submit_seconds=_elapsed_seconds(publish_time, submitted_at),
+            dry_run=snapshot.get("dry_run") is True,
+        )
+
+
 class WantedView(BaseModel):
     id: int
     season_number: int
@@ -362,6 +420,10 @@ class WantedView(BaseModel):
     next_search_at: datetime | None
     search_attempts: int
     last_search_at: datetime | None
+    # 由历史种子发布时间推导的可解释调度快照；NULL=样本不足/不适用。
+    release_forecast: dict | None
+    # 实际拉取时间链；老记录或站点未提供发布时间时可为空。
+    resource_timing: ResourceTimingView | None
     grabbed_at: datetime | None
     downloaded_at: datetime | None
     imported_at: datetime | None
@@ -373,7 +435,9 @@ class WantedView(BaseModel):
         return _iso_utc(value)
 
     @classmethod
-    def from_model(cls, w: WantedItem) -> WantedView:
+    def from_model(
+        cls, w: WantedItem, resource_timing: dict[str, object] | None = None
+    ) -> WantedView:
         return cls(
             id=w.id,  # type: ignore[arg-type]
             season_number=w.season_number,
@@ -385,6 +449,12 @@ class WantedView(BaseModel):
             next_search_at=w.next_search_at,
             search_attempts=w.search_attempts,
             last_search_at=w.last_search_at,
+            release_forecast=w.release_forecast,
+            resource_timing=(
+                ResourceTimingView.from_snapshot(resource_timing)
+                if resource_timing is not None
+                else None
+            ),
             grabbed_at=w.grabbed_at,
             downloaded_at=w.downloaded_at,
             imported_at=w.imported_at,
@@ -400,6 +470,7 @@ class SubscriptionDetailView(SubscriptionView):
         sub: Subscription,
         item: MediaItem,
         wanted_rows: list[WantedItem],
+        resource_timings: dict[tuple[int, int], dict[str, object]] | None = None,
     ) -> SubscriptionDetailView:
         counts: dict[str, int] = {}
         for w in wanted_rows:
@@ -407,7 +478,13 @@ class SubscriptionDetailView(SubscriptionView):
         base = SubscriptionView.from_model(sub, item, counts)
         return cls(
             **base.model_dump(),
-            wanted=[WantedView.from_model(w) for w in wanted_rows],
+            wanted=[
+                WantedView.from_model(
+                    w,
+                    (resource_timings or {}).get((w.season_number, w.episode_number)),
+                )
+                for w in wanted_rows
+            ],
         )
 
 

@@ -1,10 +1,11 @@
 "use client";
 
 /**
- * 调整订阅弹窗（订阅详情页「调整 ›」入口）：创建后修改季选择 / 持续追新 /
- * 入库目标库。后端 subscriptions.update 支持 diff 重算工单（加季补工单、减季收
+ * 调整订阅弹窗（订阅详情页「调整 ›」入口）：创建后修改季选择 / 入库目标库。
+ * 后端 subscriptions.update 支持 diff 重算工单（加季补工单、减季收
  * 未投递工单、已下载/已入库一律保留），此前前端只放开了换规则组——本弹窗
- * 补齐剩余三项，用户不必再"取消订阅重订"（那会丢活动记录）。
+ * 补齐剩余两项，用户不必再"取消订阅重订"（那会丢活动记录）。持续追新是
+ * 详情页「更多」里的独立动作，不与批量调整混在一起。
  *
  * 数据源与订阅弹窗同源：季结构走内部 title-preview（幂等，带播出/库存进度），
  * 库选择即时走投递预检。只提交发生变化的字段（PATCH 部分更新语义）。
@@ -45,7 +46,6 @@ export function SubscriptionAdjustDialog({
   const [selectedSeasons, setSelectedSeasons] = useState<Set<number>>(
     () => new Set(detail.selected_seasons),
   );
-  const [followFuture, setFollowFuture] = useState(detail.follow_future);
   const [libraryId, setLibraryId] = useState<number | null>(detail.library_id);
   const [preview, setPreview] = useState<DispatchPreview | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -102,8 +102,8 @@ export function SubscriptionAdjustDialog({
       return next;
     });
 
-  // 被取消勾选、且已有进度（有工单走到 grabbed 之后）的季：减季不动已下内容，
-  // 但未投递的缺口会被收掉——把后果讲在保存之前
+  // 被取消勾选、且已有进度（有工单走到 grabbed 之后）的季：减季不动下载器
+  // 任务，但会停止业务关联与换源——把后果讲在保存之前。
   const droppedWithProgress = useMemo(() => {
     if (isMovie) return [];
     const kept = selectedSeasons;
@@ -120,11 +120,10 @@ export function SubscriptionAdjustDialog({
         JSON.stringify([...detail.selected_seasons].sort((a, b) => a - b));
     return {
       seasons: seasonsChanged,
-      follow: !isMovie && followFuture !== detail.follow_future,
       library: canManageSubscriptions && libraryId !== detail.library_id,
     };
-  }, [canManageSubscriptions, detail, followFuture, isMovie, libraryId, selectedSeasons]);
-  const dirty = changed.seasons || changed.follow || changed.library;
+  }, [canManageSubscriptions, detail, isMovie, libraryId, selectedSeasons]);
+  const dirty = changed.seasons || changed.library;
 
   const save = async () => {
     setBusy(true);
@@ -134,7 +133,6 @@ export function SubscriptionAdjustDialog({
         ...(changed.seasons
           ? { selected_seasons: [...selectedSeasons].sort((a, b) => a - b) }
           : {}),
-        ...(changed.follow ? { follow_future: followFuture } : {}),
         // 显式带上 null 即「清除指定库、改回默认库路由」（后端区分未传与 null）
         ...(canManageSubscriptions && changed.library ? { library_id: libraryId } : {}),
       });
@@ -151,8 +149,8 @@ export function SubscriptionAdjustDialog({
       <div className="scroll-thin max-h-[76dvh] overflow-y-auto p-6 max-md:p-5">
         <h2 className="text-title font-bold text-white">调整订阅</h2>
         <p className="mt-1 text-sub leading-6 text-[var(--text-muted)]">
-          《{detail.media.title}》——加季会补建缺口工单；减季只收掉还没投递的，
-          已下载/已入库的内容不受影响。
+          《{detail.media.title}》——加季会恢复或补建追踪；减季会让整季退出追踪范围，
+          但不会删除下载器任务、已下载文件或入库内容。
         </p>
 
         {error && (
@@ -189,24 +187,9 @@ export function SubscriptionAdjustDialog({
               {droppedWithProgress.length > 0 && (
                 <p className="mt-2 rounded-lg border border-amber-400/25 bg-amber-500/10 px-3 py-2 text-caption leading-relaxed text-amber-200">
                   第 {droppedWithProgress.join("、")} 季已有下载进度：取消勾选不会删除
-                  已下载内容，但该季还没抓到的部分将停止寻找资源
+                  下载器任务或文件；该季将停止进度关联、缺失搜索与自动换源
                 </p>
               )}
-
-              <label className="mt-4 flex cursor-pointer items-center justify-between rounded-xl border border-white/[0.08] bg-white/[0.04] px-4 py-3">
-                <span>
-                  <span className="block text-ui font-medium text-white/90">持续追新</span>
-                  <span className="mt-0.5 block text-caption text-[var(--text-faint)]">
-                    之后播出的新集、新一季自动加入追踪
-                  </span>
-                </span>
-                <input
-                  type="checkbox"
-                  checked={followFuture}
-                  onChange={(e) => setFollowFuture(e.target.checked)}
-                  className="size-4 accent-[var(--accent-2)]"
-                />
-              </label>
             </section>
           )}
 

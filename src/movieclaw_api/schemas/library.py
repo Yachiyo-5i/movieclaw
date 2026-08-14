@@ -6,8 +6,9 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Literal
 
-from pydantic import BaseModel, Field, field_serializer
+from pydantic import Field, field_serializer
 
+from movieclaw_api.schemas.base import BaseModel
 from movieclaw_db.models.library import Library
 from movieclaw_media.models import MediaKind
 

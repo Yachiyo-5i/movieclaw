@@ -27,6 +27,26 @@ class WantedStatus(StrEnum):
     IMPORTED = "imported"  # 已整理入库（硬链到库目录 + library_file 落账）——终态
 
 
+class DownloadAttemptStatus(StrEnum):
+    """订阅下载尝试状态。
+
+    ``wanted_item`` 表达用户仍缺哪些内容；本表状态表达为了满足这些内容先后
+    投递过哪些种子。换源时旧种与试用种会短暂并存，因此不能再把单个
+    ``wanted_item.info_hash`` 当作完整下载历史。
+    """
+
+    ACTIVE = "active"  # 当前主源，正常观察下载进度
+    REPLACEMENT_PENDING = "replacement_pending"  # 主源无进度，等待/正在寻找替代源
+    TRIAL = "trial"  # 替代源已投递，等待真实字节增长后晋升
+    CLEANUP_PENDING = "cleanup_pending"  # 已切换工单，等待幂等清理旧下载任务
+    SUPERSEDED = "superseded"  # 已由健康替代源接管，旧任务已安全清理
+    RETAINED = "retained"  # 已被替代，但因用户所有权/H&R 风险保留旧任务
+    COMPLETED = "completed"  # 下载器已确认完成，继续观察落点并等待入库
+    IMPORTED = "imported"  # 关联工单已入库，退出下载观察与任务中心关联
+    FAILED = "failed"  # 试用源同样无进度，进入失败候选冷却
+    CANCELLED = "cancelled"  # 已退出当前订阅范围；保留历史但停止搜索、观察与救援
+
+
 class Subscription(TimestampMixin, table=True):
     """订阅——期望集合 E 的定义（docs/design/subscription.md 推论一）。
 
@@ -143,7 +163,7 @@ class SubscriptionFollower(TimestampMixin, table=True):
 
 
 class WantedItem(TimestampMixin, table=True):
-    """工单——期望单元及其满足状态的物化（不只是缺口）。
+    """工单——单元身份、当前订阅范围及其满足状态的物化（不只是缺口）。
 
     三个职责，多一件不做（docs/design/subscription-plan.md 数据模型汇总）：
     ① 表达期望单元身份（订阅 + 季集）；② 携带满足状态（wanted→grabbed→downloaded，
@@ -151,9 +171,9 @@ class WantedItem(TimestampMixin, table=True):
     匹配历史/拒绝原因在 match_record（P4），质量规则在 rule_set，
     内容元数据在 media_*（air_date 是唯一冗余快照，F3 负责同步）。
 
-    生命周期**只进不出**：唯一的删除是"修改订阅移除季"时删该季未完成工单；
-    已 grabbed/downloaded 的永不回收（现实不可逆），这也让重新勾选季时
-    diff 不会重复下载。
+    ``status`` 只记录不可逆现实事件，``in_scope`` 独立记录该单元是否仍属于
+    当前订阅期望集合。取消季只把 ``in_scope`` 置为 False，不抹掉投递历史；
+    重新勾选时恢复范围并复用原工单，因此不会重复下载。
 
     季/集号 NOT NULL：SQLite 唯一索引里 NULL 互不相等，用了 NULL 不变量①
     （每个期望单元至多一个工单）就没有 DB 兜底。电影 = (0,0) 哨兵；
@@ -205,6 +225,10 @@ class WantedItem(TimestampMixin, table=True):
     status: str = Field(
         default=WantedStatus.WANTED, index=True, description="wanted / grabbed / downloaded"
     )
+    in_scope: bool = Field(
+        default=True,
+        description="是否属于当前订阅期望集合；False 仅保留历史，不参与搜索、救援与进度",
+    )
     air_date: date | None = Field(
         default=None, description="播出日期快照（冗余自 episodes JSON，F3 同步）；NULL=未定档"
     )
@@ -217,6 +241,16 @@ class WantedItem(TimestampMixin, table=True):
     search_attempts: int = Field(default=0, description="已搜索次数（退避曲线的输入）")
     last_search_at: datetime | None = Field(default=None, description="上次搜索时间")
 
+    # -- 追新资源发布时间预测 ------------------------------------------------
+    # 预测是本工单的派生调度快照，不另建 observation / hint 表：原始发布时间与
+    # 首次发现时间已经由 site_torrent 保存；站点同步是否消费某个预测探测点，
+    # 由 SiteSyncCursor.last_sync_at 可重算。NULL=样本不足/不适用。
+    release_forecast: dict | None = Field(
+        default=None,
+        sa_column=Column(JSON, nullable=True),
+        description="追新资源发布时间预测快照；NULL=尚无可靠预测",
+    )
+
     grabbed_at: datetime | None = Field(default=None, description="投递成功时间")
 
     # -- 入库管线（媒体库 L2）------------------------------------------------
@@ -227,3 +261,103 @@ class WantedItem(TimestampMixin, table=True):
     )
     downloaded_at: datetime | None = Field(default=None, description="下载器确认完成时间")
     imported_at: datetime | None = Field(default=None, description="整理入库完成时间")
+
+
+class SubscriptionDownloadAttempt(TimestampMixin, table=True):
+    """一次订阅种子投递及其救援观察。
+
+    一次整季包可覆盖多条 wanted，因此尝试按 ``subscription + infohash`` 建模，
+    ``units`` 累计同一 infohash 后续认领的覆盖单元。进度只保存完成字节、
+    网络下载字节和最后增长时刻，不复制下载器实时状态；这些字段只是跨重启
+    可靠判断“连续多久没有前进”的心跳。
+    """
+
+    __tablename__ = "subscription_download_attempt"
+    __table_args__ = (
+        UniqueConstraint(
+            "subscription_id",
+            "info_hash",
+            name="uq_subscription_download_attempt_hash",
+        ),
+        Index("ix_subscription_download_attempt_status_due", "status", "next_search_at"),
+    )
+
+    id: int | None = Field(default=None, primary_key=True)
+    subscription_id: int = Field(
+        sa_column=Column(
+            Integer,
+            ForeignKey("subscription.id", ondelete="CASCADE"),
+            nullable=False,
+            index=True,
+        )
+    )
+    downloader_id: int | None = Field(
+        default=None,
+        sa_column=Column(
+            Integer,
+            ForeignKey("downloader_client.id", ondelete="SET NULL"),
+            nullable=True,
+            index=True,
+        ),
+        description="实际承载该任务的下载器；NULL=旧数据或下载器配置已删除",
+    )
+    replaces_attempt_id: int | None = Field(
+        default=None,
+        sa_column=Column(
+            Integer,
+            ForeignKey("subscription_download_attempt.id", ondelete="SET NULL"),
+            nullable=True,
+            index=True,
+        ),
+        description="试用替代源所替换的旧尝试",
+    )
+
+    info_hash: str = Field(index=True, description="BT infohash（统一小写）")
+    site_id: str | None = Field(default=None, description="候选来源站点")
+    torrent_id: str | None = Field(default=None, description="站点内种子 ID")
+    torrent_title: str = Field(default="", description="投递时的种子标题快照")
+    units: list = Field(
+        default_factory=list,
+        sa_column=Column(JSON, nullable=False),
+        description="该 infohash 历次认领累计覆盖的 [[season, episode], ...]",
+    )
+    quality: dict = Field(
+        default_factory=dict,
+        sa_column=Column(JSON, nullable=False),
+        description="分辨率/片源/HDR 等质量属性快照，换源时作为不降级底线",
+    )
+    hit_and_run: bool | None = Field(default=None, description="投递时观测到的 H&R 状态")
+    owned_by_movieclaw: bool = Field(
+        default=False,
+        description="提交前下载器中不存在该任务；只有这类任务才允许自动清理",
+    )
+
+    status: str = Field(default=DownloadAttemptStatus.ACTIVE, index=True)
+    last_downloader_state: str | None = Field(default=None)
+    last_observed_at: datetime | None = Field(default=None)
+    baseline_completed_bytes: int | None = Field(
+        default=None,
+        description="完成块观测基线；试用源晋升只认累计网络下载字节",
+    )
+    last_completed_bytes: int | None = Field(default=None)
+    baseline_downloaded_bytes: int | None = Field(
+        default=None,
+        description="试用源累计网络下载字节基线；本地校验不会增加该计数",
+    )
+    last_downloaded_bytes: int | None = Field(
+        default=None, description="最近一次观测到的累计网络下载字节"
+    )
+    last_progress_at: datetime = Field(description="完成字节最后增长时刻，也是无进度计时起点")
+    stalled_notified_at: datetime | None = Field(
+        default=None, description="15 分钟无进度提醒已产生的时刻；进度恢复后清空"
+    )
+    missing_observations: int = Field(
+        default=0, description="下载器可达但连续找不到任务的次数"
+    )
+
+    next_search_at: datetime | None = Field(
+        default=None, index=True, description="死种下一次真实跨站搜索时间"
+    )
+    search_attempts: int = Field(default=0, description="成功执行但没找到替代源的次数")
+    last_search_at: datetime | None = Field(default=None)
+    cleanup_note: str | None = Field(default=None, description="旧任务清理或保留原因")

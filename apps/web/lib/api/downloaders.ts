@@ -56,7 +56,9 @@ export interface ConfiguredDownloader {
 export type DownloadTaskState =
   | "downloading"
   | "stalled"
+  | "queued"
   | "paused"
+  | "checking"
   | "completed"
   | "error"
   | "missing"
@@ -90,6 +92,18 @@ export interface DownloadTask {
   media_kind: string | null;
   poster_url: string | null;
   subscriptions: DownloadTaskSubscription[];
+  rescue_state:
+    | "active"
+    | "replacement_pending"
+    | "trial"
+    | "cleanup_pending"
+    | "retained"
+    | "completed"
+    | null;
+  no_progress_seconds: number | null;
+  can_replace: boolean;
+  replacement_due_at: string | null;
+  rescue_message: string | null;
 }
 
 export interface DownloadTaskSource {
@@ -145,6 +159,20 @@ export function deleteDownloadTask(
       `/downloaders/${downloaderId}/torrents/${encodeURIComponent(infoHash)}${query}`,
       { method: "DELETE" },
     ),
+  );
+}
+
+/** 立即为 15 分钟无进度的订阅任务执行真实跨站换源搜索。 */
+export function replaceDownloadTask(
+  downloaderId: number,
+  infoHash: string,
+): Promise<{ downloader_id: number; info_hash: string; attempt_id: number }> {
+  return unwrap(
+    request<
+      ApiEnvelope<{ downloader_id: number; info_hash: string; attempt_id: number }>
+    >(`/downloaders/${downloaderId}/torrents/${encodeURIComponent(infoHash)}/replace`, {
+      method: "POST",
+    }),
   );
 }
 
@@ -291,8 +319,10 @@ export interface DownloadSubmitResult {
 }
 
 /**
- * 把一条搜索结果种子提交到默认下载器：后端带站点登录态取回 .torrent 再递交，
- * 保存目录用默认下载器配置的默认目录。失败抛 HttpError，message 为可读中文。
+ * 把一条搜索结果种子提交到下载器：后端带站点登录态取回 .torrent 再递交。
+ * 保存目标按 auto_route / save_path / library_id / 下载器默认目录的互斥选择决定；
+ * Web 的智能选项必须先经 resolveManualDownloadTarget 收敛身份并通过预检。
+ * 失败抛 HttpError，message 为可读中文。
  */
 export function submitTorrentDownload(
   payload: DownloadSubmitPayload,

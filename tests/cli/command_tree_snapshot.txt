@@ -170,6 +170,7 @@ subscriptions list-active-downloads
 subscriptions list-activities
 subscriptions preview-download-routing
 subscriptions search-missing-resources
+subscriptions set-follow-future
 subscriptions set-tracking-state
 subscriptions unsubscribe
 subscriptions update

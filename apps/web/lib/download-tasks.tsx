@@ -81,8 +81,8 @@ export function DownloadTasksProvider({ children }: { children: React.ReactNode 
   );
   const attentionTasks = useMemo(
     () =>
-      snapshot.items.filter((task) =>
-        ["error", "missing", "stalled"].includes(task.state),
+      snapshot.items.filter(
+        (task) => ["error", "missing"].includes(task.state) || task.can_replace,
       ),
     [snapshot.items],
   );

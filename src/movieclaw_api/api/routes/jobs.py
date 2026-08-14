@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from movieclaw_api.api.deps import require_admin
 from movieclaw_api.exceptions import BadRequestException, NotFoundException
+from movieclaw_api.schemas.base import utc_isoformat
 from movieclaw_api.schemas.jobs import (
     JobCancelView,
     JobEventListView,
@@ -176,7 +177,7 @@ async def stream_jobs(
                         "revision": event.revision,
                         "event_type": event.event_type,
                         "payload": event.payload,
-                        "created_at": event.created_at.isoformat(),
+                        "created_at": utc_isoformat(event.created_at),
                     }
                     event_data = json.dumps(payload, ensure_ascii=False)
                     yield f"id: {event.id}\nevent: job\ndata: {event_data}\n\n"

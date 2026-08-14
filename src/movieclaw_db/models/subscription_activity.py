@@ -45,6 +45,11 @@ class ActivityType(StrEnum):
     DOWNLOADED = "downloaded"
     IMPORTED = "imported"
     IMPORT_FAILED = "import_failed"
+    DOWNLOAD_STALLED = "download_stalled"
+    REPLACEMENT_SEARCHED = "replacement_searched"
+    REPLACEMENT_TRIAL = "replacement_trial"
+    REPLACEMENT_PROMOTED = "replacement_promoted"
+    REPLACEMENT_CLEANUP = "replacement_cleanup"
 
 
 class SubscriptionActivity(TimestampMixin, table=True):

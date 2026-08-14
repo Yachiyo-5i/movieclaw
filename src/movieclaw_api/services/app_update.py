@@ -58,6 +58,7 @@ from movieclaw_api.schemas.app_update import (
     UpdateProgressView,
     UpdateStatusView,
 )
+from movieclaw_api.schemas.base import normalize_utc_iso, utc_isoformat
 from movieclaw_api.services.app_config import FULL_RESTART_EXIT_CODE, schedule_restart
 from movieclaw_api.settings.schemas import (
     get_app_update_prefs,
@@ -1175,7 +1176,7 @@ async def _record_app_check(view: UpdateCheckView) -> None:
     """
     state = await get_app_update_state()
     available = view.update_available and not view.latest_known_bad
-    state.checked_at = utcnow().isoformat()
+    state.checked_at = utc_isoformat(utcnow())
     state.app_latest_version = view.latest_version if available else ""
     state.app_compatible = view.compatible if available else False
     state.app_changelog = view.changelog if available else ""
@@ -1190,7 +1191,7 @@ async def _record_model_check(view: ModelUpdateCheckView) -> None:
     对应的操作，只会变成用户消不掉的噪声。
     """
     state = await get_app_update_state()
-    state.checked_at = utcnow().isoformat()
+    state.checked_at = utc_isoformat(utcnow())
     state.model_latest_tag = (
         view.latest_tag if view.update_available and view.installable else ""
     )
@@ -1257,7 +1258,8 @@ async def read_pending() -> PendingUpdateView:
         app_changelog=state.app_changelog if app_version else "",
         app_published_at=state.app_published_at if app_version else "",
         model_tag=model_tag,
-        checked_at=state.checked_at or None,
+        # 旧版本已经持久化的裸 ISO 值也在读取边界补成 UTC，无需数据迁移。
+        checked_at=normalize_utc_iso(state.checked_at),
     )
 
 

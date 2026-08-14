@@ -21,7 +21,15 @@ from movieclaw_api.services.rule_sets import RuleSetService
 from movieclaw_api.services.subscription import FUTURE_GRACE, SubscriptionService
 from movieclaw_db.engine import dispose_db, get_database, init_db
 from movieclaw_db.migrations import run_migrations
-from movieclaw_db.models import SubscriptionStatus, WantedItem, WantedStatus
+from movieclaw_db.models import (
+    DownloadAttemptStatus,
+    NoticeStatus,
+    SubscriptionDownloadAttempt,
+    SubscriptionStatus,
+    SystemNotice,
+    WantedItem,
+    WantedStatus,
+)
 from movieclaw_db.models.base import utcnow
 from movieclaw_media.models import MediaKind
 from movieclaw_media.tmdb import TmdbClient
@@ -202,28 +210,60 @@ async def test_movie_rejects_season_selection(db) -> None:
 
 
 async def test_update_deselect_keeps_grabbed_and_no_duplicate_on_reselect(db) -> None:
-    """取消勾选：未完成工单删除、已 grabbed 保留；重新勾选不重复创建。"""
+    """取消季只退出业务范围并停止救援；重新勾选复用工单与原下载尝试。"""
     async with db.session() as session:
         service = _service(session)
         sub = await service.create(MediaKind.TV, 200, selected_seasons=[1])
         wanted = _key_map(await _wanted_of(session, sub.id))
         await _mark(session, wanted[(1, 1)], WantedStatus.GRABBED)
+        wanted[(1, 1)].info_hash = "a" * 40
+        attempt = SubscriptionDownloadAttempt(
+            subscription_id=sub.id,
+            info_hash="a" * 40,
+            units=[[1, 1]],
+            status=DownloadAttemptStatus.REPLACEMENT_PENDING,
+            last_progress_at=utcnow(),
+            next_search_at=utcnow(),
+        )
+        session.add_all([wanted[(1, 1)], attempt])
+        notice = SystemNotice(
+            dedupe_key=f"subscription.landing:{sub.id}:{attempt.info_hash}",
+            severity="error",
+            source="subscription",
+            title="下载完成但无法入库",
+            message="测试遗留告警",
+        )
+        session.add(notice)
+        await session.commit()
+        original_ids = {key: row.id for key, row in wanted.items()}
 
         await service.update(sub.id, selected_seasons=[])
         after_deselect = _key_map(await _wanted_of(session, sub.id))
-        # S1E1 已 grabbed 保留；S1E2 还缺着 → 出域删除
-        assert set(after_deselect) == {(1, 1)}
+        # 两行都保留历史身份，但已不参与详情、搜索、观察或换源。
+        assert set(after_deselect) == {(1, 1), (1, 2)}
+        assert all(not row.in_scope for row in after_deselect.values())
         assert after_deselect[(1, 1)].status == WantedStatus.GRABBED
+        await session.refresh(attempt)
+        assert attempt.status == DownloadAttemptStatus.CANCELLED
+        assert attempt.next_search_at is None
+        await session.refresh(notice)
+        assert notice.status == NoticeStatus.RESOLVED.value
+        assert (await service.detail(sub.id))[2] == []
 
         await service.update(sub.id, selected_seasons=[1])
         after_reselect = _key_map(await _wanted_of(session, sub.id))
-        # 重新入域：只补回 S1E2，S1E1 不重复创建（不会二次下载）
+        # 重新入域复用原行和原 infohash，不重复投递已经 grabbed 的单元。
         assert set(after_reselect) == {(1, 1), (1, 2)}
+        assert all(row.in_scope for row in after_reselect.values())
+        assert {key: row.id for key, row in after_reselect.items()} == original_ids
         assert after_reselect[(1, 1)].status == WantedStatus.GRABBED
+        assert after_reselect[(1, 1)].info_hash == "a" * 40
+        await session.refresh(attempt)
+        assert attempt.status == DownloadAttemptStatus.ACTIVE
 
 
 async def test_update_disable_follow_future_clears_future_units(db) -> None:
-    """关掉追新：经追新进入且未完成的单元全部出域清除。"""
+    """关掉追新：经追新进入的单元退出范围，但历史身份继续保留。"""
     async with db.session() as session:
         service = _service(session)
         sub = await service.create(
@@ -232,7 +272,102 @@ async def test_update_disable_follow_future_clears_future_units(db) -> None:
         assert len(await _wanted_of(session, sub.id)) == 2
 
         await service.update(sub.id, follow_future=False)
-        assert await _wanted_of(session, sub.id) == []
+        historical = await _wanted_of(session, sub.id)
+        assert len(historical) == 2
+        assert all(not row.in_scope for row in historical)
+        assert (await service.detail(sub.id))[2] == []
+
+
+async def test_deselect_one_season_keeps_shared_pack_for_remaining_scope(db) -> None:
+    """整季包跨两个季时，取消一季不能误停仍服务另一季的同一下载尝试。"""
+    async with db.session() as session:
+        service = _service(session)
+        sub = await service.create(MediaKind.TV, 200, selected_seasons=[1, 2])
+        wanted = _key_map(await _wanted_of(session, sub.id))
+        info_hash = "c" * 40
+        for key in ((1, 1), (2, 1)):
+            wanted[key].status = WantedStatus.GRABBED
+            wanted[key].info_hash = info_hash
+            wanted[key].grabbed_at = utcnow()
+            session.add(wanted[key])
+        attempt = SubscriptionDownloadAttempt(
+            subscription_id=sub.id,
+            info_hash=info_hash,
+            units=[[1, 1], [2, 1]],
+            status=DownloadAttemptStatus.REPLACEMENT_PENDING,
+            last_progress_at=utcnow(),
+            next_search_at=utcnow(),
+        )
+        session.add(attempt)
+        await session.commit()
+
+        await service.update(sub.id, selected_seasons=[2])
+        rows = _key_map(await _wanted_of(session, sub.id))
+        await session.refresh(attempt)
+        assert rows[(1, 1)].in_scope is False
+        assert rows[(2, 1)].in_scope is True
+        assert attempt.status == DownloadAttemptStatus.REPLACEMENT_PENDING
+        detail_units = {
+            (row.season_number, row.episode_number)
+            for row in (await service.detail(sub.id))[2]
+        }
+        assert detail_units == {
+            (2, 1),
+            (2, 2),
+            (2, 3),
+        }
+
+        await service.update(sub.id, selected_seasons=[])
+        await session.refresh(attempt)
+        assert attempt.status == DownloadAttemptStatus.CANCELLED
+
+
+async def test_update_preserves_promoted_replacement_lineage_while_still_in_scope(db) -> None:
+    """替代源晋升后，普通订阅更新不能误停仍在范围内的新源和旧源清理。"""
+    async with db.session() as session:
+        service = _service(session)
+        sub = await service.create(MediaKind.TV, 200, selected_seasons=[1])
+        wanted = _key_map(await _wanted_of(session, sub.id))[(1, 1)]
+        wanted.status = WantedStatus.GRABBED
+        wanted.info_hash = "e" * 40
+        wanted.grabbed_at = utcnow()
+        old = SubscriptionDownloadAttempt(
+            subscription_id=sub.id,
+            info_hash="d" * 40,
+            units=[[1, 1]],
+            status=DownloadAttemptStatus.CLEANUP_PENDING,
+            last_progress_at=utcnow(),
+        )
+        session.add_all([wanted, old])
+        await session.flush()
+        replacement = SubscriptionDownloadAttempt(
+            subscription_id=sub.id,
+            replaces_attempt_id=old.id,
+            info_hash=wanted.info_hash,
+            units=[[1, 1]],
+            status=DownloadAttemptStatus.ACTIVE,
+            last_progress_at=utcnow(),
+        )
+        session.add(replacement)
+        await session.commit()
+
+        await service.update(sub.id, selected_seasons=[1])
+        await session.refresh(old)
+        await session.refresh(replacement)
+        assert old.status == DownloadAttemptStatus.CLEANUP_PENDING
+        assert replacement.status == DownloadAttemptStatus.ACTIVE
+
+        await service.update(sub.id, selected_seasons=[])
+        await session.refresh(old)
+        await session.refresh(replacement)
+        assert old.status == DownloadAttemptStatus.CANCELLED
+        assert replacement.status == DownloadAttemptStatus.CANCELLED
+
+        await service.update(sub.id, selected_seasons=[1])
+        await session.refresh(old)
+        await session.refresh(replacement)
+        assert old.status == DownloadAttemptStatus.CANCELLED
+        assert replacement.status == DownloadAttemptStatus.ACTIVE
 
 
 async def test_update_keeps_follow_units_when_deselecting_other_season(db) -> None:
@@ -326,7 +461,7 @@ async def test_activity_stream_records_every_action(db) -> None:
     assert created.payload["wanted_total"] == 5
 
     adjusted = next(a for a in activities if a.type == "adjusted")
-    assert adjusted.payload["removed"] > 0  # 取消勾选 S2 移除了未完成工单
+    assert adjusted.payload["deactivated"] > 0  # 取消勾选 S2 令对应单元退出范围
 
 
 async def test_activity_records_completed_transition(db) -> None:

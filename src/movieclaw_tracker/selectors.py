@@ -73,7 +73,6 @@ class NexusPHPSelectors:
     torrent_time_fallback_css: str = "td:nth-child(4)"
     # strptime 格式
     torrent_time_fmt: str = "%Y-%m-%d %H:%M:%S"
-
     torrent_uploader_css: str = "td:nth-child(9) a"
 
     # -- 促销 --

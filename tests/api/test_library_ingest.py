@@ -225,6 +225,53 @@ async def test_movie_hardlink_import_and_ledger(db, tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_ingest_job_reports_only_files_added_by_current_run(db, tmp_path, monkeypatch):
+    """任务中心只展示本 Job 新增的文件，不混入批次里此前已入库的文件。"""
+    root, watch = tmp_path / "tv", tmp_path / "watch"
+    watch.mkdir()
+    library_id = await _make_library(db, kind=MediaKind.TV, root=root)
+    await _make_rule(db, library_id=library_id, source=watch)
+    item = await _make_item(db, kind=MediaKind.TV, title="某剧", year=2020)
+    _stub_identify(monkeypatch, item)
+    monkeypatch.setattr(ingest_mod, "probe_media", lambda _path: _FAKE_SPEC)
+    monkeypatch.setattr(
+        ingest_mod, "_unit", lambda file, _entry: (1, int(file.stem.removeprefix("ep")))
+    )
+
+    async def no_assets(_media_item_id: int) -> None:
+        return None
+
+    monkeypatch.setattr("movieclaw_api.services.media_scrape.ensure_assets", no_assets)
+
+    entry = watch / "Some.Show.S01"
+    entry.mkdir()
+    (entry / "ep1.mkv").write_bytes(b"episode-1")
+    (entry / "ep2.mkv").write_bytes(b"episode-2")
+    season = root / "某剧 (2020)" / "Season 01"
+    season.mkdir(parents=True)
+    (season / "某剧 (2020) - S01E01.mkv").write_bytes(b"episode-1")
+    snap = ingest_mod._snapshot(entry)
+
+    async with db.session() as session:
+        rule = (await session.execute(select(ImportWatch))).scalar_one()
+        created = await ingest_mod.enqueue_ingest_job(
+            session,
+            rule,
+            entry,
+            snap,
+            matched_hashes=[],
+        )
+        job_id = created.job.id
+
+    await jobs.init_job_dispatcher(max_parallel=1)
+    completed = await _wait_job_status(job_id, JobStatus.SUCCEEDED)
+    assert completed.result["imported_count"] == 1
+    assert completed.progress["details"]["imported_files"] == ["ep2.mkv"]
+    assert "already_present_files" not in completed.progress["details"]
+    assert (season / "某剧 (2020) - S01E02.mkv").read_bytes() == b"episode-2"
+
+
+@pytest.mark.asyncio
 async def test_copy_strategy(db, tmp_path, monkeypatch):
     """复制策略：目标是独立文件（不同 inode），内容一致。"""
     root, watch = tmp_path / "movies", tmp_path / "watch"
@@ -403,6 +450,298 @@ async def test_downloader_signal_is_authoritative(db, tmp_path, monkeypatch):
         _fixed_rule(watch, library_id=library_id), library, execute_inline=True
     )
     assert (root / "某电影 (2020)" / "某电影 (2020).mkv").read_bytes() == b"video"
+
+
+@pytest.mark.asyncio
+async def test_completed_files_are_ingested_while_same_torrent_keeps_downloading(
+    db, tmp_path, monkeypatch
+):
+    """季包尚未整体完成时，下载器确认完成的单集先入库，剩余文件继续挂起。"""
+    from movieclaw_downloader import TorrentBrief, TorrentFile, TorrentStatus
+
+    root, watch = tmp_path / "tv", tmp_path / "watch"
+    watch.mkdir()
+    library_id = await _make_library(db, kind=MediaKind.TV, root=root)
+    item = await _make_item(db, kind=MediaKind.TV, title="分批剧集", year=2026)
+    _stub_identify(monkeypatch, item)
+    monkeypatch.setattr(ingest_mod, "probe_media", lambda _path: _FAKE_SPEC)
+    monkeypatch.setattr(
+        ingest_mod, "_unit", lambda file, _entry: (1, int(file.stem.removeprefix("ep")))
+    )
+
+    entry = watch / "Partial.Show.S01"
+    entry.mkdir()
+    ep1 = entry / "ep1.mkv"
+    ep2 = entry / "ep2.mkv"
+    ep1.write_bytes(b"episode-1")
+    ep2.write_bytes(b"episode-2-partial")
+    brief = TorrentBrief(
+        name=entry.name,
+        content_name=entry.name,
+        completed=False,
+        info_hash="partial-hash",
+    )
+    status = TorrentStatus(
+        info_hash=brief.info_hash,
+        name=entry.name,
+        progress=0.75,
+        completed=False,
+        save_path=str(watch),
+        files=[
+            TorrentFile(
+                path=f"{entry.name}/{ep1.name}",
+                size_bytes=ep1.stat().st_size,
+                completed_bytes=ep1.stat().st_size,
+            ),
+            TorrentFile(
+                path=f"{entry.name}/{ep2.name}",
+                size_bytes=ep2.stat().st_size,
+                completed_bytes=3,
+            ),
+        ],
+    )
+
+    async def briefs():
+        return [brief]
+
+    async def statuses(_matches):
+        return [(SimpleNamespace(path_mappings=None), status)]
+
+    monkeypatch.setattr(ingest_mod, "_downloader_briefs", briefs)
+    monkeypatch.setattr(ingest_mod, "_matched_torrent_statuses", statuses)
+    library = await _get_library(db, library_id)
+    await ingest_mod._sweep_dir(
+        _fixed_rule(watch, library_id=library_id), library, execute_inline=True
+    )
+
+    season = root / "分批剧集 (2026)" / "Season 01"
+    assert (season / "分批剧集 (2026) - S01E01.mkv").read_bytes() == b"episode-1"
+    assert not (season / "分批剧集 (2026) - S01E02.mkv").exists()
+    assert str(entry) in ingest_mod._deferred
+    async with db.session() as session:
+        record = (await session.execute(select(IngestEntry))).scalar_one()
+    assert record.imported_count == 1
+
+    # 同一个种子仍未整体完成，但下一集的完成字节翻转后，自检应识别出新批次。
+    status.files[1].completed_bytes = status.files[1].size_bytes
+    assert await ingest_mod._deferred_flipped(str(watch) + "/") is True
+    await ingest_mod._sweep_dir(
+        _fixed_rule(watch, library_id=library_id), library, execute_inline=True
+    )
+    assert (season / "分批剧集 (2026) - S01E02.mkv").read_bytes() == (
+        b"episode-2-partial"
+    )
+    assert str(entry) in ingest_mod._deferred
+    async with db.session() as session:
+        record = (await session.execute(select(IngestEntry))).scalar_one()
+    assert record.imported_count == 2
+
+
+@pytest.mark.asyncio
+async def test_completed_file_waits_when_another_torrent_still_writes_same_path(
+    db, tmp_path, monkeypatch
+):
+    """同名种子的文件路径重叠时，任一写入者未完成都不能提前入库。"""
+    from movieclaw_downloader import TorrentBrief, TorrentFile, TorrentStatus
+
+    root, watch = tmp_path / "tv", tmp_path / "watch"
+    watch.mkdir()
+    library_id = await _make_library(db, kind=MediaKind.TV, root=root)
+    item = await _make_item(db, kind=MediaKind.TV, title="重叠剧集", year=2026)
+    _stub_identify(monkeypatch, item)
+    monkeypatch.setattr(ingest_mod, "probe_media", lambda _path: _FAKE_SPEC)
+    monkeypatch.setattr(ingest_mod, "_unit", lambda _file, _entry: (1, 1))
+
+    entry = watch / "Overlap.Show.S01"
+    entry.mkdir()
+    source = entry / "ep1.mkv"
+    source.write_bytes(b"episode-1")
+    completed = TorrentBrief(
+        name=entry.name,
+        content_name=entry.name,
+        completed=True,
+        info_hash="completed-hash",
+    )
+    downloading = TorrentBrief(
+        name=entry.name,
+        content_name=entry.name,
+        completed=False,
+        info_hash="downloading-hash",
+    )
+    complete_status = TorrentStatus(
+        info_hash=completed.info_hash,
+        name=entry.name,
+        progress=1.0,
+        completed=True,
+        save_path=str(watch),
+        files=[
+            TorrentFile(
+                path=f"{entry.name}/{source.name}",
+                size_bytes=source.stat().st_size,
+                completed_bytes=source.stat().st_size,
+            )
+        ],
+    )
+    writing_status = TorrentStatus(
+        info_hash=downloading.info_hash,
+        name=entry.name,
+        progress=0.5,
+        completed=False,
+        save_path=str(watch),
+        files=[
+            TorrentFile(
+                path=f"{entry.name}/{source.name}",
+                size_bytes=source.stat().st_size,
+                completed_bytes=3,
+            )
+        ],
+    )
+
+    async def briefs():
+        return [completed, downloading]
+
+    async def statuses(_matches):
+        return [
+            (SimpleNamespace(path_mappings=None), complete_status),
+            (SimpleNamespace(path_mappings=None), writing_status),
+        ]
+
+    monkeypatch.setattr(ingest_mod, "_downloader_briefs", briefs)
+    monkeypatch.setattr(ingest_mod, "_matched_torrent_statuses", statuses)
+    library = await _get_library(db, library_id)
+    await ingest_mod._sweep_dir(
+        _fixed_rule(watch, library_id=library_id), library, execute_inline=True
+    )
+
+    assert not (root / "重叠剧集 (2026)").exists()
+    assert str(entry) in ingest_mod._deferred
+
+
+@pytest.mark.asyncio
+async def test_completed_torrent_creates_file_scoped_job_while_sibling_downloads(
+    db, tmp_path, monkeypatch
+):
+    """《重器》同类场景：已完成种子的独立文件先进入持久化入库作业。"""
+    from movieclaw_downloader import TorrentBrief, TorrentFile, TorrentStatus
+
+    root, watch = tmp_path / "tv", tmp_path / "watch"
+    watch.mkdir()
+    library_id = await _make_library(db, kind=MediaKind.TV, root=root)
+    await _make_rule(db, library_id=library_id, source=watch)
+    item = await _make_item(db, kind=MediaKind.TV, title="同目录剧集", year=2026)
+    _stub_identify(monkeypatch, item)
+    monkeypatch.setattr(ingest_mod, "probe_media", lambda _path: _FAKE_SPEC)
+    monkeypatch.setattr(
+        ingest_mod, "_unit", lambda file, _entry: (1, int(file.stem.removeprefix("ep")))
+    )
+
+    async def no_assets(_media_item_id: int) -> None:
+        return None
+
+    monkeypatch.setattr("movieclaw_api.services.media_scrape.ensure_assets", no_assets)
+    entry = watch / "Shared.Show.S01"
+    entry.mkdir()
+    ep1 = entry / "ep1.mkv"
+    ep2 = entry / "ep2.mkv"
+    ep1.write_bytes(b"episode-1")
+    ep2.write_bytes(b"episode-2-partial")
+    completed = TorrentBrief(
+        name=entry.name,
+        content_name=entry.name,
+        completed=True,
+        info_hash="completed-hash",
+    )
+    downloading = TorrentBrief(
+        name=entry.name,
+        content_name=entry.name,
+        completed=False,
+        info_hash="downloading-hash",
+    )
+    complete_status = TorrentStatus(
+        info_hash=completed.info_hash,
+        name=entry.name,
+        progress=1.0,
+        completed=True,
+        save_path=str(watch),
+        files=[
+            TorrentFile(
+                path=f"{entry.name}/{ep1.name}",
+                size_bytes=ep1.stat().st_size,
+                completed_bytes=ep1.stat().st_size,
+            )
+        ],
+    )
+    writing_status = TorrentStatus(
+        info_hash=downloading.info_hash,
+        name=entry.name,
+        progress=0.5,
+        completed=False,
+        save_path=str(watch),
+        files=[
+            TorrentFile(
+                path=f"{entry.name}/{ep2.name}",
+                size_bytes=ep2.stat().st_size,
+                completed_bytes=3,
+            )
+        ],
+    )
+
+    async def briefs():
+        return [completed, downloading]
+
+    async def statuses(_matches):
+        return [
+            (SimpleNamespace(path_mappings=None), complete_status),
+            (SimpleNamespace(path_mappings=None), writing_status),
+        ]
+
+    monkeypatch.setattr(ingest_mod, "_downloader_briefs", briefs)
+    monkeypatch.setattr(ingest_mod, "_matched_torrent_statuses", statuses)
+    async with db.session() as session:
+        rule = (await session.execute(select(ImportWatch))).scalar_one()
+        library = await session.get(Library, library_id)
+        assert library is not None
+    await ingest_mod._sweep_dir(rule, library)
+
+    async with db.session() as session:
+        job = (await session.execute(select(Job))).scalar_one()
+        resources = await jobs.resources_for_jobs(session, [job.id])
+    assert job.input_data["ready_files"] == [
+        {
+            "path": "ep1.mkv",
+            "size_bytes": ep1.stat().st_size,
+            "info_hashes": ["completed-hash"],
+        }
+    ]
+    assert job.input_data["consume_info_hashes"] == ["completed-hash"]
+    assert job.input_data["keep_deferred"] is True
+    assert {
+        row.resource_id
+        for row in resources[job.id]
+        if row.resource_type == "download"
+    } == {"completed-hash"}
+
+    await jobs.init_job_dispatcher(max_parallel=1)
+    await _wait_job_status(job.id, JobStatus.SUCCEEDED)
+    season = root / "同目录剧集 (2026)" / "Season 01"
+    assert (season / "同目录剧集 (2026) - S01E01.mkv").read_bytes() == b"episode-1"
+    assert not (season / "同目录剧集 (2026) - S01E02.mkv").exists()
+    assert str(entry) in ingest_mod._deferred
+
+
+@pytest.mark.asyncio
+async def test_file_scoped_job_never_falls_back_to_whole_directory():
+    """白名单损坏时停止作业，不能静默扩大为整目录入库。"""
+    with pytest.raises(jobs.JobFailed, match="文件级入库白名单无效"):
+        await ingest_mod._execute_ingest_job(
+            SimpleNamespace(),
+            {
+                "rule_id": 1,
+                "entry_path": "/downloads/Partial.Show",
+                "info_hashes": ["partial-hash"],
+                "ready_files": [],
+            },
+        )
 
 
 @pytest.mark.asyncio

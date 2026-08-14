@@ -6,7 +6,8 @@ import type { Route } from "next";
 
 import { useToast } from "@/components/feedback";
 import { ImageLightbox } from "@/components/image-lightbox";
-import { LayersIcon, ListIcon, PhotoIcon } from "@/components/icons";
+import { LayersIcon, ListIcon, PhotoIcon, XIcon } from "@/components/icons";
+import { Modal } from "@/components/modal";
 import { PosterImage } from "@/components/poster-image";
 import { Tooltip } from "@/components/tooltip";
 import type { SearchScope } from "@/lib/categories";
@@ -2208,6 +2209,7 @@ function seasonEpisodeChip(attrs: TorrentAttrs | null): { text: string; pack: bo
 // memo：与 TorrentRow 同理，流式进结果时已有卡片的 hit 引用不变，整卡跳过
 const TorrentPosterCard = memo(function TorrentPosterCard({ hit }: { hit: TorrentHit }) {
   const [viewerOpen, setViewerOpen] = useState(false);
+  const [actionsOpen, setActionsOpen] = useState(false);
   const size = hit.size ?? formatBytes(hit.size_bytes);
   const name = parsedName(hit);
   const seChip = seasonEpisodeChip(hit.attrs);
@@ -2217,6 +2219,16 @@ const TorrentPosterCard = memo(function TorrentPosterCard({ hit }: { hit: Torren
   ).map(cachedImageUrl);
   return (
     <li className="group relative overflow-hidden rounded-xl border border-white/[0.08] bg-[rgba(14,16,22,0.75)] transition-colors hover:border-white/[0.2]">
+      {/* 手机/纯触摸设备把整张卡作为操作入口；窄屏桌面预览也走同一交互，
+          方便响应式调试。桌面鼠标环境下按钮不参与布局与命中。 */}
+      {(hit.detail_url || hit.download_url) && (
+        <button
+          type="button"
+          aria-label={`打开「${hit.title}」的资源操作`}
+          onClick={() => setActionsOpen(true)}
+          className="absolute inset-0 z-10 hidden cursor-pointer rounded-xl max-md:block [@media(hover:none)]:block"
+        />
+      )}
       <div
         role="button"
         tabIndex={0}
@@ -2280,12 +2292,10 @@ const TorrentPosterCard = memo(function TorrentPosterCard({ hit }: { hit: Torren
             {seChip.text}
           </span>
         )}
-        {/* hover：压暗 + 浮出操作（stopPropagation：点链接不触发灯箱）。
-            touch-reveal：触摸设备没有 hover，操作按钮改为常驻——此时压暗层
-            （group-hover:bg-black/35）不生效，按钮自带的深色底已足够在海报上
-            读清，海报本身也不会被一直压着。 */}
+        {/* 桌面 hover：压暗 + 浮出操作（stopPropagation：点链接不触发灯箱）。
+            手机端由整卡点击打开底部抽屉，不在海报上常驻操作。 */}
         {(hit.detail_url || hit.download_url) && (
-          <div className="touch-reveal absolute inset-0 flex items-center justify-center gap-2 bg-black/0 opacity-0 transition duration-200 group-hover:bg-black/35 group-hover:opacity-100">
+          <div className="absolute inset-0 flex items-center justify-center gap-2 bg-black/0 opacity-0 transition duration-200 group-hover:bg-black/35 group-hover:opacity-100 max-md:hidden [@media(hover:none)]:hidden">
             {hit.detail_url && (
               <a
                 href={hit.detail_url}
@@ -2348,6 +2358,19 @@ const TorrentPosterCard = memo(function TorrentPosterCard({ hit }: { hit: Torren
           onClose={() => setViewerOpen(false)}
         />
       )}
+      <TorrentActionsSheet
+        hit={hit}
+        open={actionsOpen}
+        onClose={() => setActionsOpen(false)}
+        onViewImages={
+          gallery.length > 0
+            ? () => {
+                setActionsOpen(false);
+                setViewerOpen(true);
+              }
+            : undefined
+        }
+      />
     </li>
   );
 });
@@ -2583,6 +2606,7 @@ const TorrentRow = memo(function TorrentRow({
   /** 列表模式直接展示站点原始种子名与副标题，不使用扩充层解析出的片名。 */
   showRawTitles?: boolean;
 }) {
+  const [actionsOpen, setActionsOpen] = useState(false);
   const size = hit.size ?? formatBytes(hit.size_bytes);
   const name = showRawTitles ? null : parsedName(hit);
   const complete = completeLabel(hit.attrs);
@@ -2595,6 +2619,16 @@ const TorrentRow = memo(function TorrentRow({
     // 背景，行底改用更实的半透明底色，观感几乎一致。content-visibility 让
     // 视口外的行跳过布局与绘制，长列表滚动/更新只付可见行的成本。
     <li className="group relative rounded-2xl border border-white/[0.06] bg-[rgba(16,18,25,0.82)] px-4 py-3.5 transition-all [contain-intrinsic-size:auto_72px] [content-visibility:auto] hover:-translate-y-px hover:border-white/[0.13] hover:bg-[rgba(22,25,33,0.9)] hover:shadow-[0_12px_30px_-18px_rgba(0,0,0,0.8)]">
+      {/* 移动端把整行作为一个轻量操作入口，不再让详情/下载常驻盖住正文。
+          按钮本身透明且只在窄屏存在，滚动手势仍交给浏览器原生处理。 */}
+      {(hit.detail_url || hit.download_url) && (
+        <button
+          type="button"
+          aria-label={`打开「${hit.title}」的资源操作`}
+          onClick={() => setActionsOpen(true)}
+          className="absolute inset-0 z-10 hidden cursor-pointer rounded-2xl max-md:block [@media(hover:none)]:block"
+        />
+      )}
       <div className="flex items-center gap-5">
         {/* 标题优先，来源和属性下沉为辅助信息，避免徽标抢走首屏注意力。 */}
         <div className="min-w-0 flex-1">
@@ -2665,9 +2699,9 @@ const TorrentRow = memo(function TorrentRow({
 
         {/* 操作区默认收起，hover 整行或键盘聚焦时再浮现：列表静止时专注内容，
             同时保留 focus-within，确保键盘用户可以访问操作。渐变遮罩覆盖下方指标列，
-            避免按钮出现时文字相互叠压。 */}
+            避免按钮出现时文字相互叠压。手机端统一使用底部操作抽屉。 */}
         {(hit.detail_url || hit.download_url) && (
-          <div className="touch-reveal pointer-events-none absolute inset-y-0 right-2 flex items-center gap-1.5 rounded-r-2xl bg-gradient-to-l from-[rgba(20,23,31,0.98)] from-65% to-transparent pl-16 pr-2 opacity-0 transition-opacity duration-150 group-hover:pointer-events-auto group-hover:opacity-100 group-focus-within:pointer-events-auto group-focus-within:opacity-100">
+          <div className="pointer-events-none absolute inset-y-0 right-2 flex items-center gap-1.5 rounded-r-2xl bg-gradient-to-l from-[rgba(20,23,31,0.98)] from-65% to-transparent pl-16 pr-2 opacity-0 transition-opacity duration-150 group-hover:pointer-events-auto group-hover:opacity-100 group-focus-within:pointer-events-auto group-focus-within:opacity-100 max-md:hidden [@media(hover:none)]:hidden">
             {hit.detail_url && (
               <a
                 href={hit.detail_url}
@@ -2689,9 +2723,105 @@ const TorrentRow = memo(function TorrentRow({
           </div>
         )}
       </div>
+      <TorrentActionsSheet
+        hit={hit}
+        open={actionsOpen}
+        onClose={() => setActionsOpen(false)}
+      />
     </li>
   );
 });
+
+/**
+ * 移动端单条种子的操作抽屉。列表正文只承担比较信息，详情、投给订阅和下载
+ * 收口到一次点按后的 bottom sheet；桌面端仍沿用行/海报 hover 操作层。
+ * 抽屉复用 Modal，因此遮罩关闭、Esc 与安全区处理和全站其他移动弹窗一致。
+ */
+function TorrentActionsSheet({
+  hit,
+  open,
+  onClose,
+  onViewImages,
+}: {
+  hit: TorrentHit;
+  open: boolean;
+  onClose: () => void;
+  /** 海报模式可从抽屉继续进入图片灯箱；列表模式不提供。 */
+  onViewImages?: () => void;
+}) {
+  const name = parsedName(hit);
+  const displayTitle = name?.primary ?? hit.title;
+  const secondaryTitle = name ? hit.title : hit.subtitle;
+  const size = hit.size ?? formatBytes(hit.size_bytes);
+
+  return (
+    <Modal open={open} onClose={onClose} label={`${displayTitle}的资源操作`}>
+      <div className="px-4 pb-5 pt-2">
+        <div className="mx-auto mb-3 h-1 w-10 rounded-full bg-white/20" aria-hidden="true" />
+        <div className="flex items-start gap-3">
+          <div className="min-w-0 flex-1">
+            <p className="truncate text-ui font-semibold text-[var(--text)]">{displayTitle}</p>
+            {secondaryTitle && (
+              <p className="mt-1 line-clamp-2 text-caption leading-5 text-[var(--text-muted)]">
+                {secondaryTitle}
+              </p>
+            )}
+            <p className="tnum mt-1 text-caption text-[var(--text-faint)]">
+              {[
+                hit.site_name,
+                size,
+                `${hit.seeders} 做种`,
+                hit.upload_time ? formatRelativeTime(hit.upload_time) : null,
+              ]
+                .filter(Boolean)
+                .join(" · ")}
+            </p>
+          </div>
+          <button
+            type="button"
+            aria-label="关闭资源操作"
+            onClick={onClose}
+            className="touch-target flex size-8 shrink-0 items-center justify-center rounded-full bg-white/[0.06] text-[var(--text-muted)]"
+          >
+            <XIcon className="size-4" />
+          </button>
+        </div>
+
+        <div className="mt-5 grid gap-2">
+          {onViewImages && (
+            <button
+              type="button"
+              onClick={onViewImages}
+              className="btn-glass flex h-11 w-full items-center justify-center gap-2 text-ui font-medium text-[var(--text)]"
+            >
+              <PhotoIcon className="size-4" />
+              浏览图片
+            </button>
+          )}
+          {hit.detail_url && (
+            <a
+              href={hit.detail_url}
+              target="_blank"
+              rel="noreferrer"
+              onClick={onClose}
+              className="btn-glass flex h-11 w-full items-center justify-center text-ui font-medium text-[var(--text)]"
+            >
+              查看详情
+            </a>
+          )}
+          <GrabButton
+            hit={hit}
+            className="flex h-11 w-full items-center justify-center rounded-full border border-[#6aa7ff]/50 bg-[#6aa7ff]/20 text-ui font-medium text-[#b9d4ff] transition-colors active:bg-[#6aa7ff]/35"
+          />
+          <DownloadButton
+            hit={hit}
+            className="btn-accent flex h-11 w-full items-center justify-center rounded-full text-ui font-medium"
+          />
+        </div>
+      </div>
+    </Modal>
+  );
+}
 
 /** 列表指标单元：固定标签 + 数值的两级层次，让密集数字仍然可快速扫读。 */
 function Metric({

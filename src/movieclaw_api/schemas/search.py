@@ -15,8 +15,9 @@ import json
 from datetime import UTC, datetime
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, Field, field_serializer, field_validator
+from pydantic import Field, field_serializer, field_validator
 
+from movieclaw_api.schemas.base import BaseModel
 from movieclaw_db.models.search_history import SearchHistory
 from movieclaw_enrich import TorrentAttrs
 from movieclaw_tracker.models import TorrentCategory, TorrentListItem
@@ -30,6 +31,14 @@ class TorrentHit(TorrentListItem):
     # 数据扩充层从标题/副标题推导的结构化属性（年份/分辨率/编码/压制组/季集...）。
     # 搜索链路现算现返，不落库——规则升级后下次搜索立即生效。
     attrs: TorrentAttrs | None = None
+
+    @field_serializer("upload_time", "free_deadline")
+    def _serialize_tracker_time(self, value: datetime | None) -> str | None:
+        """搜索结果时间显式输出 UTC offset，禁止浏览器把 naive 串当本地时间。"""
+        if value is None:
+            return None
+        aware = value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
+        return aware.isoformat()
 
 
 class SiteSearchStatus(BaseModel):

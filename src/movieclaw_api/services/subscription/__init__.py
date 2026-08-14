@@ -10,6 +10,8 @@ wanted_search / wanted_fulfillment / subscription_health）互相成环、靠函
 - ``wanted_search``      主动缺口搜索（定时任务 + 即时踢）
 - ``wanted_fulfillment`` 库存对账关单（入库/认领后关闭对应工单）
 - ``health``             订阅链路体检（投递 → 转移 → 入库逐段预演）
+- ``release_forecast``   从种子索引推导追新发布时间，并提供站点临时探测点
+- ``replacement``        无进度种子的跨站搜索、试用晋升与安全清理
 
 **包外只允许从本 ``__init__`` 导入**（下方显式导出的公共接口）；包内模块
 之间用完整子模块路径互相引用。守护测试（tests/api/test_subscription_package.py）
@@ -34,11 +36,27 @@ from movieclaw_api.services.subscription.matching import (
     load_match_context,
     units_text,
 )
+from movieclaw_api.services.subscription.release_forecast import (
+    FORECAST_VERSION,
+    forecast_probe_times_by_site,
+    refresh_release_forecasts,
+)
+from movieclaw_api.services.subscription.replacement import (
+    fail_trial,
+    promote_trial,
+    quality_not_lower,
+    reconcile_pending_cleanup,
+    replacement_backoff,
+    request_replacement,
+    run_replacement_search,
+    try_replacement_candidates,
+)
 from movieclaw_api.services.subscription.wanted_fulfillment import close_fulfilled_wanted
 from movieclaw_api.services.subscription.wanted_search import kick_search_soon, search_wanted
 
 __all__ = [
     "DISPATCH_RETRY_DELAY",
+    "FORECAST_VERSION",
     "FUTURE_GRACE",
     "MATCH_BATCH_SIZE",
     "REFRESH_PER_TICK",
@@ -47,13 +65,23 @@ __all__ = [
     "dispatch",
     "evaluate_and_dispatch",
     "expected_units",
+    "fail_trial",
+    "forecast_probe_times_by_site",
     "kick_search_soon",
     "load_match_context",
     "pipeline_health",
     "preview_dispatch_route",
+    "promote_trial",
+    "quality_not_lower",
+    "reconcile_pending_cleanup",
+    "replacement_backoff",
     "recompute_subscription_status",
+    "refresh_release_forecasts",
+    "request_replacement",
+    "run_replacement_search",
     "schedule_for",
     "search_wanted",
     "units_text",
+    "try_replacement_candidates",
     "wanted_search",
 ]

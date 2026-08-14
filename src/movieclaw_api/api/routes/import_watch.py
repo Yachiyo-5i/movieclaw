@@ -12,9 +12,10 @@ from pathlib import PurePosixPath
 from typing import Literal
 
 from fastapi import APIRouter, Depends
-from pydantic import BaseModel, Field
+from pydantic import Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from movieclaw_api.schemas.base import BaseModel
 from movieclaw_api.schemas.response import ApiResponse, ok
 from movieclaw_api.services.import_watch_config import ImportWatchConfigService
 from movieclaw_api.services.library import ingest

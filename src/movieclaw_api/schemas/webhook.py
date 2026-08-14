@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import Field
+
+from movieclaw_api.schemas.base import BaseModel
 
 
 class WebhookEndpointPayload(BaseModel):

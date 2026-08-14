@@ -44,10 +44,14 @@ def _normalize_state(state: str, *, completed: bool) -> str:
     """把 qBittorrent 的任务状态收敛到 TorrentStatus.state 的统一词表。"""
     if completed:
         return "completed"
-    if state in ("downloading", "forcedDL", "metaDL", "allocating", "checkingDL"):
+    if state in ("downloading", "forcedDL", "metaDL", "allocating"):
         return "downloading"
-    if state in ("stalledDL", "queuedDL"):
+    if state == "stalledDL":
         return "stalled"
+    if state == "queuedDL":
+        return "queued"
+    if state == "checkingDL":
+        return "checking"
     if state in ("pausedDL", "stoppedDL"):
         return "paused"
     if state in ("error", "missingFiles"):
@@ -169,19 +173,35 @@ class QBittorrentDownloader(BaseDownloader):
         completed = float(torrent.progress) >= 1.0
         # qBittorrent 用 8640000（100 天）表示"无法估算"
         eta = int(getattr(torrent, "eta", 0) or 0)
+        size_bytes = int(getattr(torrent, "size", 0) or 0)
+        completed_bytes = int(
+            getattr(torrent, "completed", 0) or int(size_bytes * float(torrent.progress))
+        )
+        downloaded = getattr(torrent, "downloaded", None)
         return TorrentStatus(
             info_hash=info_hash,
             name=torrent.name,
             progress=float(torrent.progress),
+            completed_bytes=max(0, completed_bytes),
+            downloaded_bytes=max(0, int(downloaded)) if downloaded is not None else None,
             # progress==1 即全部数据落盘（此后进入做种/完成态）
             completed=completed,
             save_path=torrent.save_path,
             files=[
                 # f.name 是种子内相对路径（含子目录）
-                TorrentFile(path=f.name, size_bytes=int(f.size))
+                TorrentFile(
+                    path=f.name,
+                    size_bytes=int(f.size),
+                    completed_bytes=max(
+                        0,
+                        min(int(f.size), int(int(f.size) * float(f.progress))),
+                    ),
+                    # qB priority=0 表示“不下载”；其余值只区分优先级。
+                    selected=int(getattr(f, "priority", 1)) > 0,
+                )
                 for f in files
             ],
-            size_bytes=int(getattr(torrent, "size", 0) or 0) or None,
+            size_bytes=size_bytes or None,
             dlspeed_bytes=int(getattr(torrent, "dlspeed", 0) or 0),
             eta_seconds=eta if 0 < eta < 8640000 else None,
             state=_normalize_state(str(getattr(torrent, "state", "")), completed=completed),
@@ -211,6 +231,13 @@ class QBittorrentDownloader(BaseDownloader):
                     completed=completed,
                     info_hash=str(torrent.hash).lower(),
                     progress=progress,
+                    completed_bytes=max(
+                        0,
+                        int(
+                            getattr(torrent, "completed", 0)
+                            or int(int(getattr(torrent, "size", 0) or 0) * progress)
+                        ),
+                    ),
                     size_bytes=int(getattr(torrent, "size", 0) or 0) or None,
                     dlspeed_bytes=int(getattr(torrent, "dlspeed", 0) or 0),
                     eta_seconds=eta if 0 < eta < 8640000 else None,

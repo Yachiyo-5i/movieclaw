@@ -5,8 +5,9 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import Field
 
+from movieclaw_api.schemas.base import BaseModel
 from movieclaw_db.models import JobStatus
 
 

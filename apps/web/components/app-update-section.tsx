@@ -25,7 +25,7 @@ import {
 } from "@/lib/api/app";
 import { getHealth } from "@/lib/api/health";
 import { formatBytes } from "@/lib/format";
-import { formatDateTime } from "@/lib/time";
+import { formatDateTime, formatUnixDateTime } from "@/lib/time";
 
 /**
  * 版本与更新（设置 → 应用）。
@@ -407,7 +407,7 @@ export function AppUpdateSection() {
             {status.last_abnormal_exit && (
               <div className="px-5 py-3.5">
                 <p className="text-sub text-amber-300/90">
-                  应用曾于 {new Date(status.last_abnormal_exit.at * 1000).toLocaleString()}{" "}
+                  应用曾于 {formatUnixDateTime(status.last_abnormal_exit.at)}{" "}
                   异常退出并被容器自动恢复：{status.last_abnormal_exit.detail}
                   （exit={status.last_abnormal_exit.exit_code}）。若频繁出现，请查看容器日志排查。
                 </p>

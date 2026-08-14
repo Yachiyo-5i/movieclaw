@@ -1,8 +1,9 @@
 """任务中心的下载器实时聚合视图。
 
-下载进度只存在于 qBittorrent / Transmission，本服务不复制第二份状态；每次
-请求并行读取所有可用下载器的一次列表快照，再按 infohash 关联订阅工单与手动
-下载意图。某台下载器不可达时只把该来源标为异常，其余来源仍正常返回。
+下载进度只存在于 qBittorrent / Transmission；本服务每次并行读取实时列表，
+再按 infohash 关联订阅工单、换源心跳与手动下载意图。数据库只保存完成字节
+最后增长时刻等救援证据，不复制实时进度。某台下载器不可达时只把该来源标为
+异常，其余来源仍正常返回。
 """
 
 from __future__ import annotations
@@ -11,6 +12,7 @@ import asyncio
 import logging
 import posixpath
 from collections import defaultdict
+from datetime import UTC, datetime
 from pathlib import PurePosixPath
 from typing import Any
 
@@ -21,13 +23,16 @@ from movieclaw_api.exceptions import NotFoundException, UpstreamServiceException
 from movieclaw_api.services.network_egress import effective_tmdb_image_base_url
 from movieclaw_db.models import (
     ConfigStatus,
+    DownloadAttemptStatus,
     DownloaderClient,
     LibraryFile,
     ManualDownloadIntent,
     MediaItem,
     Subscription,
+    SubscriptionDownloadAttempt,
     WantedItem,
     WantedStatus,
+    utcnow,
 )
 from movieclaw_db.repositories.downloader_repo import DownloaderRepository
 from movieclaw_downloader import (
@@ -62,28 +67,93 @@ async def _relations(
             .join(MediaItem, MediaItem.id == WantedItem.media_item_id)
             .where(
                 WantedItem.status.in_(_IN_FLIGHT),  # type: ignore[attr-defined]
+                WantedItem.in_scope.is_(True),  # type: ignore[attr-defined]
                 WantedItem.info_hash.is_not(None),  # type: ignore[union-attr]
             )
         )
     ).all()
     grouped_units: dict[tuple[str, int], list[dict[str, int]]] = defaultdict(list)
     subscription_meta: dict[tuple[str, int], dict[str, Any]] = {}
+    base_meta_by_subscription: dict[int, dict[str, Any]] = {}
+    scoped_units_by_subscription: dict[int, set[tuple[int, int]]] = defaultdict(set)
     for wanted, subscription, media in subscription_rows:
         assert wanted.info_hash is not None and subscription.id is not None
         info_hash = wanted.info_hash.lower()
         key = (info_hash, subscription.id)
-        grouped_units[key].append(
-            {
-                "season_number": wanted.season_number,
-                "episode_number": wanted.episode_number,
-            }
+        unit = {
+            "season_number": wanted.season_number,
+            "episode_number": wanted.episode_number,
+        }
+        grouped_units[key].append(unit)
+        scoped_units_by_subscription[subscription.id].add(
+            (wanted.season_number, wanted.episode_number)
         )
-        subscription_meta[key] = {
+        meta = {
             "id": subscription.id,
             "media_item_id": media.id,
             "media_title": media.title,
             "media_kind": media.kind,
             "poster_url": _poster_url(media),
+        }
+        subscription_meta[key] = meta
+        base_meta_by_subscription[subscription.id] = meta
+
+    attempt_rows = (
+        await session.execute(
+            select(SubscriptionDownloadAttempt, Subscription, MediaItem)
+            .join(
+                Subscription,
+                Subscription.id == SubscriptionDownloadAttempt.subscription_id,
+            )
+            .join(MediaItem, MediaItem.id == Subscription.media_item_id)
+            .where(
+                SubscriptionDownloadAttempt.status.in_(  # type: ignore[attr-defined]
+                    (
+                        DownloadAttemptStatus.ACTIVE,
+                        DownloadAttemptStatus.REPLACEMENT_PENDING,
+                        DownloadAttemptStatus.TRIAL,
+                        DownloadAttemptStatus.CLEANUP_PENDING,
+                        DownloadAttemptStatus.RETAINED,
+                        DownloadAttemptStatus.COMPLETED,
+                    )
+                )
+            )
+        )
+    ).all()
+    for attempt, subscription, _media in attempt_rows:
+        assert subscription.id is not None
+        info_hash = attempt.info_hash.lower()
+        key = (info_hash, subscription.id)
+        attempt_units = {
+            (int(unit[0]), int(unit[1]))
+            for unit in attempt.units
+            if isinstance(unit, list) and len(unit) == 2
+        }
+        relevant_units = attempt_units & scoped_units_by_subscription[subscription.id]
+        # 尝试台账只是历史/救援状态，不能单独制造业务任务。主源直接按 hash
+        # 关联；试用源和待清理旧源按覆盖单元关联，但都必须仍有入域在途目标。
+        if key not in subscription_meta and not relevant_units:
+            continue
+        if key not in subscription_meta:
+            grouped_units[key] = [
+                {"season_number": season, "episode_number": episode}
+                for season, episode in sorted(relevant_units)
+            ]
+        subscription_meta[key] = {
+            **base_meta_by_subscription[subscription.id],
+            "_attempt_status": attempt.status,
+            "_attempt_downloader_id": attempt.downloader_id,
+            "_last_progress_at": attempt.last_progress_at,
+            "_next_search_at": attempt.next_search_at,
+            "_cleanup_note": attempt.cleanup_note,
+            "_show_when_missing": attempt.status
+            in (
+                DownloadAttemptStatus.ACTIVE,
+                DownloadAttemptStatus.REPLACEMENT_PENDING,
+                DownloadAttemptStatus.TRIAL,
+                DownloadAttemptStatus.CLEANUP_PENDING,
+                DownloadAttemptStatus.COMPLETED,
+            ),
         }
 
     subscriptions: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -268,16 +338,48 @@ def _task_dict(
     downloader: DownloaderClient | None,
     subscriptions: list[dict[str, Any]],
     manual: dict[str, Any] | None,
+    absent_state: str = "missing",
 ) -> dict[str, Any]:
     source = "subscription" if subscriptions else "manual" if manual else "external"
     media = subscriptions[0] if subscriptions else manual
+    rescue = next(
+        (entry for entry in subscriptions if entry.get("_attempt_status") is not None),
+        None,
+    )
     completed = bool(torrent and torrent.completed)
-    state = "missing" if torrent is None else "completed" if completed else torrent.state
+    state = absent_state if torrent is None else "completed" if completed else torrent.state
+    no_progress_seconds = None
+    if rescue is not None and rescue.get("_last_progress_at") is not None:
+        last_progress = rescue["_last_progress_at"]
+        if last_progress.tzinfo is None:
+            last_progress = last_progress.replace(tzinfo=UTC)
+        no_progress_seconds = max(
+            0,
+            int((datetime.now(UTC) - last_progress.astimezone(UTC)).total_seconds()),
+        )
+    rescue_state = rescue.get("_attempt_status") if rescue is not None else None
+    next_search_at = rescue.get("_next_search_at") if rescue is not None else None
+    can_replace = bool(
+        rescue is not None
+        and rescue_state
+        in (DownloadAttemptStatus.ACTIVE, DownloadAttemptStatus.REPLACEMENT_PENDING)
+        and no_progress_seconds is not None
+        and no_progress_seconds >= 15 * 60
+        and state != "unknown"
+        and not (
+            rescue_state == DownloadAttemptStatus.REPLACEMENT_PENDING
+            and next_search_at is None
+        )
+    )
     return {
         "id": task_id,
         "info_hash": info_hash,
         "name": torrent.name if torrent is not None else (media or {}).get("media_title"),
-        "downloader_id": downloader.id if downloader is not None else None,
+        "downloader_id": (
+            downloader.id
+            if downloader is not None
+            else rescue.get("_attempt_downloader_id") if rescue is not None else None
+        ),
         "downloader_name": downloader.name if downloader is not None else None,
         "downloader_type": downloader.client_type if downloader is not None else None,
         "progress": torrent.progress if torrent is not None else None,
@@ -291,7 +393,49 @@ def _task_dict(
         "media_kind": (media or {}).get("media_kind"),
         "poster_url": (media or {}).get("poster_url"),
         "subscriptions": subscriptions,
+        "rescue_state": rescue_state,
+        "no_progress_seconds": no_progress_seconds,
+        "can_replace": can_replace,
+        "replacement_due_at": next_search_at,
+        "rescue_message": (
+            None
+            if state == "unknown"
+            else _rescue_message(
+                rescue_state,
+                no_progress_seconds,
+                next_search_at,
+                rescue.get("_cleanup_note") if rescue is not None else None,
+            )
+        ),
     }
+
+
+def _rescue_message(
+    state: str | None,
+    no_progress_seconds: int | None,
+    next_search_at,
+    cleanup_note: str | None,
+) -> str | None:
+    """把换源状态渲染成任务中心可直接显示的中文解释。"""
+    if state == DownloadAttemptStatus.TRIAL:
+        return "正在验证同品质替代源；新源产生至少 1 MiB 真实进度后才会切换旧源"
+    if state == DownloadAttemptStatus.REPLACEMENT_PENDING:
+        if next_search_at is None:
+            return "已投递同品质替代源，正在等待真实下载进度"
+        if next_search_at <= datetime.now(UTC).replace(tzinfo=None):
+            return "旧源仍保留，正在跨站寻找同品质替代源"
+        return "暂未找到同品质替代源，旧源继续保留；系统会按退避计划重新跨站搜索"
+    if state == DownloadAttemptStatus.RETAINED:
+        return cleanup_note or "换源已完成；旧任务因安全条件不足而保留"
+    if state == DownloadAttemptStatus.CLEANUP_PENDING:
+        return cleanup_note or "替代源已接管，正在安全清理旧任务"
+    if (
+        state == DownloadAttemptStatus.ACTIVE
+        and no_progress_seconds is not None
+        and no_progress_seconds >= 15 * 60
+    ):
+        return "已连续 15 分钟没有下载进度；可立即换种，30 分钟时系统会自动处理"
+    return None
 
 
 async def delete_download_task(
@@ -353,10 +497,78 @@ async def delete_download_task(
             )
         )
     ).scalar_one_or_none()
+    changed = False
     if intent is not None:
         await session.delete(intent)
-        await session.commit()
+        changed = True
         logger.info("已清理被删除手动任务的身份锚：hash=%s", normalized_hash)
+
+    attempts = list(
+        (
+            await session.execute(
+                select(SubscriptionDownloadAttempt).where(
+                    SubscriptionDownloadAttempt.info_hash == normalized_hash,
+                    SubscriptionDownloadAttempt.status.in_(  # type: ignore[attr-defined]
+                        (
+                            DownloadAttemptStatus.ACTIVE,
+                            DownloadAttemptStatus.REPLACEMENT_PENDING,
+                            DownloadAttemptStatus.TRIAL,
+                            DownloadAttemptStatus.CLEANUP_PENDING,
+                            DownloadAttemptStatus.COMPLETED,
+                        )
+                    ),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for attempt in attempts:
+        source = attempt
+        if (
+            attempt.status == DownloadAttemptStatus.TRIAL
+            and attempt.replaces_attempt_id is not None
+        ):
+            parent = await session.get(
+                SubscriptionDownloadAttempt, attempt.replaces_attempt_id
+            )
+            if parent is not None:
+                source = parent
+        target_rows = list(
+            (
+                await session.execute(
+                    select(WantedItem).where(
+                        WantedItem.subscription_id == source.subscription_id,
+                        WantedItem.info_hash == source.info_hash,
+                        WantedItem.status.in_(_IN_FLIGHT),  # type: ignore[attr-defined]
+                        WantedItem.in_scope.is_(True),  # type: ignore[attr-defined]
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        allowed = {
+            (int(unit[0]), int(unit[1]))
+            for unit in attempt.units
+            if isinstance(unit, list) and len(unit) == 2
+        }
+        if allowed:
+            target_rows = [
+                target
+                for target in target_rows
+                if (target.season_number, target.episode_number) in allowed
+            ]
+        if target_rows:
+            continue
+        attempt.status = DownloadAttemptStatus.CANCELLED
+        attempt.next_search_at = None
+        attempt.cleanup_note = "关联单元不在当前订阅范围；用户删除下载器任务后停止观察"
+        attempt.updated_at = utcnow()
+        session.add(attempt)
+        changed = True
+    if changed:
+        await session.commit()
 
 
 async def download_task_snapshot(session: AsyncSession) -> dict[str, list[dict[str, Any]]]:
@@ -479,7 +691,20 @@ async def download_task_snapshot(session: AsyncSession) -> dict[str, list[dict[s
     # 被明确删除后不应凭一条孤儿锚继续在任务中心显示“缺失”。
     for info_hash in sorted(set(subscriptions) - seen_hashes):
         linked_subscriptions = subscriptions.get(info_hash, [])
+        if not any(row.get("_show_when_missing", True) for row in linked_subscriptions):
+            continue
         linked_manual = manual.get(info_hash)
+        preferred_ids = {
+            row.get("_attempt_downloader_id")
+            for row in linked_subscriptions
+            if row.get("_attempt_downloader_id") is not None
+        }
+        source_by_id = {source["id"]: source for source in sources}
+        preferred_unreachable = any(
+            source_by_id.get(downloader_id, {}).get("status") != "active"
+            for downloader_id in preferred_ids
+        )
+        any_reachable = any(source["status"] == "active" for source in sources)
         items.append(
             _task_dict(
                 task_id=f"missing:{info_hash}",
@@ -488,6 +713,9 @@ async def download_task_snapshot(session: AsyncSession) -> dict[str, list[dict[s
                 downloader=None,
                 subscriptions=linked_subscriptions,
                 manual=linked_manual,
+                absent_state=(
+                    "unknown" if preferred_unreachable or not any_reachable else "missing"
+                ),
             )
         )
 
@@ -496,9 +724,11 @@ async def download_task_snapshot(session: AsyncSession) -> dict[str, list[dict[s
         "missing": 0,
         "stalled": 1,
         "paused": 2,
-        "downloading": 3,
-        "unknown": 4,
-        "completed": 5,
+        "queued": 3,
+        "checking": 3,
+        "downloading": 4,
+        "unknown": 5,
+        "completed": 6,
     }
     items.sort(key=lambda item: (state_order.get(item["state"], 9), item["name"] or ""))
     return {"items": items, "sources": sources}

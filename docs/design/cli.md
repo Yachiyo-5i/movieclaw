@@ -237,6 +237,9 @@ Agent 最常见的「学习方式」是试错。因此错误输出必须携带�
    命中多个 TMDB 候选时，返回候选清单（含可直接重试的 TMDB `title_ref`）+
    明确错误码。多轮消歧靠 Agent 的多次工具调用完成，
    每次调用自身保持无状态。
+   `mclaw download <row>` 同理：默认先走 `/downloaders/resolve-target`，歧义时
+   stdout 返回候选并以退出码 7 停止，Agent 带 `--tmdb-id` 重试；不得静默落到
+   下载器默认目录。
 5. **输出有预算。** 列表默认 `--limit`（各域给合理默认，如 50），截断时在
    stderr 明示「共 312 条，已截断，--all 取全量」；长文本字段（简介、日志）
    默认截断带标记。上下文窗口是 Agent 的稀缺资源，多余输出就是伤害。
@@ -308,12 +311,24 @@ CLI 的第一消费者是产品自带的 AI 助手（movieclaw_agent，隔离工
 | `mclaw search titles "关键词"` | 搜索 TMDB、豆瓣或全部影视来源；默认保存统一搜索历史 |
 | `mclaw search torrents "关键词"` | SSE 聚合 + 客户端侧筛选排序标志（--resolution/--sort…）+ 结果快照落本地供 `mclaw download` 引用；裸 `mclaw search "关键词"` 是等价简写 |
 | `mclaw search library-items "关键词"` | 搜索当前账号可见媒体库中的已入库条目 |
-| `mclaw download <行号|site:url>` | 读上次搜索快照 → `POST /downloaders/submit`，回显三级兜底路由结论（会/不会自动入库） |
+| `mclaw download <行号|site:url>` | 行号形态一步完成：读搜索快照 → `resolve-target` 识别/预演 → 唯一且可入库就带 `auto_route` 提交；只有歧义或不可路由时才中止并提示。`--library`/`--save-path` 显式覆盖，`--downloader-default` 明确选择下载器默认目录；显式 URL 因无媒体身份维持低级提交形态 |
 | `mclaw library organize-files <library_id>` | `--dry-run` 走 preview；正式执行强制先 preview 回显影响面再执行 |
 | `mclaw agent run "任务"` | start → SSE 渲染（工具调用逐行）→ 终态定退出码；`--detach`/`attach`（Last-Event-ID 续传）/`cancel` |
 | `mclaw login` | bootstrap 探测 → 密码登录 → （P1 起）自动换取长期 Token |
 | `mclaw status` | health + auth/me + spec 版本，一眼看部署状态 |
 | `mclaw logs -f` | 轮询模拟 follow |
+
+`download <row>` 与 Web 下载弹窗共用同一组 API 状态，只在交互承载上不同：
+
+| `resolve-target` 结果 | Web | CLI / Agent |
+|---|---|---|
+| `ready && ok` | 默认选中“智能入库”，用户确认后提交 | 直接带确认后的 TMDB 身份提交 |
+| `ambiguous` | 展示候选按钮，点击后重新预检 | stdout 输出候选、退出码 7；带 `--tmdb-id` 重试 |
+| `not_found` | 让用户改选目录或下载器默认目录 | 不提交，并提示显式覆盖参数 |
+| `ready && !ok` | 展示配置警示，让用户改选 | 不提交，并透传警示与修复方向 |
+
+两端提交 `auto_route` 后，API 都会按 TMDB 锚重新建档和路由；预检路径只用于
+展示与提前拦错，不作为真实提交的可信路由结果，避免配置变化产生时序偏差。
 
 预计 7 条左右。`subscriptions create` 的来源解析、建档和路由预检已收进后端，
 因此由 OpenAPI 生成层直接提供。**准入标准：需要客户端编排或本地状态才收进精选层；单接口的便利包装

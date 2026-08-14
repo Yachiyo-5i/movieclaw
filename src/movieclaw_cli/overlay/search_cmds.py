@@ -65,6 +65,100 @@ def _row_view(index: int, hit: dict) -> dict:
     }
 
 
+def _torrent_identity(hit: dict) -> tuple[str, str, int] | None:
+    """按 Web 下载弹窗的同一门槛，从搜索结果提取智能入库身份三件套。"""
+    attrs = hit.get("attrs") or {}
+    titles = (attrs.get("titles_zh") or []) + (attrs.get("titles_en") or [])
+    kind = attrs.get("media_type")
+    title = titles[0] if titles else None
+    year = attrs.get("year")
+    if (
+        kind not in ("movie", "tv")
+        or not isinstance(title, str)
+        or not title.strip()
+        or not isinstance(year, int)
+        or not 1888 <= year <= 2100
+    ):
+        return None
+    return kind, title.strip(), year
+
+
+def _auto_route_body(
+    api,
+    hit: dict,
+    *,
+    row: int,
+    selected_tmdb_id: int | None,
+    output: str | None,
+) -> dict[str, Any]:
+    """复用 Web 的「识别预检 → 确认身份」协议，返回真实提交所需字段。
+
+    CLI 面向脚本和 Agent，不能像弹窗一样停下来等点击。因此唯一身份自动
+    继续；歧义把结构化候选写到 stdout 并以退出码 7 停止，调用方可带
+    ``--tmdb-id`` 重试。任何不确定或不可入库状态都不会静默落下载器默认目录。
+    """
+    identity = _torrent_identity(hit)
+    if identity is None:
+        raise CliError(
+            "搜索结果缺少可靠的媒体类型、片名或年份，未提交下载",
+            hint=(
+                "可指定 --library <id> 或 --save-path <目录>；"
+                "确认无需自动入库时显式加 --downloader-default"
+            ),
+        )
+
+    kind, title, year = identity
+    resolve_body: dict[str, Any] = {
+        "kind": kind,
+        "title": title,
+        "year": year,
+        "subtitle": hit.get("subtitle") or None,
+    }
+    if selected_tmdb_id is not None:
+        resolve_body["selected_tmdb_id"] = selected_tmdb_id
+    target = api.request("POST", "/downloaders/resolve-target", json_body=resolve_body) or {}
+    status = target.get("status")
+    if status == "ambiguous":
+        # 歧义是机器可恢复状态：stdout 保持结构化，stderr 只写下一步。
+        emit(
+            {"status": status, "candidates": target.get("candidates") or []},
+            output=output,
+        )
+        raise CliError(
+            "识别到多个可能的影视条目，未提交下载",
+            exit_code=ExitCode.AMBIGUOUS,
+            hint=f"确认候选后重试：mclaw download {row} --tmdb-id <候选 tmdb_id>",
+        )
+    if status != "ready" or target.get("tmdb_id") is None:
+        raise CliError(
+            "未能可靠识别该资源，未提交下载",
+            hint=(
+                "可指定 --library <id> 或 --save-path <目录>；"
+                "确认无需自动入库时显式加 --downloader-default"
+            ),
+        )
+    if not target.get("ok") or target.get("library_id") is None:
+        raise CliError(
+            target.get("warning") or "已识别资源，但当前配置不能完成自动入库",
+            hint=(
+                "请按提示修复媒体库、监听目录或路径映射；也可显式指定 "
+                "--library/--save-path，或用 --downloader-default 跳过自动入库"
+            ),
+        )
+
+    route = target.get("route_reason") or f"入库到「{target.get('library_name')}」"
+    path = target.get("path")
+    print(f"智能入库：{route}" + (f"；投递目录 {path}" if path else ""), file=sys.stderr)
+    return {
+        "auto_route": True,
+        "media_kind": kind,
+        "tmdb_id": target["tmdb_id"],
+        "title": title,
+        "year": year,
+        "subtitle": hit.get("subtitle") or None,
+    }
+
+
 @click.command(name="titles", short_help="按片名搜索 TMDB、豆瓣或全部影视来源")
 @click.argument("query")
 @click.option(
@@ -272,8 +366,14 @@ def search_torrents(
 @click.argument("row", type=int, required=False)
 @click.option("--site-id", help="显式形态：种子所属站点 id（与 --url 搭配，替代行号）")
 @click.option("--url", help="显式形态：种子下载入口 download_url")
-@click.option("--library", "library_id", type=int, help="入库目标库 id（缺省走服务端路由决策）")
-@click.option("--save-path", help="手选保存目录（movieclaw 视角，覆盖库推导）")
+@click.option("--library", "library_id", type=int, help="显式指定入库目标库 id，跳过智能选库")
+@click.option("--save-path", help="显式指定保存目录（movieclaw 视角），跳过智能入库")
+@click.option("--downloader-default", is_flag=True, help="跳过智能入库，使用下载器默认目录")
+@click.option(
+    "--tmdb-id",
+    type=click.IntRange(min=1),
+    help="自动识别有歧义时，指定候选 TMDB ID 后重试",
+)
 @output_option
 @click.pass_obj
 def download(
@@ -284,6 +384,8 @@ def download(
     url: str | None,
     library_id: int | None,
     save_path: str | None,
+    downloader_default: bool,
+    tmdb_id: int | None,
 ):
     """把一条种子提交到默认下载器。
 
@@ -293,59 +395,86 @@ def download(
 
         mclaw download --site-id mteam --url ...  # 显式指定（脚本/跨会话）
 
-    投递落点由服务端三级兜底决策（监听导入 / 直接进库 / 下载器默认目录），
-    结论会回显——「会不会自动入库」当场讲清。
+    行号形态默认与 Web 下载弹窗一样，先识别 TMDB 身份并预演路由；只有
+    身份唯一且路由可用才提交。歧义时用 --tmdb-id 确认候选后重试。
+
+    --library / --save-path 可显式覆盖自动识别；确实只想交给下载器自身决定
+    保存位置时，使用 --downloader-default。
     """
     api = settings.make_api()
-    body: dict[str, Any] = {}
-    if row is not None:
-        snapshot = load_snapshot()
-        if snapshot is None:
-            api.close()
-            raise CliError(
-                "没有可用的搜索快照",
-                exit_code=ExitCode.USAGE,
-                hint="先执行 mclaw search <关键词>，或改用 --site-id + --url 显式指定",
-            )
-        if snapshot.get("server") and snapshot["server"] != api.server:
-            api.close()
-            raise CliError(
-                f"搜索快照来自另一台服务器（{snapshot['server']}），不能提交到 {api.server}",
-                exit_code=ExitCode.USAGE,
-                hint="在当前服务器重新执行 mclaw search 后再用行号下载",
-            )
-        items = snapshot.get("items") or []
-        if not 1 <= row <= len(items):
-            raise CliError(
-                f"行号超出范围：{row}（上次搜索「{snapshot.get('keyword')}」共 {len(items)} 条）",
-                exit_code=ExitCode.USAGE,
-                hint="行号以 mclaw search 输出的 row 列为准",
-            )
-        hit = items[row - 1]
-        attrs = hit.get("attrs") or {}
-        # 条目标题取解析出的片名（中文名优先）；TorrentAttrs 是 titles_zh/
-        # titles_en 列表，没有 title 标量字段
-        parsed_titles = (attrs.get("titles_zh") or []) + (attrs.get("titles_en") or [])
-        body = {
-            "site_id": hit.get("site_id"),
-            "download_url": hit.get("download_url"),
-            "title": parsed_titles[0] if parsed_titles else None,
-            "year": attrs.get("year"),
-            "subtitle": hit.get("subtitle") or None,
-        }
-        print(f"下载：{hit.get('title')}（{hit.get('site_name')}）", file=sys.stderr)
-    elif site_id and url:
-        body = {"site_id": site_id, "download_url": url}
-    else:
-        api.close()
-        raise click.UsageError("请给出搜索结果行号，或同时提供 --site-id 与 --url")
-
-    if library_id is not None:
-        body["library_id"] = library_id
-    if save_path is not None:
-        body["save_path"] = save_path
-
     try:
+        if row is not None and (site_id is not None or url is not None):
+            raise click.UsageError("行号不能与 --site-id/--url 同时使用")
+        if row is None and bool(site_id) != bool(url):
+            raise click.UsageError("--site-id 与 --url 必须同时提供")
+        explicit_targets = sum((library_id is not None, save_path is not None, downloader_default))
+        if explicit_targets > 1:
+            raise click.UsageError("--library、--save-path 与 --downloader-default 只能选择一个")
+        if tmdb_id is not None and explicit_targets:
+            raise click.UsageError("--tmdb-id 不能与显式保存目标同时使用")
+
+        body: dict[str, Any]
+        hit: dict | None = None
+        if row is not None:
+            snapshot = load_snapshot()
+            if snapshot is None:
+                raise CliError(
+                    "没有可用的搜索快照",
+                    exit_code=ExitCode.USAGE,
+                    hint="先执行 mclaw search <关键词>，或改用 --site-id + --url 显式指定",
+                )
+            if snapshot.get("server") and snapshot["server"] != api.server:
+                raise CliError(
+                    f"搜索快照来自另一台服务器（{snapshot['server']}），不能提交到 {api.server}",
+                    exit_code=ExitCode.USAGE,
+                    hint="在当前服务器重新执行 mclaw search 后再用行号下载",
+                )
+            items = snapshot.get("items") or []
+            if not 1 <= row <= len(items):
+                keyword = snapshot.get("keyword")
+                raise CliError(
+                    f"行号超出范围：{row}（上次搜索「{keyword}」共 {len(items)} 条）",
+                    exit_code=ExitCode.USAGE,
+                    hint="行号以 mclaw search 输出的 row 列为准",
+                )
+            hit = items[row - 1]
+            attrs = hit.get("attrs") or {}
+            parsed_titles = (attrs.get("titles_zh") or []) + (attrs.get("titles_en") or [])
+            body = {
+                "site_id": hit.get("site_id"),
+                "download_url": hit.get("download_url"),
+                "title": parsed_titles[0] if parsed_titles else None,
+                "year": attrs.get("year"),
+                "subtitle": hit.get("subtitle") or None,
+            }
+            print(f"下载：{hit.get('title')}（{hit.get('site_name')}）", file=sys.stderr)
+        elif site_id and url:
+            body = {"site_id": site_id, "download_url": url}
+        else:
+            raise click.UsageError("请给出搜索结果行号，或同时提供 --site-id 与 --url")
+
+        if tmdb_id is not None and row is None:
+            raise click.UsageError("--tmdb-id 只能用于搜索结果行号下载")
+
+        # Web 用弹窗显式选择；CLI/Agent 没有中途交互，因此行号下载默认走
+        # 智能选项，只有显式保存目标才跳过预检。
+        use_auto_route = row is not None and explicit_targets == 0
+        if use_auto_route:
+            assert hit is not None and row is not None
+            body.update(
+                _auto_route_body(
+                    api,
+                    hit,
+                    row=row,
+                    selected_tmdb_id=tmdb_id,
+                    output=output_override or settings.output,
+                )
+            )
+        elif library_id is not None:
+            body["library_id"] = library_id
+        elif save_path is not None:
+            body["save_path"] = save_path
+
         data = api.request("POST", "/downloaders/submit", json_body=body)
         if api.last_message:
             print(api.last_message, file=sys.stderr)

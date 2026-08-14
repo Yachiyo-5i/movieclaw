@@ -8,8 +8,9 @@
 
 from __future__ import annotations
 
-from pydantic import BaseModel, Field
+from pydantic import Field
 
+from movieclaw_api.schemas.base import BaseModel
 from movieclaw_media.models import MediaKind
 
 

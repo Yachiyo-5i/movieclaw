@@ -90,6 +90,53 @@ export interface Subscription {
   updated_at: string;
 }
 
+export interface ReleaseForecastSite {
+  site_id: string;
+  predicted_at: string;
+  window_start: string;
+  window_end: string;
+  lag_minutes: number;
+  coverage_count: number;
+  probe_times: string[];
+}
+
+/** 单集资源发布时间预测快照；它是可重算的调度结论，不是新的观测事实源。 */
+export interface ReleaseForecast {
+  version: number;
+  generated_at: string;
+  target_air_date: string;
+  predicted_at: string;
+  window_start: string;
+  window_end: string;
+  confidence: "bootstrap" | "growing" | "stable" | "volatile";
+  sample_count: number;
+  cadence_days: number;
+  basis_units: [number, number][];
+  basis_torrent_row_ids: number[];
+  sites: ReleaseForecastSite[];
+  first: {
+    generated_at: string;
+    predicted_at: string;
+    window_start: string;
+    window_end: string;
+    confidence: string;
+    sample_count: number;
+  };
+}
+
+/** 一集最近一次成功投递所用资源的发布→索引→提交时间链。 */
+export interface ResourceTiming {
+  site_id: string;
+  torrent_id: string;
+  publish_time: string | null;
+  first_seen_at: string | null;
+  submitted_at: string;
+  publish_to_seen_seconds: number | null;
+  seen_to_submit_seconds: number | null;
+  publish_to_submit_seconds: number | null;
+  dry_run: boolean;
+}
+
 export interface WantedItem {
   id: number;
   season_number: number;
@@ -100,6 +147,8 @@ export interface WantedItem {
   next_search_at: string | null;
   search_attempts: number;
   last_search_at: string | null;
+  release_forecast: ReleaseForecast | null;
+  resource_timing: ResourceTiming | null;
   grabbed_at: string | null;
   downloaded_at: string | null;
   imported_at: string | null;
@@ -401,6 +450,19 @@ export function setSubscriptionTrackingState(
   );
 }
 
+/** 独立启用 / 禁用剧集持续追新。 */
+export function setSubscriptionFollowFuture(
+  id: number,
+  enabled: boolean,
+): Promise<SubscriptionDetail> {
+  return unwrap(
+    request<ApiEnvelope<SubscriptionDetail>>(`/subscriptions/${id}/follow-future`, {
+      method: "PATCH",
+      body: JSON.stringify({ enabled }),
+    }),
+  );
+}
+
 /** 成员停止关注；服务端保证不影响仍在追踪的其他成员。 */
 export function unsubscribeFromSubscription(id: number): Promise<Record<string, never>> {
   return unwrap(
@@ -466,7 +528,12 @@ export interface SubscriptionActivity {
     | "wanted_added"
     | "downloaded"
     | "imported"
-    | "import_failed";
+    | "import_failed"
+    | "download_stalled"
+    | "replacement_searched"
+    | "replacement_trial"
+    | "replacement_promoted"
+    | "replacement_cleanup";
   message: string;
   payload: Record<string, unknown>;
   created_at: string;

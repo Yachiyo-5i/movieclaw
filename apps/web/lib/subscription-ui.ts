@@ -33,3 +33,19 @@ export function subscriptionProgressNote(sub: Subscription): string {
   ].filter(Boolean);
   return detail.length > 0 ? `缺 ${wanted} 集 · ${detail.join(" · ")}` : `缺 ${wanted} 集`;
 }
+
+/**
+ * 剧集订阅海报的追新阶段角标。
+ *
+ * - 还有缺口、已抓取或待入库单元：当前正在追新；
+ * - 已知单元均已入库（包括创建时就已在库、因此工单总数为 0）：保留自动续订，
+ *   等未来新集或新季被纳入追踪；
+ * - 电影或未开启持续追新：不展示角标。
+ */
+export function subscriptionFollowRibbon(
+  sub: Pick<Subscription, "follow_future" | "media" | "progress">,
+): "追新中" | "自动续订" | undefined {
+  if (sub.media.kind !== "tv" || !sub.follow_future) return undefined;
+  const { wanted, grabbed, downloaded } = sub.progress;
+  return wanted + grabbed + downloaded > 0 ? "追新中" : "自动续订";
+}

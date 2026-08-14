@@ -77,6 +77,10 @@ export interface PosterVisualItem {
   genres?: string[];
   extent?: string;
   badges?: string[];
+  /** 海报右上角的斜向特征标，只承载需要常显的正向能力（如「持续追新」）。 */
+  ribbon?: string;
+  /** 悬浮层的一行紧凑元信息；长内容截断，完整值保留在 title 中。 */
+  overlayMeta?: string;
   overview?: string;
   libraryStatus?: MediaLibraryStatus | null;
 }
@@ -96,24 +100,28 @@ export function PosterCardVisual({
   onClick,
   href,
   action = "subscribe",
+  revealInfoOnTouch = false,
 }: {
   item: PosterVisualItem;
   onClick?: () => void;
   href?: Route;
   action?: PosterCardAction;
+  /** 触摸端首次点按是否先展开纯信息层；默认仍单击直达详情。 */
+  revealInfoOnTouch?: boolean;
 }) {
   const { canSubscribe } = usePermissions();
   const hasSubscribeAction =
     action === "subscribe" || action === "follow" || action === "backfill";
   const showOverlayAction = action === "owned" || (hasSubscribeAction && canSubscribe);
   const showOverlay = Boolean(
-    item.genres?.length || item.overview?.trim() || showOverlayAction,
+    item.genres?.length || item.overlayMeta?.trim() || item.overview?.trim() || showOverlayAction,
   );
-  // 触摸端只有存在可点击的次级操作时才需要「首次展开」。纯信息层或无权限
-  // 动作直接进入详情，避免用户点到一个空层后还得再点一次。
-  const revealOnTouch = hasSubscribeAction && canSubscribe;
-  // 触摸端没有 hover：存在订阅操作时，第一次点按只「展开」信息层（等价于
-  // 鼠标悬停），看清操作后再点海报才进详情；没有次级操作则单击直达详情。
+  // 默认只有可点击的次级操作需要「首次展开」；订阅墙可显式要求纯信息层
+  // 也先展开，让没有 hover 的手机仍能读到选季与配置流向。
+  const revealOnTouch =
+    (hasSubscribeAction && canSubscribe) || (revealInfoOnTouch && showOverlay);
+  // 触摸端没有 hover：需要展示信息层时，第一次点按只「展开」（等价于
+  // 鼠标悬停），看清后再点海报才进详情；无需展开的卡片仍单击直达详情。
   // 点卡片外任意处收起。之前的方案是在海报角上常驻一枚订阅圆键，但图标
   // 无文案表意不清，且张张海报都印着按钮、墙面很吵。
   const noHover = useMediaQuery("(hover: none)");
@@ -163,6 +171,9 @@ export function PosterCardVisual({
   const interactiveClass =
     "group/card block w-full cursor-pointer rounded-2xl text-left outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent-ring)]";
   if (href) {
+    const accessibilityDetails = [item.ribbon, item.genres?.join("、"), item.overlayMeta].filter(
+      Boolean,
+    );
     return (
       <Link
         href={href}
@@ -172,7 +183,7 @@ export function PosterCardVisual({
         onClick={onLinkClick}
         data-revealed={revealed}
         className={interactiveClass}
-        aria-label={`查看《${item.title}》详情`}
+        aria-label={`查看《${item.title}》详情${accessibilityDetails.length > 0 ? `，${accessibilityDetails.join("，")}` : ""}`}
       >
         {content}
       </Link>
@@ -205,6 +216,7 @@ function PosterCardContent({
 }) {
   const badges = item.badges ?? [];
   const genres = item.genres ?? [];
+  const overlayMeta = item.overlayMeta?.trim() ?? "";
   const overview = item.overview ?? "";
   return (
     <>
@@ -224,9 +236,21 @@ function PosterCardContent({
             {badges[0]}
           </span>
         )}
+        {/* 右上斜标只展示已启用的长期特征；关闭态不渲染，避免每张海报
+            都堆一枚没有决策价值的否定标签。 */}
+        {item.ribbon && (
+          <span
+            aria-label={`已开启${item.ribbon}`}
+            className="pointer-events-none absolute -right-8 top-4 z-10 w-28 rotate-45 border-y border-white/25 bg-gradient-to-r from-cyan-500 via-sky-500 to-violet-500 py-1 text-center text-[10px] font-bold tracking-[0.12em] text-white shadow-[0_3px_14px_rgba(14,165,233,0.45)]"
+          >
+            {item.ribbon}
+          </span>
+        )}
         {/* 右上：评分徽章（暂无评分时不渲染，避免展示 0.0） */}
         {item.rating > 0 && (
-          <span className="tnum absolute right-2 top-2 flex items-center gap-1 rounded-md bg-black/70 px-1.5 py-0.5 text-caption font-semibold text-white">
+          <span
+            className={`tnum absolute right-2 flex items-center gap-1 rounded-md bg-black/70 px-1.5 py-0.5 text-caption font-semibold text-white ${item.ribbon ? "top-12" : "top-2"}`}
+          >
             <StarIcon className="size-3 text-[#f5c451]" />
             {item.rating.toFixed(1)}
           </span>
@@ -236,10 +260,18 @@ function PosterCardContent({
             次级操作时，触摸端由首次点按触发（根节点的 data-revealed）；纯信息层
             不拦截主导航——手机单击直接进入详情。 */}
         {showOverlay && (
-          <div className="absolute inset-x-0 bottom-0 translate-y-3 bg-gradient-to-t from-black/90 via-black/60 to-transparent px-3 pb-3 pt-10 opacity-0 transition-all duration-300 ease-out group-hover/card:translate-y-0 group-hover/card:opacity-100 group-data-[revealed=true]/card:translate-y-0 group-data-[revealed=true]/card:opacity-100">
+          <div className="absolute inset-x-0 bottom-0 translate-y-3 bg-gradient-to-t from-black/90 via-black/60 to-transparent px-3 pb-3 pt-10 opacity-0 transition-all duration-300 ease-out group-hover/card:translate-y-0 group-hover/card:opacity-100 group-focus-visible/card:translate-y-0 group-focus-visible/card:opacity-100 group-data-[revealed=true]/card:translate-y-0 group-data-[revealed=true]/card:opacity-100">
             {genres.length > 0 && (
               <p className="text-caption font-medium text-[var(--accent-2)]">
                 {genres.join(" · ")}
+              </p>
+            )}
+            {overlayMeta && (
+              <p
+                title={overlayMeta}
+                className={`${genres.length > 0 ? "mt-1" : ""} truncate text-caption leading-4 text-white/75`}
+              >
+                {overlayMeta}
               </p>
             )}
             {overview && (

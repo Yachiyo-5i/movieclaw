@@ -15,7 +15,8 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from datetime import timedelta
+from datetime import UTC, date, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
@@ -43,6 +44,7 @@ from movieclaw_matcher import (
     evaluate_rules,
     match_identity,
 )
+from movieclaw_tracker.datetime_utils import DEFAULT_SITE_TIMEZONE
 
 logger = logging.getLogger("movieclaw_api.subscription_matching")
 
@@ -63,6 +65,23 @@ SEARCH_FAILURE_RETRY = timedelta(minutes=15)  # 搜索本身失败（非无结�
 DISPATCH_RETRY_DELAY = timedelta(minutes=30)  # 投递失败后经调度通道重试
 MATCH_BATCH_SIZE = 500  # 被动匹配每批处理的种子行数
 REFRESH_PER_TICK = 5  # F3 每 tick 刷新的条目数
+
+_SITE_CALENDAR_TIMEZONE = ZoneInfo(DEFAULT_SITE_TIMEZONE)
+
+
+def publish_calendar_date(value: datetime | None) -> date:
+    """把库内 UTC 发布时间换回站点业务日历日期。
+
+    播出日与集数有效期按中国站点的本地日期判断。直接对 naive UTC 调 ``date``
+    会把本地凌晨发布误算到前一天，导致本该覆盖的单集资源被过滤。
+    """
+    utc_value = value or utcnow()
+    aware = (
+        utc_value.replace(tzinfo=UTC)
+        if utc_value.tzinfo is None
+        else utc_value.astimezone(UTC)
+    )
+    return aware.astimezone(_SITE_CALENDAR_TIMEZONE).date()
 
 
 def backoff_delay(attempts: int) -> timedelta:
@@ -108,6 +127,7 @@ async def load_match_context(session: AsyncSession) -> dict[int, MediaContext]:
         .join(Subscription, WantedItem.subscription_id == Subscription.id)  # type: ignore[arg-type]
         .where(
             WantedItem.status == WantedStatus.WANTED,
+            WantedItem.in_scope.is_(True),  # type: ignore[attr-defined]
             Subscription.status == SubscriptionStatus.ACTIVE,
         )
     )
@@ -279,9 +299,7 @@ async def evaluate_and_dispatch(
         candidate = to_candidate(row)
         if candidate is None:
             continue
-        published = (
-            candidate.publish_time.date() if candidate.publish_time is not None else utcnow().date()
-        )
+        published = publish_calendar_date(candidate.publish_time)
         for media_id, ctx in contexts.items():
             match = match_identity(candidate, ctx.identity)
             if match is None:
@@ -305,11 +323,7 @@ async def evaluate_and_dispatch(
         entries.sort(key=lambda e: (e[1].is_pack, e[2].score, e[0].seeders or 0), reverse=True)
         remaining = dict(ctx.open_wanted)
         for candidate, match, verdict in entries:
-            published = (
-                candidate.publish_time.date()
-                if candidate.publish_time is not None
-                else utcnow().date()
-            )
+            published = publish_calendar_date(candidate.publish_time)
             targets = covered_units(match, remaining, published=published)
             if not targets:
                 continue

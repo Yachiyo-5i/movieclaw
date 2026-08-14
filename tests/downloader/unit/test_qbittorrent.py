@@ -40,6 +40,7 @@ class FakeQbtClient:
 
     def __init__(self, add_response: str = "Ok."):
         self.store: dict[str, SimpleNamespace] = {}
+        self.files: dict[str, list[SimpleNamespace]] = {}
         self.add_response = add_response
         self.add_calls: list[dict] = []
         self.delete_calls: list[dict] = []
@@ -62,6 +63,9 @@ class FakeQbtClient:
     def torrents_delete(self, **kwargs):
         self.delete_calls.append(kwargs)
         self.store.pop(kwargs["torrent_hashes"], None)
+
+    def torrents_files(self, *, torrent_hash):
+        return self.files.get(torrent_hash, [])
 
     def auth_log_in(self):
         pass
@@ -218,3 +222,33 @@ class TestListTorrents:
         assert rows[0].dlspeed_bytes == 1024
         assert rows[0].eta_seconds == 120
         assert rows[0].state == "downloading"
+
+
+class TestGetTorrent:
+    async def test_file_snapshot_keeps_completed_bytes_and_selection(self):
+        fake = FakeQbtClient()
+        fake.store[TORRENT_HASH] = SimpleNamespace(
+            hash=TORRENT_HASH,
+            name="Partial.Show",
+            progress=0.5,
+            completed=150,
+            downloaded=80,
+            save_path="/downloads/tv",
+            size=300,
+            dlspeed=100,
+            eta=60,
+            state="downloading",
+        )
+        fake.files[TORRENT_HASH] = [
+            SimpleNamespace(name="Partial.Show/ep1.mkv", size=100, progress=1.0, priority=1),
+            SimpleNamespace(name="Partial.Show/ep2.mkv", size=200, progress=0.25, priority=1),
+            SimpleNamespace(name="Partial.Show/sample.mkv", size=20, progress=0.0, priority=0),
+        ]
+
+        status = await make_downloader(fake).get_torrent(TORRENT_HASH)
+
+        assert status is not None
+        assert status.completed_bytes == 150
+        assert status.downloaded_bytes == 80
+        assert [file.completed_bytes for file in status.files] == [100, 50, 0]
+        assert [file.selected for file in status.files] == [True, True, False]

@@ -159,7 +159,7 @@ function SearchVerticals({
   return (
     <div className="flex h-full flex-col">
       {/* 垂直选项卡（Google 式「综合/图片」）：深色胶囊分段，压在背景大图上 */}
-      <div className="shrink-0 px-6 pt-5 max-md:px-4 max-md:pt-3">
+      <div className="shrink-0 px-6 pt-7 max-md:px-4 max-md:pt-4">
         <div className="flex flex-wrap items-center gap-2">
           <div
             role="tablist"

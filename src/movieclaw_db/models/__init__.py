@@ -53,7 +53,9 @@ from movieclaw_db.models.site_torrent import (
 )
 from movieclaw_db.models.site_user_profile import SiteUserProfile
 from movieclaw_db.models.subscription import (
+    DownloadAttemptStatus,
     Subscription,
+    SubscriptionDownloadAttempt,
     SubscriptionFollower,
     SubscriptionStatus,
     WantedItem,
@@ -109,6 +111,8 @@ __all__ = [
     "MediaSeason",
     "RuleSet",
     "Subscription",
+    "SubscriptionDownloadAttempt",
+    "DownloadAttemptStatus",
     "SubscriptionFollower",
     "SubscriptionStatus",
     "WantedItem",

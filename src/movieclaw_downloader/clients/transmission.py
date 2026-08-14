@@ -59,9 +59,11 @@ def _normalize_state(torrent, completed: bool) -> str:  # noqa: ANN001 -- transm
         # 有速度才算真在下，零速对齐 qBittorrent 的 stalled 语义
         return "downloading" if int(torrent.fields.get("rateDownload", 0)) > 0 else "stalled"
     if status == "3":
-        return "stalled"
+        return "queued"
     if status == "0":
         return "paused"
+    if status in ("1", "2"):
+        return "checking"
     return "unknown"
 
 
@@ -175,23 +177,41 @@ class TransmissionDownloader(BaseDownloader):
         # 直接读原始字段：transmission-rpc 的 .eta 属性在无法估算时抛异常，
         # fields 里的原始值 -1（未知）/-2（不适用）直接判掉更稳
         eta = int(torrent.fields.get("eta", -1))
+        size_bytes = int(torrent.fields.get("sizeWhenDone", 0))
+        have_valid = torrent.fields.get("haveValid")
+        have_unchecked = torrent.fields.get("haveUnchecked")
+        if have_valid is None and have_unchecked is None:
+            completed_bytes = int(size_bytes * float(torrent.percent_done))
+        else:
+            completed_bytes = int(have_valid or 0) + int(have_unchecked or 0)
+        downloaded = torrent.fields.get("downloadedEver")
         return TorrentStatus(
             info_hash=info_hash,
             name=torrent.name,
             progress=float(torrent.percent_done),
+            completed_bytes=max(0, min(size_bytes, completed_bytes)) if size_bytes else None,
+            downloaded_bytes=max(0, int(downloaded)) if downloaded is not None else None,
             completed=completed,
             save_path=torrent.download_dir,
             files=(
                 [
                     # file.name 是种子内相对路径（含顶层目录）
-                    TorrentFile(path=file.name, size_bytes=int(file.size))
+                    TorrentFile(
+                        path=file.name,
+                        size_bytes=int(file.size),
+                        completed_bytes=max(
+                            0,
+                            min(int(file.size), int(file.completed)),
+                        ),
+                        selected=bool(file.selected),
+                    )
                     for file in torrent.get_files()
                 ]
                 # 进度快照类调用不需要文件清单，跳过逐文件的构造
                 if include_files
                 else []
             ),
-            size_bytes=int(torrent.fields.get("sizeWhenDone", 0)) or None,
+            size_bytes=size_bytes or None,
             dlspeed_bytes=int(torrent.fields.get("rateDownload", 0)),
             eta_seconds=eta if eta > 0 else None,
             state=_normalize_state(torrent, completed=completed),
@@ -217,6 +237,15 @@ class TransmissionDownloader(BaseDownloader):
                     completed=completed,
                     info_hash=str(torrent.hash_string).lower(),
                     progress=progress,
+                    completed_bytes=max(
+                        0,
+                        min(
+                            int(torrent.fields.get("sizeWhenDone", 0)),
+                            int(torrent.fields.get("haveValid", 0) or 0)
+                            + int(torrent.fields.get("haveUnchecked", 0) or 0)
+                            or int(int(torrent.fields.get("sizeWhenDone", 0)) * progress),
+                        ),
+                    ),
                     size_bytes=int(torrent.fields.get("sizeWhenDone", 0)) or None,
                     dlspeed_bytes=int(torrent.fields.get("rateDownload", 0)),
                     eta_seconds=eta if eta > 0 else None,

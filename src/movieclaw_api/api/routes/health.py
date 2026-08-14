@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Request
-from pydantic import BaseModel
 
 from movieclaw_api.core.config import get_settings
+from movieclaw_api.schemas.base import BaseModel
 from movieclaw_api.spec_state import get_spec_hash
 
 router = APIRouter()

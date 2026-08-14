@@ -35,6 +35,32 @@ def _fake_tmdb() -> TmdbClient:
                     "translations": {"translations": []},
                 },
             )
+        if request.url.path == "/3/tv/200":
+            return httpx.Response(
+                200,
+                json={
+                    "id": 200,
+                    "name": "测试剧集",
+                    "original_name": "Test Show",
+                    "first_air_date": "2024-01-01",
+                    "status": "Returning Series",
+                    "external_ids": {},
+                    "alternative_titles": {"results": []},
+                    "translations": {"translations": []},
+                    "seasons": [{"season_number": 1}],
+                },
+            )
+        if request.url.path == "/3/tv/200/season/1":
+            return httpx.Response(
+                200,
+                json={
+                    "name": "第 1 季",
+                    "air_date": "2024-01-01",
+                    "episodes": [
+                        {"episode_number": 1, "name": "E1", "air_date": "2999-01-01"}
+                    ],
+                },
+            )
         return httpx.Response(404, json={})
 
     return TmdbClient(_KEY, transport=httpx.MockTransport(handler))
@@ -115,6 +141,46 @@ def test_create_rejects_guessed_or_legacy_identity_fields(client: TestClient) ->
         json={"kind": "movie", "tmdb_id": 100},
     )
     assert legacy_shape.status_code == 422
+
+
+def test_set_follow_future_uses_dedicated_tv_endpoint(client: TestClient) -> None:
+    created = client.post(
+        "/api/v1/subscriptions",
+        json={"title_ref": "tmdb:tv:200", "selected_seasons": []},
+    )
+    assert created.status_code == 200, created.text
+    subscription_id = created.json()["data"]["subscription"]["id"]
+
+    enabled = client.patch(
+        f"/api/v1/subscriptions/{subscription_id}/follow-future",
+        json={"enabled": True},
+    )
+    assert enabled.status_code == 200, enabled.text
+    assert enabled.json()["message"] == "已启用持续追新"
+    assert enabled.json()["data"]["follow_future"] is True
+
+    disabled = client.patch(
+        f"/api/v1/subscriptions/{subscription_id}/follow-future",
+        json={"enabled": False},
+    )
+    assert disabled.status_code == 200, disabled.text
+    assert disabled.json()["message"] == "已禁用持续追新"
+    assert disabled.json()["data"]["follow_future"] is False
+
+
+def test_set_follow_future_rejects_movie_subscription(client: TestClient) -> None:
+    created = client.post(
+        "/api/v1/subscriptions",
+        json={"title_ref": "tmdb:movie:100"},
+    )
+    subscription_id = created.json()["data"]["subscription"]["id"]
+
+    response = client.patch(
+        f"/api/v1/subscriptions/{subscription_id}/follow-future",
+        json={"enabled": True},
+    )
+    assert response.status_code == 400
+    assert response.json()["message"] == "只有剧集订阅可以设置持续追新"
 
 
 def test_admin_permanent_delete_uses_explicit_endpoint_semantics(client: TestClient) -> None:

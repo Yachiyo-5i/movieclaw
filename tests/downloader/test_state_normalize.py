@@ -15,7 +15,7 @@ def test_qbittorrent_state_words() -> None:
     assert qb_state("downloading", completed=False) == "downloading"
     assert qb_state("forcedDL", completed=False) == "downloading"
     assert qb_state("stalledDL", completed=False) == "stalled"
-    assert qb_state("queuedDL", completed=False) == "stalled"
+    assert qb_state("queuedDL", completed=False) == "queued"
     assert qb_state("pausedDL", completed=False) == "paused"
     assert qb_state("error", completed=False) == "error"
     assert qb_state("missingFiles", completed=False) == "error"
@@ -30,7 +30,7 @@ def test_transmission_state_words() -> None:
     )
     # 下载态但零速：对齐 qBittorrent 的 stalled 语义
     assert tr_state(_FakeTrTorrent({"status": 4, "rateDownload": 0}), completed=False) == "stalled"
-    assert tr_state(_FakeTrTorrent({"status": 3}), completed=False) == "stalled"
+    assert tr_state(_FakeTrTorrent({"status": 3}), completed=False) == "queued"
     assert tr_state(_FakeTrTorrent({"status": 0}), completed=False) == "paused"
     # 错误标记优先于状态枚举
     assert tr_state(_FakeTrTorrent({"status": 4, "error": 3}), completed=False) == "error"
