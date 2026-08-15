@@ -30,5 +30,5 @@ def test_repair_migration_restores_missing_episode_count(tmp_path, monkeypatch) 
         columns = {row[1] for row in connection.execute("PRAGMA table_info(library)")}
         revision = connection.execute("SELECT version_num FROM alembic_version").fetchone()[0]
     assert "stats_episode_count" in columns
-    assert revision == "e3a6b9d2f457"
+    assert revision == "a5c8d1e3f679"
     get_settings.cache_clear()

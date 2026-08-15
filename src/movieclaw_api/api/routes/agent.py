@@ -79,6 +79,7 @@ _PAGE_ROUTES: list[tuple[str, str]] = [
     ),
     ("/discover/movie/top250", "豆瓣电影 Top250 榜单"),
     ("/discover/movie/high-score", "豆瓣高分电影榜单"),
+    ("/discover/people/{TMDB 影人ID}", "发现页影人详情与完整作品列表"),
     ("/media/{movie|tv}/{TMDB ID}", "影片/剧集详情页"),
     ("/media/douban/{豆瓣ID}", "豆瓣词条详情页"),
     ("/subscriptions", "订阅列表"),
