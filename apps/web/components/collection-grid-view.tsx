@@ -1,6 +1,14 @@
 "use client";
 
-import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useDeferredValue,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import type { Route } from "next";
 
 import { PageNav } from "@/components/page-nav";
@@ -12,6 +20,35 @@ import { useScrollRestoration } from "@/lib/use-scroll-restoration";
 
 const TMDB_PAGE_SIZE = 20;
 const DOUBAN_FULL_LIMIT = 500;
+const MAX_COLLECTION_SNAPSHOTS = 32;
+
+interface CollectionGridSnapshot {
+  items: MediaItem[];
+  title: string;
+  isRanked: boolean;
+  nextPage: number;
+  totalResults: number;
+  hasMore: boolean;
+}
+
+const collectionGridSnapshots = new Map<string, CollectionGridSnapshot>();
+
+function getCollectionGridSnapshot(collectionRef: string) {
+  return collectionGridSnapshots.get(collectionRef);
+}
+
+function rememberCollectionGridSnapshot(
+  collectionRef: string,
+  snapshot: CollectionGridSnapshot,
+) {
+  collectionGridSnapshots.delete(collectionRef);
+  collectionGridSnapshots.set(collectionRef, snapshot);
+  while (collectionGridSnapshots.size > MAX_COLLECTION_SNAPSHOTS) {
+    const oldest = collectionGridSnapshots.keys().next().value;
+    if (oldest === undefined) break;
+    collectionGridSnapshots.delete(oldest);
+  }
+}
 
 /**
  * 完整片单落地页（「看全部」的目的地）：用纵向网格承载大量条目。
@@ -24,15 +61,16 @@ export function CollectionGridView({
   /** 由发现页展示清单返回的稳定片单引用。 */
   collectionRef: string;
 }) {
+  const initialSnapshot = getCollectionGridSnapshot(collectionRef);
   const scrollRef = useScrollRestoration(`collection:${collectionRef}`);
-  const [items, setItems] = useState<MediaItem[] | null>(null);
-  const [title, setTitle] = useState("影视片单");
-  const [isRanked, setIsRanked] = useState(false);
+  const [items, setItems] = useState<MediaItem[] | null>(() => initialSnapshot?.items ?? null);
+  const [title, setTitle] = useState(() => initialSnapshot?.title ?? "影视片单");
+  const [isRanked, setIsRanked] = useState(() => initialSnapshot?.isRanked ?? false);
   const [query, setQuery] = useState("");
   const [selectedGenres, setSelectedGenres] = useState<string[]>([]);
-  const [nextPage, setNextPage] = useState(2);
-  const [totalResults, setTotalResults] = useState(0);
-  const [hasMore, setHasMore] = useState(false);
+  const [nextPage, setNextPage] = useState(() => initialSnapshot?.nextPage ?? 2);
+  const [totalResults, setTotalResults] = useState(() => initialSnapshot?.totalResults ?? 0);
+  const [hasMore, setHasMore] = useState(() => initialSnapshot?.hasMore ?? false);
   const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const loadMoreRef = useRef<HTMLDivElement>(null);
@@ -41,21 +79,50 @@ export function CollectionGridView({
   const activeCollectionRef = useRef(collectionRef);
   const [provider, mediaType] = collectionRef.split(":");
 
+  // 片单返回时先复用已加载窗口，避免滚动恢复目标对应的分页内容被重置掉。
+  useLayoutEffect(() => {
+    if (activeCollectionRef.current !== collectionRef || !items) return;
+    rememberCollectionGridSnapshot(collectionRef, {
+      items,
+      title,
+      isRanked,
+      nextPage,
+      totalResults,
+      hasMore,
+    });
+  }, [collectionRef, hasMore, isRanked, items, nextPage, title, totalResults]);
+
   useEffect(() => {
     const controller = new AbortController();
     activeCollectionRef.current = collectionRef;
     pageControllerRef.current?.abort();
     pageControllerRef.current = null;
     loadingMoreRef.current = false;
+    setError(null);
+    setQuery("");
+    setSelectedGenres([]);
+
+    const cached = getCollectionGridSnapshot(collectionRef);
+    if (cached) {
+      setItems(cached.items);
+      setTitle(cached.title);
+      setIsRanked(cached.isRanked);
+      setNextPage(cached.nextPage);
+      setTotalResults(cached.totalResults);
+      setHasMore(cached.hasMore);
+      setLoadingMore(false);
+      return () => {
+        controller.abort();
+        if (activeCollectionRef.current === collectionRef) pageControllerRef.current?.abort();
+      };
+    }
+
     // 同一动态路由切换片单时组件可能被 React 复用，先清掉上一片单的展示态，
     // 避免新请求完成前短暂显示旧榜单，或失败后把旧数据误当成新结果。
     setItems(null);
     setTitle("影视片单");
     setIsRanked(false);
     setLoadingMore(false);
-    setError(null);
-    setQuery("");
-    setSelectedGenres([]);
     setNextPage(2);
     setTotalResults(0);
     setHasMore(false);
