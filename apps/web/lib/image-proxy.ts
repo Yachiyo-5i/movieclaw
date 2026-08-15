@@ -1,5 +1,12 @@
 import { resolveRequestUrl } from "@/lib/http";
 
+/** 后端允许的固定图片派生预设；固定枚举避免调用方制造任意尺寸缓存。 */
+export type ImageVariant = "landscape-card" | "poster-card";
+
+function appendVariant(url: string, variant: ImageVariant): string {
+  return `${url}${url.includes("?") ? "&" : "?"}variant=${variant}`;
+}
+
 /**
  * 远程静态图片的统一收口入口。
  *
@@ -10,9 +17,10 @@ import { resolveRequestUrl } from "@/lib/http";
  *
  * 新增图片展示位时请一律经过本函数，不要直接引用远程 URL。
  */
-export function cachedImageUrl(url: string): string {
+export function cachedImageUrl(url: string, variant?: ImageVariant): string {
   if (!/^https?:\/\//i.test(url)) return url;
-  return resolveRequestUrl(`images/proxy?url=${encodeURIComponent(url)}`);
+  const path = `images/proxy?url=${encodeURIComponent(url)}`;
+  return resolveRequestUrl(variant ? appendVariant(path, variant) : path);
 }
 
 /**
@@ -20,7 +28,11 @@ export function cachedImageUrl(url: string): string {
  * API 相对路径（本地刮削资产 /images/assets/...、条目美术图 /libraries/...）
  * 补上 API base 直连后端。图片可能来自两种形态的展示位统一用它。
  */
-export function imageUrl(url: string | null): string {
+export function imageUrl(url: string | null, variant?: ImageVariant): string {
   if (!url) return "";
-  return /^https?:\/\//i.test(url) ? cachedImageUrl(url) : resolveRequestUrl(url);
+  if (/^https?:\/\//i.test(url)) return cachedImageUrl(url, variant);
+  // 当前只有 metadata 资产路由支持本地派生；文件缩略图等其它相对接口保持原样。
+  const resolved =
+    variant && /^\/?images\/assets\//.test(url) ? appendVariant(url, variant) : url;
+  return resolveRequestUrl(resolved);
 }

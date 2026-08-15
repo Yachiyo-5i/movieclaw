@@ -1,5 +1,6 @@
 import { request } from "@/lib/http";
 import { cachedImageUrl } from "@/lib/image-proxy";
+import type { DiscoveryFilters } from "@/lib/discovery-filters";
 import type {
   MediaLibraryLink,
   MediaLibraryStatus,
@@ -70,6 +71,24 @@ interface DiscoveryCollectionTitlesDto {
   titles: DiscoveredTitleDto[];
   returned_count: number;
   truncated: boolean;
+  page: number;
+  total_pages: number;
+  total_results: number;
+  has_more: boolean;
+}
+
+interface DiscoveryFilterOptionsDto {
+  media_type: MediaType;
+  genres: Array<{ id: number; name: string }>;
+}
+
+interface DiscoveryTitlePageDto {
+  media_type: MediaType;
+  titles: DiscoveredTitleDto[];
+  page: number;
+  total_pages: number;
+  total_results: number;
+  has_more: boolean;
 }
 
 type DiscoveryPresentation = "hero" | "ranked-row" | "poster-row";
@@ -140,6 +159,11 @@ interface DiscoveredTitleDetailsDto {
   metadata: DiscoveredTitleMetadataDto;
   backdrops: MediaImageDto[];
   posters: MediaImageDto[];
+  collection: {
+    id: string;
+    name: string;
+    titles: DiscoveredTitleDto[];
+  } | null;
   recommendations: DiscoveredTitleDto[];
   library_links?: MediaLibraryLinkDto[];
 }
@@ -168,6 +192,24 @@ export interface DiscoveredCollectionData {
   items: MediaItem[];
   returnedCount: number;
   truncated: boolean;
+  page: number;
+  totalPages: number;
+  totalResults: number;
+  hasMore: boolean;
+}
+
+export interface DiscoveryGenre {
+  id: number;
+  name: string;
+}
+
+export interface FilteredDiscoveryData {
+  mediaType: MediaType;
+  items: MediaItem[];
+  page: number;
+  totalPages: number;
+  totalResults: number;
+  hasMore: boolean;
 }
 
 export interface MediaSearchItem {
@@ -280,10 +322,11 @@ export async function browseDiscoveryCollection(
   collectionRef: string,
   limit: number,
   init?: RequestInit,
+  page = 1,
 ): Promise<DiscoveredCollectionData> {
   const dto = await unwrap(
     request<ApiEnvelope<DiscoveryCollectionTitlesDto>>(
-      `/discover/collections/${encodeURIComponent(collectionRef)}/titles?limit=${limit}`,
+      `/discover/collections/${encodeURIComponent(collectionRef)}/titles?limit=${limit}&page=${page}`,
       init,
     ),
   );
@@ -297,6 +340,50 @@ export async function browseDiscoveryCollection(
     items: dto.titles.map(toItem),
     returnedCount: dto.returned_count,
     truncated: dto.truncated,
+    page: dto.page,
+    totalPages: dto.total_pages,
+    totalResults: dto.total_results,
+    hasMore: dto.has_more,
+  };
+}
+
+export async function fetchDiscoveryGenres(
+  mediaType: MediaType,
+  init?: RequestInit,
+): Promise<DiscoveryGenre[]> {
+  const dto = await unwrap(
+    request<ApiEnvelope<DiscoveryFilterOptionsDto>>(
+      `/discover/filters?media_type=${mediaType}`,
+      init,
+    ),
+  );
+  return dto.genres;
+}
+
+/** 六维筛选使用 TMDB discover 原生分页，URL 参数和 API 参数保持一一对应。 */
+export async function fetchFilteredDiscovery(
+  mediaType: MediaType,
+  filters: DiscoveryFilters,
+  page: number,
+  init?: RequestInit,
+): Promise<FilteredDiscoveryData> {
+  const params = new URLSearchParams({ media_type: mediaType, page: String(page) });
+  for (const genreId of filters.genreIds) params.append("genre_ids", String(genreId));
+  if (filters.originCountry) params.set("origin_country", filters.originCountry);
+  if (filters.year) params.set("year", String(filters.year));
+  if (filters.ratingGte !== undefined) params.set("rating_gte", String(filters.ratingGte));
+  if (filters.runtimeLte) params.set("runtime_lte", String(filters.runtimeLte));
+  params.set("sort", filters.sort);
+  const dto = await unwrap(
+    request<ApiEnvelope<DiscoveryTitlePageDto>>(`/discover/titles?${params}`, init),
+  );
+  return {
+    mediaType: dto.media_type,
+    items: dto.titles.map(toItem),
+    page: dto.page,
+    totalPages: dto.total_pages,
+    totalResults: dto.total_results,
+    hasMore: dto.has_more,
   };
 }
 
@@ -366,6 +453,7 @@ export interface MediaDetailData {
   info: MediaDetailInfo;
   backdrops: MediaImage[];
   posters: MediaImage[];
+  collection?: { id: string; name: string; items: MediaItem[] };
   related: MediaItem[];
   libraryLinks: MediaLibraryLink[];
 }
@@ -410,6 +498,13 @@ export async function fetchDiscoveredTitleDetails(
     },
     backdrops: dto.backdrops.map(toImage),
     posters: dto.posters.map(toImage),
+    collection: dto.collection
+      ? {
+          id: dto.collection.id,
+          name: dto.collection.name,
+          items: dto.collection.titles.map(toItem),
+        }
+      : undefined,
     related: dto.recommendations.map(toItem),
     libraryLinks: (dto.library_links ?? []).map(toLibraryLink),
   };

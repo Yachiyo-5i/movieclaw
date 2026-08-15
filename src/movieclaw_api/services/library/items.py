@@ -54,6 +54,7 @@ from movieclaw_api.services.library.sort_key import title_initial, title_sort_ke
 from movieclaw_api.services.media_probe import probe_media
 from movieclaw_api.services.media_scrape import asset_version, file_version
 from movieclaw_db.models import Library, LibraryFile, MediaItem, utcnow
+from movieclaw_db.repositories.library_repo import LibraryRepository
 from movieclaw_media.models import MediaKind
 
 logger = logging.getLogger("movieclaw_api.library_items")
@@ -1080,6 +1081,8 @@ async def delete_item_files(
             await session.delete(row)
     result.rows_deleted = len(deleted_row_ids)
     await session.commit()
+    if result.rows_deleted and library.id is not None:
+        await LibraryRepository(session).refresh_stats([library.id])
 
     if result.removed_paths:
         logger.info(
@@ -1122,6 +1125,8 @@ async def delete_single_file(
         await session.delete(row)
         result.rows_deleted = 1
         await session.commit()
+        if library.id is not None:
+            await LibraryRepository(session).refresh_stats([library.id])
         return result
 
     path = Path(row.file_path)
@@ -1136,6 +1141,8 @@ async def delete_single_file(
         result.freed_bytes = row.size_bytes
         await session.delete(row)
         await session.commit()
+        if library.id is not None:
+            await LibraryRepository(session).refresh_stats([library.id])
         logger.info(
             "已从磁盘删除条目 #%s 的单个文件（库「%s」，释放约 %.1f GB）：%s",
             row.media_item_id,

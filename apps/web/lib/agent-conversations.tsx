@@ -4,13 +4,13 @@
  * Agent 会话的全站客户端状态（服务端会话模型）。
  *
  * 事实源在服务端（JSONL 转录 + SQLite 索引），本 store 只是它的渲染缓存：
- * - 会话列表来自 GET /agent/sessions（仅摘要，turns 为空的「未加载」壳）；
+ * - 会话列表来自 GET /sessions（仅摘要，消息派生轮次为空的「未加载」壳）；
  * - 打开某会话时用详情接口把 entries 回放成 AgentTurn 时间线；
- * - 新建 / 续聊只带 session_id，历史由服务端从转录重建，不再回传 history；
- * - running 的会话用 active_run_id 重新挂上 SSE：正在运行那一轮丢弃已落盘
+ * - 开始与继续统一调用 POST /sessions；session_id 决定是否续接，历史由服务端重建；
+ * - running 的会话直接用 session_id 重新挂上 SSE：正在运行那一轮丢弃已落盘
  *   的局部产出、从事件 0 完整回放，避免转录快照与事件游标不同步造成重复。
  *
- * 后台运行与 SSE 连接保持解耦：store 先取得 runId，再单独订阅事件；网络
+ * 后台运行与 SSE 连接保持解耦：公开层始终只使用 sessionId；网络
  * 中断由 SSE 客户端按事件序号续传，关闭页面也不会取消后端任务。
  */
 
@@ -27,18 +27,18 @@ import {
 import {
   type AgentDone,
   type AgentEvent,
-  type AgentSessionAnyEntry,
-  type AgentSessionDetail,
-  type AgentSessionSummary,
   type AgentTranscriptMessage,
-  cancelAgentRun,
-  deleteAgentSession,
-  getAgentSession,
-  listAgentSessions,
-  renameAgentSession,
-  startAgentRun,
-  streamAgentRun,
-  truncateAgentSession,
+  type SessionAnyEntry,
+  type SessionSummary,
+  type SessionTranscript,
+  deleteSession,
+  getSessionTranscript,
+  listSessions,
+  renameSession,
+  retrySessionMessage,
+  startSession,
+  stopSession,
+  streamSession,
 } from "@/lib/api/agent";
 import { HttpError } from "@/lib/http";
 import { nanoid } from "nanoid";
@@ -80,12 +80,9 @@ export type AgentTurnSegment =
 /** 一轮对话：用户输入 + Agent 的完整产出。 */
 export interface AgentTurn {
   id: string;
-  /** 后端异步运行编号；创建接口成功后写入，重连和取消都依赖它。 */
-  runId?: string;
-  /** 本轮用户输入在服务端转录里的 entry uuid：「改写重问」的截断锚点。
-   *  回放的历史轮次天然带它；新发起的一轮要等 /agent/start 回执才有，
-   *  在那之前不给用户看到改写入口（没有锚点就无从截断）。 */
-  entryUuid?: string;
+  /** 开启本展示轮次的 user message 稳定编号，是「改写重问」的 retry 锚点。
+   *  Turn 只是前端从消息序列派生的展示分组，不是服务端协议实体。 */
+  messageId?: string;
   input: string;
   status: "running" | "done" | "error";
   /** 本轮开始时刻（epoch ms）：进行中据此显示实时耗时；回放时取用户消息的转录时间戳 */
@@ -105,7 +102,7 @@ export interface AgentTurn {
 }
 
 export interface AgentConversation {
-  /** 服务端会话 id（路由 /runs/[id] 与续聊请求都用它） */
+  /** 服务端会话 id（路由 /sessions/[id] 与所有会话动作都用它） */
   id: string;
   title: string;
   updatedAt: number;
@@ -126,9 +123,9 @@ interface AgentConversationsValue {
   /** 取下一页会话摘要并追加到列表尾部；没有更多或正在加载时是空操作 */
   loadMore: () => void;
   get: (id: string) => AgentConversation | undefined;
-  /** 打开会话：详情未加载时从服务端回放，running 时用 active_run_id 重挂 SSE */
+  /** 打开会话：详情未加载时从服务端回放，running 时用会话 id 重挂 SSE */
   open: (id: string) => Promise<void>;
-  /** 新建服务端会话并发起首轮运行，成功后返回会话 id（调用方跳转 /runs/[id]） */
+  /** 新建服务端会话并发起首轮运行，成功后返回会话 id（调用方跳转 /sessions/[id]） */
   start: (input: string) => Promise<string>;
   /** 在既有会话中追问一轮（历史由服务端从转录重建，只传 session_id） */
   send: (conversationId: string, input: string) => void;
@@ -136,9 +133,8 @@ interface AgentConversationsValue {
   stop: (conversationId: string) => void;
   /** 重命名会话（改索引元数据，成功后同步本地标题）。 */
   rename: (conversationId: string, title: string) => Promise<void>;
-  /** 改写重问：丢弃该轮及其之后的全部记录（服务端转录一并删除，不可逆），
-   *  返回被丢弃那轮的原始提问文本，供调用方填回输入框。 */
-  truncate: (conversationId: string, entryUuid: string) => Promise<string>;
+  /** 重新提交指定用户消息；content 为空时原文重试，否则替换问题后重试。 */
+  retry: (conversationId: string, messageId: string, content?: string) => Promise<void>;
   /** 彻底删除会话（服务端转录与索引一并删除；运行中的会话会被服务端拒绝）。 */
   remove: (conversationId: string) => Promise<void>;
 }
@@ -172,11 +168,11 @@ function messageThinking(message: AgentTranscriptMessage): string {
 }
 
 /**
- * 把转录 entries 回放成 turn 列表：user 消息开启新一轮；assistant 的思考、
+ * 把转录 entries 派生成展示 turn 列表：user 消息开启新一轮；assistant 的思考、
  * 正文、tool_calls 按「thinking → text → 工具」的顺序并入时间线（与流式
  * 时的事件顺序一致）；tool 消息按 tool_call_id 合并进对应调用卡片。
  */
-function entriesToTurns(entries: AgentSessionAnyEntry[]): AgentTurn[] {
+function entriesToTurns(entries: SessionAnyEntry[]): AgentTurn[] {
   const turns: AgentTurn[] = [];
   for (const entry of entries) {
     if (entry.type === "compaction") {
@@ -202,8 +198,8 @@ function entriesToTurns(entries: AgentSessionAnyEntry[]): AgentTurn[] {
     const message = entry.message;
     if (message.role === "user") {
       turns.push({
-        id: entry.uuid,
-        entryUuid: entry.uuid,
+        id: entry.message_id,
+        messageId: entry.message_id,
         input: messageText(message),
         status: "done",
         segments: [],
@@ -245,7 +241,7 @@ function entriesToTurns(entries: AgentSessionAnyEntry[]): AgentTurn[] {
 }
 
 /** 列表摘要 → 未加载的会话壳（turns 留空，打开时再回放详情）。 */
-function conversationFromSummary(summary: AgentSessionSummary): AgentConversation {
+function conversationFromSummary(summary: SessionSummary): AgentConversation {
   return {
     id: summary.id,
     title: summary.title ?? summary.last_prompt ?? UNNAMED_TITLE,
@@ -256,18 +252,17 @@ function conversationFromSummary(summary: AgentSessionSummary): AgentConversatio
   };
 }
 
-/** 详情 → 完整会话。running 时最后一轮重置为空并挂上 active_run_id，
+/** 详情 → 完整会话。running 时最后一轮重置为空，
  * 由调用方从事件 0 回放（转录里该轮已落盘的局部产出全部丢弃）。 */
-function conversationFromDetail(detail: AgentSessionDetail): AgentConversation {
+function conversationFromDetail(detail: SessionTranscript): AgentConversation {
   const summary = detail.session;
   const turns = entriesToTurns(detail.entries);
-  const running = summary.running && summary.active_run_id != null;
+  const running = summary.running;
   if (running) {
     const last = turns[turns.length - 1];
     if (last) {
       turns[turns.length - 1] = {
         ...last,
-        runId: summary.active_run_id!,
         status: "running",
         segments: [],
         endedAt: undefined,
@@ -452,7 +447,7 @@ function applyAgentEvent(turn: AgentTurn, event: AgentEvent): AgentTurn {
 export function AgentConversationsProvider({ children }: { children: React.ReactNode }) {
   const { isAdmin } = usePermissions();
   const [conversations, setConversations] = useState<AgentConversation[]>([]);
-  // runId → 当前 SSE 读取器；仅用于页面卸载时关闭连接，不负责取消后台运行。
+  // sessionId → 当前 SSE 读取器；仅用于页面卸载时关闭连接，不负责停止后台运行。
   const controllers = useRef(new Map<string, AbortController>());
   // 会话 id → 进行中的详情加载；并发 open 同一会话时复用同一个请求
   const pendingLoads = useRef(new Map<string, Promise<void>>());
@@ -474,7 +469,7 @@ export function AgentConversationsProvider({ children }: { children: React.React
   useEffect(() => {
     let cancelled = false;
     if (!isAdmin) return;
-    void listAgentSessions({ limit: PAGE_SIZE })
+    void listSessions({ limit: PAGE_SIZE })
       .then((items) => {
         if (cancelled) return;
         fetchedCount.current = items.length;
@@ -515,7 +510,7 @@ export function AgentConversationsProvider({ children }: { children: React.React
     if (loadingRef.current || !hasMore) return;
     loadingRef.current = true;
     setLoadingMore(true);
-    void listAgentSessions({ limit: PAGE_SIZE, offset: fetchedCount.current })
+    void listSessions({ limit: PAGE_SIZE, offset: fetchedCount.current })
       .then((items) => {
         fetchedCount.current += items.length;
         setHasMore(items.length === PAGE_SIZE);
@@ -615,15 +610,15 @@ export function AgentConversationsProvider({ children }: { children: React.React
     [flushEvents],
   );
 
-  /** 连接一个已存在的后台运行；HTTP 错误才会结束，网络抖动由 API 层续传。 */
-  const connectRun = useCallback(
-    (conversationId: string, turnId: string, runId: string) => {
-      controllers.current.get(runId)?.abort();
+  /** 跟随会话当前一轮；HTTP 错误才会结束，网络抖动由 API 层续传。 */
+  const connectSession = useCallback(
+    (conversationId: string, turnId: string) => {
+      controllers.current.get(conversationId)?.abort();
       const controller = new AbortController();
-      controllers.current.set(runId, controller);
+      controllers.current.set(conversationId, controller);
 
-      void streamAgentRun(
-        runId,
+      void streamSession(
+        conversationId,
         (event) => {
           enqueueEvent(conversationId, turnId, event);
         },
@@ -644,8 +639,8 @@ export function AgentConversationsProvider({ children }: { children: React.React
           }));
         })
         .finally(() => {
-          if (controllers.current.get(runId) === controller) {
-            controllers.current.delete(runId);
+          if (controllers.current.get(conversationId) === controller) {
+            controllers.current.delete(conversationId);
           }
         });
     },
@@ -661,7 +656,7 @@ export function AgentConversationsProvider({ children }: { children: React.React
       const pending = pendingLoads.current.get(id);
       if (pending) return pending;
 
-      const promise = getAgentSession(id)
+      const promise = getSessionTranscript(id)
         .then((detail) => {
           const conversation = conversationFromDetail(detail);
           setConversations((previous) => {
@@ -670,7 +665,7 @@ export function AgentConversationsProvider({ children }: { children: React.React
           });
           if (conversation.running) {
             const turn = conversation.turns[conversation.turns.length - 1];
-            if (turn?.runId) connectRun(id, turn.id, turn.runId);
+            if (turn) connectSession(id, turn.id);
           }
         })
         .finally(() => {
@@ -679,16 +674,19 @@ export function AgentConversationsProvider({ children }: { children: React.React
       pendingLoads.current.set(id, promise);
       return promise;
     },
-    [connectRun],
+    [connectSession],
   );
 
-  /** 在会话上发起一轮运行：先落本地 running turn，再取得 runId 并连接 SSE。 */
+  /** 继续会话：先落本地展示轮次，再取得持久化消息编号并连接 SSE。 */
   const runTurn = useCallback(
     (conversationId: string, turnId: string, input: string) => {
-      void startAgentRun(input, conversationId)
-        .then(({ runId, entryUuid }) => {
-          updateTurn(conversationId, turnId, (current) => ({ ...current, runId, entryUuid }));
-          connectRun(conversationId, turnId, runId);
+      void startSession(input, conversationId)
+        .then(({ messageId }) => {
+          updateTurn(conversationId, turnId, (current) => ({
+            ...current,
+            messageId,
+          }));
+          connectSession(conversationId, turnId);
         })
         .catch((error) => {
           updateTurn(conversationId, turnId, (current) => ({
@@ -698,14 +696,14 @@ export function AgentConversationsProvider({ children }: { children: React.React
           }));
         });
     },
-    [connectRun, updateTurn],
+    [connectSession, updateTurn],
   );
 
   const start = useCallback(
     async (input: string) => {
       // 新建必须等服务端分配 session_id 才能得到路由地址，因此这一步是
       // 同步等待的；创建失败直接抛给调用方（如尚未配置模型供应商）。
-      const { runId, sessionId, entryUuid } = await startAgentRun(input);
+      const { sessionId, messageId } = await startSession(input);
       const turnId = nanoid();
       setConversations((previous) => [
         {
@@ -717,8 +715,7 @@ export function AgentConversationsProvider({ children }: { children: React.React
           turns: [
             {
               id: turnId,
-              runId,
-              entryUuid,
+              messageId,
               input,
               status: "running",
               segments: [],
@@ -729,10 +726,10 @@ export function AgentConversationsProvider({ children }: { children: React.React
         },
         ...previous,
       ]);
-      connectRun(sessionId, turnId, runId);
+      connectSession(sessionId, turnId);
       return sessionId;
     },
-    [connectRun],
+    [connectSession],
   );
 
   const send = useCallback(
@@ -763,21 +760,15 @@ export function AgentConversationsProvider({ children }: { children: React.React
   );
 
   const stop = useCallback((conversationId: string) => {
-    const conversation = conversationsRef.current.find((item) => item.id === conversationId);
-    const turn = conversation?.turns.find((item) => item.status === "running");
-    if (!turn?.runId) {
-      console.warn("Agent 尚未取得运行编号，暂时无法发送停止请求");
-      return;
-    }
-    void cancelAgentRun(turn.runId).catch((error) => {
+    void stopSession(conversationId).catch((error) => {
       // 保持 SSE 连接和 running 状态；停止失败时 Agent 可能仍在执行，不能在
       // 客户端伪造终态。后续真实终态仍会通过事件流正常落到界面。
-      console.warn("停止 Agent 运行失败，请稍后重试", error);
+      console.warn("停止 AI 会话失败，请稍后重试", error);
     });
   }, []);
 
   const rename = useCallback(async (conversationId: string, title: string) => {
-    await renameAgentSession(conversationId, title);
+    await renameSession(conversationId, title);
     setConversations((previous) =>
       previous.map((conversation) =>
         conversation.id === conversationId ? { ...conversation, title } : conversation,
@@ -786,39 +777,48 @@ export function AgentConversationsProvider({ children }: { children: React.React
   }, []);
 
   /**
-   * 改写重问：把某一轮及其之后的记录从服务端转录里删掉，本地时间线同步截断，
-   * 返回被删掉那轮的原始提问，交给调用方填回输入框。
-   *
-   * 服务端删完才动本地：删除失败（会话运行中 / 记录已不在）时界面保持原样，
-   * 错误抛给调用方提示——绝不能出现「界面上没了、服务端还在」的假象，那会让
-   * 用户以为已经改写，实际下一轮上下文里旧对话还在。
+   * 原文重试或改写重问：服务端一次完成旧轨迹丢弃与新消息提交，成功后本地才
+   * 替换时间线。请求失败时保留原对话，避免界面与服务端事实源失步。
    */
-  const truncate = useCallback(async (conversationId: string, entryUuid: string) => {
-    const conversation = conversationsRef.current.find((item) => item.id === conversationId);
-    const index = conversation?.turns.findIndex((turn) => turn.entryUuid === entryUuid) ?? -1;
-    if (!conversation || index < 0) throw new Error("这条提问已不在当前会话里");
-    const input = conversation.turns[index].input;
-    await truncateAgentSession(conversationId, entryUuid);
-    setConversations((previous) =>
-      previous.map((item) =>
-        item.id === conversationId
-          ? {
-              ...item,
-              updatedAt: Date.now(),
-              // 从首轮截断 = 会话被清空，标题也随之作废（服务端同样清掉，
-              // 见 repo.resync_after_truncate），下一条消息会重新命名它
-              title: index === 0 ? UNNAMED_TITLE : item.title,
-              turns: item.turns.slice(0, index),
-            }
-          : item,
-      ),
-    );
-    return input;
-  }, []);
+  const retry = useCallback(
+    async (conversationId: string, messageId: string, content?: string) => {
+      const conversation = conversationsRef.current.find((item) => item.id === conversationId);
+      const index = conversation?.turns.findIndex((turn) => turn.messageId === messageId) ?? -1;
+      if (!conversation || index < 0) throw new Error("这条提问已不在当前会话里");
+      const input = content ?? conversation.turns[index].input;
+      const accepted = await retrySessionMessage(conversationId, messageId, content);
+      const turnId = nanoid();
+      setConversations((previous) =>
+        previous.map((item) =>
+          item.id === conversationId
+            ? {
+                ...item,
+                updatedAt: Date.now(),
+                running: true,
+                title: index === 0 ? input.slice(0, 30) : item.title,
+                turns: [
+                  ...item.turns.slice(0, index),
+                  {
+                    id: turnId,
+                    messageId: accepted.messageId,
+                    input,
+                    status: "running",
+                    segments: [],
+                    startedAt: Date.now(),
+                  },
+                ],
+              }
+            : item,
+        ),
+      );
+      connectSession(conversationId, turnId);
+    },
+    [connectSession],
+  );
 
   const remove = useCallback(async (conversationId: string) => {
     // 服务端会拒绝删除运行中的会话（400），错误交给调用方提示
-    await deleteAgentSession(conversationId);
+    await deleteSession(conversationId);
     pendingLoads.current.delete(conversationId);
     // 服务端少了一行，后续分页的 offset 要跟着回退一格，否则下一页会跳过一条
     fetchedCount.current = Math.max(0, fetchedCount.current - 1);
@@ -839,7 +839,7 @@ export function AgentConversationsProvider({ children }: { children: React.React
       send,
       stop,
       rename,
-      truncate,
+      retry,
       remove,
     }),
     [
@@ -852,7 +852,7 @@ export function AgentConversationsProvider({ children }: { children: React.React
       send,
       stop,
       rename,
-      truncate,
+      retry,
       remove,
     ],
   );

@@ -65,7 +65,7 @@ bash）、文件系统浏览这些等价于服务器控制权的功能。
 
 **高危面清单**（成员在任何阶段都绝不可及）：
 
-- `/agent`——AI 助手内含 bash 工具，等价 shell；
+- `/sessions`——AI 助手内含 bash 工具，等价 shell；
 - `/fs`——任意目录浏览；
 - `/sites`——PT 站点凭据，泄露 = 账号被封；
 - `/downloaders` 配置面、`/import-watch`、`/rule-sets`（`/downloaders/submit`
@@ -480,7 +480,7 @@ class MemberSiteAccess(TimestampMixin, table=True):
 - **PAT**：`/auth/tokens*` 三条路由挂 `require_admin`。成员无法创建 PAT，
   存量 PAT 继续等价管理员（它们本就是超管创建的）。这同时收掉 cli.md
   开放问题①——不做 scope 分级，做"创建权限收口"，更简单且足够；
-- **Agent 令牌**：Agent 运行本身已是管理员专属（`/agent` 在 admin 组），
+- **Agent 令牌**：AI 会话本身已是管理员专属（`/sessions` 在 admin 组），
   其工作区令牌维持 `is_admin=True`（Agent 需要回调各管理接口），现有
   "禁止递归"硬闸保留。**成员开放 Agent 的前置条件**（本设计不做，仅记录
   路线，防止将来"加个开关"了事）：①工具集降级——去掉 bash/write/edit，

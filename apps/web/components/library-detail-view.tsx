@@ -468,12 +468,12 @@ export function LibraryDetailView({ libraryId }: { libraryId: number }) {
   // 用户看到的就是"页面闪没了"
   // 兜底态（加载中/失败/不存在）也渲染 PageNav（库名未知，末项留空）：向外壳
   // 登记「本页自带顶栏」，否则移动端全局顶栏（☰ + logo）会先显示再消失、顶部闪一下。
-  const fallbackTrail = [{ label: "媒体库", href: "/library" }, { label: "" }];
+  const navFallback = { label: "媒体库", href: "/library" as Route };
 
   if (failed && libraries === null) {
     return (
       <div className="flex-1">
-        <PageNav items={fallbackTrail} />
+        <PageNav title="" fallback={navFallback} />
         <CenteredNote>
           <p className="text-ui text-[var(--text-muted)]">媒体库加载失败</p>
           <button
@@ -491,7 +491,7 @@ export function LibraryDetailView({ libraryId }: { libraryId: number }) {
   if (libraries === null) {
     return (
       <div className="flex-1">
-        <PageNav items={fallbackTrail} />
+        <PageNav title="" fallback={navFallback} />
         <CenteredNote>
           <span className="size-4 animate-spin rounded-full border-2 border-white/20 border-t-white/70" />
           <p className="text-ui text-[var(--text-muted)]">正在加载媒体库…</p>
@@ -503,10 +503,14 @@ export function LibraryDetailView({ libraryId }: { libraryId: number }) {
   if (library === null) {
     return (
       <div className="flex-1">
-        <PageNav items={fallbackTrail} />
+        <PageNav title="" fallback={navFallback} />
         <CenteredNote>
           <p className="text-ui text-[var(--text-muted)]">这个媒体库不存在（可能已被删除）</p>
-          <Link href={"/library" as Route} className="btn-glass px-4 py-2 text-ui font-medium">
+          <Link
+            href={"/library" as Route}
+            replace
+            className="btn-glass px-4 py-2 text-ui font-medium"
+          >
             返回媒体库
           </Link>
         </CenteredNote>
@@ -597,7 +601,8 @@ export function LibraryDetailView({ libraryId }: { libraryId: number }) {
     <div ref={scrollRef} className="scroll-thin scroll-safe flex-1 overflow-y-auto pb-10">
       {/* 顶栏：返回媒体库 + 吸顶库名 + 库操作 ⋯（无 pt——顶边与侧栏卡片顶边齐平） */}
       <PageNav
-        items={[{ label: "媒体库", href: "/library" }, { label: library.name }]}
+        title={library.name}
+        fallback={navFallback}
         actions={actionsMenu}
       />
       {/* —— 库头部 —— */}

@@ -77,8 +77,10 @@ export interface PosterVisualItem {
   genres?: string[];
   extent?: string;
   badges?: string[];
-  /** 海报右上角的斜向特征标，只承载需要常显的正向能力（如「持续追新」）。 */
+  /** 海报右上角的斜向特征标，只承载需要常显的正向能力（如「自动续订」）。 */
   ribbon?: string;
+  /** 海报底部常显的一行左右信息；订阅墙用来承载剧集范围与收录进度。 */
+  posterFooter?: { label: string; value: string; tracking?: boolean };
   /** 悬浮层的一行紧凑元信息；长内容截断，完整值保留在 title 中。 */
   overlayMeta?: string;
   overview?: string;
@@ -171,9 +173,12 @@ export function PosterCardVisual({
   const interactiveClass =
     "group/card block w-full cursor-pointer rounded-2xl text-left outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent-ring)]";
   if (href) {
-    const accessibilityDetails = [item.ribbon, item.genres?.join("、"), item.overlayMeta].filter(
-      Boolean,
-    );
+    const accessibilityDetails = [
+      item.ribbon,
+      item.posterFooter ? `${item.posterFooter.label}，收录 ${item.posterFooter.value}` : undefined,
+      item.genres?.join("、"),
+      item.overlayMeta,
+    ].filter(Boolean);
     return (
       <Link
         href={href}
@@ -254,6 +259,27 @@ function PosterCardContent({
             <StarIcon className="size-3 text-[#f5c451]" />
             {item.rating.toFixed(1)}
           </span>
+        )}
+
+        {/* 订阅墙的剧集收录摘要常驻海报内部，利用底部暗部承载一眼可扫的
+            “范围 / 数量”；悬浮信息层出现时让位，避免两层文字叠在一起。 */}
+        {item.posterFooter && (
+          <div
+            className={`pointer-events-none absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/90 via-black/55 to-transparent px-3 pb-2.5 pt-9 ${showOverlay ? "transition-opacity duration-200 group-hover/card:opacity-0 group-focus-visible/card:opacity-0 group-data-[revealed=true]/card:opacity-0" : ""}`}
+          >
+            <p className="flex items-center justify-between gap-2 text-caption text-white/80">
+              <span className="truncate">{item.posterFooter.label}</span>
+              <span className="tnum flex shrink-0 items-center gap-1.5 font-semibold text-white">
+                {item.posterFooter.tracking && (
+                  <span
+                    aria-hidden="true"
+                    className="size-1.5 rounded-full bg-[#4ade80] shadow-[0_0_7px_rgba(74,222,128,0.55)]"
+                  />
+                )}
+                {item.posterFooter.value}
+              </span>
+            </p>
+          </div>
         )}
 
         {/* hover 信息层：底部渐变升起，展示类型 / 简介 / 快捷操作。有可点击的

@@ -443,7 +443,7 @@ export function JobCard({ job, onNavigate }: { job: JobView; onNavigate: () => v
           ].join("\n"),
         );
         onNavigate();
-        router.push(`/runs/${sessionId}` as Route);
+        router.push(`/sessions/${sessionId}` as Route);
         return;
       }
       const section =

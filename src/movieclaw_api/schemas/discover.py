@@ -33,6 +33,15 @@ class DiscoveryProviderSelection(StrEnum):
     DOUBAN = "douban"
 
 
+class DiscoverySort(StrEnum):
+    """TMDB 组合筛选支持的稳定排序值。"""
+
+    POPULAR = "popular"
+    RATING = "rating"
+    NEWEST = "newest"
+    MOST_RATED = "most-rated"
+
+
 class DiscoveryCollectionView(BaseModel):
     """一个可浏览的影视片单及其能力说明。"""
 
@@ -93,6 +102,35 @@ class DiscoveryCollectionTitlesView(BaseModel):
     titles: list[DiscoveredTitleView]
     returned_count: int
     truncated: bool = Field(description="服务端当前取得的条目是否因本次 limit 被截断")
+    page: int = Field(default=1, ge=1)
+    total_pages: int = Field(default=1, ge=1)
+    total_results: int = Field(default=0, ge=0)
+    has_more: bool = False
+
+
+class DiscoveryGenreView(BaseModel):
+    """筛选器里一个本地化的 TMDB 类型。"""
+
+    id: int
+    name: str
+
+
+class DiscoveryFilterOptionsView(BaseModel):
+    """指定媒体类型可用于组合发现的动态选项。"""
+
+    media_type: MediaKind
+    genres: list[DiscoveryGenreView]
+
+
+class DiscoveryTitlePageView(BaseModel):
+    """一次组合筛选得到的一页影视条目。"""
+
+    media_type: MediaKind
+    titles: list[DiscoveredTitleView]
+    page: int = Field(ge=1)
+    total_pages: int = Field(ge=1)
+    total_results: int = Field(ge=0)
+    has_more: bool
 
 
 class TitleSearchPayload(BaseModel):
@@ -139,6 +177,14 @@ class DiscoveredTitleMetadata(BaseModel):
     source_url: str | None = None
 
 
+class DiscoveredTitleCollectionView(BaseModel):
+    """电影详情中的系列作品。"""
+
+    id: str
+    name: str
+    titles: list[DiscoveredTitleView]
+
+
 class DiscoveredTitleDetailsView(BaseModel):
     """影视条目的完整资料、图片、相关推荐与本地媒体库入口。"""
 
@@ -146,6 +192,7 @@ class DiscoveredTitleDetailsView(BaseModel):
     metadata: DiscoveredTitleMetadata
     backdrops: list[MediaImage] = Field(default_factory=list)
     posters: list[MediaImage] = Field(default_factory=list)
+    collection: DiscoveredTitleCollectionView | None = None
     recommendations: list[DiscoveredTitleView] = Field(default_factory=list)
     library_links: list[MediaLibraryLink] = Field(default_factory=list)
 

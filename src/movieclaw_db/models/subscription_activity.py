@@ -65,6 +65,9 @@ class SubscriptionActivity(TimestampMixin, table=True):
       见 docs/design/subscription-plan.md 数据模型汇总的修订）。
     - ``wanted_item_id`` 用 SET NULL：工单可能因修改订阅被删，活动作为历史
       必须保留（payload 里的季集号仍可定位）。
+    - 每次 INSERT 由数据库触发器原子推进 ``subscription.last_activity_at``；
+      因此所有写入路径（包括与换源状态同事务的直接 INSERT）都会及时刷新
+      海报墙排序键，读取列表时无需扫描本表。
     """
 
     __tablename__ = "subscription_activity"

@@ -1,19 +1,18 @@
 "use client";
 
 import { useEffect, useLayoutEffect, useRef } from "react";
-import Link from "next/link";
 import type { Route } from "next";
-import { useRouter } from "next/navigation";
 
 import { ChevronLeftIcon, MenuIcon } from "@/components/icons";
 import { SearchCommand } from "@/components/search-command";
+import { useBackNavigation } from "@/lib/back-navigation";
 import { usePageChrome } from "@/lib/page-chrome";
 import { useIsMobile } from "@/lib/use-media-query";
 
-/** 页面导航节点：href 为空表示当前页；祖先节点提供「向上一级」的回跳地址。 */
-export interface PageNavItem {
+/** 没有可用站内历史时的结构父级；只作兜底，不覆盖真实来路。 */
+export interface PageNavFallback {
   label: string;
-  href?: string;
+  href: Route;
 }
 
 /**
@@ -58,14 +57,14 @@ function scrollParentOf(node: HTMLElement | null): HTMLElement | null {
  * 为什么从「面包屑」改成这个：
  * - 子页面的层级链路已经由侧栏高亮 + 来路推导表达清楚了，顶部再排一条
  *   「A › B › C」是重复信息，且占掉整行宽度；
- * - 用户在子页面真正高频的动作只有一个——回上一级。把它做成一颗随手可点的
+ * - 用户在子页面真正高频的动作只有一个——回到刚才的位置。把它做成一颗随手可点的
  *   圆键，比「点面包屑倒数第二段」的命中区更大、动线更短；
  * - 页面标题在首屏本来就以大标题呈现（Hero / 页头），滚走之后才需要一条
  *   小标题补位「我在看什么」——所以标题跟着滚动淡入，而不是一直占位。
  *
- * 回跳目标：取 items 里最后一个带 href 的祖先节点（详情页的祖先按「来路」
- * 动态推导，见 lib/media-detail.tsx），因此「从哪个列表点进来就回哪个列表」；
- * 没有祖先节点时退化为浏览器后退。
+ * 回跳目标：优先消费浏览器里真实存在的同源上一页，保留用户进入前的列表、筛选
+ * 与滚动上下文；分享链接或新标签直达、没有可用站内历史时，才 replace 到调用方
+ * 给出的结构父级。这里的箭头因此始终是「后退」，不再与「向上一级」混用。
  *
  * 淡入实现：滚动回调只往根节点写一个 CSS 变量 --nav-reveal（0→1），
  * 蒙版与标题各自用它驱动 opacity——不触发 React 重渲染，滚动过程零抖动。
@@ -77,33 +76,32 @@ function scrollParentOf(node: HTMLElement | null): HTMLElement | null {
  * 内边距一一对应，否则窄屏会多探出 8px、把页面横向撑出滚动条。
  */
 export function PageNav({
-  items,
+  title,
+  fallback,
   actions,
   className = "",
 }: {
-  items: PageNavItem[];
+  title: string;
+  fallback: PageNavFallback;
   /** 页面级操作（如 ⋯ 菜单）：排在同一行的最右端，随顶栏一起吸顶常驻 */
   actions?: React.ReactNode;
   className?: string;
 }) {
-  const router = useRouter();
+  const back = useBackNavigation(fallback.href);
   const rootRef = useRef<HTMLDivElement>(null);
   const chrome = usePageChrome();
   const isMobile = useIsMobile();
 
   // 向外壳登记「本页自带顶栏」：移动端据此撤掉全局顶栏，两条顶栏不再摞在一起
-  // （见 lib/page-chrome.tsx）。登记与 items 是否为空无关——空 items 时本组件
-  // 不渲染任何东西，也就没有认领顶栏，因此这个 effect 必须在早退之前声明，
-  // 但真正登记要跟着「本次是否真的渲染了顶栏」走。
+  // （见 lib/page-chrome.tsx）。PageNav 只在子页面渲染，挂载即认领顶栏。
   // 必须用 useLayoutEffect：登记要赶在浏览器绘制之前生效，用 useEffect（绘制后）
   // 会让外壳的全局顶栏（☰ + 字标）先画出一帧再被撤掉——进入详情页时顶部 logo
   // 会肉眼可见地闪一下。本组件只在 AuthGate 之后的纯客户端子树渲染，无 SSR 警告问题。
   const registerPageNav = chrome?.registerPageNav;
-  const rendersNav = items.length > 0;
   useLayoutEffect(() => {
-    if (!registerPageNav || !rendersNav) return;
+    if (!registerPageNav) return;
     return registerPageNav();
-  }, [registerPageNav, rendersNav]);
+  }, [registerPageNav]);
 
   useEffect(() => {
     const root = rootRef.current;
@@ -120,14 +118,8 @@ export function PageNav({
     return () => target.removeEventListener("scroll", sync);
   }, []);
 
-  if (items.length === 0) return null;
-
-  // 祖先节点：从后往前找第一个带 href 的，即「上一级」
-  const parent = [...items].reverse().find((item) => item.href);
-  const title = items[items.length - 1].label;
-
   const backClass = PAGE_NAV_BUTTON_CLASS;
-  const backLabel = parent ? `返回${parent.label}` : "返回上一页";
+  const backLabel = `返回上一页；无历史时返回${fallback.label}`;
 
   return (
     /* pt-[var(--safe-top)]：窄屏上主区不再为安全区让位（见 globals.css 的
@@ -169,27 +161,15 @@ export function PageNav({
               <MenuIcon className="size-[18px] max-md:size-[22px]" />
             </button>
           )}
-          {parent ? (
-            <Link
-              href={parent.href as Route}
-              scroll={false}
-              aria-label={backLabel}
-              title={backLabel}
-              className={backClass}
-            >
-              <ChevronLeftIcon className="size-[18px] max-md:size-[22px]" />
-            </Link>
-          ) : (
-            <button
-              type="button"
-              onClick={() => router.back()}
-              aria-label={backLabel}
-              title={backLabel}
-              className={backClass}
-            >
-              <ChevronLeftIcon className="size-[18px] max-md:size-[22px]" />
-            </button>
-          )}
+          <button
+            type="button"
+            onClick={back}
+            aria-label={backLabel}
+            title={backLabel}
+            className={backClass}
+          >
+            <ChevronLeftIcon className="size-[18px] max-md:size-[22px]" />
+          </button>
         </div>
         {/* 吸顶标题：内容区下方本来就有同名大标题，这里只是滚动后的补位视觉，
             对读屏隐藏，避免同一个标题被念两遍。 */}

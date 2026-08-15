@@ -140,15 +140,19 @@ export function SubscriptionInspectorView({ id }: { id: number }) {
 
   // 兜底态（加载中/失败）也渲染 PageNav（片名未知，末项留空）：向外壳登记
   // 「本页自带顶栏」，否则移动端全局顶栏（☰ + logo）会先显示再消失、顶部闪一下。
-  const fallbackTrail = [{ label: "我的订阅", href: "/subscriptions" }, { label: "" }];
+  const navFallback = { label: "我的订阅", href: "/subscriptions" as Route };
 
   if (failed) {
     return (
       <div className="flex h-full flex-col">
-        <PageNav items={fallbackTrail} />
+        <PageNav title="" fallback={navFallback} />
         <div className="flex flex-1 flex-col items-center justify-center gap-4">
           <p className="text-body text-[var(--text-muted)]">未能加载该订阅，可能已被删除。</p>
-          <Link href="/subscriptions" className="btn-glass px-4 py-2 text-ui font-medium">
+          <Link
+            href="/subscriptions"
+            replace
+            className="btn-glass px-4 py-2 text-ui font-medium"
+          >
             <ArrowLeftIcon className="size-4" />
             返回订阅列表
           </Link>
@@ -160,7 +164,7 @@ export function SubscriptionInspectorView({ id }: { id: number }) {
   if (!detail) {
     return (
       <div className="flex h-full flex-col">
-        <PageNav items={fallbackTrail} />
+        <PageNav title="" fallback={navFallback} />
         <div className="flex flex-1 items-center justify-center gap-2.5 text-ui text-[var(--text-muted)]">
           <span className="size-4 animate-spin rounded-full border-2 border-white/20 border-t-white/70" />
           正在加载订阅详情…
@@ -200,17 +204,17 @@ export function SubscriptionInspectorView({ id }: { id: number }) {
     }
   };
 
-  /** 持续追新是可逆的单一状态动作，详情页直接切换，不再打开批量调整弹窗。 */
+  /** 自动续订是可逆的单一状态动作，详情页直接切换，不再打开批量调整弹窗。 */
   const toggleFollowFuture = async () => {
     const enabling = !detail.follow_future;
     setBusy(true);
     try {
       await setSubscriptionFollowFuture(detail.id, enabling);
-      toast.success(enabling ? "已启用持续追新" : "已禁用持续追新");
+      toast.success(enabling ? "已开启自动续订" : "已关闭自动续订");
       reload();
       refreshSubscriptions();
     } catch (e) {
-      toast.error(e instanceof Error ? e.message : "设置持续追新失败，请稍后重试");
+      toast.error(e instanceof Error ? e.message : "设置自动续订失败，请稍后重试");
     } finally {
       setBusy(false);
     }
@@ -255,7 +259,8 @@ export function SubscriptionInspectorView({ id }: { id: number }) {
       if (isAdmin) await deleteSubscriptionPermanently(detail.id);
       else await unsubscribeFromSubscription(detail.id);
       refreshSubscriptions();
-      router.push("/subscriptions");
+      // 订阅已不存在，替换当前历史项，避免浏览器后退再次进入失效详情。
+      router.replace("/subscriptions");
     } finally {
       setBusy(false);
     }
@@ -265,7 +270,8 @@ export function SubscriptionInspectorView({ id }: { id: number }) {
     <div className="scroll-thin scroll-safe flex-1 overflow-y-auto px-6 pb-12 max-md:px-4">
       {/* 顶栏：返回订阅列表 + 吸顶片名（容器已有 px-6，用 -mx-6 让吸顶蒙版铺满） */}
       <PageNav
-        items={[{ label: "我的订阅", href: "/subscriptions" }, { label: detail.media.title }]}
+        title={detail.media.title}
+        fallback={navFallback}
         className="-mx-6 max-md:-mx-4"
       />
       {/* —— 1. 订阅摘要卡：状态、身份、配置、进度、操作自上而下形成单一路径。
@@ -356,7 +362,7 @@ export function SubscriptionInspectorView({ id }: { id: number }) {
               />
               {!isMovie && (
                 <SubscriptionFact
-                  label="持续追新"
+                  label="自动续订"
                   value={detail.follow_future ? "已开启" : "已关闭"}
                 />
               )}
@@ -522,7 +528,7 @@ interface SubscriptionManageActionsProps {
   completed: boolean;
   canSubscribe: boolean;
   canManageSubscriptions: boolean;
-  /** null 表示电影订阅，不展示没有业务语义的追新动作。 */
+  /** null 表示电影订阅，不展示没有业务语义的自动续订动作。 */
   followFuture: boolean | null;
   onAdjust: () => void;
   onToggleFollowFuture: () => void;
@@ -581,7 +587,7 @@ function SubscriptionManageMenu({
               disabled={busy}
               className={itemClass}
             >
-              {followFuture ? "禁用持续追新" : "启用持续追新"}
+              {followFuture ? "关闭自动续订" : "开启自动续订"}
             </DropdownMenu.Item>
           )}
           {canManageSubscriptions && (
@@ -654,7 +660,7 @@ function SubscriptionManageSheet({
               onClick={onToggleFollowFuture}
               className={rowClass}
             >
-              <span>{followFuture ? "禁用持续追新" : "启用持续追新"}</span>
+              <span>{followFuture ? "关闭自动续订" : "开启自动续订"}</span>
             </button>
           )}
           {canManageSubscriptions && (
@@ -976,7 +982,7 @@ function WantedBreakdown({
   if (wanted.length === 0) {
     return (
       <p className="rounded-2xl border border-white/[0.07] bg-[rgba(14,16,22,0.45)] p-5 text-sub leading-6 text-[var(--text-muted)] backdrop-blur-xl">
-        当前没有追踪项。开启「持续追新」后，新集播出会自动加入。
+        当前没有追踪项。开启「自动续订」后，新集播出会自动加入。
       </p>
     );
   }

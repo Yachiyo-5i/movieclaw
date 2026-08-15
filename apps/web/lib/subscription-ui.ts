@@ -1,4 +1,9 @@
-import type { Subscription, SubscriptionStatus } from "@/lib/api/subscriptions";
+import type { DownloadTask } from "@/lib/api/downloaders";
+import type {
+  Subscription,
+  SubscriptionStatus,
+  TodaySubscriptionArrival,
+} from "@/lib/api/subscriptions";
 
 /**
  * 订阅状态的展示元数据与进度文案（订阅页海报墙、详情页操作区共用）。
@@ -34,18 +39,260 @@ export function subscriptionProgressNote(sub: Subscription): string {
   return detail.length > 0 ? `缺 ${wanted} 集 · ${detail.join(" · ")}` : `缺 ${wanted} 集`;
 }
 
-/**
- * 剧集订阅海报的追新阶段角标。
- *
- * - 还有缺口、已抓取或待入库单元：当前正在追新；
- * - 已知单元均已入库（包括创建时就已在库、因此工单总数为 0）：保留自动续订，
- *   等未来新集或新季被纳入追踪；
- * - 电影或未开启持续追新：不展示角标。
- */
+/** 自动续订是需要常显的特殊能力；工单阶段不再占用右上角标。 */
 export function subscriptionFollowRibbon(
-  sub: Pick<Subscription, "follow_future" | "media" | "progress">,
-): "追新中" | "自动续订" | undefined {
+  sub: Pick<Subscription, "follow_future" | "media">,
+): "自动续订" | undefined {
   if (sub.media.kind !== "tv" || !sub.follow_future) return undefined;
-  const { wanted, grabbed, downloaded } = sub.progress;
-  return wanted + grabbed + downloaded > 0 ? "追新中" : "自动续订";
+  return "自动续订";
+}
+
+export interface SubscriptionCollectionMeta {
+  label: string;
+  value: string;
+  /** 启用中的未完结追更：海报在收录集数前显示静态绿点。 */
+  tracking: boolean;
+}
+
+/**
+ * 把按季库存压成海报内的一行短信息：在播剧只看最新一季，完结剧聚合订阅季。
+ * 特别季不计入“共 n 季”；如果订阅只含特别季，则不展示这块摘要。
+ */
+export function subscriptionCollectionMeta(
+  sub: Pick<
+    Subscription,
+    "follow_future" | "media" | "season_collection" | "selected_seasons" | "status"
+  >,
+): SubscriptionCollectionMeta | undefined {
+  if (sub.media.kind !== "tv") return undefined;
+
+  const allSeasons = sub.season_collection
+    .filter((season) => season.season_number > 0)
+    .toSorted((a, b) => a.season_number - b.season_number);
+  if (allSeasons.length === 0) return undefined;
+
+  const selected = new Set(sub.selected_seasons.filter((season) => season > 0));
+  let scoped = selected.size
+    ? allSeasons.filter((season) => selected.has(season.season_number))
+    : allSeasons;
+  const ended =
+    sub.status === "completed" || ["ended", "canceled"].includes(sub.media.status?.toLowerCase() ?? "");
+
+  // 自动续订的在播剧可能已经出现尚未写入 selected_seasons 的新季；把最新季
+  // 纳入候选后仍只展示一季，避免历史季信息挤占用户最关心的当前进度。
+  if (!ended && sub.follow_future) {
+    const latest = allSeasons.at(-1);
+    if (latest && !scoped.some((season) => season.season_number === latest.season_number)) {
+      scoped = [...scoped, latest].toSorted((a, b) => a.season_number - b.season_number);
+    }
+  }
+  if (scoped.length === 0) return undefined;
+
+  const totalOf = (season: (typeof scoped)[number]) =>
+    Math.max(season.episode_count ?? 0, season.aired_count, season.owned_count);
+
+  if (!ended) {
+    const latest = scoped.at(-1);
+    if (!latest) return undefined;
+    const total = totalOf(latest);
+    return {
+      label: `第 ${latest.season_number} 季`,
+      value:
+        latest.aired_count === 0 && latest.owned_count === 0
+          ? "待播出"
+          : `${latest.owned_count} / ${total}`,
+      tracking: sub.status === "active",
+    };
+  }
+
+  const total = scoped.reduce((sum, season) => sum + totalOf(season), 0);
+  if (total === 0) return undefined;
+  const owned = scoped.reduce((sum, season) => sum + season.owned_count, 0);
+  return {
+    label: scoped.length === 1 ? `第 ${scoped[0].season_number} 季` : `共 ${scoped.length} 季`,
+    value: owned >= total ? `${total} 集全` : `${owned} / ${total}`,
+    tracking: false,
+  };
+}
+
+export interface TodayArrivalPresentation {
+  statusLabel: "预计入库" | "等待资源" | "下载中" | "整理中";
+  timeLabel: string;
+  estimatedAt: number | null;
+}
+
+export interface PresentedTodayArrival {
+  arrival: TodaySubscriptionArrival;
+  presentation: TodayArrivalPresentation;
+}
+
+export interface TodayArrivalGroup {
+  subscriptionId: number;
+  mediaTitle: string;
+  episodeLabel: string;
+  episodeCount: number;
+  firstWantedId: number;
+  presentation: TodayArrivalPresentation;
+}
+
+function paddedUnit(value: number): string {
+  return String(value).padStart(2, "0");
+}
+
+function episodeRanges(episodes: number[]): string {
+  const unique = [...new Set(episodes)].toSorted((left, right) => left - right);
+  const ranges: Array<{ start: number; end: number }> = [];
+  for (const episode of unique) {
+    const previous = ranges.at(-1);
+    if (previous && episode === previous.end + 1) {
+      previous.end = episode;
+    } else {
+      ranges.push({ start: episode, end: episode });
+    }
+  }
+  return ranges
+    .map(({ start, end }) =>
+      start === end ? `E${paddedUnit(start)}` : `E${paddedUnit(start)}–E${paddedUnit(end)}`,
+    )
+    .join("、");
+}
+
+/** 同一订阅同日更新的集数合并成一条紧凑的季集范围。 */
+function groupedEpisodeLabel(rows: PresentedTodayArrival[]): string {
+  const bySeason = new Map<number, number[]>();
+  for (const { arrival } of rows) {
+    const episodes = bySeason.get(arrival.season_number) ?? [];
+    episodes.push(arrival.episode_number);
+    bySeason.set(arrival.season_number, episodes);
+  }
+  return [...bySeason.entries()]
+    .toSorted(([left], [right]) => left - right)
+    .map(([season, episodes]) => `S${paddedUnit(season)}${episodeRanges(episodes)}`)
+    .join(" · ");
+}
+
+const arrivalStageOrder: Record<TodayArrivalPresentation["statusLabel"], number> = {
+  预计入库: 0,
+  等待资源: 0,
+  下载中: 1,
+  整理中: 2,
+};
+
+/**
+ * 一部剧的多集以完成最慢的一集为整组状态：未知时间优先于已知时间，
+ * 同阶段则取更晚的预计时间，避免部分集已下载时把整组过早显示为整理中。
+ */
+function blockingPresentation(rows: PresentedTodayArrival[]): TodayArrivalPresentation {
+  return rows.toSorted((left, right) => {
+    const stage =
+      arrivalStageOrder[left.presentation.statusLabel] -
+      arrivalStageOrder[right.presentation.statusLabel];
+    if (stage !== 0) return stage;
+    const leftTime = left.presentation.estimatedAt;
+    const rightTime = right.presentation.estimatedAt;
+    if (leftTime == null) return rightTime == null ? 0 : -1;
+    if (rightTime == null) return 1;
+    return rightTime - leftTime;
+  })[0].presentation;
+}
+
+/** 今日区域按订阅聚合，确保同一部剧无论更新多少集都只占一行。 */
+export function groupTodayArrivals(rows: PresentedTodayArrival[]): TodayArrivalGroup[] {
+  const grouped = new Map<number, PresentedTodayArrival[]>();
+  for (const row of rows) {
+    const group = grouped.get(row.arrival.subscription_id) ?? [];
+    group.push(row);
+    grouped.set(row.arrival.subscription_id, group);
+  }
+  return [...grouped.entries()].map(([subscriptionId, group]) => ({
+    subscriptionId,
+    mediaTitle: group[0].arrival.media_title,
+    episodeLabel: groupedEpisodeLabel(group),
+    episodeCount: group.length,
+    firstWantedId: Math.min(...group.map(({ arrival }) => arrival.wanted_id)),
+    presentation: blockingPresentation(group),
+  }));
+}
+
+function parsedTime(value: string | null | undefined): number | null {
+  if (!value) return null;
+  const timestamp = Date.parse(value);
+  return Number.isFinite(timestamp) ? timestamp : null;
+}
+
+function localDayKey(value: Date): string {
+  return `${value.getFullYear()}-${value.getMonth()}-${value.getDate()}`;
+}
+
+/** 首页只展示一个结果时间：同日写时刻，跨到次日时明确标注“明日”。 */
+function formatEstimatedArrival(timestamp: number, now: Date): string {
+  const value = new Date(timestamp);
+  const clock = new Intl.DateTimeFormat("zh-CN", {
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).format(value);
+  if (localDayKey(value) === localDayKey(now)) return `约 ${clock}`;
+  const tomorrow = new Date(now);
+  tomorrow.setDate(tomorrow.getDate() + 1);
+  if (localDayKey(value) === localDayKey(tomorrow)) return `明日 ${clock}`;
+  return `${value.getMonth() + 1}月${value.getDate()}日 ${clock}`;
+}
+
+/**
+ * 首次预计时间过期后，以后端调度器给出的下一有效探测点重新计算入库时间；
+ * 没有后续探测时不再展示已经失效的旧时间。
+ */
+function estimatedWantedArrival(
+  arrival: TodaySubscriptionArrival,
+  predictedAt: number,
+  now: Date,
+): number | null {
+  const importDelay = arrival.estimated_release_to_import_minutes * 60 * 1000;
+  const initialEstimate = predictedAt + importDelay;
+  if (initialEstimate >= now.getTime()) return initialEstimate;
+
+  const nextProbeAt = parsedTime(arrival.next_probe_at);
+  return nextProbeAt == null ? null : Math.max(nextProbeAt, now.getTime()) + importDelay;
+}
+
+/**
+ * 把后台阶段、出种预测和下载器 ETA 压成首页需要的“状态 + 一个入库时间”。
+ * 下载器一旦给出 ETA，就覆盖播出期预测；进度百分比仍留在任务中心。
+ */
+export function todayArrivalPresentation(
+  arrival: TodaySubscriptionArrival,
+  task?: DownloadTask,
+  now = new Date(),
+): TodayArrivalPresentation {
+  const taskCompleted = task?.state === "completed";
+  if (arrival.status === "downloaded" || taskCompleted) {
+    return { statusLabel: "整理中", timeLabel: "即将完成", estimatedAt: now.getTime() };
+  }
+
+  if (arrival.status === "grabbed") {
+    const etaSeconds = task?.state === "downloading" ? task.eta_seconds : null;
+    const estimatedAt =
+      etaSeconds != null && etaSeconds >= 0
+        ? now.getTime() +
+          (etaSeconds + arrival.estimated_download_to_import_minutes * 60) * 1000
+        : null;
+    return {
+      statusLabel: "下载中",
+      timeLabel: estimatedAt == null ? "时间待更新" : formatEstimatedArrival(estimatedAt, now),
+      estimatedAt,
+    };
+  }
+
+  const predictedAt = parsedTime(arrival.release_forecast?.predicted_at);
+  const forecastUsable = arrival.release_forecast?.confidence !== "volatile";
+  const estimatedAt =
+    predictedAt == null || !forecastUsable
+      ? null
+      : estimatedWantedArrival(arrival, predictedAt, now);
+  return {
+    statusLabel: predictedAt != null && predictedAt <= now.getTime() ? "等待资源" : "预计入库",
+    timeLabel: estimatedAt == null ? "时间待更新" : formatEstimatedArrival(estimatedAt, now),
+    estimatedAt,
+  };
 }

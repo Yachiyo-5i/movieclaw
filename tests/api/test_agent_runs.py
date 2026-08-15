@@ -31,7 +31,7 @@ async def _next(registry: AgentRunRegistry, run_id: str, after: int = 0):
 async def test_history_resume_and_two_subscribers_receive_same_events() -> None:
     registry = AgentRunRegistry()
     runner = _ControlledRunner()
-    run_id = registry.start(runner, AgentStartParams(input="测试"))
+    run_id = registry.start(runner, AgentStartParams(input="测试"), session_id="session-1")
     try:
         first, terminal = await _next(registry, run_id)
         assert [item.sequence for item in first] == [1]
@@ -59,10 +59,10 @@ async def test_history_resume_and_two_subscribers_receive_same_events() -> None:
 async def test_cancel_publishes_cancelled_terminal() -> None:
     registry = AgentRunRegistry()
     runner = _ControlledRunner()
-    run_id = registry.start(runner, AgentStartParams(input="测试"))
+    run_id = registry.start(runner, AgentStartParams(input="测试"), session_id="session-1")
     try:
         first, _ = await _next(registry, run_id)
-        await registry.cancel(run_id)
+        await registry.cancel_session("session-1")
         events, terminal = await _next(registry, run_id, first[-1].sequence)
         assert terminal
         assert [item.event.type for item in events] == ["agent_cancelled"]
@@ -82,7 +82,9 @@ async def test_unexpected_runner_error_becomes_visible_terminal() -> None:
             raise RuntimeError("测试异常")
 
     registry = AgentRunRegistry()
-    run_id = registry.start(BrokenRunner(), AgentStartParams(input="测试"))
+    run_id = registry.start(
+        BrokenRunner(), AgentStartParams(input="测试"), session_id="session-1"
+    )
     try:
         events, terminal = await _next(registry, run_id)
         if not terminal:
@@ -106,7 +108,9 @@ async def test_completed_run_expires_after_retention() -> None:
             )
 
     registry = AgentRunRegistry(retention_seconds=10, clock=lambda: now[0])
-    run_id = registry.start(DoneRunner(), AgentStartParams(input="测试"))
+    run_id = registry.start(
+        DoneRunner(), AgentStartParams(input="测试"), session_id="session-1"
+    )
     try:
         _, terminal = await _next(registry, run_id)
         assert terminal

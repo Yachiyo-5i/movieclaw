@@ -37,8 +37,11 @@ from movieclaw_api.services.subscription.matching import (
     units_text,
 )
 from movieclaw_api.services.subscription.release_forecast import (
+    FORECAST_MIN_INTERVAL,
     FORECAST_VERSION,
+    effective_forecast_probe_at,
     forecast_probe_times_by_site,
+    next_forecast_probe_times_by_wanted,
     refresh_release_forecasts,
 )
 from movieclaw_api.services.subscription.replacement import (
@@ -56,6 +59,7 @@ from movieclaw_api.services.subscription.wanted_search import kick_search_soon, 
 
 __all__ = [
     "DISPATCH_RETRY_DELAY",
+    "FORECAST_MIN_INTERVAL",
     "FORECAST_VERSION",
     "FUTURE_GRACE",
     "MATCH_BATCH_SIZE",
@@ -63,12 +67,14 @@ __all__ = [
     "SubscriptionService",
     "close_fulfilled_wanted",
     "dispatch",
+    "effective_forecast_probe_at",
     "evaluate_and_dispatch",
     "expected_units",
     "fail_trial",
     "forecast_probe_times_by_site",
     "kick_search_soon",
     "load_match_context",
+    "next_forecast_probe_times_by_wanted",
     "pipeline_health",
     "preview_dispatch_route",
     "promote_trial",

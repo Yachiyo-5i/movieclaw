@@ -3,7 +3,8 @@ import { NextResponse } from "next/server";
 
 /** Jellyfin 兼容接口经 Next rewrite 反代时，保留播放器实际连接的外部地址。 */
 export function middleware(request: NextRequest) {
-  const firstSegment = request.nextUrl.pathname.split("/")[1]?.toLowerCase();
+  const pathname = request.nextUrl.pathname.toLowerCase();
+  const firstSegment = pathname.split("/")[1];
   const jellyfinNamespaces = new Set([
     "system",
     "users",
@@ -14,13 +15,21 @@ export function middleware(request: NextRequest) {
     "items",
     "videos",
     "shows",
-    "sessions",
     "playingitems",
     "branding",
     "quickconnect",
     "emby",
   ]);
-  if (!firstSegment || !jellyfinNamespaces.has(firstSegment)) {
+  const jellyfinSessionPath =
+    pathname === "/sessions" ||
+    pathname === "/sessions/capabilities" ||
+    pathname.startsWith("/sessions/capabilities/") ||
+    pathname === "/sessions/playing" ||
+    pathname.startsWith("/sessions/playing/");
+  if (
+    !firstSegment ||
+    (!jellyfinNamespaces.has(firstSegment) && !jellyfinSessionPath)
+  ) {
     return NextResponse.next();
   }
 

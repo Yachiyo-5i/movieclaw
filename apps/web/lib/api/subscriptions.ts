@@ -86,8 +86,29 @@ export interface Subscription {
   /** 入库目标库；null = 该类型的默认库 */
   library_id: number | null;
   progress: SubscriptionProgress;
+  /** 剧集按季收录统计；电影为空数组 */
+  season_collection: SeasonOverview[];
   created_at: string;
   updated_at: string;
+}
+
+/** 订阅首页的一行“今日可能入库”单集摘要。 */
+export interface TodaySubscriptionArrival {
+  subscription_id: number;
+  wanted_id: number;
+  media_title: string;
+  season_number: number;
+  episode_number: number;
+  status: Extract<WantedStatus, "wanted" | "grabbed" | "downloaded">;
+  air_date: string | null;
+  release_forecast: ReleaseForecast | null;
+  /** 后端按站点游标和礼貌间隔计算的下一次有效预测探测时间。 */
+  next_probe_at: string | null;
+  info_hash: string | null;
+  grabbed_at: string | null;
+  downloaded_at: string | null;
+  estimated_release_to_import_minutes: number;
+  estimated_download_to_import_minutes: number;
 }
 
 export interface ReleaseForecastSite {
@@ -372,12 +393,24 @@ export function listSubscriptions(
   return unwrap(request<ApiEnvelope<Subscription[]>>(`/subscriptions${query}`, init));
 }
 
+/** 今天待播或仍在下载/整理中的剧集；预计耗时已按各订阅历史校准。 */
+export function listTodaySubscriptionArrivals(
+  init?: RequestInit,
+): Promise<TodaySubscriptionArrival[]> {
+  return unwrap(
+    request<ApiEnvelope<TodaySubscriptionArrival[]>>(
+      "/subscriptions/today-arrivals",
+      init,
+    ),
+  );
+}
+
 /** 订阅详情（含工单明细）。 */
 export function getSubscription(id: number): Promise<SubscriptionDetail> {
   return unwrap(request<ApiEnvelope<SubscriptionDetail>>(`/subscriptions/${id}`));
 }
 
-/** 修改订阅（季选择/追新/规则组，后端 diff 重算工单）。 */
+/** 修改订阅（季选择/自动续订/规则组，后端 diff 重算工单）。 */
 export function updateSubscription(
   id: number,
   payload: {
@@ -450,7 +483,7 @@ export function setSubscriptionTrackingState(
   );
 }
 
-/** 独立启用 / 禁用剧集持续追新。 */
+/** 独立开启 / 关闭剧集自动续订。 */
 export function setSubscriptionFollowFuture(
   id: number,
   enabled: boolean,

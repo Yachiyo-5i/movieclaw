@@ -28,7 +28,10 @@ from movieclaw_api.services.site_access import (
     get_site_access,
     invalidate_site_access,
 )
-from movieclaw_api.services.subscription import forecast_probe_times_by_site
+from movieclaw_api.services.subscription import (
+    effective_forecast_probe_at,
+    forecast_probe_times_by_site,
+)
 from movieclaw_api.services.verification import friendly_error, is_transient_error
 from movieclaw_db.engine import get_database
 from movieclaw_db.models.base import utcnow
@@ -53,9 +56,6 @@ _TICK_SECONDS = 120
 # 每站轮询间隔的上下限与起始值（秒）
 _MIN_INTERVAL = 300  # 5 分钟：发布最快的站也不会比这更密（礼貌下限之上的调度下限）
 _MAX_INTERVAL = 21600  # 6 小时：冷站最疏到此为止
-# 预测只能提前现有同步，不能绕过单站礼貌下限。多个订阅命中同站时也按游标合并，
-# 至少间隔 15 分钟才允许再探测一次，避免热门时段形成请求风暴。
-_FORECAST_MIN_INTERVAL = 900
 # 回补翻页上限：长时间宕机后避免失控狂爬；到顶仍未接上则记录缺口
 _MAX_BACKFILL_PAGES = 10
 # 站点时间最多允许比当前 UTC 快 15 分钟（容忍服务器轻微漂移）。超过通常意味着
@@ -227,19 +227,10 @@ async def _plan_sync(
 
             # 只看上次同步之后的预测点：无论那次是普通轮询还是预测触发，都说明
             # 更早探测已经被消费。若刚同步过，则把探测推迟到礼貌间隔之后。
-            pending_probes = [
-                probe
-                for probe in probes_by_site.get(cred.site_id, [])
-                if cursor.last_sync_at is None or probe > cursor.last_sync_at
-            ]
-            forecast_due_at: datetime | None = None
-            if pending_probes:
-                forecast_due_at = pending_probes[0]
-                if cursor.last_sync_at is not None:
-                    forecast_due_at = max(
-                        forecast_due_at,
-                        cursor.last_sync_at + timedelta(seconds=_FORECAST_MIN_INTERVAL),
-                    )
+            forecast_due_at = effective_forecast_probe_at(
+                probes_by_site.get(cred.site_id, []),
+                last_sync_at=cursor.last_sync_at,
+            )
 
             forecast_due = forecast_due_at is not None and now >= forecast_due_at
             if normal_due or forecast_due:

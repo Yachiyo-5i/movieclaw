@@ -46,15 +46,18 @@ class LibraryReorderPayload(BaseModel):
 
 
 class LibraryStats(BaseModel):
-    """库存统计（library_file 聚合，查询时现算——L1 曾用订阅数占位，L3 起是真库存）。"""
+    """库存统计快照（台账变化时重算，查询时直接读取 library 表）。"""
 
-    item_count: int = Field(default=0, description="已识别的媒体条目数")
-    file_count: int = Field(default=0, description="在账文件总数（含待识别）")
-    total_size_bytes: int = Field(default=0, description="文件总大小（字节）")
-    unidentified_count: int = Field(default=0, description="待识别文件数（不含已忽略）")
+    item_count: int = Field(default=0, description="在位且已识别的媒体条目数")
+    file_count: int = Field(default=0, description="在位文件总数（含待识别）")
+    total_size_bytes: int = Field(default=0, description="在位文件总大小（字节）")
+    unidentified_count: int = Field(
+        default=0, description="在位待识别文件数（不含已忽略）"
+    )
     missing_count: int = Field(default=0, description="标记 missing 的文件数（缺失清单入口）")
     ignored_count: int = Field(
-        default=0, description="用户忽略过的文件数（不再参与识别，可在已忽略清单恢复）"
+        default=0,
+        description="在位且被用户忽略的文件数（不再参与识别，可在已忽略清单恢复）",
     )
 
 
@@ -189,7 +192,6 @@ class LibraryView(BaseModel):
         cls,
         row: Library,
         *,
-        stats: LibraryStats | None = None,
         scanning: bool = False,
         scan_progress: ScanProgressView | None = None,
         last_scan: LastScanView | None = None,
@@ -207,7 +209,14 @@ class LibraryView(BaseModel):
             is_default=row.is_default,
             match_rules=list(row.match_rules),
             auto_clear_missing=row.auto_clear_missing,
-            stats=stats or LibraryStats(),
+            stats=LibraryStats(
+                item_count=row.stats_item_count,
+                file_count=row.stats_file_count,
+                total_size_bytes=row.stats_total_size_bytes,
+                unidentified_count=row.stats_unidentified_count,
+                missing_count=row.stats_missing_count,
+                ignored_count=row.stats_ignored_count,
+            ),
             scanning=scanning,
             scan_progress=scan_progress,
             last_scan=last_scan,

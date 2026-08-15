@@ -9,6 +9,7 @@ import {
   CheckIcon,
   ChevronLeftIcon,
   ChevronRightIcon,
+  FilmIcon,
   FolderIcon,
   PhotoIcon,
   BellIcon,
@@ -28,10 +29,11 @@ import {
   type MediaImage,
 } from "@/lib/api/discover";
 import { useSubscribeEntry } from "@/components/subscribe-entry";
+import { useBackNavigation } from "@/lib/back-navigation";
 import { useBackdrop } from "@/lib/backdrop";
 import { buildDiscoveryReturnPath } from "@/lib/discovery-return-path";
 import { useDoubanAppHref } from "@/lib/douban-app-link";
-import { getMediaOrigin, getMediaSeed, useMediaDetail } from "@/lib/media-detail";
+import { getMediaSeed } from "@/lib/media-detail";
 import { usePageTitle } from "@/lib/use-page-title";
 import { usePermissions } from "@/lib/permissions";
 import type { MediaSource, MediaType } from "@/lib/media-types";
@@ -64,10 +66,11 @@ import {
  *   6. 词条信息玻璃卡（上映 / 地区 / 语言 / 平台 / 别名）——「主演」已经由
  *      演职员条完整呈现，不在这里重复成一行文字。
  *   7. 剧照与海报 —— Apple TV+ 式横滚图片条，胶囊标签切换类型，点图开灯箱。
- *   8. 相似推荐 —— 复用 MediaRow，点击可继续跳详情。
+ *   8. 系列电影 —— 头部给出系列名、总数和当前顺序的直达入口，下方展示完整系列。
+ *   9. 相似推荐 —— 复用 MediaRow，点击可继续跳详情。
  *
  * 数据分两段呈现：点卡片时已有的列表字段（标题/海报/简介）立即渲染，
- * 词条信息与相似推荐从稳定 titleRef 对应的详情接口异步补齐（回填片长/季数）。
+ * 词条信息、系列电影与相似推荐从稳定 titleRef 对应的详情接口异步补齐（回填片长/季数）。
  */
 export function MediaDetailView({
   type,
@@ -79,7 +82,6 @@ export function MediaDetailView({
   source?: MediaSource;
 }) {
   const { canSearch } = usePermissions();
-  const { close } = useMediaDetail();
   const [detail, setDetail] = useState<MediaDetailData | null>(null);
   // 详情拉取失败状态：仅在无 seed（硬刷新/分享直达）时才需要整页兜底
   const [loadFailed, setLoadFailed] = useState(false);
@@ -93,9 +95,17 @@ export function MediaDetailView({
   const sub = subscriptionOf({ id, source, type: type ?? "movie" });
   // 订阅弹层的打开参数；null = 关闭
   const [subscribeTarget, setSubscribeTarget] = useState<SubscribeTarget | null>(null);
+  // 系列入口与完整海报行相距较远，用稳定 DOM 引用完成页内定位，不污染详情 URL。
+  const collectionSectionRef = useRef<HTMLDivElement>(null);
   // 站内点卡片跳转时预存的列表字段（标题/海报/简介），用于首屏零白屏；
   // 硬刷新 / 分享链接直达时为空，此时全靠 Discover 详情接口拉取。
   const listItem = getMediaSeed(source, id);
+  const fallbackType = listItem?.type ?? type ?? "movie";
+  const navFallback = {
+    label: fallbackType === "tv" ? "发现剧集" : "发现电影",
+    href: `/discover/${fallbackType}` as Route,
+  };
+  const back = useBackNavigation(navFallback.href);
   // 站内跳转优先沿用列表响应给出的稳定引用；硬刷新没有 seed 时，详情 URL
   // 本身已携带等价的来源/类型/ID，再据此恢复引用。
   const reference = listItem?.titleRef ?? titleRef(source, type ?? "movie", id);
@@ -141,28 +151,25 @@ export function MediaDetailView({
   // 装了豆瓣 App 直接拉起进词条页（桌面/未命中时为 null，回落网页地址）
   const doubanAppHref = useDoubanAppHref(source === "douban" ? id : null);
 
-  // 来路祖先（与影片标题无关）：加载/失败兜底与正常内容共用同一条回跳链路。
   // 兜底态也必须渲染 PageNav——它向外壳登记「本页自带顶栏」，否则移动端的
   // 全局顶栏（☰ + logo）会在数据到达前先显示、随后又消失，顶部闪一下；
   // 顺带让用户在转圈期间就有返回键可点。
-  const ancestors = getMediaOrigin(source, id) ?? [
-    (item?.type ?? type ?? "movie") === "movie"
-      ? { label: "发现电影", href: "/discover/movie" }
-      : { label: "发现剧集", href: "/discover/tv" },
-  ];
-
   // 无 seed 且详情尚未到达：直达链接的加载态（或失败兜底）。
   if (!item) {
     return (
       <div className="flex h-full flex-col">
-        {/* 当前页标题未知，末项留空——只为立起返回键并认领顶栏 */}
-        <PageNav items={[...ancestors, { label: "" }]} />
-        <DetailFallback failed={loadFailed} onBack={close} />
+        {/* 当前页标题未知，留空——只为立起返回键并认领顶栏 */}
+        <PageNav title="" fallback={navFallback} />
+        <DetailFallback failed={loadFailed} onBack={back} />
       </div>
     );
   }
 
   const info = detail?.info;
+  const collection = detail?.collection;
+  const collectionPosition =
+    collection?.items.findIndex((collectionItem) => collectionItem.id === item.id) ?? -1;
+  const collectionSectionId = collection ? `series-collection-${collection.id}` : "";
   const related = detail?.related ?? [];
   const libraryLinks = detail?.libraryLinks ?? [];
   // 发现详情路由是媒体库页可安全返回的唯一来源；不从标题或媒体库数据反推条目。
@@ -190,8 +197,13 @@ export function MediaDetailView({
       year: item.year || undefined,
     });
 
-  // 来路：站内点进来按来的列表页作返回目标；直达/刷新按影片类型兜底
-  const trail = [...ancestors, { label: item.title }];
+  /** 从头部系列卡定位到完整系列；系统要求减少动态效果时取消平滑动画。 */
+  const revealCollection = () => {
+    const section = collectionSectionRef.current;
+    if (!section) return;
+    const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    section.scrollIntoView({ behavior: reduceMotion ? "auto" : "smooth", block: "start" });
+  };
 
   return (
     // rounded-2xl + overflow 裁切：内容渐变到底部是近实色的深色板，方角会与
@@ -209,7 +221,7 @@ export function MediaDetailView({
       {/* —— 1. 顶栏：不再有任何 Hero 卡片图层——全站背景此刻就是本片剧照
           （沉浸覆盖 + 本页豁免全局蒙版，见 app-shell 的 isHome），大图直出、
           零边界。首屏只有一颗圆形返回键浮在剧照上 —— */}
-      <PageNav items={trail} />
+      <PageNav title={item.title} fallback={navFallback} />
 
       {/* 氛围留白：这一段什么都不放，让剧照完整呼吸。shrink-0 是必须的——
           它是 flex 子项，不加会在内容长的时候被压扁 */}
@@ -351,10 +363,21 @@ export function MediaDetailView({
               </span>
             )}
           </div>
+
+          {/* 系列是内容导航，不与订阅/搜索混成同一排操作；完整信息到达后才出现。 */}
+          {collection && collection.items.length > 1 && (
+            <SeriesCollectionEntry
+              name={collection.name}
+              count={collection.items.length}
+              position={collectionPosition}
+              targetId={collectionSectionId}
+              onOpen={revealCollection}
+            />
+          )}
         </div>
       </div>
 
-      {/* 订阅弹层：prepare → 季选择/追新/规则组 → 创建；已订阅时为管理态 */}
+      {/* 订阅弹层：prepare → 季选择/自动续订/规则组 → 创建；已订阅时为管理态 */}
       <SubscribeDialog
         target={subscribeTarget}
         onClose={() => setSubscribeTarget(null)}
@@ -418,7 +441,24 @@ export function MediaDetailView({
         </div>
       )}
 
-      {/* —— 8. 相似推荐 —— */}
+      {/* —— 8. 系列电影：使用 TMDB collection 的完整作品顺序，不混入相似推荐。 —— */}
+      {collection && collection.items.length > 1 && (
+        <div
+          ref={collectionSectionRef}
+          id={collectionSectionId}
+          className="mt-9 scroll-mt-20"
+        >
+          <MediaRow
+            row={{
+              id: `collection-${collection.id}`,
+              title: collection.name,
+              items: collection.items,
+            }}
+          />
+        </div>
+      )}
+
+      {/* —— 9. 相似推荐 —— */}
       {related.length > 0 && (
         <div className="mt-9">
           <MediaRow row={{ id: `related-${item.id}`, title: "相似推荐", items: related }} />
@@ -427,6 +467,53 @@ export function MediaDetailView({
       </div>
       </div>
     </div>
+  );
+}
+
+/**
+ * 详情头部的系列电影入口：先说明“属于哪个系列、共有几部、当前排第几”，
+ * 再把用户带到完整海报行。它只做页内导航，不承担订阅或资源搜索动作。
+ */
+function SeriesCollectionEntry({
+  name,
+  count,
+  position,
+  targetId,
+  onOpen,
+}: {
+  name: string;
+  count: number;
+  /** -1 表示上游系列列表未包含当前影片，此时不猜测顺序。 */
+  position: number;
+  targetId: string;
+  onOpen: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      aria-controls={targetId}
+      aria-label={`查看${name}的全部 ${count} 部系列电影`}
+      onClick={onOpen}
+      className="group/series mt-4 flex w-full max-w-[440px] items-center gap-3 rounded-xl border border-[var(--accent)]/25 bg-[linear-gradient(110deg,var(--accent-soft),rgba(255,255,255,0.045))] px-3.5 py-3 text-left shadow-[0_14px_36px_rgba(0,0,0,0.18)] backdrop-blur-md transition-[transform,border-color] hover:-translate-y-0.5 hover:border-[var(--accent)]/45 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent-ring)] max-md:mt-3 max-md:px-3 max-md:py-2.5"
+    >
+      <span className="flex size-10 shrink-0 items-center justify-center rounded-lg bg-[var(--accent-soft)] text-[var(--accent-2)] ring-1 ring-[var(--accent)]/20 max-md:size-9">
+        <FilmIcon className="size-5 max-md:size-4" />
+      </span>
+      <span className="min-w-0 flex-1">
+        <span className="block text-caption font-semibold tracking-[0.12em] text-[var(--accent-2)]">
+          系列电影 · 共 {count} 部
+        </span>
+        <span className="mt-0.5 flex min-w-0 items-baseline gap-2">
+          <span className="truncate text-ui font-semibold text-white">{name}</span>
+          {position >= 0 && (
+            <span className="tnum shrink-0 text-caption text-white/45">
+              当前第 {position + 1} 部
+            </span>
+          )}
+        </span>
+      </span>
+      <ChevronRightIcon className="size-4 shrink-0 rotate-90 text-white/45 transition-[transform,color] group-hover/series:translate-y-0.5 group-hover/series:text-white/75" />
+    </button>
   );
 }
 

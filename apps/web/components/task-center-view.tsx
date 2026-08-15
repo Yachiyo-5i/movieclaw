@@ -43,14 +43,13 @@ import {
 import { shouldOfferInlineReplacement } from "@/lib/download-task-actions";
 import { cancelJob, retryJob, type JobStatus, type JobView } from "@/lib/api/jobs";
 import { useJobs } from "@/lib/jobs";
+import type { TaskCenterViewName } from "@/lib/task-center";
 import {
   formatClockTime,
   formatRelativeTime,
   formatTimelineDayLabel,
   timelineDayKey,
 } from "@/lib/time";
-
-type TaskView = "all" | "attention" | "active" | "history";
 
 const ATTENTION_JOB_STATUSES = new Set<JobStatus>(["blocked", "failed"]);
 const ACTIVE_FEED_JOB_STATUSES = new Set<JobStatus>([
@@ -62,7 +61,7 @@ const ACTIVE_FEED_JOB_STATUSES = new Set<JobStatus>([
 ]);
 const HISTORY_JOB_STATUSES = new Set<JobStatus>(["succeeded", "cancelled"]);
 
-const VIEW_LABELS: { id: TaskView; label: string }[] = [
+const VIEW_LABELS: { id: TaskCenterViewName; label: string }[] = [
   { id: "all", label: "全部" },
   { id: "attention", label: "需要处理" },
   { id: "active", label: "进行中" },
@@ -74,8 +73,12 @@ const VIEW_LABELS: { id: TaskView; label: string }[] = [
  * Job 状态来自 MovieClaw 数据库，下载状态来自下载器实时快照，订阅关系仅按
  * infohash 投影视图；各自的取消、重试和入库生命周期仍由原领域负责。
  */
-export function TaskCenterView() {
-  const [view, setView] = useState<TaskView>("all");
+export function TaskCenterView({
+  initialView = "all",
+}: {
+  initialView?: TaskCenterViewName;
+}) {
+  const [view, setView] = useState<TaskCenterViewName>(initialView);
   const [deletingTaskId, setDeletingTaskId] = useState<string | null>(null);
   const [replacingTaskId, setReplacingTaskId] = useState<string | null>(null);
   const [cancellingJobId, setCancellingJobId] = useState<string | null>(null);
@@ -220,7 +223,7 @@ export function TaskCenterView() {
     (showHistory ? standaloneHistoricalJobs.length : 0);
   const failedSources = sources.filter((source) => source.status !== "active");
   const healthySourceCount = sources.length - failedSources.length;
-  const viewCounts: Partial<Record<TaskView, number>> = {
+  const viewCounts: Partial<Record<TaskCenterViewName, number>> = {
     attention: attentionTotal,
     active: activeTotal,
     history: standaloneHistoricalJobs.length,
@@ -334,7 +337,6 @@ export function TaskCenterView() {
             {activeDownloadGroups.map((group) => (
               <TaskTimelineItem
                 key={group.key}
-                time="实时"
                 label={`${group.title}的实时状态`}
                 tone={downloadGroupTimelineTone(group, ingestJobsByHash)}
               >
@@ -551,7 +553,7 @@ function TaskTimelineItem({
   tone = "active",
   children,
 }: {
-  time: string;
+  time?: string;
   label: string;
   tone?: "active" | "waiting" | "success" | "cancelled";
   children: React.ReactNode;
@@ -568,7 +570,8 @@ function TaskTimelineItem({
   return (
     <div className="grid grid-cols-[3.75rem_1.5rem_minmax(0,1fr)] gap-x-2 last:[&_[data-timeline-line]]:hidden max-md:grid-cols-[1.25rem_minmax(0,1fr)] max-md:gap-x-2.5">
       <span
-        aria-label={label}
+        aria-label={time ? label : undefined}
+        aria-hidden={time ? undefined : true}
         className="tnum pt-2.5 text-right text-caption text-white/35 max-md:hidden"
       >
         {time}
@@ -588,7 +591,9 @@ function TaskTimelineItem({
         />
       </span>
       <div className="min-w-0 pb-4">
-        <p className="tnum mb-1 hidden text-caption text-white/35 max-md:block">{time}</p>
+        {time && (
+          <p className="tnum mb-1 hidden text-caption text-white/35 max-md:block">{time}</p>
+        )}
         {children}
       </div>
     </div>
@@ -1072,8 +1077,11 @@ function DownloadTaskGroupFeed({
       {grouped && (
         <div className="mb-2 flex min-w-0 items-start justify-between gap-3">
           <div className="min-w-0 flex-1">
-            <h3 className="text-ui font-semibold leading-5 text-white/90">
-              <OverflowText>{group.title}</OverflowText>
+            <h3 className="flex min-w-0 items-center gap-2 text-ui font-semibold leading-5 text-white/90">
+              <span className="shrink-0 rounded-full border border-[#7dd3fc]/25 bg-[#7dd3fc]/[0.12] px-1.5 py-0.5 text-[11px] font-semibold leading-none text-[#b9e8ff]">
+                实时
+              </span>
+              <OverflowText className="flex-1">{group.title}</OverflowText>
             </h3>
             <p className="mt-1 text-caption text-white/35">
               {group.kind === "tv" ? "剧集" : "电影"}
@@ -1157,8 +1165,17 @@ function DownloadTaskFeedItem({
     <div className={grouped ? "py-2.5 first:pt-1 last:pb-1" : ""}>
       <div className="flex min-w-0 items-start justify-between gap-3">
         <div className="min-w-0 flex-1">
-          <h3 className={`${grouped ? "text-sub" : "text-ui"} font-semibold leading-5 text-white/88`}>
-            <OverflowText>{title}</OverflowText>
+          <h3
+            className={`flex min-w-0 items-center gap-2 ${
+              grouped ? "text-sub" : "text-ui"
+            } font-semibold leading-5 text-white/88`}
+          >
+            {!grouped && (
+              <span className="shrink-0 rounded-full border border-[#7dd3fc]/25 bg-[#7dd3fc]/[0.12] px-1.5 py-0.5 text-[11px] font-semibold leading-none text-[#b9e8ff]">
+                实时
+              </span>
+            )}
+            <OverflowText className="flex-1">{title}</OverflowText>
           </h3>
           <p className="mt-1 flex flex-wrap items-center gap-x-1.5 text-caption">
             <span className="font-medium" style={{ color: meta.color }}>
@@ -1805,8 +1822,8 @@ function EpisodeUnitsLabel({
   );
 }
 
-function EmptyView({ view }: { view: TaskView }) {
-  const copy: Record<TaskView, { title: string; note: string }> = {
+function EmptyView({ view }: { view: TaskCenterViewName }) {
+  const copy: Record<TaskCenterViewName, { title: string; note: string }> = {
     all: { title: "当前没有任务", note: "新的后台作业或下载任务会自动出现在这里。" },
     attention: { title: "当前无需处理", note: "异常或需要确认的任务会优先出现在这里。" },
     active: { title: "当前没有进行中的任务", note: "新任务启动后会自动进入实时过程。" },

@@ -602,44 +602,6 @@ async def list_libraries(
     return list((await session.execute(q)).scalars())
 
 
-@dataclass
-class LibraryStats:
-    """库卡片素材：条目数（播放器的库列表用；封面另走拼贴服务）。"""
-
-    item_count: int = 0  # 顶层条目数（电影部数 / 剧集部数）
-    episode_count: int = 0
-
-
-async def load_library_stats(session: AsyncSession) -> dict[int, LibraryStats]:
-    """一次性算出全部库的条目数（封面见 library.cover 拼贴服务）。"""
-    stats: dict[int, LibraryStats] = {}
-    rows = (
-        await session.execute(
-            select(
-                LibraryFile.library_id,
-                LibraryFile.media_item_id,
-                LibraryFile.season_number,
-                LibraryFile.episode_number,
-            ).where(
-                LibraryFile.media_item_id.is_not(None),
-                LibraryFile.missing_since.is_(None),
-            )
-        )
-    ).all()
-    per_lib_items: dict[int, set[int]] = {}
-    per_lib_units: dict[int, set[tuple[int, int, int]]] = {}
-    for r in rows:
-        per_lib_items.setdefault(r.library_id, set()).add(r.media_item_id)
-        per_lib_units.setdefault(r.library_id, set()).add(
-            (r.media_item_id, r.season_number, r.episode_number)
-        )
-    for lib_id, items in per_lib_items.items():
-        stats[lib_id] = LibraryStats(
-            item_count=len(items), episode_count=len(per_lib_units[lib_id])
-        )
-    return stats
-
-
 # ---------------------------------------------------------------------------
 # 图片 tag
 # ---------------------------------------------------------------------------
@@ -1096,7 +1058,6 @@ def episode_dto(
 def library_view_dto(
     ctx: DtoContext,
     library: Library,
-    stats: LibraryStats | None = None,
     cover_tag: str | None = None,
 ) -> dict[str, Any]:
     dto = _common(ctx, library_guid(library.id), library.name, "CollectionFolder", "Unknown")
@@ -1106,12 +1067,15 @@ def library_view_dto(
     dto["ImageTags"] = {"Primary": cover_tag} if cover_tag else {}
     dto["BackdropImageTags"] = []
     dto["ParentId"] = root_guid()
-    if stats is not None:
-        # UserViews 是全字段语义：CollectionFolder 带 ChildCount（库卡片计数）
-        dto["ChildCount"] = stats.item_count
-        dto["RecursiveItemCount"] = (
-            stats.episode_count if library.kind == "tv" else stats.item_count
-        )
+    # UserViews 是全字段语义：CollectionFolder 带 ChildCount（库卡片计数）。
+    # 直接读 library 上由扫描/入库写路径维护的快照，不再为每次
+    # Jellyfin 浏览请求扫描 library_file 全表。
+    dto["ChildCount"] = library.stats_item_count
+    dto["RecursiveItemCount"] = (
+        library.stats_episode_count
+        if library.kind == "tv"
+        else library.stats_item_count
+    )
     # 库视图不做已看聚合（CollectionFolder.SupportsPlayedStatus=false）
     guid = library_guid(library.id)
     dto["UserData"] = {

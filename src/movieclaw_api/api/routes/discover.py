@@ -24,9 +24,12 @@ from movieclaw_api.schemas.discover import (
     DiscoveredTitleDetailsView,
     DiscoveryCollectionListView,
     DiscoveryCollectionTitlesView,
+    DiscoveryFilterOptionsView,
     DiscoveryPageSectionView,
     DiscoveryPageView,
     DiscoveryPresentation,
+    DiscoverySort,
+    DiscoveryTitlePageView,
     TitleSearchPayload,
     TitleSearchView,
 )
@@ -136,6 +139,7 @@ async def list_discovery_collections(
 async def browse_discovery_collection(
     collection_ref: str,
     limit: int = Query(20, ge=1, le=500, description="最多返回多少条；完整榜单可调大"),
+    page: int = Query(1, ge=1, le=500, description="TMDB 原生页码；豆瓣片单恒为第 1 页"),
     service: TitleDiscoveryService = Depends(get_title_discovery_service),
     projection: DiscoverLibraryProjectionService = Depends(get_projection),
 ) -> ApiResponse[DiscoveryCollectionTitlesView]:
@@ -144,6 +148,7 @@ async def browse_discovery_collection(
         result = await service.browse_collection(
             collection_ref,
             limit=limit,
+            page=page,
             projection=projection,
         )
     except ValueError as exc:
@@ -151,6 +156,63 @@ async def browse_discovery_collection(
     except LookupError as exc:
         raise NotFoundException(str(exc)) from exc
     except (TmdbError, DoubanError) as exc:
+        raise _translate(exc) from exc
+    return ok(result)
+
+
+@router.get(
+    "/filters",
+    response_model=ApiResponse[DiscoveryFilterOptionsView],
+    summary="获取组合发现可用的类型选项",
+    operation_id="discover.filter-options",
+)
+async def get_discovery_filter_options(
+    media_type: MediaKind = Query(description="筛选的媒体类型：movie / tv"),
+    service: TitleDiscoveryService = Depends(get_title_discovery_service),
+) -> ApiResponse[DiscoveryFilterOptionsView]:
+    try:
+        return ok(await service.filter_options(media_type))
+    except TmdbError as exc:
+        raise _translate(exc) from exc
+
+
+@router.get(
+    "/titles",
+    response_model=ApiResponse[DiscoveryTitlePageView],
+    summary="按类型、地区、年份、评分、片长和排序组合发现影视",
+    operation_id="discover.filter-titles",
+)
+async def filter_discovery_titles(
+    media_type: MediaKind = Query(description="筛选的媒体类型：movie / tv"),
+    genre_ids: list[int] = Query(default=[], description="类型 ID；多个值按任一匹配"),
+    origin_country: str | None = Query(
+        default=None,
+        min_length=2,
+        max_length=2,
+        pattern="^[A-Za-z]{2}$",
+        description="制片国家/地区代码",
+    ),
+    year: int | None = Query(default=None, ge=1874, le=2100),
+    rating_gte: float | None = Query(default=None, ge=0, le=10),
+    runtime_lte: int | None = Query(default=None, ge=1, le=600),
+    sort: DiscoverySort = Query(default=DiscoverySort.POPULAR),
+    page: int = Query(default=1, ge=1, le=500),
+    service: TitleDiscoveryService = Depends(get_title_discovery_service),
+    projection: DiscoverLibraryProjectionService = Depends(get_projection),
+) -> ApiResponse[DiscoveryTitlePageView]:
+    try:
+        result = await service.discover_titles(
+            media_type,
+            genre_ids=genre_ids,
+            origin_country=origin_country.upper() if origin_country else None,
+            year=year,
+            rating_gte=rating_gte,
+            runtime_lte=runtime_lte,
+            sort=sort,
+            page=page,
+            projection=projection,
+        )
+    except TmdbError as exc:
         raise _translate(exc) from exc
     return ok(result)
 

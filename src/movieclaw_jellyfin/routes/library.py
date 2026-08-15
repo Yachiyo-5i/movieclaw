@@ -30,7 +30,6 @@ from movieclaw_jellyfin.catalog import (
     library_view_dto,
     list_libraries,
     load_bundles,
-    load_library_stats,
     movie_dto,
     movie_library_page,
     next_up_item_ids,
@@ -162,9 +161,8 @@ async def user_views(
     ctx = await dto_context()
     async with get_database().session() as session:
         libraries = await list_libraries(session, visible_ids=scope.visible)
-        stats = await load_library_stats(session)
     dtos = [
-        library_view_dto(ctx, lib, stats.get(lib.id), await _cover_tag(lib.id))
+        library_view_dto(ctx, lib, await _cover_tag(lib.id))
         for lib in libraries
     ]
     return JSONResponse(query_result(dtos, len(dtos)))
@@ -529,11 +527,8 @@ async def _query_items(request: Request, scope: ViewerScope) -> JSONResponse:
             if entries is None:
                 # 根级：返回视图列表
                 libraries = await list_libraries(session, visible_ids=scope.visible)
-                stats = await load_library_stats(session)
                 dtos = [
-                    library_view_dto(
-                        ctx, lib, stats.get(lib.id), await _cover_tag(lib.id)
-                    )
+                    library_view_dto(ctx, lib, await _cover_tag(lib.id))
                     for lib in libraries
                 ]
                 return JSONResponse(query_result(dtos, len(dtos)))
@@ -908,39 +903,86 @@ async def items_counts(
 ) -> JSONResponse:
     """全服统计（LibraryController.cs:453，ItemCounts 的 12 个非可空计数）。
 
-    播放器的服务器/媒体库卡片用它显示"多少部电影、多少部剧"。"""
+    播放器的服务器/媒体库卡片用它显示"多少部电影、多少部剧"。
+    每类型只有一个在用库时直接读扫描/入库写路径维护的快照。
+    同类型多库可能收藏同一作品（例如一部剧的分集跨库），此时才用
+    library_file 的覆盖索引做跨库去重，避免盲目相加快照导致重复计数。"""
     async with get_database().session() as session:
-        movie_ids = await item_ids_with_files(
-            session, kind="movie", visible_library_ids=scope.visible
-        )
-        tv_ids = await item_ids_with_files(
-            session, kind="tv", visible_library_ids=scope.visible
-        )
-        episode_count = 0
-        if tv_ids:
+        libraries = await list_libraries(session, visible_ids=scope.visible)
+        movie_libraries = [
+            library
+            for library in libraries
+            if library.kind == "movie" and library.stats_item_count > 0
+        ]
+        tv_libraries = [
+            library
+            for library in libraries
+            if library.kind == "tv" and library.stats_item_count > 0
+        ]
+
+        movie_count = sum(library.stats_item_count for library in movie_libraries)
+        series_count = sum(library.stats_item_count for library in tv_libraries)
+        episode_count = sum(library.stats_episode_count for library in tv_libraries)
+
+        if len(movie_libraries) > 1 or len(tv_libraries) > 1:
+            from sqlalchemy import func
             from sqlalchemy import select as sa_select
 
             from movieclaw_db.models import LibraryFile
 
-            units = (
-                await session.execute(
+            async def distinct_item_count(library_ids: list[int]) -> int:
+                distinct_items = (
+                    sa_select(LibraryFile.media_item_id)
+                    .where(
+                        LibraryFile.library_id.in_(library_ids),
+                        LibraryFile.media_item_id.is_not(None),
+                        LibraryFile.missing_since.is_(None),
+                    )
+                    .distinct()
+                    .subquery()
+                )
+                return int(
+                    (
+                        await session.execute(
+                            sa_select(func.count()).select_from(distinct_items)
+                        )
+                    ).scalar_one()
+                )
+
+            if len(movie_libraries) > 1:
+                movie_count = await distinct_item_count(
+                    [library.id for library in movie_libraries if library.id is not None]
+                )
+            if len(tv_libraries) > 1:
+                tv_library_ids = [
+                    library.id for library in tv_libraries if library.id is not None
+                ]
+                series_count = await distinct_item_count(tv_library_ids)
+                distinct_units = (
                     sa_select(
                         LibraryFile.media_item_id,
                         LibraryFile.season_number,
                         LibraryFile.episode_number,
                     )
                     .where(
-                        LibraryFile.media_item_id.in_(tv_ids),
+                        LibraryFile.library_id.in_(tv_library_ids),
+                        LibraryFile.media_item_id.is_not(None),
                         LibraryFile.missing_since.is_(None),
                     )
                     .distinct()
+                    .subquery()
                 )
-            ).all()
-            episode_count = len(units)
+                episode_count = int(
+                    (
+                        await session.execute(
+                            sa_select(func.count()).select_from(distinct_units)
+                        )
+                    ).scalar_one()
+                )
     return JSONResponse(
         {
-            "MovieCount": len(movie_ids),
-            "SeriesCount": len(tv_ids),
+            "MovieCount": movie_count,
+            "SeriesCount": series_count,
             "EpisodeCount": episode_count,
             "ArtistCount": 0,
             "ProgramCount": 0,
@@ -950,7 +992,7 @@ async def items_counts(
             "MusicVideoCount": 0,
             "BoxSetCount": 0,
             "BookCount": 0,
-            "ItemCount": len(movie_ids) + len(tv_ids) + episode_count,
+            "ItemCount": movie_count + series_count + episode_count,
         }
     )
 
@@ -1074,11 +1116,8 @@ async def get_item(
             library = await session.get(Library, ref.entity_id)
             if library is None:
                 raise not_found()
-            stats = await load_library_stats(session)
             return JSONResponse(
-                library_view_dto(
-                    ctx, library, stats.get(library.id), await _cover_tag(library.id)
-                )
+                library_view_dto(ctx, library, await _cover_tag(library.id))
             )
         # 单条目是全字段语义，People 恒输出；可见性先行（GUID 可枚举）
         if not await _item_visible(session, ref.entity_id, scope):

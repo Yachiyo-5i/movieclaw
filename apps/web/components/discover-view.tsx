@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import type { Route } from "next";
@@ -14,6 +14,8 @@ import {
   StarIcon,
 } from "@/components/icons";
 import { MediaRow } from "@/components/media-row";
+import { DiscoveryFilterControl } from "@/components/discovery-filter-dialog";
+import { FilteredDiscoveryView } from "@/components/filtered-discovery-view";
 import { PosterImage } from "@/components/poster-image";
 import { useSubscribeEntry } from "@/components/subscribe-entry";
 import {
@@ -25,6 +27,13 @@ import {
   type DiscoveryPageSection,
 } from "@/lib/api/discover";
 import { HttpError } from "@/lib/http";
+import {
+  discoveryFilterCount,
+  discoveryFiltersKey,
+  discoveryFiltersQuery,
+  EMPTY_DISCOVERY_FILTERS,
+  type DiscoveryFilters,
+} from "@/lib/discovery-filters";
 import { useMediaDetail } from "@/lib/media-detail";
 import { usePageChrome } from "@/lib/page-chrome";
 import { useScrollRestoration } from "@/lib/use-scroll-restoration";
@@ -42,7 +51,7 @@ import type {
  *
  * 页面纵向结构：
  *   1. HeroBanner —— 精选影片轮播大横幅（宽幅剧照 + 渐变蒙版 + 标题区 + 操作按钮）
- *   2. 若干 MediaRow —— 「今日热榜 Top 10（排名变体）/ 热门 / 高分 / …」横滚海报行
+ *   2. 若干 MediaRow —— 「今日热榜（排名变体）/ 热门 / 高分 / …」横滚海报行
  *
  * 渐进加载：先读取 Web 展示清单，再把每个 collectionRef 原样交给领域接口。
  * 页面只知道一个片单应画成 Hero、排名行还是普通行，不再拼装 provider 专属
@@ -78,13 +87,20 @@ function toErrorInfo(err: unknown): DiscoverErrorInfo {
 export function DiscoverView({
   mediaType,
   source,
+  filters,
+  currentYear,
 }: {
   mediaType: MediaType;
   source: MediaSource;
+  filters: DiscoveryFilters;
+  /** 服务端确定年份，避免跨年瞬间 SSR 与浏览器水合生成不同选项。 */
+  currentYear: number;
 }) {
   const router = useRouter();
   const cacheKey = `${mediaType}:${source}`;
-  const scrollRef = useScrollRestoration(`discover:${cacheKey}`);
+  const filterKey = discoveryFiltersKey(filters);
+  const filtering = source === "tmdb" && discoveryFilterCount(filters) > 0;
+  const scrollRef = useScrollRestoration(`discover:${cacheKey}:${filterKey}`);
   const [page, setPage] = useState<DiscoveryPageData | null>(() => pageCache.get(cacheKey) ?? null);
   // Hero 三态：undefined=加载中（出骨架）、[]=无或失败（收起）、有值=轮播
   const [hero, setHero] = useState<MediaItem[] | undefined>();
@@ -95,6 +111,7 @@ export function DiscoverView({
   const [reloadKey, setReloadKey] = useState(0);
 
   useEffect(() => {
+    if (filtering) return;
     const controller = new AbortController();
     setError(null);
     setHero(undefined);
@@ -184,7 +201,7 @@ export function DiscoverView({
         });
     }
     return () => controller.abort();
-  }, [cacheKey, mediaType, reloadKey, source]);
+  }, [cacheKey, filtering, mediaType, reloadKey, source]);
 
   const switchSource = useCallback(
     (nextSource: MediaSource) => {
@@ -192,6 +209,31 @@ export function DiscoverView({
       router.push(`/discover/${mediaType}?source=${nextSource}` as Route);
     },
     [mediaType, router, source],
+  );
+
+  const applyFilters = useCallback(
+    (nextFilters: DiscoveryFilters) => {
+      const query = discoveryFiltersQuery(nextFilters);
+      router.push(`/discover/${mediaType}${query ? `?${query}` : ""}` as Route);
+    },
+    [mediaType, router],
+  );
+
+  const controls = useMemo(
+    () => (
+      <div className="flex items-center gap-2">
+        {source === "tmdb" && (
+          <DiscoveryFilterControl
+            mediaType={mediaType}
+            filters={filters}
+            currentYear={currentYear}
+            onApply={applyFilters}
+          />
+        )}
+        <SourceSwitcher value={source} onChange={switchSource} />
+      </div>
+    ),
+    [applyFilters, currentYear, filters, mediaType, source, switchSource],
   );
 
   // 发现页是侧栏一级入口，没有 PageNav，数据源切换若自己吸一条顶栏，窄屏上
@@ -202,14 +244,32 @@ export function DiscoverView({
   const setTopBarActions = chrome?.setTopBarActions;
   useEffect(() => {
     if (!isMobile || !setTopBarActions) return;
-    return setTopBarActions(<SourceSwitcher value={source} onChange={switchSource} />);
-  }, [isMobile, setTopBarActions, source, switchSource]);
+    return setTopBarActions(controls);
+  }, [controls, isMobile, setTopBarActions]);
 
   const toolbar = isMobile ? null : (
     <div className="sticky top-0 z-20 flex items-center justify-end px-6 pb-3 pt-7">
-      <SourceSwitcher value={source} onChange={switchSource} />
+      {controls}
     </div>
   );
+
+  if (filtering) {
+    return (
+      <div
+        ref={scrollRef}
+        data-scroll-root
+        className="scroll-thin scroll-safe flex-1 overflow-y-auto pb-10 max-md:pt-4"
+      >
+        {toolbar}
+        <FilteredDiscoveryView
+          key={filterKey}
+          mediaType={mediaType}
+          filters={filters}
+          onClear={() => applyFilters(EMPTY_DISCOVERY_FILTERS)}
+        />
+      </div>
+    );
+  }
 
   if (error) {
     return (

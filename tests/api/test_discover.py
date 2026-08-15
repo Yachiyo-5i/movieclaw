@@ -15,9 +15,11 @@ from movieclaw_media.models import (
     DiscoverLayout,
     DiscoverRowStub,
     MediaCard,
+    MediaCollection,
     MediaDetail,
     MediaFacts,
     MediaKind,
+    MediaPage,
     MediaRow,
     MediaSearchItem,
     MediaSource,
@@ -121,13 +123,47 @@ class _StubTmdbService(_StubService):
             )
         ]
 
+    async def discover_page(
+        self, kind: MediaKind, row_id: str, page: int = 1
+    ) -> MediaPage | None:
+        if row_id != "popular":
+            return None
+        card = _sample_card()
+        card.type = kind
+        return MediaPage(
+            id=row_id,
+            title="热门电影",
+            items=[card],
+            page=page,
+            total_pages=3,
+            total_results=41,
+        )
+
+    async def discovery_genres(self, kind: MediaKind) -> dict[int, str]:
+        return {878: "科幻", 28: "动作"}
+
+    async def discover_filtered(self, kind: MediaKind, **kwargs) -> MediaPage:
+        card = _sample_card()
+        card.type = kind
+        return MediaPage(
+            id="filtered",
+            title="筛选结果",
+            items=[card],
+            page=kwargs["page"],
+            total_pages=2,
+            total_results=21,
+        )
+
     async def media_detail(self, kind: MediaKind, tmdb_id: int) -> MediaDetail:
         card = _sample_card()
         card.id = str(tmdb_id)
         card.type = kind
+        series_card = _sample_card()
+        series_card.id = "43"
         return MediaDetail(
             card=card,
             facts=MediaFacts(aliases=["示例别名"], source_url="https://www.themoviedb.org/"),
+            collection=MediaCollection(id="7", name="示例系列", items=[card, series_card]),
         )
 
 
@@ -204,6 +240,41 @@ def test_browse_collection_returns_titles_with_stable_refs(
     assert data["titles"][0]["title_ref"] == "tmdb:movie:42"
     assert data["titles"][0]["external_id"] == "42"
     assert data["returned_count"] == 1
+    assert data["page"] == 1
+    assert data["total_pages"] == 3
+    assert data["total_results"] == 41
+    assert data["has_more"] is True
+
+
+def test_filter_options_and_combined_discovery(client: TestClient, monkeypatch) -> None:
+    _patch_title_discovery_providers(monkeypatch)
+
+    options = client.get("/api/v1/discover/filters", params={"media_type": "movie"})
+    assert options.status_code == 200, options.text
+    assert options.json()["data"]["genres"] == [
+        {"id": 878, "name": "科幻"},
+        {"id": 28, "name": "动作"},
+    ]
+
+    result = client.get(
+        "/api/v1/discover/titles",
+        params=[
+            ("media_type", "movie"),
+            ("genre_ids", "878"),
+            ("genre_ids", "28"),
+            ("origin_country", "jp"),
+            ("year", "2025"),
+            ("rating_gte", "7"),
+            ("runtime_lte", "90"),
+            ("sort", "rating"),
+            ("page", "1"),
+        ],
+    )
+    assert result.status_code == 200, result.text
+    data = result.json()["data"]
+    assert data["titles"][0]["title_ref"] == "tmdb:movie:42"
+    assert data["total_results"] == 21
+    assert data["has_more"] is True
 
 
 def test_search_titles_combines_providers_and_returns_refs(
@@ -285,6 +356,11 @@ def test_get_title_details_consumes_title_ref(client: TestClient, monkeypatch) -
     data = resp.json()["data"]
     assert data["title"]["title_ref"] == "tmdb:movie:438631"
     assert data["metadata"]["aliases"] == ["示例别名"]
+    assert data["collection"]["name"] == "示例系列"
+    assert [item["title_ref"] for item in data["collection"]["titles"]] == [
+        "tmdb:movie:438631",
+        "tmdb:movie:43",
+    ]
 
 
 def test_invalid_stable_refs_return_readable_400(client: TestClient, monkeypatch) -> None:
@@ -315,3 +391,4 @@ def test_discovery_ui_manifest_references_domain_collections(
         "preview_limit": 6,
         "supports_full_listing": False,
     }
+    assert sections[1]["supports_full_listing"] is True

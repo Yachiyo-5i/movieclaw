@@ -31,6 +31,7 @@ from movieclaw_api.services.subscription import close_fulfilled_wanted
 from movieclaw_db.models import Library, LibraryFile, MediaItem, utcnow
 from movieclaw_db.models.library_file import IdentitySource
 from movieclaw_db.repositories.library_file_repo import LibraryFileRepository
+from movieclaw_db.repositories.library_repo import LibraryRepository
 from movieclaw_media.models import MediaKind
 
 logger = logging.getLogger("movieclaw_api.library_claim")
@@ -110,6 +111,7 @@ async def claim_files(
     await asyncio.to_thread(_correct_conflicting_nfos, rows, kind, library, item)
     # 库存对账：认领让单元"在库"成立，关闭对应的订阅工单
     await close_fulfilled_wanted(session, item.id)
+    await LibraryRepository(session).refresh_stats(library_ids)
     return item, len(rows), displaced
 
 
@@ -183,4 +185,5 @@ async def resolve_review(
     # 库存对账：改挂让新条目的单元"在库"成立，关闭对应的订阅工单
     for item_id in accepted_items:
         await close_fulfilled_wanted(session, item_id)
+    await LibraryRepository(session).refresh_stats({row.library_id for row in pending})
     return len(pending), title, displaced

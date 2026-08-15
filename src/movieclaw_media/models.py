@@ -81,8 +81,20 @@ class MediaRow(BaseModel):
 
     id: str
     title: str
-    ranked: bool = Field(default=False, description="是否为 Top 10 大数字排名行")
+    ranked: bool = Field(default=False, description="是否为大数字排名行")
     items: list[MediaCard]
+
+
+class MediaPage(BaseModel):
+    """一页可继续向后加载的 TMDB 发现结果。"""
+
+    id: str
+    title: str
+    ranked: bool = Field(default=False, description="是否为大数字排名行")
+    items: list[MediaCard]
+    page: int = Field(ge=1)
+    total_pages: int = Field(ge=1)
+    total_results: int = Field(ge=0)
 
 
 class DiscoverRowStub(BaseModel):
@@ -94,7 +106,7 @@ class DiscoverRowStub(BaseModel):
 
     id: str
     title: str
-    ranked: bool = Field(default=False, description="是否为 Top 10 大数字排名行")
+    ranked: bool = Field(default=False, description="是否为大数字排名行")
 
 
 class DiscoverLayout(BaseModel):
@@ -163,6 +175,14 @@ class MediaImage(BaseModel):
     height: int
 
 
+class MediaCollection(BaseModel):
+    """电影所属系列及其全部作品；剧集和不属于系列的电影没有此字段。"""
+
+    id: str = Field(description="TMDB collection ID")
+    name: str
+    items: list[MediaCard] = Field(default_factory=list)
+
+
 class MediaDetail(BaseModel):
     """条目详情：卡片字段（详情接口回填了 extent 等）+ 词条信息 + 图片 + 相似推荐。"""
 
@@ -171,6 +191,10 @@ class MediaDetail(BaseModel):
     backdrops: list[MediaImage] = Field(default_factory=list, description="剧照（16:9 宽幅）")
     posters: list[MediaImage] = Field(
         default_factory=list, description="海报（2:3 竖版，配置语言优先）"
+    )
+    collection: MediaCollection | None = Field(
+        default=None,
+        description="电影所属系列的完整作品清单；不属于系列或剧集为 null",
     )
     related: list[MediaCard] = Field(default_factory=list, description="TMDB 推荐的相似作品")
     library_links: list[MediaLibraryLink] = Field(

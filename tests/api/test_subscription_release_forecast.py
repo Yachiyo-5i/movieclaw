@@ -10,14 +10,20 @@ import pytest_asyncio
 from sqlmodel import select
 
 from movieclaw_api.core.config import get_settings
-from movieclaw_api.services.subscription import refresh_release_forecasts
+from movieclaw_api.services.subscription import (
+    next_forecast_probe_times_by_wanted,
+    refresh_release_forecasts,
+)
 from movieclaw_api.services.torrent_sync import _plan_sync
 from movieclaw_db.engine import dispose_db, get_database, init_db
 from movieclaw_db.migrations import run_migrations
 from movieclaw_db.models import (
+    AuthType,
+    ConfigStatus,
     MediaEpisode,
     MediaItem,
     RuleSet,
+    SiteCredential,
     SiteSyncCursor,
     SiteTorrent,
     Subscription,
@@ -40,7 +46,9 @@ async def db(tmp_path, monkeypatch):
     get_settings.cache_clear()
 
 
-async def _seed_target(session, *, cadence_days: int = 7) -> tuple[WantedItem, datetime]:
+async def _seed_target(
+    session, *, cadence_days: int = 7, follow_future: bool = True
+) -> tuple[WantedItem, datetime]:
     """建立 E1 已发布、E2 待追的最小周播/日播样本。"""
     today = utcnow().date()
     first_air = today - timedelta(days=1)
@@ -85,7 +93,7 @@ async def _seed_target(session, *, cadence_days: int = 7) -> tuple[WantedItem, d
         media_item_id=item.id,
         kind="tv",
         selected_seasons=[],
-        follow_future=True,
+        follow_future=follow_future,
         rule_set_id=rule.id,
         status=SubscriptionStatus.ACTIVE,
     )
@@ -147,6 +155,65 @@ async def test_e2_bootstrap_predicts_daily_and_weekly_release(db, cadence_days: 
         assert len(forecast["sites"][0]["probe_times"]) == 3
 
 
+async def test_selected_episode_forecast_ignores_follow_future(db) -> None:
+    """自动续订关闭后，已在当前范围内的待播集仍须生成预测。"""
+    async with db.session() as session:
+        wanted, _expected = await _seed_target(session, follow_future=False)
+        changed = await refresh_release_forecasts(
+            session, media_item_ids={wanted.media_item_id}
+        )
+
+        assert changed == 1
+        assert wanted.release_forecast is not None
+
+
+async def test_displayed_probe_uses_scheduler_courtesy_time(db) -> None:
+    """首页返回的探测点必须与调度器应用 15 分钟礼貌间隔后的时间一致。"""
+    async with db.session() as session:
+        wanted, _expected = await _seed_target(session, follow_future=False)
+        now = utcnow()
+        last_sync_at = now - timedelta(minutes=5)
+        raw_probe = now + timedelta(minutes=1)
+        expected_probe = last_sync_at + timedelta(minutes=15)
+        wanted.release_forecast = {
+            "version": 1,
+            "target_air_date": wanted.air_date.isoformat(),
+            "confidence": "bootstrap",
+            "window_end": (now + timedelta(hours=1)).replace(tzinfo=UTC).isoformat(),
+            "sites": [
+                {
+                    "site_id": "site-a",
+                    "probe_times": [raw_probe.replace(tzinfo=UTC).isoformat()],
+                }
+            ],
+        }
+        session.add_all(
+            [
+                wanted,
+                SiteCredential(
+                    site_id="site-a",
+                    auth_type=AuthType.COOKIE,
+                    cookie="session=test",
+                    enabled=True,
+                    status=ConfigStatus.ACTIVE,
+                ),
+                SiteSyncCursor(
+                    site_id="site-a",
+                    tracking_since=now - timedelta(days=1),
+                    last_sync_at=last_sync_at,
+                    next_sync_at=now + timedelta(hours=6),
+                ),
+            ]
+        )
+        await session.commit()
+
+        probe_times = await next_forecast_probe_times_by_wanted(
+            session, wanted_items=[wanted]
+        )
+
+        assert probe_times[wanted.id] == expected_probe
+
+
 async def test_pack_is_not_used_as_single_episode_observation(db) -> None:
     """整季包发布时间无法代表某一集，必须排除，避免污染下一集预测。"""
     async with db.session() as session:
@@ -171,9 +238,9 @@ async def test_pack_is_not_used_as_single_episode_observation(db) -> None:
 
 
 async def test_prediction_probe_advances_existing_site_sync(db) -> None:
-    """预测只提前既有同步；普通同步消费探测点，暂停订阅后也立即失效。"""
+    """预测不受自动续订影响；普通同步消费探测点，暂停后探测立即失效。"""
     async with db.session() as session:
-        wanted, _expected = await _seed_target(session)
+        wanted, _expected = await _seed_target(session, follow_future=False)
         now = utcnow()
         wanted.release_forecast = {
             "version": 1,

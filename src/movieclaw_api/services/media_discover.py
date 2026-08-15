@@ -73,6 +73,7 @@ def get_media_service() -> MediaDiscoverService:
             image_base_url=effective_tmdb_image_base_url(),
             language=settings.tmdb_language,
             region=settings.tmdb_region,
+            timezone=settings.scheduler_timezone,
         )
     return _service
 

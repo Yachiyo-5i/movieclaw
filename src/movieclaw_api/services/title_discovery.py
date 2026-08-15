@@ -19,12 +19,17 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from movieclaw_api.schemas.discover import (
+    DiscoveredTitleCollectionView,
     DiscoveredTitleDetailsView,
     DiscoveredTitleMetadata,
     DiscoveredTitleView,
     DiscoveryCollectionTitlesView,
     DiscoveryCollectionView,
+    DiscoveryFilterOptionsView,
+    DiscoveryGenreView,
     DiscoveryProviderSelection,
+    DiscoverySort,
+    DiscoveryTitlePageView,
     TitleSearchProviderStatus,
 )
 from movieclaw_api.services.discover_library import DiscoverLibraryProjectionService
@@ -102,7 +107,9 @@ class TitleDiscoveryService:
                     name=row.title,
                     is_ranked=row.ranked,
                     default_limit=30 if provider is MediaSource.DOUBAN else 20,
-                    supports_full_listing=full_limit is not None,
+                    supports_full_listing=(
+                        provider is MediaSource.TMDB or full_limit is not None
+                    ),
                 )
             )
         return collections
@@ -112,6 +119,7 @@ class TitleDiscoveryService:
         collection_ref: str,
         *,
         limit: int,
+        page: int = 1,
         projection: DiscoverLibraryProjectionService | None = None,
     ) -> DiscoveryCollectionTitlesView:
         """读取一个片单；白名单校验由 ``list_collections`` 的事实集合完成。"""
@@ -128,14 +136,31 @@ class TitleDiscoveryService:
             raise LookupError("该片单不存在或当前来源未开放浏览")
 
         service = self._provider(provider)
+        total_pages = 1
+        total_results = 0
+        current_page = 1
         if provider is MediaSource.TMDB:
             if collection_id == _TMDB_FEATURED_ID:
                 cards = await service.discover_hero(media_type)
+                total_results = len(cards)
             else:
-                row = await service.discover_row(media_type, collection_id)
-                if row is None:
-                    raise LookupError("该片单不存在或当前来源未开放浏览")
-                cards = row.items
+                # 旧测试桩与第三方内嵌调用可能只实现 discover_row；生产服务优先
+                # 使用 discover_page，兼容分支保持原单页语义且不会伪造后续页。
+                discover_page = getattr(service, "discover_page", None)
+                if discover_page is not None:
+                    result_page = await discover_page(media_type, collection_id, page)
+                    if result_page is None:
+                        raise LookupError("该片单不存在或当前来源未开放浏览")
+                    cards = result_page.items
+                    current_page = result_page.page
+                    total_pages = result_page.total_pages
+                    total_results = result_page.total_results
+                else:
+                    row = await service.discover_row(media_type, collection_id)
+                    if row is None:
+                        raise LookupError("该片单不存在或当前来源未开放浏览")
+                    cards = row.items
+                    total_results = len(cards)
         else:
             full_limit = _DOUBAN_FULL_LIMITS.get(collection_id)
             if full_limit is not None and limit > descriptor.default_limit:
@@ -145,6 +170,7 @@ class TitleDiscoveryService:
                 if row is None:
                     raise LookupError("该片单不存在或当前来源未开放浏览")
             cards = row.items
+            total_results = len(cards)
 
         truncated = len(cards) > limit
         selected = cards[:limit]
@@ -155,6 +181,56 @@ class TitleDiscoveryService:
             titles=[title_from_card(card, provider=provider) for card in selected],
             returned_count=len(selected),
             truncated=truncated,
+            page=current_page,
+            total_pages=total_pages,
+            total_results=total_results,
+            has_more=current_page < total_pages,
+        )
+
+    async def filter_options(self, media_type: MediaKind) -> DiscoveryFilterOptionsView:
+        """返回 TMDB 的本地化类型清单；其余筛选值由稳定枚举或数值范围表达。"""
+        genres = await self._tmdb_factory().discovery_genres(media_type)
+        return DiscoveryFilterOptionsView(
+            media_type=media_type,
+            genres=[
+                DiscoveryGenreView(id=genre_id, name=name)
+                for genre_id, name in genres.items()
+            ],
+        )
+
+    async def discover_titles(
+        self,
+        media_type: MediaKind,
+        *,
+        genre_ids: list[int] | None = None,
+        origin_country: str | None = None,
+        year: int | None = None,
+        rating_gte: float | None = None,
+        runtime_lte: int | None = None,
+        sort: DiscoverySort = DiscoverySort.POPULAR,
+        page: int = 1,
+        projection: DiscoverLibraryProjectionService | None = None,
+    ) -> DiscoveryTitlePageView:
+        """执行组合筛选，并在返回前补齐当前主体可见的本地库存状态。"""
+        result = await self._tmdb_factory().discover_filtered(
+            media_type,
+            genre_ids=genre_ids,
+            origin_country=origin_country,
+            year=year,
+            rating_gte=rating_gte,
+            runtime_lte=runtime_lte,
+            sort=sort.value,
+            page=page,
+        )
+        if projection is not None:
+            await projection.apply_cards(result.items)
+        return DiscoveryTitlePageView(
+            media_type=media_type,
+            titles=[title_from_card(card) for card in result.items],
+            page=result.page,
+            total_pages=result.total_pages,
+            total_results=result.total_results,
+            has_more=result.page < result.total_pages,
         )
 
     async def search_titles(
@@ -322,6 +398,15 @@ def title_details_from_legacy(
         ),
         backdrops=detail.backdrops,
         posters=detail.posters,
+        collection=(
+            DiscoveredTitleCollectionView(
+                id=detail.collection.id,
+                name=detail.collection.name,
+                titles=[title_from_card(card) for card in detail.collection.items],
+            )
+            if detail.collection is not None
+            else None
+        ),
         recommendations=[title_from_card(card) for card in detail.related],
         library_links=detail.library_links,
     )

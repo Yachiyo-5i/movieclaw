@@ -38,6 +38,7 @@ from movieclaw_api.schemas.subscription import (
     SubscriptionTrackingStatePayload,
     SubscriptionUpdatePayload,
     SubscriptionView,
+    TodayArrivalView,
 )
 from movieclaw_api.services.auth import Principal
 from movieclaw_api.services.media_discover import get_tmdb_client
@@ -48,6 +49,7 @@ from movieclaw_api.services.title_discovery import (
     parse_title_ref,
 )
 from movieclaw_db.engine import get_session
+from movieclaw_db.repositories import LibraryFileRepository, MediaItemRepository
 from movieclaw_media import DoubanError, TmdbError
 from movieclaw_media.library import ResolveStatus
 from movieclaw_media.models import MediaKind, MediaSource
@@ -76,8 +78,6 @@ async def _prepare_resolved_target(
 ) -> PrepareView:
     """把已消歧的目标投影成订阅表单需要的季集、库存与现有订阅状态。"""
     item, seasons, existing = await service.prepare(kind, tmdb_id, douban_id=douban_id)
-    from movieclaw_db.repositories import MediaItemRepository
-    from movieclaw_db.repositories.library_file_repo import LibraryFileRepository
 
     assert item.id is not None
     owned = await LibraryFileRepository(session).owned_units(item.id)
@@ -309,7 +309,60 @@ async def list_subscriptions(
         kind=kind,
         member_id=None if principal.is_admin else principal.member_id,
     )
-    return ok([SubscriptionView.from_model(s, m, c) for s, m, c in rows])
+    # 收录信息必须以元数据季骨架 + 媒体库实际在位文件为准，不能复用工单进度：
+    # 创建订阅前已经在库的集不会生成工单，用工单数会把真实库存漏掉。
+    tv_item_ids = list(
+        {item.id for _sub, item, _counts in rows if item.kind == "tv" and item.id is not None}
+    )
+    media_repo = MediaItemRepository(session)
+    seasons_by_item = await media_repo.list_seasons_many(tv_item_ids)
+    aired_by_item = await media_repo.aired_units_many(tv_item_ids, include_specials=True)
+    owned_by_item = await LibraryFileRepository(session).owned_units_many(tv_item_ids)
+
+    views: list[SubscriptionView] = []
+    for sub, item, counts in rows:
+        item_id = item.id or -1
+        aired = aired_by_item.get(item_id, set())
+        owned = owned_by_item.get(item_id, set())
+        collection = [
+            SeasonOverview.from_row(
+                season,
+                aired_count=sum(1 for unit in aired if unit[0] == season.season_number),
+                owned_units=owned,
+            )
+            for season in seasons_by_item.get(item_id, [])
+        ]
+        views.append(SubscriptionView.from_model(sub, item, counts, collection))
+    return ok(views)
+
+
+@router.get(
+    "/today-arrivals",
+    response_model=ApiResponse[list[TodayArrivalView]],
+    summary="列出今天可能入库的订阅剧集",
+    operation_id="subscriptions.list-today-arrivals",
+)
+async def list_today_arrivals(
+    principal: Principal = Depends(require_login),
+    session: AsyncSession = Depends(get_session),
+) -> ApiResponse[list[TodayArrivalView]]:
+    """首页专用聚合：成员沿用“自己发起 + 自己关注”的订阅可见边界。"""
+    candidates = await _service(session).today_arrivals(
+        member_id=None if principal.is_admin else principal.member_id
+    )
+    return ok(
+        [
+            TodayArrivalView.from_models(
+                candidate.subscription,
+                candidate.media,
+                candidate.wanted,
+                next_probe_at=candidate.next_probe_at,
+                release_to_import_minutes=candidate.release_to_import_minutes,
+                download_to_import_minutes=candidate.download_to_import_minutes,
+            )
+            for candidate in candidates
+        ]
+    )
 
 
 @router.get(
@@ -372,7 +425,7 @@ async def list_subscription_activities(
 @router.patch(
     "/{subscription_id}",
     response_model=ApiResponse[SubscriptionDetailView],
-    summary="修改订阅的选季、持续追新、过滤规则或目标媒体库",
+    summary="修改订阅的选季、自动续订、过滤规则或目标媒体库",
     operation_id="subscriptions.update",
 )
 async def update_subscription(
@@ -510,7 +563,7 @@ async def set_subscription_tracking_state(
 @router.patch(
     "/{subscription_id}/follow-future",
     response_model=ApiResponse[SubscriptionDetailView],
-    summary="启用或禁用一条剧集订阅的持续追新",
+    summary="开启或关闭一条剧集订阅的自动续订",
     operation_id="subscriptions.set-follow-future",
 )
 async def set_subscription_follow_future(
@@ -519,7 +572,7 @@ async def set_subscription_follow_future(
     principal: Principal = Depends(require_subscribe_capability),
     session: AsyncSession = Depends(get_session),
 ) -> ApiResponse[SubscriptionDetailView]:
-    """详情页直接操作入口；电影订阅没有持续追新语义。"""
+    """详情页直接操作入口；电影订阅没有自动续订语义。"""
     service = _service(session)
     await service.assert_can_manage(
         subscription_id, None if principal.is_admin else principal.member_id
@@ -527,7 +580,7 @@ async def set_subscription_follow_future(
     await service.set_follow_future(subscription_id, payload.enabled)
     sub, item, wanted = await service.detail(subscription_id)
     resource_timings = await service.resource_timings(subscription_id)
-    message = "已启用持续追新" if payload.enabled else "已禁用持续追新"
+    message = "已开启自动续订" if payload.enabled else "已关闭自动续订"
     return ok(
         SubscriptionDetailView.from_detail(sub, item, wanted, resource_timings),
         message=message,

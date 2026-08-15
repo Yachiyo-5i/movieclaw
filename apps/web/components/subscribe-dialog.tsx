@@ -38,13 +38,13 @@ export interface SubscribeTarget {
  * 订阅弹层：一次点击完成订阅，复杂度沉到默认值。
  *
  * 流程（对应后端 /subscriptions/title-preview 的三态）：
- *   loading → ready（渲染季选择 + 追新开关 + 规则组）
+ *   loading → ready（渲染季选择 + 自动续订开关 + 规则组）
  *           → ambiguous（豆瓣收敛歧义：候选墙确认一次后重新 prepare）
  *           → not_found（TMDB 未收录，无法订阅）
  * 已订阅的条目进入管理态：展示状态并提供取消订阅。
  *
  * 默认值策略：剧集默认勾选全部已播出的正季（特别季 0 须手动勾）、
- * 在播剧默认打开「持续追新」；规则组默认选中系统默认组。
+ * 在播剧默认打开「自动续订」；规则组默认选中系统默认组。
  */
 export function SubscribeDialog({
   target,
@@ -130,7 +130,7 @@ export function SubscribeDialog({
         }
         setLibraryId(pickedId);
         setPrepared(result);
-        // 默认勾选全部已播出的正季；在播剧默认追新
+        // 默认勾选全部已播出的正季；在播剧默认开启自动续订
         const airedSeasons = result.seasons
           .filter((s) => s.season_number > 0 && s.aired_count > 0)
           .map((s) => s.season_number);
@@ -335,7 +335,7 @@ export function SubscribeDialog({
                   <label className="mt-4 flex cursor-pointer items-center justify-between rounded-xl border border-white/[0.08] bg-white/[0.04] px-4 py-3">
                     <span>
                       <span className="block text-ui font-medium text-white/90">
-                        持续追新
+                        自动续订
                       </span>
                       <span className="mt-0.5 block text-caption text-[var(--text-faint)]">
                         之后播出的新集、新一季自动加入追踪

@@ -19,7 +19,6 @@ from movieclaw_cli.core.errors import CliError
 from movieclaw_cli.core.http import Api
 from movieclaw_cli.gen import spec_loader
 from movieclaw_cli.gen.tree_builder import DOMAIN_HELP, build_tree
-from movieclaw_cli.overlay.agent_cmds import agent_attach, agent_run
 from movieclaw_cli.overlay.auth_cmds import login, logout, status
 from movieclaw_cli.overlay.groups import DefaultCommandGroup
 from movieclaw_cli.overlay.jobs_cmds import jobs_wait
@@ -30,6 +29,11 @@ from movieclaw_cli.overlay.search_cmds import (
     search_library_items,
     search_titles,
     search_torrents,
+)
+from movieclaw_cli.overlay.session_cmds import (
+    session_follow,
+    session_retry,
+    session_start,
 )
 
 
@@ -105,10 +109,11 @@ def _assemble() -> None:
     library_group.add_command(library_reconcile_paths)
     cli.add_command(library_group)
 
-    agent_group = click.Group(name="agent", help=DOMAIN_HELP.get("agent"))
-    agent_group.add_command(agent_run)
-    agent_group.add_command(agent_attach)
-    cli.add_command(agent_group)
+    session_group = click.Group(name="session", help=DOMAIN_HELP.get("session"))
+    session_group.add_command(session_start)
+    session_group.add_command(session_retry)
+    session_group.add_command(session_follow)
+    cli.add_command(session_group)
 
     logs_group = click.Group(name="logs", help=DOMAIN_HELP.get("logs"))
     logs_group.add_command(logs_tail)

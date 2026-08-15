@@ -1,27 +1,83 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import type { Route } from "next";
 import Link from "next/link";
 
 import { ContentEmptyState } from "@/components/content-empty-state";
-import { CompassIcon } from "@/components/icons";
+import { ChevronRightIcon, ClockIcon, CompassIcon } from "@/components/icons";
 import { PosterCardVisual, type PosterVisualItem } from "@/components/poster-card";
 import { useSubscribeEntry } from "@/components/subscribe-entry";
+import type { DownloadTask } from "@/lib/api/downloaders";
 import {
   checkSubscriptionAutomationReadiness,
   listRuleSets,
+  listTodaySubscriptionArrivals,
   type RuleSet,
   type Subscription,
+  type TodaySubscriptionArrival,
 } from "@/lib/api/subscriptions";
+import { useDownloadTasks } from "@/lib/download-tasks";
 import { listLibraries, type MediaLibrary } from "@/lib/api/libraries";
 import { cachedImageUrl } from "@/lib/image-proxy";
 import { usePageChrome } from "@/lib/page-chrome";
 import { usePermissions } from "@/lib/permissions";
-import { subscriptionFollowRibbon } from "@/lib/subscription-ui";
+import {
+  nextSubscriptionVisibleCount,
+  SUBSCRIPTION_BATCH_SIZE,
+  subscriptionOverviewSections,
+  type SubscriptionFilter,
+  type SubscriptionKind,
+} from "@/lib/subscription-overview";
+import {
+  groupTodayArrivals,
+  subscriptionCollectionMeta,
+  subscriptionFollowRibbon,
+  todayArrivalPresentation,
+  type TodayArrivalPresentation,
+} from "@/lib/subscription-ui";
 import { useIsMobile } from "@/lib/use-media-query";
 import { useScrollRestoration } from "@/lib/use-scroll-restoration";
+import { useVisiblePolling } from "@/lib/use-visible-polling";
+
+const TODAY_ARRIVALS_POLL_MS = 10_000;
+
+const rememberedVisibleCounts: Record<SubscriptionKind, number> = {
+  movie: SUBSCRIPTION_BATCH_SIZE,
+  tv: SUBSCRIPTION_BATCH_SIZE,
+};
+
+/** 今日时间轨道的状态色：只承担进度语义，不与下方海报墙争夺视觉焦点。 */
+const todayArrivalStyle: Record<
+  TodayArrivalPresentation["statusLabel"],
+  { node: string; status: string; time: string; pulse: boolean }
+> = {
+  预计入库: {
+    node: "border-violet-300/70 bg-violet-400 shadow-[0_0_12px_rgba(167,139,250,0.38)]",
+    status: "border-violet-300/15 bg-violet-400/10 text-violet-200/90",
+    time: "text-violet-100/90",
+    pulse: false,
+  },
+  等待资源: {
+    node: "border-amber-200/70 bg-amber-300 shadow-[0_0_12px_rgba(252,211,77,0.3)]",
+    status: "border-amber-200/15 bg-amber-300/10 text-amber-100/85",
+    time: "text-amber-50/85",
+    pulse: false,
+  },
+  下载中: {
+    node: "border-cyan-200/75 bg-cyan-300 shadow-[0_0_14px_rgba(103,232,249,0.42)]",
+    status: "border-cyan-200/20 bg-cyan-300/10 text-cyan-100",
+    time: "text-cyan-50/90",
+    pulse: true,
+  },
+  整理中: {
+    node: "border-emerald-200/70 bg-emerald-300 shadow-[0_0_13px_rgba(110,231,183,0.38)]",
+    status: "border-emerald-200/15 bg-emerald-300/10 text-emerald-100/90",
+    time: "text-emerald-50/90",
+    pulse: false,
+  },
+};
 
 /**
  * 订阅页：用户全部订阅的海报墙。
@@ -30,16 +86,31 @@ import { useScrollRestoration } from "@/lib/use-scroll-restoration";
  * 弹层里取消订阅后 context 刷新，这里的墙面即时同步，无需各自维护快照。
  * 进入本页时主动 refresh 一次，保证订阅清单是新鲜的。
  *
- * 结构：页头（标题 + 订阅总数说明）+ 自适应海报网格。
- * 海报只表达不会随任务瞬时变化的订阅配置：持续追新常显为右上斜标，
- * 桌面悬浮时补充选季与「规则 → 媒体库」；执行状态与进度统一去任务中心查看。
+ * 结构：页头（标题 + 二级导航）+ 今日摘要 + 剧集/电影分区海报墙。
+ * 海报常显自动续订与真实收录摘要；桌面悬浮时补充选季与
+ * 「规则 → 媒体库」，瞬时执行状态统一去任务中心查看。
  */
 export function SubscriptionsView() {
-  const { canManageSubscriptions, canSubscribe } = usePermissions();
-  const scrollRef = useScrollRestoration("subscriptions");
-  const [mediaType, setMediaType] = useState<"movie" | "tv">("movie");
+  const { canManageSubscriptions, canSubscribe, isAdmin } = usePermissions();
+  const restoreScrollRef = useScrollRestoration("subscriptions", {
+    anchorAttribute: "data-subscription-id",
+  });
+  const scrollRootRef = useRef<HTMLDivElement | null>(null);
+  const scrollRef = useCallback(
+    (node: HTMLDivElement | null) => {
+      scrollRootRef.current = node;
+      restoreScrollRef(node);
+    },
+    [restoreScrollRef],
+  );
+  const [mediaType, setMediaType] = useState<SubscriptionFilter>("all");
   const { subscriptions, refresh } = useSubscribeEntry();
+  const { tasks: downloadTasks } = useDownloadTasks();
   const [failed, setFailed] = useState(false);
+  const [todayArrivals, setTodayArrivals] = useState<TodaySubscriptionArrival[] | null>(null);
+  const [todayArrivalsFailed, setTodayArrivalsFailed] = useState(false);
+  const todayArrivalsRequestRef = useRef(0);
+  const hasTodayArrivalsSnapshotRef = useRef(false);
   const [ruleSets, setRuleSets] = useState<RuleSet[]>([]);
   const [libraries, setLibraries] = useState<MediaLibrary[]>([]);
   // 链路体检整体为 error 时顶部亮警示横幅（提醒推到用户在的地方，
@@ -63,6 +134,50 @@ export function SubscriptionsView() {
   useEffect(() => {
     reload();
   }, [reload]);
+
+  const todayArrivalsEnabled =
+    mediaType !== "movie" &&
+    subscriptions !== null &&
+    subscriptions.some((sub) => sub.media.kind === "tv");
+  const refreshTodayArrivals = useCallback(() => {
+    if (!todayArrivalsEnabled) return;
+    const requestId = ++todayArrivalsRequestRef.current;
+    void listTodaySubscriptionArrivals()
+      .then((rows) => {
+        if (requestId !== todayArrivalsRequestRef.current) return;
+        hasTodayArrivalsSnapshotRef.current = true;
+        setTodayArrivals(rows);
+        setTodayArrivalsFailed(false);
+      })
+      .catch(() => {
+        if (
+          requestId === todayArrivalsRequestRef.current &&
+          !hasTodayArrivalsSnapshotRef.current
+        ) {
+          setTodayArrivals([]);
+          setTodayArrivalsFailed(true);
+        }
+      });
+  }, [todayArrivalsEnabled]);
+
+  // 今日区域属于“全部”和“剧集”视图。首次进入与订阅清单变化时立即读取，
+  // 停留期间每 10 秒静默同步；后台标签页暂停，恢复可见时补一次。已有快照
+  // 遇到瞬时请求失败继续保留，避免时间轨道闪成错误态或重新出现加载文案。
+  useEffect(() => {
+    if (!todayArrivalsEnabled) {
+      todayArrivalsRequestRef.current += 1;
+      hasTodayArrivalsSnapshotRef.current = false;
+      setTodayArrivals(null);
+      setTodayArrivalsFailed(false);
+      return;
+    }
+    setTodayArrivalsFailed(false);
+    refreshTodayArrivals();
+  }, [refreshTodayArrivals, subscriptions, todayArrivalsEnabled]);
+  useVisiblePolling(
+    refreshTodayArrivals,
+    todayArrivalsEnabled ? TODAY_ARRIVALS_POLL_MS : null,
+  );
 
   // 配置名称不是订阅摘要的一部分，分别用现有列表接口补齐。规则组沿用详情页
   // 的管理员可见边界；媒体库接口会按成员白名单过滤，因此所有登录用户都可安全读取。
@@ -91,18 +206,41 @@ export function SubscriptionsView() {
     };
   }, [canManageSubscriptions]);
 
-  // 电影/剧集切换在移动端挂进全局顶栏右上角（字标与搜索之间那段空位），
+  // 全部/剧集/电影切换在移动端挂进全局顶栏右上角（字标与搜索之间那段空位），
   // 与发现页的数据源切换同一套安放方式——窄屏页头不再为它单独堆一行。
-  // 桌面端维持页头右侧的原位不变。
+  // 桌面端则作为标题下方的二级导航，避免把内容分类误读成页面操作。
   const chrome = usePageChrome();
   const isMobile = useIsMobile();
   const setTopBarActions = chrome?.setTopBarActions;
+  const switchMediaType = useCallback(
+    (next: SubscriptionFilter) => {
+      if (next === mediaType) return;
+      scrollRootRef.current?.scrollTo({ top: 0 });
+      setMediaType(next);
+    },
+    [mediaType],
+  );
   useEffect(() => {
     if (!isMobile || !setTopBarActions) return;
-    return setTopBarActions(<MediaTypeSwitcher value={mediaType} onChange={setMediaType} />);
-  }, [isMobile, setTopBarActions, mediaType]);
+    return setTopBarActions(
+      <MediaTypeSwitcher compact value={mediaType} onChange={switchMediaType} />,
+    );
+  }, [isMobile, mediaType, setTopBarActions, switchMediaType]);
 
-  const visible = (subscriptions ?? []).filter((s) => s.media.kind === mediaType);
+  const allSections = useMemo(
+    () => subscriptionOverviewSections(subscriptions ?? [], "all"),
+    [subscriptions],
+  );
+  const tvSubscriptions =
+    allSections.find((section) => section.kind === "tv")?.subscriptions ?? [];
+  const movieSubscriptions =
+    allSections.find((section) => section.kind === "movie")?.subscriptions ?? [];
+  const visible =
+    mediaType === "all"
+      ? subscriptions ?? []
+      : mediaType === "tv"
+        ? tvSubscriptions
+        : movieSubscriptions;
   const ruleSetNameById = useMemo(
     () => new Map(ruleSets.map((rule) => [rule.id, rule.name])),
     [ruleSets],
@@ -122,19 +260,26 @@ export function SubscriptionsView() {
   );
 
   return (
-    <div ref={scrollRef} className="scroll-thin scroll-safe flex-1 overflow-y-auto pb-10">
-      <div className="flex items-start justify-between gap-4 px-6 pt-7 max-md:px-4 max-md:pt-4">
-        <div>
-          <h2 className="text-on-image text-[26px] font-bold leading-tight tracking-[-0.02em] text-white max-md:text-[21px]">
-            我的订阅
-          </h2>
-          <p className="text-on-image mt-1.5 text-ui text-[var(--text-muted)] max-md:mt-1 max-md:text-sub">
-            共 {visible.length} 部{mediaType === "movie" ? "电影" : "剧集"} ·
-            movieclaw 会持续追踪并在新资源放出后自动入库
-          </p>
-        </div>
-
-        {!isMobile && <MediaTypeSwitcher value={mediaType} onChange={setMediaType} />}
+    <div
+      ref={scrollRef}
+      data-scroll-root
+      className="scroll-thin scroll-safe flex-1 overflow-y-auto pb-10"
+    >
+      <div className="px-6 pt-7 max-md:px-4 max-md:pt-4">
+        <h2 className="text-on-image text-[26px] font-bold leading-tight tracking-[-0.02em] text-white max-md:text-[21px]">
+          我的订阅
+        </h2>
+        <p className="text-on-image mt-1.5 text-ui text-[var(--text-muted)] max-md:mt-1 max-md:text-sub">
+          {mediaType === "all"
+            ? `共 ${visible.length} 部订阅 · ${tvSubscriptions.length} 部剧集 · ${movieSubscriptions.length} 部电影`
+            : `共 ${visible.length} 部${mediaType === "movie" ? "电影" : "剧集"}`}
+          {" · "}movieclaw 会持续追踪并在新资源放出后自动入库
+        </p>
+        {!isMobile && (
+          <div className="mt-4">
+            <MediaTypeSwitcher value={mediaType} onChange={switchMediaType} />
+          </div>
+        )}
       </div>
 
       {/* 链路警示横幅：只在体检整体为 error 时出现——订阅不会丢（工单退避
@@ -150,6 +295,18 @@ export function SubscriptionsView() {
           ——点击查看体检详情与修复入口 →
         </Link>
       )}
+
+      {mediaType !== "movie" &&
+        subscriptions !== null &&
+        !failed &&
+        tvSubscriptions.length > 0 && (
+          <TodayArrivalsSection
+            arrivals={todayArrivals}
+            failed={todayArrivalsFailed}
+            downloadTasks={downloadTasks}
+            canOpenTasks={isAdmin}
+          />
+        )}
 
       {subscriptions === null && !failed && (
         <div className="mt-16 flex items-center justify-center gap-2.5 text-ui text-[var(--text-muted)]">
@@ -187,7 +344,7 @@ export function SubscriptionsView() {
           action={
             canSubscribe ? (
               <Link
-                href={`/discover/${mediaType}` as Route}
+                href={`/discover/${mediaType === "movie" ? "movie" : "tv"}` as Route}
                 className="btn-accent flex items-center gap-1.5 rounded-full px-4 py-2 text-ui font-semibold"
               >
                 <CompassIcon className="size-4" />
@@ -198,11 +355,112 @@ export function SubscriptionsView() {
         />
       )}
 
-      {visible.length > 0 && (
-        <div className="mt-6 grid gap-x-4 gap-y-7 px-6 [grid-template-columns:repeat(auto-fill,minmax(148px,1fr))] max-md:mt-4 max-md:gap-x-3 max-md:gap-y-5 max-md:px-4 max-md:[grid-template-columns:repeat(auto-fill,minmax(140px,1fr))]">
-          {visible.map((sub) => (
+      {visible.length > 0 && mediaType === "all" && (
+        allSections.map((section) => (
+          <SubscriptionSection
+            key={`all-${section.kind}`}
+            title={section.title}
+            kind={section.kind}
+            subscriptions={section.subscriptions}
+            ruleSetNameById={ruleSetNameById}
+            libraryNameById={libraryNameById}
+            defaultLibraryNameByKind={defaultLibraryNameByKind}
+          />
+        ))
+      )}
+      {visible.length > 0 && mediaType !== "all" && (
+        <SubscriptionSection
+          key={`filtered-${mediaType}`}
+          kind={mediaType}
+          subscriptions={visible}
+          ruleSetNameById={ruleSetNameById}
+          libraryNameById={libraryNameById}
+          defaultLibraryNameByKind={defaultLibraryNameByKind}
+        />
+      )}
+    </div>
+  );
+}
+
+/**
+ * 一个订阅分区：首次只挂载有限数量海报，距离分区末端约一屏时提前追加。
+ * 标题只用于“全部”总览；sticky 受 section 边界约束，下一分区会自然将它顶走。
+ */
+function SubscriptionSection({
+  title,
+  kind,
+  subscriptions,
+  ruleSetNameById,
+  libraryNameById,
+  defaultLibraryNameByKind,
+}: {
+  title?: string;
+  kind: SubscriptionKind;
+  subscriptions: Subscription[];
+  ruleSetNameById: ReadonlyMap<number, string>;
+  libraryNameById: ReadonlyMap<number, string>;
+  defaultLibraryNameByKind: ReadonlyMap<string, string>;
+}) {
+  const [visibleCount, setVisibleCount] = useState(() => rememberedVisibleCounts[kind]);
+  const loadMoreRef = useRef<HTMLDivElement>(null);
+  const hasMore = visibleCount < subscriptions.length;
+
+  useEffect(() => {
+    rememberedVisibleCounts[kind] = Math.max(rememberedVisibleCounts[kind], visibleCount);
+  }, [kind, visibleCount]);
+
+  useEffect(() => {
+    const target = loadMoreRef.current;
+    if (!target || !hasMore) return;
+    const scrollRoot = target.closest<HTMLElement>("[data-scroll-root]");
+    if (!scrollRoot) return;
+    const preloadDistance = Math.max(800, Math.round(scrollRoot.clientHeight * 1.25));
+    const observer = new IntersectionObserver(
+      ([entry]) => {
+        if (!entry.isIntersecting) return;
+        setVisibleCount((count) => nextSubscriptionVisibleCount(count, subscriptions.length));
+      },
+      {
+        root: scrollRoot,
+        rootMargin: `${preloadDistance}px 0px`,
+      },
+    );
+    observer.observe(target);
+    return () => observer.disconnect();
+  }, [hasMore, subscriptions.length, visibleCount]);
+
+  return (
+    <section
+      className={title ? "mt-7" : "mt-6"}
+      aria-labelledby={title ? `${kind}-subscriptions-title` : undefined}
+    >
+      {title && (
+        <header className="sticky top-2 z-20 mb-4 px-6 max-md:px-4">
+          <div className="flex items-center justify-between rounded-2xl border border-white/[0.09] bg-[linear-gradient(145deg,rgba(18,21,30,0.88),rgba(10,12,18,0.82))] px-4 py-2.5 shadow-[0_10px_28px_rgba(0,0,0,0.24),inset_0_1px_0_rgba(255,255,255,0.04)] backdrop-blur-xl">
+            <h3
+              id={`${kind}-subscriptions-title`}
+              className="flex items-center gap-2.5 text-ui font-semibold tracking-[-0.01em] text-white/90"
+            >
+              <span
+                aria-hidden="true"
+                className={`size-2 rounded-full ${
+                  kind === "tv"
+                    ? "bg-emerald-400 shadow-[0_0_10px_rgba(52,211,153,0.42)]"
+                    : "bg-violet-400 shadow-[0_0_10px_rgba(167,139,250,0.42)]"
+                }`}
+              />
+              {title}
+            </h3>
+            <span className="tnum rounded-full border border-white/[0.07] bg-white/[0.04] px-2.5 py-0.5 text-caption text-[var(--text-muted)]">
+              {subscriptions.length} 部
+            </span>
+          </div>
+        </header>
+      )}
+      <div className="grid gap-x-4 gap-y-7 px-6 [grid-template-columns:repeat(auto-fill,minmax(148px,1fr))] max-md:gap-x-3 max-md:gap-y-5 max-md:px-4 max-md:[grid-template-columns:repeat(auto-fill,minmax(140px,1fr))]">
+        {subscriptions.slice(0, visibleCount).map((sub) => (
+          <div key={sub.id} data-subscription-id={sub.id}>
             <SubscriptionCell
-              key={sub.id}
               sub={sub}
               ruleSetName={ruleSetNameById.get(sub.rule_set_id)}
               libraryName={
@@ -211,10 +469,169 @@ export function SubscriptionsView() {
                   : libraryNameById.get(sub.library_id)
               }
             />
-          ))}
-        </div>
-      )}
-    </div>
+          </div>
+        ))}
+      </div>
+      {hasMore && <div ref={loadMoreRef} className="h-px" aria-hidden="true" />}
+    </section>
+  );
+}
+
+/**
+ * 首页首屏的今日待入库摘要。这里刻意不放海报与下载百分比：标题负责识别，
+ * “下载中”深链到任务中心查看完整下载细节，避免和下方订阅海报墙重复。
+ */
+function TodayArrivalsSection({
+  arrivals,
+  failed,
+  downloadTasks,
+  canOpenTasks,
+}: {
+  arrivals: TodaySubscriptionArrival[] | null;
+  failed: boolean;
+  downloadTasks: DownloadTask[];
+  canOpenTasks: boolean;
+}) {
+  const [now, setNow] = useState(() => new Date());
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(new Date()), 60_000);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  const taskByHash = useMemo(
+    () => new Map(downloadTasks.map((task) => [task.info_hash.toLowerCase(), task])),
+    [downloadTasks],
+  );
+  const rows = useMemo(() => {
+    const presented = (arrivals ?? [])
+      .map((arrival) => {
+        const task = arrival.info_hash
+          ? taskByHash.get(arrival.info_hash.toLowerCase())
+          : undefined;
+        return {
+          arrival,
+          presentation: todayArrivalPresentation(arrival, task, now),
+        };
+      });
+    return groupTodayArrivals(presented).toSorted((left, right) => {
+      const leftTime = left.presentation.estimatedAt ?? Number.MAX_SAFE_INTEGER;
+      const rightTime = right.presentation.estimatedAt ?? Number.MAX_SAFE_INTEGER;
+      if (leftTime !== rightTime) return leftTime - rightTime;
+      return left.firstWantedId - right.firstWantedId;
+    });
+  }, [arrivals, now, taskByHash]);
+
+  return (
+    <section
+      aria-labelledby="today-arrivals-title"
+      className="relative mx-6 mt-5 rounded-[22px] shadow-[0_18px_55px_rgba(0,0,0,0.2)] max-md:mx-4 max-md:mt-4"
+    >
+      <div className="relative isolate overflow-hidden rounded-[22px] border border-white/[0.1] bg-[linear-gradient(145deg,rgba(16,19,29,0.82),rgba(8,10,16,0.68))] shadow-[inset_0_1px_0_rgba(255,255,255,0.035)] backdrop-blur-xl">
+        <span
+          aria-hidden="true"
+          className="pointer-events-none absolute -right-16 -top-24 size-56 rounded-full bg-violet-500/[0.09] blur-3xl"
+        />
+        <span
+          aria-hidden="true"
+          className="pointer-events-none absolute -left-20 top-10 size-44 rounded-full bg-cyan-400/[0.045] blur-3xl"
+        />
+        <header className="relative flex items-center justify-between gap-4 border-b border-white/[0.065] px-5 py-4 max-md:px-4 max-md:py-3.5">
+          <div className="flex min-w-0 items-center gap-3">
+            <span className="grid size-9 shrink-0 place-items-center rounded-xl border border-white/[0.09] bg-white/[0.055] text-violet-200 shadow-[inset_0_1px_0_rgba(255,255,255,0.055)] max-md:size-8 max-md:rounded-lg">
+              <ClockIcon className="size-[18px] max-md:size-4" />
+            </span>
+            <div className="min-w-0">
+              <h3 id="today-arrivals-title" className="text-ui font-semibold text-white/92">
+                今日可能入库
+              </h3>
+              <p className="mt-0.5 truncate text-caption text-white/38">
+                播出、出种与下载状态动态估算
+              </p>
+            </div>
+          </div>
+          {arrivals !== null && !failed && (
+            <span className="tnum shrink-0 rounded-full border border-white/[0.075] bg-white/[0.045] px-2.5 py-1 text-caption text-white/48 shadow-[inset_0_1px_0_rgba(255,255,255,0.035)]">
+              {rows.length} 部 · {rows.reduce((total, row) => total + row.episodeCount, 0)} 集
+            </span>
+          )}
+        </header>
+
+        {arrivals === null && !failed && (
+          <p className="relative px-5 py-5 text-sub text-[var(--text-muted)] max-md:px-4">
+            正在计算今日入库时间…
+          </p>
+        )}
+        {failed && (
+          <p className="relative px-5 py-5 text-sub text-amber-100/70 max-md:px-4">
+            今日入库信息暂时不可用
+          </p>
+        )}
+        {!failed && arrivals !== null && rows.length === 0 && (
+          <p className="relative px-5 py-5 text-sub text-[var(--text-muted)] max-md:px-4">
+            今天暂无可能入库的剧集
+          </p>
+        )}
+        {!failed && rows.length > 0 && (
+          <div className="relative space-y-1 p-3">
+            {rows.map(({ subscriptionId, mediaTitle, episodeLabel, presentation }, index) => {
+            const style = todayArrivalStyle[presentation.statusLabel];
+            const statusClass = `inline-flex shrink-0 items-center gap-0.5 rounded-full border px-2 py-0.5 text-caption font-medium transition-colors ${style.status}`;
+            return (
+              <div
+                key={subscriptionId}
+                className="group/today grid grid-cols-[1.5rem_minmax(0,1fr)_auto] items-center gap-x-3 rounded-xl px-3 py-3 text-sub transition duration-200 hover:translate-x-0.5 hover:bg-white/[0.042] hover:shadow-[inset_0_1px_0_rgba(255,255,255,0.025)] max-md:grid-cols-[1.25rem_minmax(0,1fr)] max-md:gap-x-2.5 max-md:px-2.5"
+              >
+                <span className="relative flex h-full self-stretch items-start justify-center pt-1.5 max-md:row-span-2">
+                  {index < rows.length - 1 && (
+                    <span
+                      aria-hidden="true"
+                      className="absolute left-1/2 top-4 -bottom-5 w-px -translate-x-1/2 bg-gradient-to-b from-white/16 via-white/10 to-white/[0.035]"
+                    />
+                  )}
+                  {style.pulse && (
+                    <span
+                      aria-hidden="true"
+                      className="absolute top-1 size-3 animate-ping rounded-full bg-cyan-300/25"
+                    />
+                  )}
+                  <span
+                    aria-hidden="true"
+                    className={`relative z-10 size-2.5 rounded-full border-2 ${style.node}`}
+                  />
+                </span>
+                <div className="min-w-0 self-center">
+                  <Link
+                    href={`/subscriptions/${subscriptionId}` as Route}
+                    className="block min-w-0 truncate font-medium text-white/86 transition-colors group-hover/today:text-white"
+                  >
+                    {mediaTitle}
+                  </Link>
+                  <span className="tnum mt-0.5 block min-w-0 truncate text-caption text-white/38">
+                    {episodeLabel}
+                  </span>
+                </div>
+                <div className="flex flex-col items-end gap-1 max-md:col-start-2 max-md:row-start-2 max-md:mt-1.5 max-md:flex-row max-md:items-center max-md:gap-2">
+                  {presentation.statusLabel === "下载中" && canOpenTasks ? (
+                    <Link href={"/tasks?view=active" as Route} className={statusClass}>
+                      下载中
+                      <ChevronRightIcon className="size-3" />
+                    </Link>
+                  ) : (
+                    <span className={statusClass}>{presentation.statusLabel}</span>
+                  )}
+                  <span
+                    className={`tnum whitespace-nowrap text-[15px] font-semibold tracking-[-0.01em] transition-colors ${style.time}`}
+                  >
+                    {presentation.timeLabel}
+                  </span>
+                </div>
+              </div>
+            );
+            })}
+          </div>
+        )}
+      </div>
+    </section>
   );
 }
 
@@ -222,28 +639,35 @@ export function SubscriptionsView() {
 function MediaTypeSwitcher({
   value,
   onChange,
+  compact = false,
 }: {
-  value: "movie" | "tv";
-  onChange: (type: "movie" | "tv") => void;
+  value: SubscriptionFilter;
+  onChange: (type: SubscriptionFilter) => void;
+  compact?: boolean;
 }) {
+  const labels: Record<SubscriptionFilter, string> = {
+    all: "全部",
+    tv: "剧集",
+    movie: "电影",
+  };
   return (
     <div
       className="flex shrink-0 rounded-full border border-white/10 bg-black/35 p-1 backdrop-blur-xl"
       aria-label="订阅类型"
     >
-      {(["movie", "tv"] as const).map((type) => (
+      {(["all", "tv", "movie"] as const).map((type) => (
         <button
           key={type}
           type="button"
           aria-pressed={value === type}
           onClick={() => onChange(type)}
-          className={`rounded-full px-4 py-1.5 text-sub font-semibold transition ${
+          className={`rounded-full py-1.5 text-sub font-semibold transition ${compact ? "px-2.5" : "px-4"} ${
             value === type
               ? "bg-white/15 text-white shadow-sm"
               : "text-[var(--text-muted)] hover:text-white"
           }`}
         >
-          {type === "movie" ? "电影" : "剧集"}
+          {labels[type]}
         </button>
       ))}
     </div>
@@ -289,6 +713,7 @@ function toVisualItem(
     genres: scope ? [scope] : undefined,
     overlayMeta: configFlow || undefined,
     ribbon: subscriptionFollowRibbon(sub),
+    posterFooter: subscriptionCollectionMeta(sub),
   };
 }
 

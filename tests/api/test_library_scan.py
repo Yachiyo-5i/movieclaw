@@ -280,6 +280,40 @@ async def test_scan_identifies_by_name_and_flags_unknown(db, tmp_path) -> None:
     assert summary2.retried == 1 and summary2.unidentified == 1
 
 
+async def test_scan_refreshes_persisted_library_stats(db, tmp_path) -> None:
+    """扫描收尾落统计快照；missing 历史行不计入在位文件数和占用空间。"""
+    root = _make_tv_library(tmp_path)
+    async with db.session() as session:
+        library = await LibraryRepository(session).create(
+            name="剧集库", kind="tv", root_paths=[str(root)]
+        )
+
+    await scan_library(library.id)
+    async with db.session() as session:
+        refreshed = await session.get(Library, library.id)
+        assert refreshed is not None
+        assert refreshed.stats_item_count == 1
+        assert refreshed.stats_episode_count == 2
+        assert refreshed.stats_file_count == 3
+        assert refreshed.stats_total_size_bytes == 8
+        assert refreshed.stats_unidentified_count == 1
+        assert refreshed.stats_missing_count == 0
+        assert refreshed.stats_ignored_count == 0
+        assert refreshed.stats_refreshed_at is not None
+
+    (root / "测试剧集 (2024)" / "Season 01" / "测试剧集.S01E01.1080p.mkv").unlink()
+    await scan_library(library.id)
+    async with db.session() as session:
+        refreshed = await session.get(Library, library.id)
+        assert refreshed is not None
+        assert refreshed.stats_item_count == 1
+        assert refreshed.stats_episode_count == 1
+        assert refreshed.stats_file_count == 2
+        assert refreshed.stats_total_size_bytes == 6
+        assert refreshed.stats_unidentified_count == 1
+        assert refreshed.stats_missing_count == 1
+
+
 async def test_scan_persists_file_mtime(db, tmp_path) -> None:
     """扫描落 mtime（issue #88）：入账时随 stat 顺手记录 file_mtime_ns，
     播放接口的 ETag 由它派生，浏览请求不再对媒体文件本体做文件系统调用。

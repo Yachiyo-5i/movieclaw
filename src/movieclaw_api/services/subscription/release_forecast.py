@@ -27,8 +27,11 @@ from movieclaw_api.services.subscription.matching import (
     to_candidate,
 )
 from movieclaw_db.models import (
+    ConfigStatus,
     MediaEpisode,
     MediaItem,
+    SiteCredential,
+    SiteSyncCursor,
     SiteTorrent,
     Subscription,
     SubscriptionStatus,
@@ -41,6 +44,7 @@ from movieclaw_matcher import MediaIdentity, TorrentCandidate, match_identity
 logger = logging.getLogger("movieclaw_api.subscription.release_forecast")
 
 FORECAST_VERSION = 1
+FORECAST_MIN_INTERVAL = timedelta(minutes=15)
 _OBSERVATION_LOOKBACK = timedelta(days=90)
 _MAX_HISTORY_EPISODES = 4
 _MAX_WINDOW = timedelta(hours=12)
@@ -377,10 +381,12 @@ def _build_forecast(
 async def refresh_release_forecasts(
     session: AsyncSession, *, media_item_ids: set[int] | None = None
 ) -> int:
-    """刷新活跃追新订阅的单集预测快照，返回实际变化的工单数。
+    """刷新活跃剧集订阅范围内的单集预测快照，返回实际变化的工单数。
 
     只处理 ``wanted`` 状态且已定档的剧集工单；暂停、完成、已投递工单不会生成
-    新探测。已过期工单的旧快照无需删除，调度读取时会按窗口截止时间忽略。
+    新探测。``in_scope`` 已表达用户是否订阅该集，自动续订只影响未来范围扩张，
+    不得影响现有范围的预测与探测。已过期工单的旧快照无需删除，调度读取时会按
+    窗口截止时间忽略。
     """
     statement = (
         select(WantedItem, Subscription)
@@ -390,7 +396,6 @@ async def refresh_release_forecasts(
             WantedItem.in_scope.is_(True),  # type: ignore[attr-defined]
             WantedItem.air_date.is_not(None),  # type: ignore[union-attr]
             Subscription.kind == "tv",
-            Subscription.follow_future.is_(True),  # type: ignore[union-attr]
             Subscription.status == SubscriptionStatus.ACTIVE,
         )
     )
@@ -452,8 +457,64 @@ async def refresh_release_forecasts(
 
     if changed:
         await session.commit()
-        logger.info("已更新 %s 个追新单集的资源发布时间预测", changed)
+        logger.info("已更新 %s 个订阅单集的资源发布时间预测", changed)
     return changed
+
+
+def _forecast_site_probes(
+    wanted: WantedItem, *, site_ids: set[str], now: datetime
+) -> dict[str, list[datetime]]:
+    """读取一个工单在当前有效站点上的原始探测点，保持与调度器相同的站点取舍。"""
+    forecast = wanted.release_forecast
+    if not isinstance(forecast, dict):
+        return {}
+    if forecast.get("version") != FORECAST_VERSION:
+        return {}
+    if wanted.air_date is None or forecast.get("target_air_date") != wanted.air_date.isoformat():
+        return {}
+    if forecast.get("confidence") == "volatile":
+        return {}
+    window_end = _parse_utc_text(forecast.get("window_end"))
+    if window_end is None or window_end < now:
+        return {}
+    sites = forecast.get("sites")
+    if not isinstance(sites, list):
+        return {}
+
+    result: dict[str, list[datetime]] = {}
+    eligible_sites = [
+        site
+        for site in sites
+        if isinstance(site, dict) and site.get("site_id") in site_ids
+    ][:2]
+    for rank, site in enumerate(eligible_sites):
+        site_id = str(site["site_id"])
+        probes = site.get("probe_times")
+        if not isinstance(probes, list):
+            continue
+        selected_probes = probes if rank == 0 else probes[-2:]
+        parsed = [probe for value in selected_probes if (probe := _parse_utc_text(value))]
+        if parsed:
+            result[site_id] = sorted(set(parsed))
+    return result
+
+
+def effective_forecast_probe_at(
+    probes: list[datetime], *, last_sync_at: datetime | None
+) -> datetime | None:
+    """把原始预测点换算成站点真正可执行的下一探测时间。
+
+    上次同步之后的探测点才算未消费；即使预测点已到，也必须遵守单站 15 分钟
+    礼貌间隔。调度器与页面共用本函数，避免两边分别计算后发生时间漂移。
+    """
+    pending = sorted(
+        probe for probe in probes if last_sync_at is None or probe > last_sync_at
+    )
+    if not pending:
+        return None
+    if last_sync_at is None:
+        return pending[0]
+    return max(pending[0], last_sync_at + FORECAST_MIN_INTERVAL)
 
 
 async def forecast_probe_times_by_site(
@@ -462,7 +523,8 @@ async def forecast_probe_times_by_site(
     """读取当前有效的站点探测点；返回值可直接合并到既有同步规划器。
 
     这里只筛选业务状态与快照有效性，不记录“已消费”状态。同步规划器用站点游标的
-    ``last_sync_at`` 跳过旧探测点，因此一次普通同步同样能够消费它们。
+    ``last_sync_at`` 跳过旧探测点，因此一次普通同步同样能够消费它们。是否自动续订
+    与这里无关：只要工单仍在当前订阅范围内，就必须继续探测。
     """
     if not site_ids:
         return {}
@@ -474,51 +536,79 @@ async def forecast_probe_times_by_site(
             WantedItem.in_scope.is_(True),  # type: ignore[attr-defined]
             WantedItem.release_forecast.is_not(None),  # type: ignore[union-attr]
             Subscription.kind == "tv",
-            Subscription.follow_future.is_(True),  # type: ignore[union-attr]
             Subscription.status == SubscriptionStatus.ACTIVE,
         )
     )
     now = utcnow()
     result: dict[str, set[datetime]] = defaultdict(set)
     for wanted in rows.scalars().all():
-        forecast = wanted.release_forecast
-        if not isinstance(forecast, dict):
-            continue
-        if forecast.get("version") != FORECAST_VERSION:
-            continue
-        if (
-            wanted.air_date is None
-            or forecast.get("target_air_date") != wanted.air_date.isoformat()
-        ):
-            continue
-        if forecast.get("confidence") == "volatile":
-            continue
-        window_end = _parse_utc_text(forecast.get("window_end"))
-        if window_end is None or window_end < now:
-            continue
-        sites = forecast.get("sites")
-        if not isinstance(sites, list):
-            continue
-        eligible_sites = [
-            site
-            for site in sites
-            if isinstance(site, dict) and site.get("site_id") in site_ids
-        ][:2]
-        for rank, site in enumerate(eligible_sites):
-            site_id = str(site["site_id"])
-            probes = site.get("probe_times")
-            if not isinstance(probes, list):
-                continue
-            selected_probes = probes if rank == 0 else probes[-2:]
-            for value in selected_probes:
-                probe = _parse_utc_text(value)
-                if probe is not None:
-                    result[site_id].add(probe)
+        for site_id, probes in _forecast_site_probes(
+            wanted, site_ids=site_ids, now=now
+        ).items():
+            result[site_id].update(probes)
     return {site_id: sorted(values) for site_id, values in result.items()}
 
 
+async def next_forecast_probe_times_by_wanted(
+    session: AsyncSession, *, wanted_items: list[WantedItem]
+) -> dict[int, datetime]:
+    """按工单返回与调度器一致的下一有效探测时间，供首页计算预计入库时间。"""
+    if not wanted_items:
+        return {}
+    credentials = (
+        (
+            await session.execute(
+                select(SiteCredential).where(
+                    SiteCredential.enabled.is_(True),  # type: ignore[attr-defined]
+                    SiteCredential.status == ConfigStatus.ACTIVE,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    active_site_ids = {credential.site_id for credential in credentials}
+    if not active_site_ids:
+        return {}
+    cursors = (
+        (
+            await session.execute(
+                select(SiteSyncCursor).where(
+                    SiteSyncCursor.site_id.in_(active_site_ids)  # type: ignore[attr-defined]
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    cursor_by_site = {cursor.site_id: cursor for cursor in cursors}
+    now = utcnow()
+    result: dict[int, datetime] = {}
+    for wanted in wanted_items:
+        if wanted.id is None:
+            continue
+        effective: list[datetime] = []
+        for site_id, probes in _forecast_site_probes(
+            wanted, site_ids=active_site_ids, now=now
+        ).items():
+            cursor = cursor_by_site.get(site_id)
+            due_at = effective_forecast_probe_at(
+                probes,
+                last_sync_at=cursor.last_sync_at if cursor is not None else None,
+            )
+            if due_at is not None:
+                effective.append(due_at)
+        if effective:
+            # 已到期但尚未等到下一轮全局 tick 时，从“现在”起估算，不回传过去时间。
+            result[wanted.id] = max(min(effective), now)
+    return result
+
+
 __all__ = [
+    "FORECAST_MIN_INTERVAL",
     "FORECAST_VERSION",
+    "effective_forecast_probe_at",
     "forecast_probe_times_by_site",
+    "next_forecast_probe_times_by_wanted",
     "refresh_release_forecasts",
 ]

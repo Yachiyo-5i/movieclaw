@@ -218,7 +218,7 @@ class SubscriptionCreatePayload(BaseModel):
     selected_seasons: list[int] = Field(
         default_factory=list, description="剧集要订阅的季号数组，如 [1,2]；空=全部缺失季"
     )
-    follow_future: bool = Field(default=False, description="持续追新：未来新季自动纳入订阅")
+    follow_future: bool = Field(default=False, description="自动续订：未来新集与新季自动纳入订阅")
     rule_set_id: int | None = Field(default=None, description="缺省用默认规则组")
     library_id: int | None = Field(default=None, description="入库目标库；缺省用该类型默认库")
 
@@ -230,7 +230,7 @@ class SubscriptionUpdatePayload(BaseModel):
         default=None, description="新的季选择，如 [1,2]；不传=不变"
     )
     follow_future: bool | None = Field(
-        default=None, description="是否持续追新（新季自动纳入）；不传=不变"
+        default=None, description="是否自动续订（未来新集与新季自动纳入）；不传=不变"
     )
     rule_set_id: int | None = Field(default=None, description="换绑规则组 id；不传=不变")
     library_id: int | None = Field(
@@ -253,7 +253,7 @@ class SubscriptionTrackingStatePayload(BaseModel):
 
 
 class SubscriptionFollowFuturePayload(BaseModel):
-    """持续追新是详情页上的独立动作，不与选季等批量调整耦合。"""
+    """自动续订是详情页上的独立动作，不与选季等批量调整耦合。"""
 
     enabled: bool = Field(description="是否持续追踪之后播出的新集与新一季")
 
@@ -322,6 +322,10 @@ class SubscriptionView(BaseModel):
     rule_set_id: int
     library_id: int | None = Field(description="入库目标库；null=该类型默认库")
     progress: ProgressView
+    season_collection: list[SeasonOverview] = Field(
+        default_factory=list,
+        description="剧集按季收录统计；电影或无需展示时为空",
+    )
     created_at: datetime
     updated_at: datetime
 
@@ -331,7 +335,11 @@ class SubscriptionView(BaseModel):
 
     @classmethod
     def from_model(
-        cls, sub: Subscription, item: MediaItem, counts: dict[str, int]
+        cls,
+        sub: Subscription,
+        item: MediaItem,
+        counts: dict[str, int],
+        season_collection: list[SeasonOverview] | None = None,
     ) -> SubscriptionView:
         wanted = counts.get("wanted", 0)
         grabbed = counts.get("grabbed", 0)
@@ -352,8 +360,66 @@ class SubscriptionView(BaseModel):
                 downloaded=downloaded,
                 imported=imported,
             ),
+            season_collection=season_collection or [],
             created_at=sub.created_at,
             updated_at=sub.updated_at,
+        )
+
+
+class TodayArrivalView(BaseModel):
+    """订阅首页的单集待入库摘要；不携带海报和下载进度等重复信息。"""
+
+    subscription_id: int
+    wanted_id: int
+    media_title: str
+    season_number: int
+    episode_number: int
+    status: Literal["wanted", "grabbed", "downloaded"]
+    air_date: date | None
+    release_forecast: dict | None
+    next_probe_at: datetime | None = Field(
+        description="按站点游标与礼貌间隔换算后的下一次有效预测探测时间"
+    )
+    info_hash: str | None
+    grabbed_at: datetime | None
+    downloaded_at: datetime | None
+    estimated_release_to_import_minutes: int = Field(
+        description="预计出种后到入库的分钟数；优先使用本订阅历史中位数"
+    )
+    estimated_download_to_import_minutes: int = Field(
+        description="下载完成后到入库的分钟数；优先使用本订阅历史中位数"
+    )
+
+    @field_serializer("next_probe_at", "grabbed_at", "downloaded_at")
+    def _serialize_utc(self, value: datetime | None) -> str | None:
+        return _iso_utc(value)
+
+    @classmethod
+    def from_models(
+        cls,
+        sub: Subscription,
+        item: MediaItem,
+        wanted: WantedItem,
+        *,
+        next_probe_at: datetime | None,
+        release_to_import_minutes: int,
+        download_to_import_minutes: int,
+    ) -> TodayArrivalView:
+        return cls(
+            subscription_id=sub.id,  # type: ignore[arg-type]
+            wanted_id=wanted.id,  # type: ignore[arg-type]
+            media_title=item.title,
+            season_number=wanted.season_number,
+            episode_number=wanted.episode_number,
+            status=wanted.status,  # type: ignore[arg-type]
+            air_date=wanted.air_date,
+            release_forecast=wanted.release_forecast,
+            next_probe_at=next_probe_at,
+            info_hash=wanted.info_hash,
+            grabbed_at=wanted.grabbed_at,
+            downloaded_at=wanted.downloaded_at,
+            estimated_release_to_import_minutes=release_to_import_minutes,
+            estimated_download_to_import_minutes=download_to_import_minutes,
         )
 
 

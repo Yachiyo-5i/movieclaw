@@ -7,6 +7,8 @@
 
 from __future__ import annotations
 
+import sqlite3
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -56,6 +58,35 @@ def _create(client, *, name: str, kind: str, root: str) -> dict:
 def test_first_start_has_no_libraries(client) -> None:
     # 系统不预置任何默认库：首次部署库表为空，由前端空态引导用户创建
     assert client.get("/api/v1/libraries").json()["data"] == []
+
+
+def test_list_reads_precomputed_stats_without_inventory_rows(client, tmp_path) -> None:
+    """列表统计来自 library 快照，而不是请求时重新扫描 library_file。"""
+    library = _create(client, name="电影库", kind="movie", root="/media/movies")
+    with sqlite3.connect(tmp_path / "test.db") as connection:
+        connection.execute(
+            """
+            UPDATE library
+            SET stats_item_count = 12,
+                stats_file_count = 15,
+                stats_total_size_bytes = 1099511627776,
+                stats_unidentified_count = 2,
+                stats_missing_count = 3,
+                stats_ignored_count = 1
+            WHERE id = ?
+            """,
+            (library["id"],),
+        )
+
+    rows = client.get("/api/v1/libraries").json()["data"]
+    assert rows[0]["stats"] == {
+        "item_count": 12,
+        "file_count": 15,
+        "total_size_bytes": 1099511627776,
+        "unidentified_count": 2,
+        "missing_count": 3,
+        "ignored_count": 1,
+    }
 
 
 def test_scanning_response_always_carries_phase(client) -> None:

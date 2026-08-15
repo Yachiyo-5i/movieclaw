@@ -69,7 +69,8 @@ class DiscoverLibraryProjectionService:
 
     async def apply_detail(self, detail: MediaDetail) -> None:
         """回填详情主条目与相关推荐摘要，并为主条目生成媒体库深链。"""
-        await self.apply_cards([detail.card, *detail.related])
+        collection_cards = detail.collection.items if detail.collection is not None else []
+        await self.apply_cards([detail.card, *collection_cards, *detail.related])
         status = detail.card.library_status
         detail.library_links = [] if status is None else await self._links_for(status.media_item_id)
 

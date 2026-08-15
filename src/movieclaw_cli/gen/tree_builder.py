@@ -36,14 +36,13 @@ RESERVED_PARAM_NAMES = (
     | set(_OVERRIDE_FLAG_OPTS)
     | {"file", "output_file", "wait", "wait_timeout"}
 )
-# "input" 不在保留清单：API 字段叫 input 时（如 agent.start 的用户输入），
+# "input" 不在保留清单：API 字段叫 input 时（如 session.start 的用户输入），
 # API 字段优先，该命令放弃 --input 整体替代形态（逐字段传参仍完整可用）
 
 # 域分组的一行产品能力简介（click group 的 help；生成命令自身的参数与详细
 # 说明来自 spec）。模型会先看 mclaw 工具目录、再用域级 --help 探索命令，
 # 因此这里要用用户语义区分相邻域，不能只重复内部对象名。
 DOMAIN_HELP = {
-    "agent": "AI 助手对话任务、运行状态与历史记录",
     "app": "外部访问设置、应用重启、版本升级/回退与 NER 模型更新",
     "appearance": "首页背景与图库",
     "auth": "个人信息、会话与 API 令牌",
@@ -62,6 +61,7 @@ DOMAIN_HELP = {
     "people": "本地媒体库影人档案与作品",
     "rules": "订阅资源质量与过滤规则组",
     "search": "统一搜索影视条目、PT 种子和本地媒体库，并管理搜索预设与历史",
+    "session": "AI 会话开始/继续、指定消息重试、SSE 跟随、完整轨迹与上下文管理",
     "site": "PT 资源站点接入、鉴权验证与缓存状态",
     "subscriptions": "持续追踪电影/剧集缺失资源并自动搜索、下载和整理入库",
     "ui": "Web 界面质感、布局与显示偏好",
@@ -248,7 +248,7 @@ def _load_input_body(value: str) -> Any:
 
 def _build_body(op: dict[str, Any], kwargs: dict[str, Any]) -> Any:
     """从命令标志组装 JSON 请求体（或采用 --input 整体替代）。"""
-    # API 字段本身叫 input 时（如 agent.start），该命令没有整体替代形态，
+    # API 字段本身叫 input 时（如 session.start），该命令没有整体替代形态，
     # kwargs 里的 input 是普通字段值，不能在这里消费掉
     has_input_field = any(f["name"] == "input" for f in op["body_fields"])
     if not has_input_field and (input_value := kwargs.pop("input", None)):

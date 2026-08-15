@@ -142,6 +142,7 @@ from movieclaw_db.models import (
 )
 from movieclaw_db.models.scheduled_task import TriggerType
 from movieclaw_db.repositories.library_file_repo import LibraryFileRepository
+from movieclaw_db.repositories.library_repo import LibraryRepository
 from movieclaw_enrich import enrich
 from movieclaw_media.models import MediaKind
 from movieclaw_scheduler.registry import register_task
@@ -1448,6 +1449,10 @@ async def _ingest_entry(
         imported += 1
 
     if imported and staging is None:
+        assert dest_library is not None and dest_library.id is not None
+        # 监听入库不经过存量扫描；条目文件全部落账后在同一写路径刷新一次
+        # 快照，避免首页要等下一轮定时扫描才看到新库存。
+        await LibraryRepository(session).refresh_stats([dest_library.id])
         # NFO 身份档案：Emby 零歧义、自家重扫免收敛（已存在不覆盖，失败不阻断）
         from movieclaw_api.services.library.nfo import write_entry_nfo
 

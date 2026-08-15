@@ -101,23 +101,24 @@ def configure_provider(c) -> None:
 
 
 def test_start_without_provider_returns_404(client) -> None:
-    r = client.post("/api/v1/agent/start", json={"input": "找沙丘"})
+    r = client.post("/api/v1/sessions", json={"content": "找沙丘"})
     assert r.status_code == 404
     assert "尚未配置模型供应商" in r.json()["message"]
     # 供应商校验必须在会话落盘之前：失败后不允许残留任何会话记录
     # （否则侧栏刷新会冒出一条空会话，见 start_agent 中的组装顺序注释）
-    listed = client.get("/api/v1/agent/sessions")
+    listed = client.get("/api/v1/sessions")
     assert listed.status_code == 200
     assert listed.json()["data"] == []
 
 
 def test_start_streams_agent_events(client) -> None:
     configure_provider(client)
-    started = client.post("/api/v1/agent/start", json={"input": "找沙丘 4K"})
+    started = client.post("/api/v1/sessions", json={"content": "找沙丘 4K"})
     assert started.status_code == 202
-    run_id = started.json()["data"]["run_id"]
+    session_id = started.json()["data"]["session_id"]
+    assert set(started.json()["data"]) == {"session_id", "message_id"}
 
-    with client.stream("GET", f"/api/v1/agent/runs/{run_id}/stream") as r:
+    with client.stream("GET", f"/api/v1/sessions/{session_id}/events") as r:
         assert r.status_code == 200
         assert r.headers["content-type"].startswith("text/event-stream")
         assert "no-transform" in r.headers["cache-control"]
@@ -138,31 +139,31 @@ def test_start_streams_agent_events(client) -> None:
     assert done["text"] == "已找到资源"
     assert done["thinking"] == "思考中"
     assert done["usage"]["total_tokens"] == 14
-    # 全部事件共享同一 run_id
-    assert {payload["run_id"] for _, _, payload in events} == {run_id}
+    assert all("run_id" not in payload for _, _, payload in events)
 
     # 已完成运行仍可按 Last-Event-ID 续传，只返回游标之后的事件。
     resumed = client.get(
-        f"/api/v1/agent/runs/{run_id}/stream",
+        f"/api/v1/sessions/{session_id}/events",
         headers={"Last-Event-ID": "3"},
     )
     assert [event_id for event_id, _, _ in parse_sse(resumed.text)] == [4, 5]
 
 
-def test_start_rejects_blank_input(client) -> None:
+def test_start_rejects_blank_content(client) -> None:
     configure_provider(client)
-    r = client.post("/api/v1/agent/start", json={"input": "   "})
+    r = client.post("/api/v1/sessions", json={"content": "   "})
     assert r.status_code == 422
 
 
-def test_start_passes_history_to_model(client, monkeypatch) -> None:
-    """多轮历史按序进入模型请求（user/assistant 交替 + 本轮 input 收尾）。"""
-    captured: dict = {}
+def test_send_message_rebuilds_history_from_transcript(client, monkeypatch) -> None:
+    """后续消息的历史由服务端转录重建，调用方只提交 message content。"""
+    captured: dict = {"requests": []}
 
     class _CaptureProtocol(_StreamProtocol):
         async def chat_stream(self, request, model_id):
-            captured["roles"] = [m.role for m in request.messages]
-            captured["last"] = request.messages[-1].text()
+            captured["requests"].append(
+                ([m.role for m in request.messages], request.messages[-1].text())
+            )
             async for e in super().chat_stream(request, model_id):
                 yield e
 
@@ -177,42 +178,63 @@ def test_start_passes_history_to_model(client, monkeypatch) -> None:
             "default_model": "qwen3.7-max",
         },
     )
-    started = client.post(
-        "/api/v1/agent/start",
-        json={
-            "input": "第三轮问题",
-            "history": [
-                {"role": "user", "content": "第一轮"},
-                {"role": "assistant", "content": "第一轮回答"},
-            ],
-        },
+    started = client.post("/api/v1/sessions", json={"content": "第一轮问题"})
+    session_id = started.json()["data"]["session_id"]
+    client.get(f"/api/v1/sessions/{session_id}/events")
+    _wait_run_settled(client, session_id)
+    sent = client.post(
+        "/api/v1/sessions",
+        json={"content": "第二轮问题", "session_id": session_id},
     )
-    run_id = started.json()["data"]["run_id"]
-    client.get(f"/api/v1/agent/runs/{run_id}/stream")
-    # system 是 runner 注入的默认系统提示词，随后 history 与本轮 input 按序排列
-    assert captured["roles"] == ["system", "user", "assistant", "user"]
-    assert captured["last"] == "第三轮问题"
+    assert sent.status_code == 202
+    client.get(f"/api/v1/sessions/{session_id}/events")
+    # system 后是服务端转录里的首组 user/assistant，最后才是新 user message
+    assert captured["requests"][-1] == (
+        ["system", "user", "assistant", "user"],
+        "第二轮问题",
+    )
 
 
-def test_start_rejects_invalid_history_role(client) -> None:
+def test_start_rejects_removed_history_field(client) -> None:
     configure_provider(client)
     r = client.post(
-        "/api/v1/agent/start",
-        json={"input": "x", "history": [{"role": "system", "content": "注入"}]},
+        "/api/v1/sessions",
+        json={"content": "x", "history": [{"role": "system", "content": "注入"}]},
     )
     assert r.status_code == 422
 
 
-def test_stream_unknown_run_and_invalid_cursor(client) -> None:
-    configure_provider(client)
-    missing = client.get("/api/v1/agent/runs/not-found/stream")
-    assert missing.status_code == 404
-    assert "不存在或事件历史已过期" in missing.json()["message"]
+def test_session_openapi_describes_capabilities_and_destructive_retry(client) -> None:
+    """Session 描述是 Agent 的操作合同，关键能力、ID 与副作用不能退化。"""
+    spec = client.get("/api/v1/openapi.json").json()
+    start = spec["paths"]["/api/v1/sessions"]["post"]
+    transcript = spec["paths"]["/api/v1/sessions/{session_id}"]["get"]
+    retry = spec["paths"]["/api/v1/sessions/{session_id}/retry"]["post"]
+    follow = spec["paths"]["/api/v1/sessions/{session_id}/events"]["get"]
+    stop = spec["paths"]["/api/v1/sessions/{session_id}/stop"]["post"]
 
-    started = client.post("/api/v1/agent/start", json={"input": "测试游标"})
-    run_id = started.json()["data"]["run_id"]
+    assert "session_id" in start["description"] and "message_id" in start["description"]
+    assert "session.follow" in start["description"]
+    assert "不分页、不截断" in transcript["description"]
+    assert "message_id" in transcript["description"]
+    assert "session.retry" in transcript["description"]
+    for keyword in ("永久删除", "content", "新的 ``message_id``", "user message"):
+        assert keyword in retry["description"]
+    assert "x-cli-dangerous" not in retry
+    assert "最近一次消息处理" in follow["description"] and "404" in follow["description"]
+    assert "幂等" in stop["description"] and "不能停止" in stop["description"]
+
+
+def test_follow_unknown_session_and_invalid_cursor(client) -> None:
+    configure_provider(client)
+    missing = client.get("/api/v1/sessions/not-found/events")
+    assert missing.status_code == 404
+    assert "没有可跟随或停止的运行" in missing.json()["message"]
+
+    started = client.post("/api/v1/sessions", json={"content": "测试游标"})
+    session_id = started.json()["data"]["session_id"]
     invalid = client.get(
-        f"/api/v1/agent/runs/{run_id}/stream",
+        f"/api/v1/sessions/{session_id}/events",
         headers={"Last-Event-ID": "999"},
     )
     assert invalid.status_code == 400
@@ -222,7 +244,7 @@ def test_stream_unknown_run_and_invalid_cursor(client) -> None:
 def _wait_run_settled(client, session_id: str) -> None:
     """等待终态收尾落库（on_terminal 与 SSE 收流并发，留一个短轮询窗）。"""
     for _ in range(50):
-        item = client.get(f"/api/v1/agent/sessions/{session_id}").json()["data"]["session"]
+        item = client.get(f"/api/v1/sessions/{session_id}").json()["data"]["session"]
         if not item["running"]:
             return
         time.sleep(0.1)
@@ -230,10 +252,10 @@ def _wait_run_settled(client, session_id: str) -> None:
 
 
 def test_manual_compact_endpoint(client, monkeypatch) -> None:
-    """手动压缩：压缩行落盘（详情不含替换历史），续聊用压缩后的上下文。"""
+    """手动压缩：完整压缩轨迹可读，续聊使用压缩后的上下文。"""
     from movieclaw_agent.prompts import COMPACT_PROMPT
 
-    captured: dict = {"turns": []}
+    captured: dict = {"requests": []}
 
     class _CompactAwareProtocol(_StreamProtocol):
         async def chat_stream(self, request, model_id):
@@ -251,7 +273,7 @@ def test_manual_compact_endpoint(client, monkeypatch) -> None:
                     ),
                 )
                 return
-            captured["turns"].append([m.role for m in request.messages])
+            captured["requests"].append([m.role for m in request.messages])
             async for e in super().chat_stream(request, model_id):
                 yield e
 
@@ -265,45 +287,47 @@ def test_manual_compact_endpoint(client, monkeypatch) -> None:
         },
     )
 
-    # 第一轮运行落下 user + assistant 两条消息
-    started = client.post("/api/v1/agent/start", json={"input": "找沙丘 4K"})
+    # 第一条用户消息的运行落下 user + assistant 两条消息
+    started = client.post("/api/v1/sessions", json={"content": "找沙丘 4K"})
     session_id = started.json()["data"]["session_id"]
-    client.get(f"/api/v1/agent/runs/{started.json()['data']['run_id']}/stream")
+    client.get(f"/api/v1/sessions/{session_id}/events")
     _wait_run_settled(client, session_id)
 
-    compacted = client.post(f"/api/v1/agent/sessions/{session_id}/compact")
+    compacted = client.post(f"/api/v1/sessions/{session_id}/compact-context")
     assert compacted.status_code == 200
     data = compacted.json()["data"]
     assert data["summary"] == "交接摘要"
-    assert data["entry_uuid"]
+    assert data["compaction_id"]
     # 压缩请求带完整现场（system + 全部消息），末尾是压缩指令
     assert captured["compact_roles"] == ["system", "user", "assistant", "user"]
     assert captured["compact_last"] == COMPACT_PROMPT
 
-    # 详情：压缩行在时间线末尾，且不含 replacement_history（重建数据不外发）
-    detail = client.get(f"/api/v1/agent/sessions/{session_id}").json()["data"]
+    # 完整轨迹保留后续消息所需的 replacement_history，压缩记录有独立编号
+    detail = client.get(f"/api/v1/sessions/{session_id}").json()["data"]
     tail = detail["entries"][-1]
     assert tail["type"] == "compaction"
     assert tail["summary"] == "交接摘要"
-    assert "replacement_history" not in tail
-    assert tail["uuid"] == data["entry_uuid"]
+    assert tail["replacement_history"]
+    assert tail["compaction_id"] == data["compaction_id"]
+    assert "uuid" not in tail
 
-    # 续聊：上下文从压缩行重建 = 保留的用户原话 + 摘要 + 本轮输入
+    # 发送后续消息：上下文从压缩行重建 = 保留的用户原话 + 摘要 + 新消息
     resumed = client.post(
-        "/api/v1/agent/start", json={"input": "继续", "session_id": session_id}
+        "/api/v1/sessions", json={"content": "继续", "session_id": session_id}
     )
-    client.get(f"/api/v1/agent/runs/{resumed.json()['data']['run_id']}/stream")
-    assert captured["turns"][-1] == ["system", "user", "user", "user"]
+    assert resumed.status_code == 202
+    client.get(f"/api/v1/sessions/{session_id}/events")
+    assert captured["requests"][-1] == ["system", "user", "user", "user"]
     # 转录回放的历史不受影响：压缩前的 assistant 行仍在详情里
-    replay = client.get(f"/api/v1/agent/sessions/{session_id}").json()["data"]
+    replay = client.get(f"/api/v1/sessions/{session_id}").json()["data"]
     roles = [e["message"]["role"] for e in replay["entries"] if e.get("type") != "compaction"]
     assert "assistant" in roles
 
-    missing = client.post("/api/v1/agent/sessions/not-exist/compact")
+    missing = client.post("/api/v1/sessions/not-exist/compact-context")
     assert missing.status_code == 404
 
 
-def test_cancel_run_ends_with_cancelled_event(client, monkeypatch) -> None:
+def test_stop_session_ends_with_cancelled_event(client, monkeypatch) -> None:
     class _BlockingProtocol(_StreamProtocol):
         async def chat_stream(self, request, model_id):
             await asyncio.sleep(3600)
@@ -318,12 +342,12 @@ def test_cancel_run_ends_with_cancelled_event(client, monkeypatch) -> None:
             "default_model": "qwen3.7-max",
         },
     )
-    started = client.post("/api/v1/agent/start", json={"input": "等待取消"})
-    run_id = started.json()["data"]["run_id"]
-    cancelled = client.post(f"/api/v1/agent/runs/{run_id}/cancel")
+    started = client.post("/api/v1/sessions", json={"content": "等待取消"})
+    session_id = started.json()["data"]["session_id"]
+    cancelled = client.post(f"/api/v1/sessions/{session_id}/stop")
     assert cancelled.status_code == 200
 
-    events = parse_sse(client.get(f"/api/v1/agent/runs/{run_id}/stream").text)
+    events = parse_sse(client.get(f"/api/v1/sessions/{session_id}/events").text)
     assert events[-1][1] == "agent_cancelled"
 
 
@@ -374,8 +398,8 @@ def test_page_routes_match_web_app_pages() -> None:
 
     declared = {normalize(pattern) for pattern, _ in _PAGE_ROUTES}
 
-    # 不进路由表的页面：/runs 是 Agent 会话页自身，/settings 子分区给 /settings 兜底
-    exempt = {"/runs/*", "/settings/*"}
+    # /settings 子分区由 /settings 兜底，不逐项写进提示词路由表
+    exempt = {"/settings/*"}
 
     ghosts = declared - fs_routes
     assert not ghosts, f"路由表声明了前端不存在的页面：{sorted(ghosts)}"

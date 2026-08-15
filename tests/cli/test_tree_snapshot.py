@@ -42,9 +42,10 @@ KNOWN_NON_GENERATED = {
     "auth.login",  # 精选命令 mclaw login 负责（要持久化本地凭证）
     "auth.logout",  # 精选命令 mclaw logout 负责
     "workflow.search.torrents.stream",
-    "agent.runs.stream",
+    "session.follow",
     "fs.browse",  # 仅 Web 端目录选择器用；CLI/Agent 有 bash 等通用工具，不再暴露
     "jobs.stream",  # 前端全局事件流；CLI 使用 jobs wait/events
+    "playback.recent",  # 按成员投影的 Web 首页卡片；CLI 暂无对应消费场景
     "dl.tasks",  # 任务中心的下载器聚合投影；CLI 直接使用 downloader 命令
     "dl.torrent.replace",  # 任务中心无进度下载的就地换源动作，仅供 Web 使用
     "dl.torrent.delete",  # 任务中心 Web 操作；删除数据时具有破坏性，不开放给 CLI
@@ -99,6 +100,8 @@ def test_discover_exposes_only_semantic_domain_commands() -> None:
     assert command_ids == {
         "discover.list-collections",
         "discover.browse-collection",
+        "discover.filter-options",
+        "discover.filter-titles",
         "discover.get-title-details",
     }
 
@@ -119,12 +122,33 @@ def test_subscriptions_exposes_only_user_intent_commands() -> None:
         "subscriptions.list",
         "subscriptions.list-active-downloads",
         "subscriptions.list-activities",
+        "subscriptions.list-today-arrivals",
         "subscriptions.preview-download-routing",
         "subscriptions.search-missing-resources",
         "subscriptions.set-follow-future",
         "subscriptions.set-tracking-state",
         "subscriptions.unsubscribe",
         "subscriptions.update",
+    }
+
+
+def test_session_exposes_only_message_semantic_operations() -> None:
+    """Session 公开面只保留会话/message 语义，不重新引入 run、turn 或 rewind。"""
+    operation_ids = {
+        op["operation_id"]
+        for op in iter_operations(load_baseline())
+        if op["operation_id"].startswith("session.")
+    }
+    assert operation_ids == {
+        "session.compact-context",
+        "session.delete",
+        "session.follow",
+        "session.get-transcript",
+        "session.list",
+        "session.rename",
+        "session.retry",
+        "session.start",
+        "session.stop",
     }
 
 

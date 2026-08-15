@@ -33,7 +33,6 @@ from movieclaw_api.schemas.library import (
     LibraryPayload,
     LibraryReorderPayload,
     LibrarySearchGroupView,
-    LibraryStats,
     LibraryView,
     LocalMetaView,
     MetadataRefreshView,
@@ -150,6 +149,7 @@ from movieclaw_db.models import (
 )
 from movieclaw_db.repositories import MediaItemRepository
 from movieclaw_db.repositories.library_file_repo import LibraryFileRepository
+from movieclaw_db.repositories.library_repo import LibraryRepository
 from movieclaw_media.genres import COUNTRY_NAMES, MOVIE_GENRES, REGION_PRESETS, TV_GENRES
 from movieclaw_media.models import MediaKind, MediaSource
 
@@ -468,45 +468,6 @@ async def _persistent_metadata_refresh_view(
     )
 
 
-async def _stats_by_library(session: AsyncSession) -> dict[int, LibraryStats]:
-    """全部库的库存统计（一次查询，Python 聚合——单机规模足够）。
-
-    只取统计要用的五列。这是媒体库首页的数据源，扫的是**全部库**的台账；
-    整行取 ORM 对象要连带反序列化每行的音轨/字幕/候选三段 JSON，几万个
-    文件就是几万次白费的解析，而这些列一个都用不上。
-    """
-    rows = (
-        await session.execute(
-            select(
-                LibraryFile.library_id,
-                LibraryFile.size_bytes,
-                LibraryFile.missing_since,
-                LibraryFile.media_item_id,
-                LibraryFile.ignored_at,
-            )
-        )
-    ).all()
-    stats: dict[int, LibraryStats] = {}
-    items: dict[int, set[int]] = {}
-    for library_id, size_bytes, missing_since, media_item_id, ignored_at in rows:
-        s = stats.setdefault(library_id, LibraryStats())
-        s.file_count += 1
-        s.total_size_bytes += size_bytes
-        if missing_since is not None:
-            s.missing_count += 1
-        if media_item_id is None:
-            # 用户忽略过的不算"待识别"——那是已经处理完的决定，不该再催
-            if ignored_at is not None:
-                s.ignored_count += 1
-            else:
-                s.unidentified_count += 1
-        else:
-            items.setdefault(library_id, set()).add(media_item_id)
-    for library_id, media_ids in items.items():
-        stats[library_id].item_count = len(media_ids)
-    return stats
-
-
 @router.get(
     "",
     response_model=ApiResponse[list[LibraryView]],
@@ -524,14 +485,12 @@ async def list_libraries(
     visible = await visible_library_ids(session, principal)
     if visible is not None:
         rows = [r for r in rows if r.id in visible]
-    stats = await _stats_by_library(session)
     scan_views = {
         row.id: await _persistent_scan_views(session, row.id) for row in rows if row.id is not None
     }
     views = [
         LibraryView.from_model(
             r,
-            stats=stats.get(r.id or -1),
             scanning=scan_views.get(r.id, (False, None, None))[0],
             scan_progress=scan_views.get(r.id, (False, None, None))[1],
             last_scan=scan_views.get(r.id, (False, None, None))[2],
@@ -835,11 +794,10 @@ async def get_library(
     organizing, organize_view, last_organize_view = await _persistent_organize_views(
         session, library_id
     )
-    # 字段口径与列表接口保持一致（stats/metadata_refresh 一个不缺）：
-    # 单库接口少给字段就是给调用方埋雷——stats 会静默回全零默认值
+    # 字段口径与列表接口保持一致（stats/metadata_refresh 一个不缺）。
+    # stats 已随 Library 行读出，不再为一次详情请求扫描整张库存台账。
     view = LibraryView.from_model(
         row,
-        stats=(await _stats_by_library(session)).get(library_id),
         scanning=scanning,
         scan_progress=scan_view,
         last_scan=last_scan_view,
@@ -2512,6 +2470,8 @@ async def clear_missing(
     cleared = await LibraryFileRepository(session).delete_missing(
         payload.library_id, media_item_id=payload.media_item_id
     )
+    if cleared:
+        await LibraryRepository(session).refresh_stats([payload.library_id])
     return ok({"cleared": cleared}, message=f"已清理 {cleared} 条缺失记录（磁盘未动）")
 
 
@@ -2532,6 +2492,8 @@ async def clear_unidentified(
     repo = LibraryFileRepository(session)
     rows = await repo.list_unidentified(library_id=payload.library_id)
     cleared = await repo.mark_ignored([row.id for row in rows if row.id is not None])
+    if cleared:
+        await LibraryRepository(session).refresh_stats([payload.library_id])
     return ok(
         {"cleared": cleared},
         message=f"已忽略 {cleared} 个待识别文件（磁盘未动；可在「已忽略」里恢复）",
@@ -2652,9 +2614,11 @@ async def ignore_file(
     分钟都撑不住，用户看到的是"忽略了又自己回来"）。
     """
     repo = LibraryFileRepository(session)
-    if await session.get(LibraryFile, file_id) is None:
+    row = await session.get(LibraryFile, file_id)
+    if row is None:
         raise NotFoundException(f"台账记录不存在：id={file_id}")
     await repo.mark_ignored([file_id])
+    await LibraryRepository(session).refresh_stats([row.library_id])
     return ok({}, message="已忽略，之后扫描不再过问（磁盘文件未受影响；可在「已忽略」里恢复）")
 
 
@@ -2681,9 +2645,17 @@ async def detach_files(
     清单里一键恢复即可重新参与识别。
     """
     repo = LibraryFileRepository(session)
+    library_ids = set(
+        (
+            await session.execute(
+                select(LibraryFile.library_id).where(LibraryFile.id.in_(payload.file_ids))  # type: ignore[attr-defined]
+            )
+        ).scalars()
+    )
     detached, displaced = await repo.detach_and_ignore(payload.file_ids)
     if detached == 0:
         raise NotFoundException("这些台账记录都不存在（可能已被处理）")
+    await LibraryRepository(session).refresh_stats(library_ids)
     # 摘锚后旧条目往往一个文件都不剩，连同图片资产清掉，不在库里留空壳
     if displaced:
         background_tasks.add_task(media_scrape.cleanup_orphan_items, sorted(displaced))
@@ -2712,9 +2684,17 @@ async def restore_ignored_files(
     识别器一直在变强，当初认不出的以后未必认不出——忽略必须可反悔。
     """
     repo = LibraryFileRepository(session)
+    library_ids = set(
+        (
+            await session.execute(
+                select(LibraryFile.library_id).where(LibraryFile.id.in_(payload.file_ids))  # type: ignore[attr-defined]
+            )
+        ).scalars()
+    )
     restored = await repo.restore_ignored(payload.file_ids)
     if restored == 0:
         raise NotFoundException("这些记录都不存在或本来就没被忽略")
+    await LibraryRepository(session).refresh_stats(library_ids)
     return ok(
         {"restored": restored},
         message=f"{restored} 个文件已恢复，重新扫描即可再试识别",

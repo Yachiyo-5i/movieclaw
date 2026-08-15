@@ -25,6 +25,7 @@ import { usePageTitle } from "@/lib/use-page-title";
  */
 export function PersonDetailView({ tmdbPersonId }: { tmdbPersonId: number | string }) {
   const [person, setPerson] = useState<PersonDetail | null>(null);
+  const navFallback = { label: "媒体库", href: "/library" as Route };
   // null=加载中；"missing"=库内没有这个人；"error"=其他失败
   const [failure, setFailure] = useState<"missing" | "error" | null>(null);
 
@@ -50,12 +51,11 @@ export function PersonDetailView({ tmdbPersonId }: { tmdbPersonId: number | stri
   usePageTitle(person?.name);
 
   // 兜底态也要渲染 PageNav（姓名未知，标签留空）：向外壳登记「本页自带顶栏」，
-  // 否则移动端全局顶栏（☰ + logo）会先显示再消失、顶部闪一下；无 href 的
-  // 单节点回退为浏览器后退，与正文态的返回行为一致。
+  // 否则移动端全局顶栏（☰ + logo）会先显示再消失、顶部闪一下。
   if (failure !== null) {
     return (
       <div className="flex h-full flex-col">
-        <PageNav items={[{ label: "" }]} />
+        <PageNav title="" fallback={navFallback} />
         <PersonFallback failure={failure} />
       </div>
     );
@@ -63,7 +63,7 @@ export function PersonDetailView({ tmdbPersonId }: { tmdbPersonId: number | stri
   if (person === null) {
     return (
       <div className="flex h-full flex-col">
-        <PageNav items={[{ label: "" }]} />
+        <PageNav title="" fallback={navFallback} />
         <div className="flex flex-1 items-center justify-center gap-2.5 text-ui text-[var(--text-muted)]">
           <span className="size-4 animate-spin rounded-full border-2 border-white/20 border-t-white/70" />
           正在读取影人档案…
@@ -77,11 +77,11 @@ export function PersonDetailView({ tmdbPersonId }: { tmdbPersonId: number | stri
 
   return (
     <div className="scroll-thin scroll-safe h-full overflow-y-auto pb-12">
-      {/* 来路交给浏览器后退：进人物页的入口是各处演职员条，来路不固定，
-          写死「返回媒体库」会把用户带到他没来过的地方。
+      {/* 来路交给统一后退：进人物页的入口是各处演职员条，来路不固定；
+          只有分享链接或新标签直达时才兜底去媒体库。
           不补负边距——本页的横向内边距在各分区上，滚动容器自身没有 px，
           PageNav 自带的 px-6/max-md:px-4 正好对齐（补了反而会撑出横向滚动条）。 */}
-      <PageNav items={[{ label: person.name }]} />
+      <PageNav title={person.name} fallback={navFallback} />
 
       {/* 头部：头像 + 姓名。刻意不做大 Hero——影人没有专属剧照 */}
       <header className="flex items-end gap-6 px-12 pt-2 max-md:gap-4 max-md:px-4">

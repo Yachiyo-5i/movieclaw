@@ -73,12 +73,27 @@ def test_service_map_reflects_frontend_product_language() -> None:
     assert "播放、收藏" in lines["webhook"] and "HMAC" in lines["webhook"]
 
 
-def test_agent_domain_is_excluded() -> None:
-    """agent 域被工具硬闸禁止，目录里绝不能出现（自相矛盾会误导模型）。"""
+def test_session_domain_is_exposed_without_agent_domain() -> None:
+    """Agent 分类已移除；模型直接看到一级 session 会话管理能力。"""
     rendered = render_service_map()
     assert not any(line.lstrip("- ").startswith("agent ") for line in rendered.splitlines()), (
-        "目录不应包含被硬闸禁止的 agent 域"
+        "目录不应残留旧 agent 域"
     )
+    session = next(line for line in rendered.splitlines() if line.startswith("- session "))
+    for keyword in (
+        "用户与智能体",
+        "发起新对话",
+        "继续已有对话",
+        "指定用户消息",
+        "读取并分析",
+        "message/compaction",
+        "压缩上下文",
+        "跟随或停止",
+        "删除会话",
+    ):
+        assert keyword in session
+    for protocol_word in ("先 list", "禁用", "可能很大", "不分页、不截断"):
+        assert protocol_word not in session
 
 
 def test_full_description_matches_snapshot() -> None:
@@ -123,8 +138,8 @@ def client(tmp_path, monkeypatch):
     get_settings.cache_clear()
 
 
-def test_agent_token_cannot_start_new_run(client: TestClient) -> None:
-    """持 agent 工作区令牌调 /agent/start → 400 禁止递归（先于一切校验）。"""
+def test_agent_token_cannot_start_or_send_session_message(client: TestClient) -> None:
+    """Agent 令牌不能开始会话或发送消息，且硬闸先于资源/模型校验。"""
     import asyncio
 
     from movieclaw_api.services import auth as auth_service
@@ -135,10 +150,37 @@ def test_agent_token_cannot_start_new_run(client: TestClient) -> None:
     # bootstrap 的管理员 Cookie 会把身份判成 admin。真实 Agent 工作区
     # 也只有 Bearer 令牌，这正是它的调用形态。
     fresh = TestClient(client.app)
+    for body in (
+        {"content": "递归测试"},
+        {"content": "递归测试", "session_id": "missing"},
+    ):
+        resp = fresh.post(
+            "/api/v1/sessions",
+            json=body,
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 400
+        assert "禁止递归" in resp.json()["message"]
+    retry = fresh.post(
+        "/api/v1/sessions/missing/retry",
+        json={"message_id": "m1"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert retry.status_code == 400
+    assert "禁止递归" in retry.json()["message"]
+
+
+def test_agent_token_cannot_stop_its_own_session(client: TestClient) -> None:
+    """即使绕过 mclaw 工具直调 API，当前 Agent 也不能自我终止。"""
+    import asyncio
+
+    from movieclaw_api.services import auth as auth_service
+
+    token = asyncio.run(auth_service.issue_agent_token("sess-x"))
+    fresh = TestClient(client.app)
     resp = fresh.post(
-        "/api/v1/agent/start",
-        json={"input": "递归测试"},
+        "/api/v1/sessions/sess-x/stop",
         headers={"Authorization": f"Bearer {token}"},
     )
     assert resp.status_code == 400
-    assert "禁止递归" in resp.json()["message"]
+    assert "不能停止承载自己的会话" in resp.json()["message"]

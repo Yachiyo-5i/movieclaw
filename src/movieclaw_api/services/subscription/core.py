@@ -16,6 +16,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
+from statistics import median
 from types import EllipsisType
 
 from sqlalchemy import and_, or_
@@ -29,7 +30,11 @@ from movieclaw_api.exceptions import (
 )
 from movieclaw_api.services.media_library import MediaLibraryService
 from movieclaw_api.services.rule_sets import RuleSetService
-from movieclaw_api.services.subscription.release_forecast import refresh_release_forecasts
+from movieclaw_api.services.subscription.matching import publish_calendar_date
+from movieclaw_api.services.subscription.release_forecast import (
+    next_forecast_probe_times_by_wanted,
+    refresh_release_forecasts,
+)
 from movieclaw_api.services.system_notice import resolve_notices
 from movieclaw_db.models import (
     ActivityType,
@@ -60,6 +65,11 @@ logger = logging.getLogger("movieclaw_api.subscription")
 # 被动匹配通常在到点前满足工单；真到点仍缺的，worker 捞起即漏抓兜底。
 FUTURE_GRACE = timedelta(hours=48)
 
+# 首页“预计入库”在缺少本剧历史样本时使用的冷启动值。出现真实入库记录后，
+# 会自动切换成该订阅自己的中位耗时，不把这个展示层兜底写进预测快照。
+_DEFAULT_RELEASE_TO_IMPORT_MINUTES = 60
+_DEFAULT_DOWNLOAD_TO_IMPORT_MINUTES = 10
+
 # 剧集完结类 status：期望集合不再生长的判定输入之一
 _ENDED_STATUSES = frozenset({"Ended", "Canceled"})
 
@@ -86,6 +96,46 @@ class ExpectedUnit:
     air_date: date | None
 
 
+@dataclass(frozen=True)
+class TodayArrivalCandidate:
+    """订阅首页的一行待入库剧集，以及由本剧历史得出的耗时基线。"""
+
+    subscription: Subscription
+    media: MediaItem
+    wanted: WantedItem
+    next_probe_at: datetime | None
+    release_to_import_minutes: int
+    download_to_import_minutes: int
+
+
+def _median_pipeline_minutes(
+    rows: list[WantedItem],
+    *,
+    start_field: str,
+    end_field: str,
+    fallback: int,
+    maximum: timedelta,
+) -> int:
+    """从已完成工单取中位耗时；异常长链路不参与首页的日内时间估算。"""
+    durations: list[float] = []
+    for row in rows:
+        start = getattr(row, start_field)
+        end = getattr(row, end_field)
+        if not isinstance(start, datetime) or not isinstance(end, datetime):
+            continue
+        elapsed = end - start
+        if timedelta(0) < elapsed <= maximum:
+            durations.append(elapsed.total_seconds() / 60)
+    return max(1, round(median(durations))) if durations else fallback
+
+
+def _forecast_predicted_at(wanted: WantedItem) -> datetime | None:
+    forecast = wanted.release_forecast
+    if not isinstance(forecast, dict):
+        return None
+    return _payload_time(forecast.get("predicted_at"))
+
+
 def expected_units(
     kind: MediaKind,
     episodes: list[MediaEpisode],
@@ -98,7 +148,7 @@ def expected_units(
 
     集数据来自 ``media_episode`` 表（集数据唯一事实源，metadata.md 第 1 节）。
     追新的锚定取**评估时刻**而非订阅创建时刻：创建时二者等价；后来才打开
-    追新开关时，不回补开关关闭期间播出的集（用户此刻的意图是"从现在起追"）。
+    自动续订开关时，不回补开关关闭期间播出的集（用户此刻的意图是"从现在起追"）。
     更早的历史集通过勾选季表达。特别季 0 仅显式勾选才纳入。
     """
     if kind is MediaKind.MOVIE:
@@ -320,7 +370,7 @@ class SubscriptionService:
         await self._recompute_status(subscription, item)
         await refresh_release_forecasts(self._session, media_item_ids={item.id})
         logger.info(
-            "已订阅《%s》(%s)：勾选季 %s，追新 %s，生成工单 %d 个",
+            "已订阅《%s》(%s)：勾选季 %s，自动续订 %s，生成工单 %d 个",
             item.title,
             kind.value,
             selected or "无",
@@ -343,7 +393,7 @@ class SubscriptionService:
         rule_set_id: int | None = None,
         library_id: int | None | EllipsisType = ...,
     ) -> Subscription:
-        """修改 E 的定义（季选择/追新/规则组/入库目标库），diff 重算工单。
+        """修改 E 的定义（季选择/自动续订/规则组/入库目标库），diff 重算工单。
 
         ``library_id`` 用 ``...``（Ellipsis）作「未传=不变」的哨兵：显式传 None
         表示清除指定库、改回按默认库路由——旧订阅（library_id 为空）需要这条
@@ -455,7 +505,7 @@ class SubscriptionService:
         await self._log(
             subscription,
             ActivityType.ADJUSTED,
-            f"调整订阅：勾选{season_text}，持续追新{'开' if subscription.follow_future else '关'}"
+            f"调整订阅：勾选{season_text}，自动续订{'开' if subscription.follow_future else '关'}"
             f"{rule_note}；新增 {len(to_add)} 个单元，重新纳入 {reactivated} 个，"
             f"退出范围 {deactivated} 个"
             "（下载器任务不会自动删除；退出范围后停止搜索与换源）",
@@ -487,10 +537,10 @@ class SubscriptionService:
         return subscription
 
     async def set_follow_future(self, subscription_id: int, enabled: bool) -> Subscription:
-        """独立启用/禁用剧集持续追新；重复设置同一状态保持幂等。"""
+        """独立开启/关闭剧集自动续订；重复设置同一状态保持幂等。"""
         subscription = await self._get_or_404(subscription_id)
         if MediaKind(subscription.kind) is not MediaKind.TV:
-            raise BadRequestException("只有剧集订阅可以设置持续追新")
+            raise BadRequestException("只有剧集订阅可以设置自动续订")
         if subscription.follow_future == enabled:
             return subscription
         return await self.update(subscription_id, follow_future=enabled)
@@ -819,6 +869,94 @@ class SubscriptionService:
             rows.append((sub, item, counts.get(sub.id or -1, {})))
         return rows
 
+    async def today_arrivals(self, *, member_id: int | None = None) -> list[TodayArrivalCandidate]:
+        """聚合今天待播或仍在下载/整理中的可见剧集，不查询外部下载器。
+
+        资源预测只负责给出“何时可能出种”。首页把本订阅过往的
+        ``投递→入库`` 中位耗时叠加上去，得到面向用户的预计入库时间；
+        下载中的实时 ETA 由 Web 已有的全局下载快照进一步覆盖。
+        """
+        visible = await self.list_with_progress(kind=MediaKind.TV.value, member_id=member_id)
+        subscriptions = {
+            sub.id: (sub, media) for sub, media, _counts in visible if sub.id is not None
+        }
+        wanted_rows = await self._repo.list_wanted_many(list(subscriptions), in_scope_only=True)
+        next_probe_by_wanted = await next_forecast_probe_times_by_wanted(
+            self._session,
+            wanted_items=[row for row in wanted_rows if row.status == WantedStatus.WANTED],
+        )
+        by_subscription: dict[int, list[WantedItem]] = {}
+        for wanted in wanted_rows:
+            by_subscription.setdefault(wanted.subscription_id, []).append(wanted)
+
+        today = publish_calendar_date(utcnow())
+        candidates: list[TodayArrivalCandidate] = []
+        for subscription_id, (subscription, media) in subscriptions.items():
+            rows = by_subscription.get(subscription_id, [])
+            release_to_import = _median_pipeline_minutes(
+                rows,
+                start_field="grabbed_at",
+                end_field="imported_at",
+                fallback=_DEFAULT_RELEASE_TO_IMPORT_MINUTES,
+                maximum=timedelta(days=7),
+            )
+            download_to_import = _median_pipeline_minutes(
+                rows,
+                start_field="downloaded_at",
+                end_field="imported_at",
+                fallback=_DEFAULT_DOWNLOAD_TO_IMPORT_MINUTES,
+                maximum=timedelta(days=1),
+            )
+            for wanted in rows:
+                in_pipeline = wanted.status in (
+                    WantedStatus.GRABBED,
+                    WantedStatus.DOWNLOADED,
+                )
+                if in_pipeline:
+                    # 模拟投递没有后续下载/入库链路，不应伪装成首页的“下载中”。
+                    if wanted.info_hash is None:
+                        continue
+                elif wanted.status == WantedStatus.WANTED:
+                    if subscription.status != SubscriptionStatus.ACTIVE:
+                        continue
+                    predicted = _forecast_predicted_at(wanted)
+                    predicted_import_day = (
+                        publish_calendar_date(predicted + timedelta(minutes=release_to_import))
+                        if predicted is not None
+                        else None
+                    )
+                    if wanted.air_date != today and predicted_import_day != today:
+                        continue
+                else:
+                    continue
+
+                candidates.append(
+                    TodayArrivalCandidate(
+                        subscription=subscription,
+                        media=media,
+                        wanted=wanted,
+                        next_probe_at=next_probe_by_wanted.get(wanted.id or -1),
+                        release_to_import_minutes=release_to_import,
+                        download_to_import_minutes=download_to_import,
+                    )
+                )
+
+        status_order = {
+            WantedStatus.DOWNLOADED: 0,
+            WantedStatus.GRABBED: 1,
+            WantedStatus.WANTED: 2,
+        }
+        candidates.sort(
+            key=lambda row: (
+                status_order.get(row.wanted.status, 9),
+                _forecast_predicted_at(row.wanted) or datetime.max,
+                row.media.title,
+                row.wanted.season_number,
+                row.wanted.episode_number,
+            )
+        )
+        return candidates
+
     async def detail(
         self, subscription_id: int
     ) -> tuple[Subscription, MediaItem, list[WantedItem]]:
@@ -978,7 +1116,7 @@ class SubscriptionService:
         detail = "；".join(parts) if parts else "暂无待办集"
         return (
             f"创建订阅《{item.title}》：勾选{self._season_text(selected)}，"
-            f"持续追新{'开' if follow_future else '关'}；"
+            f"自动续订{'开' if follow_future else '关'}；"
             f"共生成 {len(rows)} 个追踪项——{detail}"
         )
 

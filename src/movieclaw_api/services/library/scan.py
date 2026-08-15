@@ -96,6 +96,7 @@ from movieclaw_db.models import (
 from movieclaw_db.models.library_file import IdentitySource, UnidentifiedCode
 from movieclaw_db.models.scheduled_task import TriggerType
 from movieclaw_db.repositories.library_file_repo import LibraryFileRepository
+from movieclaw_db.repositories.library_repo import LibraryRepository
 from movieclaw_enrich import enrich
 from movieclaw_enrich.structure import title_candidates
 from movieclaw_media.models import MediaKind
@@ -510,6 +511,19 @@ def scan_progress(library_id: int) -> ScanState | None:
     return _scan_tasks.state_of(library_id)
 
 
+async def _refresh_stats_snapshot(library_id: int, summary: ScanSummary) -> None:
+    """用独立事务刷新库存快照；失败只记结论，不回滚已经提交的扫描成果。"""
+    try:
+        db = get_database()
+        async with db.session() as session:
+            await LibraryRepository(session).refresh_stats([library_id])
+    except Exception:  # noqa: BLE001 -- 统计失败不应把已完成的入库事务回滚
+        logger.exception("媒体库 #%s 库存统计刷新失败", library_id)
+        message = "库存统计刷新失败，将在下次扫描时重试"
+        if message not in summary.errors:
+            summary.errors.append(message)
+
+
 async def enqueue_scan_job(
     session: AsyncSession,
     library_id: int,
@@ -654,6 +668,7 @@ async def scan_library(
         return result
     except jobs.JobCancelled:
         summary.cancelled = True
+        await _refresh_stats_snapshot(library_id, summary)
         if bridge is not None:
             # 取消结论也落进 progress.details；Job 的 cancelled 状态本身不写
             # result，重启后库详情仍能还原“扫到哪里后停止”。
@@ -661,6 +676,7 @@ async def scan_library(
         raise
     except Exception:  # noqa: BLE001 -- 后台任务兜底
         logger.exception("媒体库 #%s 扫描时发生未知错误", library_id)
+        await _refresh_stats_snapshot(library_id, summary)
         if raise_unexpected:
             raise
         summary.errors.append("扫描中断：发生未知错误（详见后端日志）")
@@ -1037,6 +1053,10 @@ async def _scan(
         # 用户只能一个条目一个条目点开、靠详情页那点限量补探慢慢磨。
         if backfill_existing_specs:
             await _probe_backfill(session, library_id, summary, state, bridge=bridge)
+
+    # 文件台账已经收口就立刻发布统计，不等后续可能耗时数分钟的图片资产
+    # 下载。扫描仍显示进行中，但首页的作品数与容量已经是本轮最新结果。
+    await _refresh_stats_snapshot(library_id, summary)
 
     # AI 字幕自动生成挂钩（G2，subtitle-ai-translate.md §6）：开关默认关，
     # fire-and-forget 后台批次，绝不阻塞/影响扫描收尾
@@ -3368,6 +3388,7 @@ async def _reidentify(
         elif new_ids:
             # 分裂成多个条目（如剧集目录混入了别的剧）：不给单一跳转目标
             summary.changed = True
+        await LibraryRepository(session).refresh_stats([library_id])
     logger.info(
         "媒体库 #%s 条目 #%s 重新识别完成：%d 个文件（识别 %d / 待识别 %d），新身份 %s%s",
         library_id,

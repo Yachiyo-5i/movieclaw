@@ -458,6 +458,17 @@ def test_library_visibility_whitelist(client: TestClient) -> None:
     assert all(r["root_paths"] for r in admin_rows)
 
 
+def test_recent_playback_is_a_member_browsing_route(client: TestClient) -> None:
+    """最近观看属于成员浏览面；新账号没有记录时返回空列表而不是拒绝访问。"""
+    _admin_cookie, member_cookie, _ = _setup_admin_and_member(client)
+    _use(client, member_cookie)
+
+    response = client.get("/api/v1/playback/recent")
+
+    assert response.status_code == 200
+    assert response.json()["data"] == {"items": []}
+
+
 # ---------------------------------------------------------------------------
 # 守护测试：成员越权默认拒绝兜底
 # ---------------------------------------------------------------------------
@@ -490,6 +501,8 @@ _MEMBER_ALLOWLIST = {
     ("GET", "/api/v1/ui/discovery/{media_type}"),
     ("GET", "/api/v1/discover/collections"),
     ("GET", "/api/v1/discover/collections/{collection_ref}/titles"),
+    ("GET", "/api/v1/discover/filters"),
+    ("GET", "/api/v1/discover/titles"),
     ("POST", "/api/v1/search/titles"),
     ("GET", "/api/v1/discover/titles/{title_ref}"),
     ("GET", "/api/v1/people/{tmdb_person_id}"),
@@ -510,6 +523,8 @@ _MEMBER_ALLOWLIST = {
     ("GET", "/api/v1/libraries/{library_id}/items/{media_item_id}"),
     ("GET", "/api/v1/libraries/{library_id}/items/{media_item_id}/artwork"),
     ("GET", "/api/v1/libraries/{library_id}/items/{media_item_id}/episodes"),
+    # 最近观看是按成员隔离的个人播放数据，并继续受媒体库白名单过滤。
+    ("GET", "/api/v1/playback/recent"),
     # 搜索历史：个人数据；统一结果端点再按记录类型检查对应能力。
     ("GET", "/api/v1/search/history"),
     ("GET", "/api/v1/search/history/{history_id}/results"),
@@ -517,6 +532,7 @@ _MEMBER_ALLOWLIST = {
     ("DELETE", "/api/v1/search/history"),
     # 订阅：读 + 写（写受 allow_subscribe，默认开）；运维接口是管理员专属
     ("GET", "/api/v1/subscriptions"),
+    ("GET", "/api/v1/subscriptions/today-arrivals"),
     ("POST", "/api/v1/subscriptions"),
     ("POST", "/api/v1/subscriptions/title-preview"),
     ("GET", "/api/v1/subscriptions/{subscription_id}"),

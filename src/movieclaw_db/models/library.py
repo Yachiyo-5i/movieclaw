@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from sqlalchemy import JSON, Column
+from datetime import datetime
+
+from sqlalchemy import JSON, BigInteger, Column
 from sqlmodel import Field
 
 from movieclaw_db.models.base import TimestampMixin
@@ -70,6 +72,31 @@ class Library(TimestampMixin, table=True):
     # 台账、绝不动磁盘
     auto_clear_missing: bool = Field(
         default=False, description="扫描后自动清理已确认丢失的库存记录（不可恢复）"
+    )
+
+    # —— 库存统计快照 ----------------------------------------------------
+    # 媒体库首页是高频读路径，不能每次打开都扫描 library_file 全表再聚合。
+    # 这些派生值随扫描、监听入库、转移、删除和人工认领等台账变更在事务收尾
+    # 时统一重算；列表接口因此只读 library 的少量行，查询成本与文件数无关。
+    # item/file/size 只统计在位文件（missing_since IS NULL）：“占用空间”必须
+    # 反映当前磁盘内容；历史缺失记录另由 stats_missing_count 单独表达。
+    stats_item_count: int = Field(default=0, description="在位且已识别的媒体条目数")
+    # Jellyfin 库卡片与 /Items/Counts 还需要剧集的分集总数；与
+    # 作品数一同预计算，避免兼容接口另外扫描整张 library_file。
+    stats_episode_count: int = Field(default=0, description="在位且已识别的剧集分集数")
+    stats_file_count: int = Field(default=0, description="在位文件数（含待识别）")
+    stats_total_size_bytes: int = Field(
+        default=0,
+        sa_column=Column(BigInteger, nullable=False, default=0),
+        description="在位文件总大小（字节）",
+    )
+    stats_unidentified_count: int = Field(
+        default=0, description="在位待识别文件数（不含已忽略）"
+    )
+    stats_missing_count: int = Field(default=0, description="标记 missing 的历史文件数")
+    stats_ignored_count: int = Field(default=0, description="在位且已忽略的文件数")
+    stats_refreshed_at: datetime | None = Field(
+        default=None, description="库存统计最近一次重算时间；NULL=尚未扫描"
     )
 
     @property

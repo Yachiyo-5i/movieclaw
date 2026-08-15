@@ -18,6 +18,7 @@ import { SettingsSidebar } from "@/components/settings-view";
 import { Sidebar } from "@/components/sidebar";
 import { SubscribeEntryProvider } from "@/components/subscribe-entry";
 import { AgentConversationsProvider } from "@/lib/agent-conversations";
+import { useAppNavigationTracking } from "@/lib/back-navigation";
 import { BackdropProvider } from "@/lib/backdrop";
 import type { SearchScope } from "@/lib/categories";
 import { PageChromeProvider } from "@/lib/page-chrome";
@@ -38,7 +39,7 @@ import { usePermissions } from "@/lib/permissions";
  *   /tasks               任务中心
  *   /media/[type]/[id]   影片详情
  *   /search?q=…          跨站搜索结果（范围/快照都在查询参数里）
- *   /runs/[id]           任务会话
+ *   /sessions/[id]       AI 会话
  *   /settings/[section]  设置各分区
  *
  * 布局参考 Codex / Claude Code：两种模式共用「左栏 + 右区」两栏结构：
@@ -55,8 +56,8 @@ function navIdFromPath(pathname: string): string {
   if (pathname.startsWith("/tasks")) return "tasks";
   if (pathname.startsWith("/discover/movie")) return "explore-movies";
   if (pathname.startsWith("/discover/tv")) return "explore-tv";
-  const run = /^\/runs\/([^/]+)$/.exec(pathname);
-  return run ? run[1] : "";
+  const session = /^\/sessions\/([^/]+)$/.exec(pathname);
+  return session ? session[1] : "";
 }
 
 /** 侧栏项 id → 路由地址（与 navIdFromPath 互逆） */
@@ -75,13 +76,16 @@ function pathOfNavId(id: string): Route {
     case "explore-tv":
       return "/discover/tv" as Route;
     default:
-      return `/runs/${id}` as Route;
+      return `/sessions/${id}` as Route;
   }
 }
 
 export function AppShell({ children }: { children: React.ReactNode }) {
   const router = useRouter();
   const pathname = usePathname();
+  // PageNav 用这份会话标记在 Safari 判断「真实上一页是否仍在站内」；Chromium
+  // 会直接读取 Navigation API，不依赖该兼容层。
+  useAppNavigationTracking(pathname);
   // 移动端（< 768px）走另一套骨架：单栏 + 顶栏 + 抽屉式侧栏，见文件末尾的分支渲染
   const isMobile = useIsMobile();
   // 抽屉开合（仅移动端有意义）
@@ -184,7 +188,8 @@ export function AppShell({ children }: { children: React.ReactNode }) {
     } catch {
       // 读取失败回首页
     }
-    router.push(target as Route);
+    // 这是退出设置模式而不是打开一个新页面；replace 避免浏览器后退后又回到设置。
+    router.replace(target as Route);
   };
 
   // 全站布局规范：默认所有页面都铺一层模糊蒙版（.page-scrim）压住背景大图、
@@ -198,10 +203,10 @@ export function AppShell({ children }: { children: React.ReactNode }) {
     pathname.startsWith("/media/");
   // Agent 对话页走沉浸模式：蒙版换成完全不透明的 .page-solid，整页盖掉
   // 背景大图（密集文本页不允许透图）；侧栏切换为实色形态。
-  const isImmersive = pathname.startsWith("/runs");
+  const isImmersive = pathname.startsWith("/sessions/");
 
   // 沉浸路由标记：强刷时由 layout.tsx 的内联脚本在首帧绘制前打上（避免闪出
-  // 背景大图），这里负责客户端路由切换时的双向同步——进入 /runs 关掉背景
+  // 背景大图），这里负责客户端路由切换时的双向同步——进入 /sessions/[id] 关掉背景
   // 大图伪元素，离开时恢复其他页面的大图。
   useEffect(() => {
     document.documentElement.classList.toggle("immersive-route", isImmersive);
@@ -264,8 +269,8 @@ export function AppShell({ children }: { children: React.ReactNode }) {
       应用启动各拉取一次、Context 共享，设置页的改动即时同步到所有消费页面。 */}
     <SearchPrefsProvider>
     <UiPrefsProvider>
-    {/* AgentConversationsProvider：Agent 会话的全站状态（侧栏最近会话 +
-      /runs/[id] 会话页共用），本地持久化运行编号并在刷新后自动回放未完成任务。 */}
+    {/* AgentConversationsProvider：AI 会话的全站状态（侧栏最近会话 +
+      /sessions/[id] 会话页共用），刷新后按会话编号自动回放未完成任务。 */}
     <AgentConversationsProvider>
     {/* SubscribeEntryProvider：海报卡片「订阅影片」按钮的全站入口，
       订阅弹层只在这里挂一份（见 components/subscribe-entry.tsx）。 */}
@@ -427,12 +432,12 @@ function MobileTopBar({
             className="flex h-11 shrink-0 items-center transition-opacity active:opacity-60"
           >
             <Image
-              src="/movieclaw-logo-rotor.png"
+              src={actions ? "/movieclaw-logo-mark-rotor.png" : "/movieclaw-logo-rotor.png"}
               alt="MovieClaw"
-              width={1920}
+              width={actions ? 525 : 1920}
               height={525}
               priority
-              className="h-7 w-auto max-w-[104px] object-contain"
+              className={actions ? "size-7 object-contain" : "h-7 w-auto max-w-[104px] object-contain"}
             />
           </button>
         )}

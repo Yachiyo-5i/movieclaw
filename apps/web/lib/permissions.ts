@@ -43,7 +43,7 @@ export function roleLabel(session: SessionView): string {
  */
 export function accessiblePathFor(session: SessionView, requestedPath: string): string {
   if (session.role === "member") {
-    if (requestedPath === "/" || requestedPath.startsWith("/runs/")) return "/library";
+    if (requestedPath === "/" || requestedPath.startsWith("/sessions/")) return "/library";
     if (!session.capabilities.allow_subscribe && requestedPath.startsWith("/subscriptions")) {
       return "/library";
     }

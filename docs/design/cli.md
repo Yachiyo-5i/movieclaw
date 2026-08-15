@@ -30,7 +30,7 @@
    配置目录（`~/.config/movieclaw/`）保留产品全名（命令短、产品标识全，
    同 gcloud 之于 Google Cloud）。Python 实现（同栈同仓，见 §9）。
 4. 现状硬约束（盘点结论）：认证只有 Cookie 会话（无通用 API Token）；
-   2 个 SSE 端点（搜索流、Agent 运行流）；长任务全部「POST 启动 + 轮询」；
+   2 个 SSE 端点（搜索流、AI 会话流）；长任务全部「POST 启动 + 轮询」；
    响应统一 `ApiResponse{success,code,message,data}` 信封；敏感字段保存后不回读；
    生产环境 openapi.json 当前关闭（`app.py` 中 `docs_enabled = app_env == "local"`）。
 
@@ -39,7 +39,7 @@
 ## 1. 总体架构：两层命令面（less is more）
 
 ```
-精选命令（overlay，手写，个位数）  mclaw download / mclaw search torrents / mclaw agent run ...
+精选命令（overlay，手写，个位数）  mclaw download / mclaw search torrents / mclaw session start ...
    跨接口工作流、长任务 --wait、SSE 聚合 —— 覆盖「多步才能完成一件事」的场景
 ─────────────────────────────────────────────────────────────
 生成命令（gen，自动，=接口数）     mclaw subscriptions list / mclaw library scan start / mclaw site add ...
@@ -128,7 +128,7 @@ spec 标准字段表达不了的 CLI 语义，用少量扩展字段声明（声�
 | `x-cli-long-task` | 声明这是长任务启动端点 + 进度从哪读（端点或字段路径），驱动统一 `--wait` | `{"progress_op": "library.get", "progress_field": "scan_progress"}` |
 | `x-cli-stream` | SSE 端点标记 + 终态事件名 | 搜索流 / Agent 流 |
 | `x-cli-hidden` | 不生成命令（纯 Web 基础设施，如图片代理），CI 快照中显式记为豁免 | `/images/proxy` |
-| `x-cli-paged` | 分页参数名，驱动统一 `--limit/--all` | `/agent/sessions` |
+| `x-cli-paged` | 分页参数名，驱动统一 `--limit/--all` | `/sessions` |
 
 **CI 守护测试**（新 API 自动支持 CLI 的强制机制）：遍历 OpenAPI 全部路由，
 校验 ① summary 非空（已满足）② operation_id 合规 ③ 写操作有 description
@@ -313,10 +313,19 @@ CLI 的第一消费者是产品自带的 AI 助手（movieclaw_agent，隔离工
 | `mclaw search library-items "关键词"` | 搜索当前账号可见媒体库中的已入库条目 |
 | `mclaw download <行号|site:url>` | 行号形态一步完成：读搜索快照 → `resolve-target` 识别/预演 → 唯一且可入库就带 `auto_route` 提交；只有歧义或不可路由时才中止并提示。`--library`/`--save-path` 显式覆盖，`--downloader-default` 明确选择下载器默认目录；显式 URL 因无媒体身份维持低级提交形态 |
 | `mclaw library organize-files <library_id>` | `--dry-run` 走 preview；正式执行强制先 preview 回显影响面再执行 |
-| `mclaw agent run "任务"` | start → SSE 渲染（工具调用逐行）→ 终态定退出码；`--detach`/`attach`（Last-Event-ID 续传）/`cancel` |
+| `mclaw session start "任务"` | 不传 `--session-id` 时以首条用户消息新建会话，传入时自动继续已有会话 → SSE 渲染（工具调用逐行）→ 终态定退出码；`--detach` 后可用 `session follow`（Last-Event-ID 续传），停止用 `session stop` |
+| `mclaw session retry <session_id> --message-id <id>` | 删除指定 user message 及其后的轨迹，默认按原文重试；传 `--prompt` 时用新问题替换，再接入 SSE |
 | `mclaw login` | bootstrap 探测 → 密码登录 → （P1 起）自动换取长期 Token |
 | `mclaw status` | health + auth/me + spec 版本，一眼看部署状态 |
 | `mclaw logs -f` | 轮询模拟 follow |
+
+Session 命令面采用两层模型：`session` 是完整对话，`message` 是一条持久化的
+`system/user/assistant/tool` 协议消息。开始与继续统一映射到 `POST /sessions`：
+请求不含 `session_id` 时新建，含 `session_id` 时继续已有会话；回执返回稳定的
+`session_id/message_id`。完整轨迹是 `message | compaction` 判别联合；重新提问统一使用
+`session retry --message-id <message_id>`，可选 `--prompt` 改写原问题。`turn` 只允许作为 Web 将“一个 user
+message 到下一个 user message 之前的输出”组合展示时的派生概念，不进入 API、CLI
+参数或持久化身份。
 
 `download <row>` 与 Web 下载弹窗共用同一组 API 状态，只在交互承载上不同：
 
@@ -408,7 +417,7 @@ CI 守护测试、`/health` 附带 spec_hash、`GET /api/v1/spec` 刷新端点�
 |---|---|---|
 | **P0 地基 + 生成层雏形** | 后端：spec 导出脚本 + operation_id 约定 + CI 守护测试。CLI：core 全套、内置基线 spec 装载、`mclaw login`(Cookie)、`mclaw status`、生成器先覆盖「纯 GET + path/query 参数」类端点 | 断网状态 `mclaw --help` 全树可浏览；命令树快照测试跑通；`mclaw login && mclaw subscriptions list -o json` 远程全通；退出码契约测试通过 |
 | **P1 生成层全量 + Token** | gen/ 映射规则全量落地（requestBody/上传/下载/分页）；x-cli-* 标注铺完 129 端点；`/health` spec_hash + `/spec` 刷新通道；后端 PAT + Agent 工作区令牌注入；长任务 `--wait`、危险确认 | 命令树快照 = 全部非 hidden 端点；产品内 Agent 工作区里 `mclaw subscriptions list` 零配置跑通；偏斜场景（老 CLI × 新服务器）刷新与回退路径有测试覆盖；漏标元数据 CI 红 |
-| **P2 精选层 + 流式** | 精选命令（search+download / organize / agent run…）；SSE 两处；订阅创建编排下沉后端 | 「搜索→下载→订阅→扫描入库」全流程由 Agent 通过 mclaw 完成，全程零交互 |
+| **P2 精选层 + 流式** | 精选命令（search+download / organize / session start…）；SSE 两处；订阅创建编排下沉后端 | 「搜索→下载→订阅→扫描入库」全流程由 Agent 通过 mclaw 完成，全程零交互 |
 | **P3 打磨** | 错误 hint 全覆盖、编辑距离建议、shell 补全、`logs -f`、README/示例扩充 | 抽样端点的 --help 含示例率 100%；退出码契约回归测试全绿 |
 
 ## 11. 需要产品拍板的开放问题

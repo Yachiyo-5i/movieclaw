@@ -6,6 +6,9 @@
 
 from __future__ import annotations
 
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
 import httpx
 import pytest
 from fastapi.testclient import TestClient
@@ -59,6 +62,32 @@ def _fake_tmdb() -> TmdbClient:
                     "episodes": [
                         {"episode_number": 1, "name": "E1", "air_date": "2999-01-01"}
                     ],
+                },
+            )
+        if request.url.path == "/3/tv/201":
+            today = datetime.now(ZoneInfo("Asia/Shanghai")).date().isoformat()
+            return httpx.Response(
+                200,
+                json={
+                    "id": 201,
+                    "name": "今日更新剧集",
+                    "original_name": "Today Show",
+                    "first_air_date": today,
+                    "status": "Returning Series",
+                    "external_ids": {},
+                    "alternative_titles": {"results": []},
+                    "translations": {"translations": []},
+                    "seasons": [{"season_number": 1}],
+                },
+            )
+        if request.url.path == "/3/tv/201/season/1":
+            today = datetime.now(ZoneInfo("Asia/Shanghai")).date().isoformat()
+            return httpx.Response(
+                200,
+                json={
+                    "name": "第 1 季",
+                    "air_date": today,
+                    "episodes": [{"episode_number": 2, "name": "E2", "air_date": today}],
                 },
             )
         return httpx.Response(404, json={})
@@ -151,12 +180,25 @@ def test_set_follow_future_uses_dedicated_tv_endpoint(client: TestClient) -> Non
     assert created.status_code == 200, created.text
     subscription_id = created.json()["data"]["subscription"]["id"]
 
+    listed = client.get("/api/v1/subscriptions?kind=tv")
+    assert listed.status_code == 200, listed.text
+    assert listed.json()["data"][0]["season_collection"] == [
+        {
+            "season_number": 1,
+            "name": "第 1 季",
+            "air_date": "2024-01-01",
+            "episode_count": 1,
+            "aired_count": 0,
+            "owned_count": 0,
+        }
+    ]
+
     enabled = client.patch(
         f"/api/v1/subscriptions/{subscription_id}/follow-future",
         json={"enabled": True},
     )
     assert enabled.status_code == 200, enabled.text
-    assert enabled.json()["message"] == "已启用持续追新"
+    assert enabled.json()["message"] == "已开启自动续订"
     assert enabled.json()["data"]["follow_future"] is True
 
     disabled = client.patch(
@@ -164,8 +206,43 @@ def test_set_follow_future_uses_dedicated_tv_endpoint(client: TestClient) -> Non
         json={"enabled": False},
     )
     assert disabled.status_code == 200, disabled.text
-    assert disabled.json()["message"] == "已禁用持续追新"
+    assert disabled.json()["message"] == "已关闭自动续订"
     assert disabled.json()["data"]["follow_future"] is False
+
+
+def test_today_arrivals_lists_today_episode_without_poster_or_progress(
+    client: TestClient,
+) -> None:
+    created = client.post(
+        "/api/v1/subscriptions",
+        json={"title_ref": "tmdb:tv:201", "selected_seasons": [1]},
+    )
+    assert created.status_code == 200, created.text
+
+    response = client.get("/api/v1/subscriptions/today-arrivals")
+    assert response.status_code == 200, response.text
+    rows = response.json()["data"]
+    assert len(rows) == 1
+    assert rows == [
+        {
+            "subscription_id": created.json()["data"]["subscription"]["id"],
+            "wanted_id": rows[0]["wanted_id"],
+            "media_title": "今日更新剧集",
+            "season_number": 1,
+            "episode_number": 2,
+            "status": "wanted",
+            "air_date": datetime.now(ZoneInfo("Asia/Shanghai")).date().isoformat(),
+            "release_forecast": None,
+            "next_probe_at": None,
+            "info_hash": None,
+            "grabbed_at": None,
+            "downloaded_at": None,
+            "estimated_release_to_import_minutes": 60,
+            "estimated_download_to_import_minutes": 10,
+        }
+    ]
+    assert "poster_url" not in rows[0]
+    assert "progress" not in rows[0]
 
 
 def test_set_follow_future_rejects_movie_subscription(client: TestClient) -> None:
@@ -180,7 +257,7 @@ def test_set_follow_future_rejects_movie_subscription(client: TestClient) -> Non
         json={"enabled": True},
     )
     assert response.status_code == 400
-    assert response.json()["message"] == "只有剧集订阅可以设置持续追新"
+    assert response.json()["message"] == "只有剧集订阅可以设置自动续订"
 
 
 def test_admin_permanent_delete_uses_explicit_endpoint_semantics(client: TestClient) -> None:

@@ -2216,7 +2216,7 @@ const TorrentPosterCard = memo(function TorrentPosterCard({ hit }: { hit: Torren
   // 灯箱图集：海报 + 全部图片（poster_url 通常是 image_urls 第一张，去重兜底）
   const gallery = Array.from(
     new Set([hit.poster_url, ...hit.image_urls].filter((u): u is string => !!u)),
-  ).map(cachedImageUrl);
+  ).map((url) => cachedImageUrl(url));
   return (
     <li className="group relative overflow-hidden rounded-xl border border-white/[0.08] bg-[rgba(14,16,22,0.75)] transition-colors hover:border-white/[0.2]">
       {/* 手机/纯触摸设备把整张卡作为操作入口；窄屏桌面预览也走同一交互，

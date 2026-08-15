@@ -35,6 +35,20 @@ class MediaItemRepository:
         )
         return list(result.scalars().all())
 
+    async def list_seasons_many(self, media_item_ids: list[int]) -> dict[int, list[MediaSeason]]:
+        """批量返回多个条目的季骨架，供海报墙统计使用，避免逐订阅查询。"""
+        if not media_item_ids:
+            return {}
+        result = await self._session.execute(
+            select(MediaSeason)
+            .where(MediaSeason.media_item_id.in_(media_item_ids))  # type: ignore[attr-defined]
+            .order_by(MediaSeason.media_item_id, MediaSeason.season_number)
+        )
+        grouped: dict[int, list[MediaSeason]] = {}
+        for season in result.scalars().all():
+            grouped.setdefault(season.media_item_id, []).append(season)
+        return grouped
+
     async def aired_units_many(
         self, media_item_ids: list[int], *, include_specials: bool = False
     ) -> dict[int, set[tuple[int, int]]]:

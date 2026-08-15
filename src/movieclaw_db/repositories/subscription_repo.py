@@ -102,7 +102,12 @@ class SubscriptionRepository:
         return result.scalar_one_or_none()
 
     async def list_all(self, *, kind: str | None = None) -> list[Subscription]:
-        query = select(Subscription).order_by(Subscription.created_at.desc())  # type: ignore[attr-defined]
+        # 最近活动时间由数据库触发器在写活动流水时维护；读取路径只走固定字段
+        # 与覆盖索引，不扫描工单或聚合活动表。id 兜底保证同一时间戳下顺序稳定。
+        query = select(Subscription).order_by(  # type: ignore[attr-defined]
+            Subscription.last_activity_at.desc(),
+            Subscription.id.desc(),
+        )
         if kind is not None:
             query = query.where(Subscription.kind == kind)
         result = await self._session.execute(query)
@@ -190,6 +195,26 @@ class SubscriptionRepository:
         )
         return list(result.scalars().all())
 
+    async def list_wanted_many(
+        self, subscription_ids: list[int], *, in_scope_only: bool = False
+    ) -> list[WantedItem]:
+        """批量读取多条订阅的工单，供首页聚合视图使用，避免逐订阅查询。"""
+        if not subscription_ids:
+            return []
+        query = select(WantedItem).where(
+            WantedItem.subscription_id.in_(subscription_ids)  # type: ignore[union-attr]
+        )
+        if in_scope_only:
+            query = query.where(WantedItem.in_scope.is_(True))  # type: ignore[attr-defined]
+        result = await self._session.execute(
+            query.order_by(
+                WantedItem.subscription_id,
+                WantedItem.season_number,
+                WantedItem.episode_number,
+            )
+        )
+        return list(result.scalars().all())
+
     async def add_wanted(self, rows: list[WantedItem]) -> None:
         """批量补工单；与订阅行的变更共用调用方的提交时机。"""
         for row in rows:
@@ -206,7 +231,7 @@ class SubscriptionRepository:
     # ------------------------------------------------------------------
 
     async def add_activity(self, row: SubscriptionActivity) -> None:
-        """落一条活动。活动是历史事实，只增不改。"""
+        """落一条活动。活动是历史事实，只增不改；数据库同步推进海报墙排序键。"""
         self._session.add(row)
         await self._session.commit()
 

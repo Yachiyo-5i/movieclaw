@@ -15,6 +15,7 @@ import { LibraryOrganizeDialog } from "@/components/library-organize-dialog";
 import { Modal } from "@/components/modal";
 import { MediaRow } from "@/components/media-row";
 import type { PosterCardAction } from "@/components/poster-card";
+import { RecentWatchRow } from "@/components/recent-watch-row";
 import { Tooltip } from "@/components/tooltip";
 import {
   type LibraryItem,
@@ -36,9 +37,11 @@ import {
   stopLibraryScan,
   updateLibrary,
 } from "@/lib/api/libraries";
+import { listRecentWatch, type RecentWatchItem } from "@/lib/api/playback";
 import { refreshLibraryConfirm, scanLibraryConfirm } from "@/lib/library-confirm";
 import type { Subscription } from "@/lib/api/subscriptions";
 import { publicEnv } from "@/lib/env";
+import { formatBytes } from "@/lib/format";
 import { imageUrl } from "@/lib/image-proxy";
 import type { MediaItem, MediaType } from "@/lib/media-types";
 import { usePermissions } from "@/lib/permissions";
@@ -190,6 +193,23 @@ export function effectiveLibraryId(
   return libraries.find((l) => l.kind === sub.media.kind && l.is_default)?.id ?? null;
 }
 
+/** 媒体库首页摘要：只聚合接口随库返回的预计算快照，不触发额外请求。 */
+export function libraryStatsSummary(libraries: MediaLibrary[] | null): string {
+  if (libraries === null) return "正在汇总媒体库统计…";
+  if (libraries.length === 0) return "还没有媒体库，创建后会在这里显示库存统计";
+  const movieCount = libraries
+    .filter((library) => library.kind === "movie")
+    .reduce((total, library) => total + library.stats.item_count, 0);
+  const tvCount = libraries
+    .filter((library) => library.kind === "tv")
+    .reduce((total, library) => total + library.stats.item_count, 0);
+  const totalSizeBytes = libraries.reduce(
+    (total, library) => total + library.stats.total_size_bytes,
+    0,
+  );
+  return `${libraries.length} 个媒体库 · ${movieCount} 部电影 · ${tvCount} 部剧集 · 共占用 ${formatBytes(totalSizeBytes)} 存储空间`;
+}
+
 /**
  * 媒体库页（/library）：全部库的 Emby 风格卡片横排。
  *
@@ -208,6 +228,7 @@ export function LibraryView() {
   const [itemsByLibrary, setItemsByLibrary] = useState<Map<number, LibraryItem[]>>(
     new Map(),
   );
+  const [recentWatch, setRecentWatch] = useState<RecentWatchItem[] | null>(null);
   const [failed, setFailed] = useState(false);
   const [error, setError] = useState<string | null>(null);
   // 弹窗态：新增（"new"）/ 编辑（库对象）/ 关闭(null)
@@ -228,10 +249,16 @@ export function LibraryView() {
   const lastLibsSnapshot = useRef<string | null>(null);
   const reload = useCallback(() => {
     const seq = ++reloadSeq.current;
-    listLibraries()
-      .then(async (libs) => {
+    Promise.all([
+      listLibraries(),
+      // 最近观看失败不拖垮媒体库首页；保留旧数据，下一轮轮询自动重试。
+      listRecentWatch(RECENT_COUNT).catch(() => null),
+    ])
+      .then(async ([libs, latestWatch]) => {
         if (seq !== reloadSeq.current) return;
         setFailed(false);
+        if (latestWatch !== null) setRecentWatch(latestWatch);
+        else setRecentWatch((previous) => previous ?? []);
         const snapshot = JSON.stringify(libs);
         // 内容没变就复用旧引用，跳过整页卡片的无谓重渲染
         setLibraries((prev) => (prev && JSON.stringify(prev) === snapshot ? prev : libs));
@@ -358,25 +385,17 @@ export function LibraryView() {
 
   return (
     <div ref={scrollRef} className="scroll-thin scroll-safe flex-1 overflow-y-auto pb-10">
-      <div className="flex items-start justify-between gap-4 px-6 pt-7 max-md:flex-col max-md:items-stretch max-md:gap-3 max-md:px-4 max-md:pt-4">
+      <div className="px-6 pt-7 max-md:px-4 max-md:pt-4">
         <div>
           <h2 className="text-on-image text-[26px] font-bold leading-tight tracking-[-0.02em] text-white max-md:text-[21px]">
             媒体库
           </h2>
           <p className="text-on-image mt-1.5 text-ui text-[var(--text-muted)] max-md:mt-1 max-md:line-clamp-2 max-md:text-sub">
-            你的影视收藏在这里安家：订阅与下载的内容按「入库到哪个库」落盘，Plex / Emby 可直接识别
+            {failed && libraries === null
+              ? "暂时无法获取媒体库统计，正在自动重试"
+              : libraryStatsSummary(libraries)}
           </p>
         </div>
-        {canManageLibraries && (
-          <button
-            type="button"
-            onClick={() => setEditing("new")}
-            className="btn-accent flex shrink-0 items-center justify-center gap-1 rounded-full py-2 pl-3 pr-4 text-ui font-semibold max-md:self-start"
-          >
-            <PlusIcon className="size-4" />
-            添加媒体库
-          </button>
-        )}
       </div>
 
       {error && (
@@ -424,6 +443,9 @@ export function LibraryView() {
         </div>
       )}
 
+      {/* 当前账号跨可见库聚合的播放状态；空列表时组件整段隐藏。 */}
+      {(!failed || libraries !== null) && <RecentWatchRow items={recentWatch} />}
+
       {libraries !== null && libraries.length === 0 && (
         <ContentEmptyState
           variant="library"
@@ -449,32 +471,52 @@ export function LibraryView() {
       )}
 
       {/* 库卡片横排：库多了不换行堆高，改为一行横滚（与下方「最近添加」
-          同一交互），首屏始终保住「库 → 最近添加」的信息层次 */}
-      {libraries !== null && (
-        <HScroller className="mt-6 gap-5 px-6 pb-1 pt-1 max-md:mt-4 max-md:gap-3.5 max-md:px-4">
-          {libraries.map((library, index) => (
-            <div
-              key={library.id}
-              data-library-card={library.id}
-              className={`w-[268px] shrink-0 rounded-2xl transition max-md:w-[230px] ${
-                highlightId === library.id ? "ring-2 ring-[var(--accent-2)] ring-offset-4 ring-offset-transparent" : ""
-              }`}
+          同一交互），首屏始终保住「最近观看 → 我的媒体库 → 最近添加」的层次。 */}
+      {libraries !== null && libraries.length > 0 && (
+        <section className="mt-8 max-md:mt-6" aria-labelledby="my-libraries-title">
+          <div className="flex items-center justify-between gap-4 px-6 max-md:px-4">
+            <h3
+              id="my-libraries-title"
+              className="text-on-image text-body-lg font-semibold tracking-[-0.01em] text-[var(--text)]"
             >
-              <LibraryCard
-                library={library}
-                items={itemsByLibrary.get(library.id) ?? []}
-                canManage={canManageLibraries}
-                onEdit={() => setEditing(library)}
-                onOrganize={() => setOrganizeTarget(library)}
-                onRefresh={reload}
-                onError={setError}
-                canMoveLeft={index > 0}
-                canMoveRight={index < libraries.length - 1}
-                onMove={(offset) => moveLibrary(library.id, offset)}
-              />
-            </div>
-          ))}
-        </HScroller>
+              我的媒体库
+            </h3>
+            {canManageLibraries && (
+              <button
+                type="button"
+                onClick={() => setEditing("new")}
+                className="btn-glass h-7 shrink-0 gap-1 px-2.5 text-caption font-medium"
+              >
+                <PlusIcon className="size-3.5" />
+                添加媒体库
+              </button>
+            )}
+          </div>
+          <HScroller className="mt-3 gap-5 px-6 pb-1 pt-1 max-md:gap-3.5 max-md:px-4">
+            {libraries.map((library, index) => (
+              <div
+                key={library.id}
+                data-library-card={library.id}
+                className={`w-[268px] shrink-0 rounded-2xl transition max-md:w-[230px] ${
+                  highlightId === library.id ? "ring-2 ring-[var(--accent-2)] ring-offset-4 ring-offset-transparent" : ""
+                }`}
+              >
+                <LibraryCard
+                  library={library}
+                  items={itemsByLibrary.get(library.id) ?? []}
+                  canManage={canManageLibraries}
+                  onEdit={() => setEditing(library)}
+                  onOrganize={() => setOrganizeTarget(library)}
+                  onRefresh={reload}
+                  onError={setError}
+                  canMoveLeft={index > 0}
+                  canMoveRight={index < libraries.length - 1}
+                  onMove={(offset) => moveLibrary(library.id, offset)}
+                />
+              </div>
+            ))}
+          </HScroller>
+        </section>
       )}
 
       {/* —— 最近添加：Emby 首页式分区，每个非空库一行横滚海报 —— */}

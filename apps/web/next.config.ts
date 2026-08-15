@@ -37,8 +37,8 @@ const nextConfig: NextConfig = {
     }
 
     // Jellyfin 兼容播放接口的命名空间（docs/design/jellyfin-compat.md 8.3）：
-    // 播放器直连本前端端口，这些前缀反代到后端根路径。大小写两种形态都注册
-    // （Next 匹配大小写敏感；后端另有归一化中间件兜底）。
+    // 播放器直连本前端端口，这些前缀反代到后端根路径。协议原始大小写和
+    // 小写形态都显式注册，后端另有归一化中间件兜底。
     const jellyfinNamespaces = [
       "System",
       "Users",
@@ -49,7 +49,6 @@ const nextConfig: NextConfig = {
       "Items",
       "Videos",
       "Shows",
-      "Sessions",
       "PlayingItems",
       "Branding",
       "QuickConnect",
@@ -63,6 +62,26 @@ const nextConfig: NextConfig = {
       source: `/${ns}/:path*`,
       destination: `${proxyTarget}/${ns}/:path*`,
     }));
+    // Sessions 不能整段通配：Next rewrite 匹配大小写不敏感，通配规则会把
+    // 控制台的 /sessions/[id] 会话页误判成 Jellyfin API，导致页面请求被代理
+    // 到后端并返回 500。兼容层在该命名空间实际只实现根路径、Capabilities
+    // 和 Playing 三组接口，因此只代理这些明确路径。
+    jellyfinRewrites.push({
+      source: "/Sessions",
+      destination: `${proxyTarget}/Sessions`,
+    });
+    for (const sub of ["Capabilities", "Playing"]) {
+      jellyfinRewrites.push(
+        {
+          source: `/Sessions/${sub}`,
+          destination: `${proxyTarget}/Sessions/${sub}`,
+        },
+        {
+          source: `/Sessions/${sub}/:path*`,
+          destination: `${proxyTarget}/Sessions/${sub}/:path*`,
+        },
+      );
+    }
     // Library 命名空间不能整段通配（issue #124）：Next 的 rewrite source 匹配
     // 大小写**不敏感**，且 afterFiles rewrites 在动态路由之前求值——
     // `/Library/:path*` 会连带劫持本应用自己的媒体库详情页 /library/[id]。

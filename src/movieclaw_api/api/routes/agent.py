@@ -16,22 +16,24 @@ from movieclaw_api.exceptions import (
     UpstreamServiceException,
 )
 from movieclaw_api.schemas.agent import (
-    AgentCompactView,
-    AgentSessionDetailView,
-    AgentSessionListItem,
-    AgentSessionRenamePayload,
-    AgentSessionTruncatePayload,
-    AgentStartPayload,
-    AgentStartView,
-    AgentTruncateView,
+    SessionCompactionEntryView,
+    SessionContextCompactionView,
+    SessionMessageAcceptedView,
+    SessionMessageEntryView,
+    SessionMessageView,
+    SessionRenamePayload,
+    SessionRetryPayload,
+    SessionStartPayload,
+    SessionSummary,
+    SessionTranscriptView,
 )
 from movieclaw_api.schemas.response import ApiResponse, ok
 from movieclaw_api.services import auth as auth_service
 from movieclaw_api.services.agent_runs import get_agent_run_registry
 from movieclaw_api.services.agent_session_recorder import AgentSessionRecorder
 from movieclaw_api.services.agent_sessions import (
-    CompactionEntry,
-    SessionEntry,
+    SessionCompactionEntry,
+    SessionMessageEntry,
     get_agent_session_store,
 )
 from movieclaw_api.services.auth import Principal
@@ -43,9 +45,9 @@ from movieclaw_db.repositories.agent_session_repo import (
     AgentSessionRepository,
     is_running,
 )
-from movieclaw_llm import ChatMessage, ModelSettings
+from movieclaw_llm import ChatMessage, LlmRouter, ModelSettings
 
-router = APIRouter(prefix="/agent", tags=["agent"])
+router = APIRouter(prefix="/sessions", tags=["session"])
 
 
 def get_agent_tools(cli_env: dict[str, str]) -> list[AgentTool]:
@@ -88,6 +90,7 @@ _PAGE_ROUTES: list[tuple[str, str]] = [
         "库内条目详情（条目 ID 来自 library items list）",
     ),
     ("/tasks", "任务中心（后台作业、下载任务的统一观察页）"),
+    ("/sessions/{会话ID}", "AI 会话详情（ID 来自 session list/start）"),
     ("/people/{影人ID}", "影人档案（ID 来自 people 域）"),
     ("/settings", "设置页"),
 ]
@@ -136,28 +139,15 @@ async def _cli_env(session_id: str) -> dict[str, str]:
     }
 
 
-@router.post(
-    "/start",
-    response_model=ApiResponse[AgentStartView],
-    status_code=202,
-    summary="创建一次异步 Agent 运行",
-    operation_id="agent.start",
-)
-async def start_agent(
-    payload: AgentStartPayload,
-    identity: Principal = Depends(require_login),
-    session: AsyncSession = Depends(get_session),
-) -> ApiResponse[AgentStartView]:
-    """创建后台运行并立即返回编号，执行生命周期不再绑定当前 HTTP 连接。
+async def _accept_user_message(
+    payload: SessionStartPayload,
+    identity: Principal,
+    session: AsyncSession,
+) -> ApiResponse[SessionMessageAcceptedView]:
+    """持久化一条用户消息、创建后台运行并返回消息编号。
 
-    会话持久化：每次运行都归属一个服务端会话（新建或续聊）。用户输入先落
-    转录文件，运行过程中的定稿消息经 recorder 持续追加；续聊时 LLM 上下文
-    从转录重建，前端无需再回传历史。
-
-    路由器在任何会话记录落盘之前组装：读配置、解密 Key 依赖请求级 session；
-    组装完成后 runner 只持有进程级 LlmRouter、工具集和纯数据参数，后台执行不
-    再访问该 session。尚未配置模型供应商时同步返回 404，且因校验前置，不会残
-    留任何空会话记录，便于前端引导用户去设置。
+    ``run_id`` 只服务于进程内任务调度、心跳和事件日志，不进入公开协议。
+    后续消息的上下文始终从服务端转录重建，调用方无需也不能注入历史。
     """
     # 递归硬闸（docs/design/agent-cli-integration.md §4）：Agent 工作区令牌
     # 不允许再发起新的 Agent 运行——工具层已有软闸，这里是绕过工具（curl 等）
@@ -174,136 +164,208 @@ async def start_agent(
     llm_router = await acquire_llm_router(session)
 
     if payload.session_id:
-        row = await repo.get(payload.session_id)
+        session_id = payload.session_id
+        row = await repo.get(session_id)
         if row is None:
             raise NotFoundException("Agent 会话不存在")
         if is_running(row):
             raise BadRequestException("该会话已有正在进行的运行，请先停止或等待完成")
-        # 续聊：LLM 上下文从转录文件重建（事实源），忽略前端回传的 history
-        history = store.build_history(payload.session_id)
-        session_id = payload.session_id
-        # 一条 entry 对应一条消息，重建出的历史长度就是文件当前的 entry 数
-        entry_count = len(history)
+        history = store.build_history(session_id)
+        _, existing_entries = store.read(session_id)
+        entry_count = len(existing_entries)
     else:
         header = store.create()
         session_id = header.session_id
         await repo.create(session_id, title=None)
-        # 过渡期兼容：老前端在新会话上仍可能带本地历史，只用于本次上下文，
-        # 不写入转录（新文件从 0 条 entry 起步）
-        history = [ChatMessage(role=m.role, content=m.content) for m in payload.history]
+        history = []
         entry_count = 0
 
-    recorder = AgentSessionRecorder(store, session_id, entry_count=entry_count)
-    entry_uuid = await recorder.record_user_input(payload.input)
+    return await _launch_user_message(
+        session_id=session_id,
+        content=payload.content,
+        model=payload.model,
+        history=history,
+        entry_count=entry_count,
+        llm_router=llm_router,
+    )
+
+
+async def _launch_user_message(
+    *,
+    session_id: str,
+    content: str,
+    model: str,
+    history: list[ChatMessage],
+    entry_count: int,
+    llm_router: LlmRouter,
+    tools: list[AgentTool] | None = None,
+    system_prompt: str | None = None,
+) -> ApiResponse[SessionMessageAcceptedView]:
+    """在已校验的会话链尾追加用户消息并启动后台处理。"""
+    actual_tools = tools if tools is not None else get_agent_tools(await _cli_env(session_id))
+    actual_system_prompt = system_prompt or await _agent_system_prompt()
+    recorder = AgentSessionRecorder(
+        get_agent_session_store(), session_id, entry_count=entry_count
+    )
+    message_id = await recorder.record_user_message(content)
 
     runner = AgentRunner(
         llm_router,
-        tools=get_agent_tools(await _cli_env(session_id)),
+        tools=actual_tools,
         on_message=recorder.on_message,
         on_compaction=recorder.on_compaction,
     )
     params = AgentStartParams(
-        input=payload.input,
+        input=content,
         history=history,
-        model=payload.model,
-        system_prompt=await _agent_system_prompt(),
+        model=model,
+        system_prompt=actual_system_prompt,
     )
-    run_id = get_agent_run_registry().start(runner, params, on_terminal=recorder.on_terminal)
+    run_id = get_agent_run_registry().start(
+        runner,
+        params,
+        session_id=session_id,
+        on_terminal=recorder.on_terminal,
+    )
     await recorder.begin(run_id)
     return ok(
-        AgentStartView(run_id=run_id, session_id=session_id, entry_uuid=entry_uuid),
-        message="Agent 运行已创建",
+        SessionMessageAcceptedView(session_id=session_id, message_id=message_id),
+        message="用户消息已提交",
     )
+
+
+@router.post(
+    "",
+    response_model=ApiResponse[SessionMessageAcceptedView],
+    status_code=202,
+    summary="开始新会话，或向已有会话发送用户消息",
+    operation_id="session.start",
+)
+async def start_session(
+    payload: SessionStartPayload,
+    identity: Principal = Depends(require_login),
+    session: AsyncSession = Depends(get_session),
+) -> ApiResponse[SessionMessageAcceptedView]:
+    """提交用户消息并异步启动模型处理。
+
+    ``session_id`` 留空时创建新会话，传入时从该会话的服务端轨迹重建历史后
+    继续；调用方不能自行注入历史。返回的 ``message_id`` 是新 user message
+    的稳定编号。处理事件用 ``session.follow`` 订阅；已有消息正在处理时拒绝。
+    持内部 ``agent:`` 令牌调用会被拒绝，防止 Agent 递归启动 Agent。
+    """
+    return await _accept_user_message(payload, identity, session)
 
 
 @router.get(
-    "/sessions",
-    response_model=ApiResponse[list[AgentSessionListItem]],
+    "",
+    response_model=ApiResponse[list[SessionSummary]],
     summary="最近会话列表（按最后活跃时间倒序）",
-    operation_id="agent.sessions.list",
+    operation_id="session.list",
 )
-async def list_agent_sessions(
+async def list_sessions(
     limit: int = Query(default=50, description="返回条数上限"),
     offset: int = Query(default=0, description="分页偏移（跳过前 N 条）"),
     session: AsyncSession = Depends(get_session),
-) -> ApiResponse[list[AgentSessionListItem]]:
-    """从索引表分页读取；运行状态由 active_run_id + 心跳窗派生，
-    running 的条目附带 active_run_id 供调用方重新订阅事件流。"""
+) -> ApiResponse[list[SessionSummary]]:
+    """按最近活动时间倒序分页返回会话摘要。
+
+    ``running`` 表示当前是否有消息正在处理；``entry_count`` 同时统计 message
+    与 compaction。最多返回 200 条，公开协议不披露内部运行编号。
+    """
     rows = await AgentSessionRepository(session).list_recent(
         limit=min(limit, 200), offset=max(offset, 0)
     )
-    return ok([AgentSessionListItem.from_model(row) for row in rows])
+    return ok([SessionSummary.from_model(row) for row in rows])
 
 
 @router.get(
-    "/sessions/{session_id}",
-    response_model=ApiResponse[AgentSessionDetailView],
-    summary="会话详情（完整消息回放）",
-    operation_id="agent.sessions.show",
+    "/{session_id}",
+    response_model=ApiResponse[SessionTranscriptView],
+    summary="读取会话的完整轨迹",
+    operation_id="session.get-transcript",
 )
-async def get_agent_session(
+async def get_session_transcript(
     session_id: str,
     session: AsyncSession = Depends(get_session),
-) -> ApiResponse[AgentSessionDetailView]:
-    """entries 为转录文件的原样投影，渲染约定见 AgentSessionDetailView。"""
+) -> ApiResponse[SessionTranscriptView]:
+    """一次返回按写入顺序排列的完整 message/compaction 轨迹。
+
+    结果不分页、不截断，长会话响应可能很大。user message 的 ``message_id``
+    可作为 ``session.retry`` 的定位参数；compaction 记录不会隐藏更早的原始消息。
+    """
     row = await AgentSessionRepository(session).get(session_id)
     if row is None:
         raise NotFoundException("Agent 会话不存在")
     _, entries = get_agent_session_store().read(session_id)
     return ok(
-        AgentSessionDetailView(
-            session=AgentSessionListItem.from_model(row),
+        SessionTranscriptView(
+            session=SessionSummary.from_model(row),
             entries=[_entry_view(e) for e in entries],
         )
     )
 
 
-def _entry_view(entry: SessionEntry | CompactionEntry) -> dict:
-    """entry → 详情接口的渲染投影。
-
-    压缩行不含 replacement_history：那是 resume 重建数据（可达几十 KB），
-    渲染只需要摘要与前后 token 数。
-    """
-    if isinstance(entry, CompactionEntry):
-        return entry.model_dump(exclude_none=True, exclude={"replacement_history"})
-    return entry.model_dump(exclude_none=True)
+def _entry_view(
+    entry: SessionMessageEntry | SessionCompactionEntry,
+) -> SessionMessageEntryView | SessionCompactionEntryView:
+    """内部 JSONL entry → 公开的 message/compaction 判别联合。"""
+    if isinstance(entry, SessionCompactionEntry):
+        return SessionCompactionEntryView(
+            compaction_id=entry.uuid,
+            parent_id=entry.parent_uuid,
+            timestamp=entry.timestamp,
+            summary=entry.summary,
+            replacement_history=[
+                SessionMessageView.from_model(message) for message in entry.replacement_history
+            ],
+            tokens_before=entry.tokens_before,
+            tokens_after=entry.tokens_after,
+        )
+    return SessionMessageEntryView(
+        message_id=entry.uuid,
+        parent_id=entry.parent_uuid,
+        timestamp=entry.timestamp,
+        message=SessionMessageView.from_model(entry.message),
+        model=entry.model,
+        usage=entry.usage,
+        finish_reason=entry.finish_reason,
+    )
 
 
 @router.patch(
-    "/sessions/{session_id}",
-    response_model=ApiResponse[AgentSessionListItem],
+    "/{session_id}",
+    response_model=ApiResponse[SessionSummary],
     summary="重命名会话",
-    operation_id="agent.sessions.rename",
+    operation_id="session.rename",
 )
-async def rename_agent_session(
+async def rename_session(
     session_id: str,
-    payload: AgentSessionRenamePayload,
+    payload: SessionRenamePayload,
     session: AsyncSession = Depends(get_session),
-) -> ApiResponse[AgentSessionListItem]:
-    """标题只写索引表（转录文件 append-only，不存可变元数据）。"""
+) -> ApiResponse[SessionSummary]:
+    """修改会话标题，不改变任何消息、模型上下文或完整轨迹。"""
     row = await AgentSessionRepository(session).rename(session_id, payload.title)
     if row is None:
         raise NotFoundException("Agent 会话不存在")
-    return ok(AgentSessionListItem.from_model(row), message="会话已重命名")
+    return ok(SessionSummary.from_model(row), message="会话已重命名")
 
 
 @router.post(
-    "/sessions/{session_id}/compact",
-    response_model=ApiResponse[AgentCompactView],
+    "/{session_id}/compact-context",
+    response_model=ApiResponse[SessionContextCompactionView],
     summary="手动压缩会话上下文",
-    operation_id="agent.sessions.compact",
+    operation_id="session.compact-context",
 )
-async def compact_agent_session(
+async def compact_session_context(
     session_id: str,
     identity: Principal = Depends(require_login),
     session: AsyncSession = Depends(get_session),
-) -> ApiResponse[AgentCompactView]:
-    """把会话历史压缩成「保留的用户原话 + 交接摘要」，压缩行写入转录。
+) -> ApiResponse[SessionContextCompactionView]:
+    """压缩后续模型请求使用的上下文，不删除或截断完整轨迹。
 
-    与运行中的自动压缩共用同一套领域逻辑（movieclaw_agent.compact），只是
-    触发与持久化路径不同：这里同步执行、直接落盘。会话正在运行时拒绝——
-    运行内自有 mid-run 自动压缩，双方并发写转录会破坏链尾一致性。
-    模型沿用会话最近一次使用的模型（无记录时走默认路由）。
+    服务端保留预算内的用户原话，并生成一份历史交接摘要；结果作为 compaction
+    entry 追加到完整轨迹，后续 ``start`` 从该压缩历史继续。此操作会调用模型，
+    沿用会话最近一次使用的模型（没有记录时用默认模型）；运行中或空会话拒绝。
     """
     store = get_agent_session_store()
     repo = AgentSessionRepository(session)
@@ -321,7 +383,7 @@ async def compact_agent_session(
     # 沿用会话最近一次运行的模型（转录里 assistant 行带 model 元数据）
     _, entries = store.read(session_id)
     model = next(
-        (e.model for e in reversed(entries) if isinstance(e, SessionEntry) and e.model),
+        (e.model for e in reversed(entries) if isinstance(e, SessionMessageEntry) and e.model),
         "",
     )
 
@@ -337,72 +399,98 @@ async def compact_agent_session(
         entry_count=len(entries) + 1,
     )
     return ok(
-        AgentCompactView(
+        SessionContextCompactionView(
             summary=result.summary,
             tokens_before=result.tokens_before,
             tokens_after=result.tokens_after,
-            entry_uuid=entry.uuid,
+            compaction_id=entry.uuid,
         ),
         message="会话上下文已压缩",
     )
 
 
 @router.post(
-    "/sessions/{session_id}/truncate",
-    response_model=ApiResponse[AgentTruncateView],
-    summary="从某条提问处截断会话（该轮及其后的记录全部丢弃）",
-    operation_id="agent.sessions.truncate",
-    openapi_extra={"x-cli-dangerous": "confirm"},
+    "/{session_id}/retry",
+    response_model=ApiResponse[SessionMessageAcceptedView],
+    status_code=202,
+    summary="重新提交指定用户消息（可替换问题内容）",
+    operation_id="session.retry",
 )
-async def truncate_agent_session(
+async def retry_session_message(
     session_id: str,
-    payload: AgentSessionTruncatePayload,
+    payload: SessionRetryPayload,
+    identity: Principal = Depends(require_login),
     session: AsyncSession = Depends(get_session),
-) -> ApiResponse[AgentTruncateView]:
-    """「改写某轮重新提问」的服务端动作：把这一轮连同其后的往返从转录里删除。
+) -> ApiResponse[SessionMessageAcceptedView]:
+    """从指定 user message 重新提问，并异步启动新的模型处理。
 
-    调用方（会话页）随后把原提问填回输入框，用户改完再发一次——新的一轮就
-    接在被截断处，重建出的 LLM 上下文里不再有被丢弃的内容。**不可逆**：转录
-    是事实源，删掉即无从恢复，前端必须先做二次确认。
-
-    运行中拒绝：正在写转录的运行与整文件重写并发，会把链尾写乱。
+    ``content`` 留空时重提目标消息原文，传入时用新问题替换；目标消息及其后的
+    现有 message/compaction 轨迹会被永久删除，新问题取得新的 ``message_id``。
+    目标必须是 user message，运行中的会话拒绝。服务端会先校验会话、目标消息
+    与模型配置，再改写事实源。CLI 与 Web 共用此一步重试入口。
     """
+    if identity.kind == "agent":
+        raise BadRequestException("Agent 工作区内不能再发起新的 Agent 运行（禁止递归）")
+
     store = get_agent_session_store()
     repo = AgentSessionRepository(session)
     row = await repo.get(session_id)
     if row is None:
         raise NotFoundException("Agent 会话不存在")
     if is_running(row):
-        raise BadRequestException("该会话正在运行中，请先停止运行再改写")
+        raise BadRequestException("该会话正在运行中，请先停止运行再重试")
 
-    removed = store.truncate_from(session_id, payload.entry_uuid)
-    # 按截断后的文件重新校准索引：条数、链尾、列表副标题都变了
+    _, entries = store.read(session_id)
+    target = next((entry for entry in entries if entry.uuid == payload.message_id), None)
+    if target is None:
+        raise NotFoundException("会话中没有这条记录，可能已被改写")
+    if not isinstance(target, SessionMessageEntry) or target.message.role != "user":
+        raise BadRequestException("只能重试用户消息")
+    content = payload.content or target.message.text()
+
+    # 供应商校验和运行所需上下文在删除轨迹前准备完成；下面才进入不可逆阶段。
+    llm_router = await acquire_llm_router(session)
+    system_prompt = await _agent_system_prompt()
+    tools = get_agent_tools(await _cli_env(session_id))
+
+    store.discard_from_user_message(session_id, payload.message_id)
+    history = store.build_history(session_id)
+    _, remaining_entries = store.read(session_id)
     summary = store.summarize(session_id)
-    await repo.resync_after_truncate(
+    await repo.resync_after_discard(
         session_id,
         leaf_uuid=summary.leaf_uuid,
         entry_count=summary.entry_count,
         last_prompt=summary.last_prompt,
     )
-    return ok(
-        AgentTruncateView(removed_entries=removed, entry_count=summary.entry_count),
-        message="会话已截断",
+
+    return await _launch_user_message(
+        session_id=session_id,
+        content=content,
+        model=payload.model,
+        history=history,
+        entry_count=len(remaining_entries),
+        llm_router=llm_router,
+        tools=tools,
+        system_prompt=system_prompt,
     )
 
 
 @router.delete(
-    "/sessions/{session_id}",
+    "/{session_id}",
     response_model=ApiResponse[dict],
     summary="删除会话（转录文件与索引一并删除）",
-    operation_id="agent.sessions.delete",
+    operation_id="session.delete",
     openapi_extra={"x-cli-dangerous": "confirm"},
 )
-async def delete_agent_session(
+async def delete_session(
     session_id: str,
     session: AsyncSession = Depends(get_session),
 ) -> ApiResponse[dict]:
-    """有正在进行的运行时拒绝删除（先取消运行）；按「先文件后索引」的
-    逆序执行——先删文件再删行，即使中途失败也不会出现幽灵会话。"""
+    """永久删除会话的完整轨迹文件与索引记录；不可恢复。
+
+    会话正在处理消息时拒绝，需先调用 ``session.stop`` 并等待取消终态。
+    """
     repo = AgentSessionRepository(session)
     row = await repo.get(session_id)
     if row is None:
@@ -415,29 +503,30 @@ async def delete_agent_session(
 
 
 @router.get(
-    "/runs/{run_id}/stream",
-    summary="订阅 Agent 运行事件（SSE，支持断线续传）",
-    operation_id="agent.runs.stream",
+    "/{session_id}/events",
+    summary="跟随会话当前消息的处理事件（SSE，支持断线续传）",
+    operation_id="session.follow",
     openapi_extra={
         "x-cli-stream": {"terminal_events": ["agent_done", "agent_error", "agent_cancelled"]},
     },
 )
-async def stream_agent_run(
-    run_id: str,
+async def follow_session(
+    session_id: str,
     last_event_id: int | None = Header(default=None, alias="Last-Event-ID"),
 ) -> StreamingResponse:
-    """先回放游标后的历史，再实时推送新事件，直到运行进入终态。
+    """跟随会话当前或进程内保留的最近一次消息处理，直到运行进入终态。
 
-    SSE ``id`` 是运行内从 1 开始的递增序号。客户端首次订阅不传
-    ``Last-Event-ID`` 即可回放全部；重连时传最后已处理的 id，服务端只发送
-    缺失事件。心跳使用 SSE 注释，不进入事件日志，也不推进游标。
+    先回放游标后的事件，再实时推送新事件。SSE ``id`` 是本次处理内从 1
+    开始的递增序号；首次订阅不传 ``Last-Event-ID`` 即回放全部，重连时传
+    最后已处理的 id，只接收缺失事件。心跳不进入事件日志，也不推进游标。
+    没有当前或尚在保留期内的最近一次处理时返回 404；持久记录应读取完整轨迹。
     """
     registry = get_agent_run_registry()
     cursor = last_event_id or 0
     # 在 StreamingResponse 建立前完成存在性和游标校验，确保 404/400 仍能以
     # 标准 JSON 错误返回，而不是已经发出 200 后才在生成器里异常断流。
-    initial_events, initial_terminal = await registry.get_events(
-        run_id,
+    initial_events, initial_terminal = await registry.get_session_events(
+        session_id,
         cursor,
         timeout_seconds=0,
     )
@@ -453,12 +542,12 @@ async def stream_agent_run(
                 yield (
                     f"id: {stored.sequence}\n"
                     f"event: {event.type}\n"
-                    f"data: {event.model_dump_json(exclude_none=True)}\n\n"
+                    f"data: {event.model_dump_json(exclude_none=True, exclude={'run_id'})}\n\n"
                 )
             if terminal:
                 return
-            events, terminal = await registry.get_events(
-                run_id,
+            events, terminal = await registry.get_session_events(
+                session_id,
                 cursor,
                 timeout_seconds=15,
             )
@@ -478,12 +567,22 @@ async def stream_agent_run(
 
 
 @router.post(
-    "/runs/{run_id}/cancel",
+    "/{session_id}/stop",
     response_model=ApiResponse[dict],
-    summary="取消一次 Agent 运行",
-    operation_id="agent.runs.cancel",
+    summary="停止会话当前消息的模型处理",
+    operation_id="session.stop",
 )
-async def cancel_agent_run(run_id: str) -> ApiResponse[dict]:
-    """幂等请求取消后台任务；运行的 SSE 会以 agent_cancelled 事件收尾。"""
-    await get_agent_run_registry().cancel(run_id)
-    return ok({}, message="已请求停止 Agent 运行")
+async def stop_session(
+    session_id: str,
+    identity: Principal = Depends(require_login),
+) -> ApiResponse[dict]:
+    """请求取消当前或进程内保留的最近一次消息处理。
+
+    同一次处理重复停止是幂等的，SSE 会以 ``agent_cancelled`` 事件收尾；没有
+    尚在保留期内的处理时返回 404。内部 Agent 可以停止其他会话，但不能停止
+    承载自己的当前会话。
+    """
+    if identity.kind == "agent" and identity.agent_session_id == session_id:
+        raise BadRequestException("当前 Agent 不能停止承载自己的会话")
+    await get_agent_run_registry().cancel_session(session_id)
+    return ok({}, message="已请求停止会话")

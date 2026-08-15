@@ -632,17 +632,17 @@ def test_path_reconcile_with_yes_starts_job(run_cli) -> None:
 
 
 # ---------------------------------------------------------------------------
-# agent run：start → SSE 渲染 → 终态定退出码
+# session start：创建会话 → SSE 渲染 → 终态定退出码
 # ---------------------------------------------------------------------------
 
 
-def _agent_transport(calls: list[dict], sse_body: str):
+def _session_transport(calls: list[dict], sse_body: str):
     return _transport(
         {
-            ("POST", "/api/v1/agent/start"): httpx.Response(
-                200, json=_envelope({"run_id": "r1", "session_id": "s1"})
+            ("POST", "/api/v1/sessions"): httpx.Response(
+                202, json=_envelope({"session_id": "s1", "message_id": "m1"})
             ),
-            ("GET", "/api/v1/agent/runs/r1/stream"): httpx.Response(
+            ("GET", "/api/v1/sessions/s1/events"): httpx.Response(
                 200, content=sse_body.encode(), headers={"content-type": "text/event-stream"}
             ),
         },
@@ -650,7 +650,7 @@ def _agent_transport(calls: list[dict], sse_body: str):
     )
 
 
-def test_agent_run_renders_and_exits_0(run_cli) -> None:
+def test_session_start_renders_and_exits_0(run_cli) -> None:
     sse = (
         'id: 1\nevent: agent_start\ndata: {"provider": "deepseek", "model": "v3"}\n\n'
         'id: 2\nevent: text_delta\ndata: {"delta": "你好"}\n\n'
@@ -672,27 +672,122 @@ def test_agent_run_renders_and_exits_0(run_cli) -> None:
         )
         + "\n\n"
     )
-    code, out, err = run_cli(["agent", "run", "整理一下"], _agent_transport([], sse))
+    code, out, err = run_cli(["session", "start", "整理一下"], _session_transport([], sse))
     assert code == 0, err
     assert "你好" in out
     assert "→ 工具 bash" in err and "[完成] 2 步" in err
 
 
-def test_agent_run_error_exits_1(run_cli) -> None:
+def test_session_start_error_exits_1(run_cli) -> None:
     sse = 'id: 1\nevent: agent_error\ndata: {"error": "模型连接失败"}\n\n'
-    code, _out, err = run_cli(["agent", "run", "任务"], _agent_transport([], sse))
+    code, _out, err = run_cli(["session", "start", "任务"], _session_transport([], sse))
     assert code == 1
     assert "模型连接失败" in err
 
 
-def test_agent_run_detach_returns_ids(run_cli) -> None:
+def test_session_start_detach_returns_ids(run_cli) -> None:
     calls: list[dict] = []
     code, out, _err = run_cli(
-        ["agent", "run", "任务", "--detach", "-o", "json"], _agent_transport(calls, "")
+        ["session", "start", "任务", "--detach", "-o", "json"],
+        _session_transport(calls, ""),
     )
     assert code == 0
-    assert json.loads(out) == {"run_id": "r1", "session_id": "s1"}
-    assert [c["path"] for c in calls] == ["/api/v1/agent/start"]  # 未订阅事件流
+    assert json.loads(out) == {"session_id": "s1", "message_id": "m1"}
+    assert [c["path"] for c in calls] == ["/api/v1/sessions"]  # 未订阅事件流
+
+
+def test_session_start_with_id_continues_existing_session(run_cli) -> None:
+    calls: list[dict] = []
+    transport = _transport(
+        {
+            ("POST", "/api/v1/sessions"): httpx.Response(
+                202, json=_envelope({"session_id": "s1", "message_id": "m2"})
+            )
+        },
+        calls,
+    )
+    code, out, err = run_cli(
+        [
+            "session",
+            "start",
+            "继续",
+            "--session-id",
+            "s1",
+            "--detach",
+            "-o",
+            "json",
+        ],
+        transport,
+    )
+    assert code == 0, err
+    assert json.loads(out) == {"session_id": "s1", "message_id": "m2"}
+    assert [call["path"] for call in calls] == ["/api/v1/sessions"]
+    assert json.loads(calls[0]["body"]) == {
+        "content": "继续",
+        "session_id": "s1",
+    }
+
+
+def test_session_retry_replaces_and_resubmits_in_one_command(run_cli) -> None:
+    calls: list[dict] = []
+    transport = _transport(
+        {
+            ("POST", "/api/v1/sessions/s1/retry"): httpx.Response(
+                202, json=_envelope({"session_id": "s1", "message_id": "m3"})
+            )
+        },
+        calls,
+    )
+    code, out, err = run_cli(
+        [
+            "session",
+            "retry",
+            "s1",
+            "--message-id",
+            "m2",
+            "--prompt",
+            "改写后的问题",
+            "--detach",
+            "-o",
+            "json",
+        ],
+        transport,
+    )
+    assert code == 0, err
+    assert json.loads(out) == {"session_id": "s1", "message_id": "m3"}
+    assert [call["path"] for call in calls] == ["/api/v1/sessions/s1/retry"]
+    assert json.loads(calls[0]["body"]) == {
+        "message_id": "m2",
+        "content": "改写后的问题",
+    }
+
+
+def test_session_retry_help_explains_history_replacement_without_confirmation(run_cli) -> None:
+    code, out, err = run_cli(["session", "retry", "--help"], _transport({}, []))
+    assert code == 0, err
+    normalized = " ".join(out.split())
+    assert "现有目标消息及其后的轨迹会被永久删除" in normalized
+    assert "不传 --prompt 时按原文重试" in normalized
+    assert "新的 message_id" in normalized
+    assert "--yes" not in out and "⚠" not in out
+
+
+def test_legacy_agent_continue_and_send_message_commands_are_removed(run_cli) -> None:
+    transport = _transport({}, [])
+    agent_code, _out, agent_err = run_cli(["agent", "--help"], transport)
+    continue_code, _out, continue_err = run_cli(
+        ["session", "continue", "s1", "旧命令"], transport
+    )
+    send_code, _out, send_err = run_cli(
+        ["session", "send-message", "s1", "旧命令"], transport
+    )
+    rewind_code, _out, rewind_err = run_cli(
+        ["session", "rewind", "s1", "--before-message", "m1"], transport
+    )
+    assert agent_code == 2 and "No such command 'agent'" in agent_err
+    assert continue_code == 2 and "No such command 'continue'" in continue_err
+    assert send_code == 2 and "No such command 'send-message'" in send_err
+    assert rewind_code == 2 and "No such command 'rewind'" in rewind_err
 
 
 # ---------------------------------------------------------------------------
@@ -781,14 +876,16 @@ def test_wrong_password_shows_server_message(run_cli) -> None:
     assert "用户名或密码错误" in err
 
 
-def test_agent_stream_reconnects_after_interruption(run_cli, monkeypatch) -> None:
+def test_session_stream_reconnects_after_interruption(run_cli, monkeypatch) -> None:
     """事件流中断（含服务重启的连接拒绝形态）应重连续传，而不是立刻放弃。"""
     monkeypatch.setattr("time.sleep", lambda _s: None)
     attempts: list[int] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/api/v1/agent/start":
-            return httpx.Response(200, json=_envelope({"run_id": "r1", "session_id": "s1"}))
+        if request.url.path == "/api/v1/sessions":
+            return httpx.Response(
+                202, json=_envelope({"session_id": "s1", "message_id": "m1"})
+            )
         attempts.append(1)
         if len(attempts) == 1:
             # 第一次连接：发一半就断（无终态）
@@ -804,7 +901,7 @@ def test_agent_stream_reconnects_after_interruption(run_cli, monkeypatch) -> Non
             headers={"content-type": "text/event-stream"},
         )
 
-    code, out, err = run_cli(["agent", "run", "任务"], httpx.MockTransport(handler))
+    code, out, err = run_cli(["session", "start", "任务"], httpx.MockTransport(handler))
     assert code == 0, err
     assert len(attempts) == 2
     assert "part" in out

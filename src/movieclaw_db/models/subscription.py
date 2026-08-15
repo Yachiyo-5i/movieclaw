@@ -3,10 +3,10 @@ from __future__ import annotations
 from datetime import date, datetime
 from enum import StrEnum
 
-from sqlalchemy import JSON, Column, ForeignKey, Index, Integer, UniqueConstraint
+from sqlalchemy import JSON, Column, DateTime, ForeignKey, Index, Integer, UniqueConstraint, text
 from sqlmodel import Field
 
-from movieclaw_db.models.base import TimestampMixin
+from movieclaw_db.models.base import TimestampMixin, utcnow
 
 
 class SubscriptionStatus(StrEnum):
@@ -62,9 +62,24 @@ class Subscription(TimestampMixin, table=True):
     __table_args__ = (
         # 同一条目一个订阅——重复订阅幂等复用的依据
         UniqueConstraint("media_item_id", name="uq_subscription_media_item"),
+        # 海报墙只按持久化时间倒序扫描；id 是同一时间戳下的稳定次序。
+        Index("ix_subscription_last_activity", "last_activity_at", "id"),
     )
 
     id: int | None = Field(default=None, primary_key=True)
+
+    # 订阅活动是用户与后台管线的统一事实流水。数据库触发器在每条活动插入时
+    # 原子推进此时间，列表查询无需 join/聚合活动表，也不依赖调用方手工维护。
+    # 保留服务端默认值，应用回退到不了解此列的旧版本后仍可继续创建订阅。
+    last_activity_at: datetime = Field(
+        default_factory=utcnow,
+        sa_column=Column(
+            DateTime(),
+            nullable=False,
+            server_default=text("CURRENT_TIMESTAMP"),
+        ),
+        description="最近一条订阅活动的发生时间；订阅海报墙的持久化排序键",
+    )
 
     media_item_id: int = Field(
         sa_column=Column(

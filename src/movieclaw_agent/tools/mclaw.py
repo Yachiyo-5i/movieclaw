@@ -7,7 +7,7 @@
   （--help 齐全、错误带 hint），工具层不重复建模；
 - shlex 解析后以 argv 直接执行，不经 shell——无管道/变量展开，注入面为零；
   令牌只注入本工具子进程，bash 环境里拿不到（泄漏面收窄）；
-- handler 硬闸：agent 子命令（递归）与 login/logout（破坏凭证）直接拒绝；
+- handler 硬闸：会话开始/继续/重试/跟随（递归）、login/logout 与 --server 直接拒绝；
 - 退出码语义标注：结果尾部按退出码契约附一行中文解读，模型从工具结果
   本身就能学会正确的下一步（运行时教学，不占 description）。
 """
@@ -39,8 +39,6 @@ _EXIT_CODE_NOTES = {
 
 # 硬闸：这些子命令在工具里没有任何合法用途
 _BLOCKED = {
-    "agent": "不能在工具里调用 mclaw agent——那是你自己的运行入口（禁止递归）。"
-    "请直接在当前会话完成任务。",
     "login": "授权已自动配置，不需要也不允许执行 login/logout（会破坏凭证状态）。",
     "logout": "授权已自动配置，不需要也不允许执行 login/logout（会破坏凭证状态）。",
 }
@@ -95,8 +93,25 @@ def make_mclaw_tool(
             raise ValueError(f"参数串无法解析（引号不配对？）：{exc}") from None
         if not argv:
             raise ValueError('args 不能为空；例如 args="subscriptions list" 或 args="--help"')
-        if note := _BLOCKED.get(argv[0]):
+        blocked_action = next((arg for arg in argv if arg in _BLOCKED), None)
+        if note := _BLOCKED.get(blocked_action or ""):
             raise ValueError(note)
+        if any(arg == "--server" or arg.startswith("--server=") for arg in argv):
+            raise ValueError("不允许覆盖服务器地址；mclaw 已绑定当前 movieclaw 实例")
+        session_action = next(
+            (
+                argv[index + 1]
+                for index, arg in enumerate(argv[:-1])
+                if arg == "session"
+            ),
+            None,
+        )
+        if session_action in {"start", "retry", "follow"}:
+            raise ValueError(
+                f"不能在工具里调用 session {session_action}（禁止递归或嵌套跟随）；"
+                "请直接在当前会话完成任务"
+            )
+        full_transcript = session_action == "get-transcript"
 
         # 与当前解释器同环境的 CLI 入口（同 venv/镜像内必然可用，无需依赖 PATH）
         proc = await asyncio.create_subprocess_exec(
@@ -123,7 +138,7 @@ def make_mclaw_tool(
         stdout = stdout_b.decode(errors="replace")
         stderr = stderr_b.decode(errors="replace")
         if stdout.strip():
-            sections.append(_truncate_tail(stdout, label="stdout"))
+            sections.append(stdout if full_transcript else _truncate_tail(stdout, label="stdout"))
         if stderr.strip():
             sections.append("[stderr]\n" + _truncate_tail(stderr, label="stderr"))
         code = proc.returncode or 0

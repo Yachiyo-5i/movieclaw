@@ -53,6 +53,7 @@ from movieclaw_api.services.task_state import TaskState
 from movieclaw_db.engine import get_database
 from movieclaw_db.models import Library, LibraryFile, MediaItem, Subscription, utcnow
 from movieclaw_db.repositories.library_file_repo import LibraryFileRepository
+from movieclaw_db.repositories.library_repo import LibraryRepository
 
 logger = logging.getLogger("movieclaw_api.library_transfer")
 
@@ -432,6 +433,7 @@ async def _run(plan: TransferPlan, state: TransferState) -> None:
         )
         summary.errors.append("转移中断：发生未知错误（详见后端日志）")
     finally:
+        await _refresh_stats_after_transfer(plan, summary)
         finished = (utcnow(), summary)
         _transfer_tasks.finish(plan.source_library_id, result=finished)
         _transfer_tasks.finish(plan.target_library_id, result=finished)
@@ -562,7 +564,6 @@ async def _transfer(
                 subscription.updated_at = utcnow()
                 await session.commit()
                 summary.subscription_moved = True
-
     from movieclaw_api.services.media_server_notify import notify_media_server_refresh
 
     try:
@@ -582,6 +583,23 @@ async def _transfer(
         summary.removed_dirs,
         len(summary.errors),
     )
+
+
+async def _refresh_stats_after_transfer(plan: TransferPlan, summary: TransferSummary) -> None:
+    """转移收尾时一次刷新源/目标库；部分失败已提交的随迁行同样要纳入。"""
+    if not summary.files_relocated:
+        return
+    try:
+        db = get_database()
+        async with db.session() as session:
+            await LibraryRepository(session).refresh_stats(
+                [plan.source_library_id, plan.target_library_id]
+            )
+    except Exception:  # noqa: BLE001 -- 统计失败不回滚已完成的磁盘搬运
+        logger.exception(
+            "条目 #%s 转移后的媒体库统计刷新失败", plan.media_item_id
+        )
+        summary.errors.append("媒体库统计刷新失败，将在下次扫描时重试")
 
 
 async def enqueue_transfer_job(
@@ -705,6 +723,7 @@ async def _run_transfer_job(
             message += f"，{len(summary.errors)} 个问题已跳过"
         return {"message": message, **asdict(summary)}
     finally:
+        await _refresh_stats_after_transfer(plan, summary)
         finished = (utcnow(), summary)
         _transfer_tasks.finish(plan.source_library_id, result=finished)
         _transfer_tasks.finish(plan.target_library_id, result=finished)

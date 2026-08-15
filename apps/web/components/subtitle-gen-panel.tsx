@@ -549,7 +549,7 @@ export function SubtitleGenPanel({
       try {
         const id = await startAgent(prompt);
         setDialogOpen(false);
-        router.push(`/runs/${id}` as Route);
+        router.push(`/sessions/${id}` as Route);
       } catch (error) {
         setRequestError(`无法启动 Agent：${errorMessage(error)}`);
       } finally {

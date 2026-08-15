@@ -41,6 +41,7 @@ class _AgentRun:
     """一次运行的全部进程内状态，由 AgentRunRegistry 在同一事件循环中保护。"""
 
     run_id: str
+    session_id: str
     condition: asyncio.Condition = field(default_factory=asyncio.Condition)
     events: list[StoredAgentEvent] = field(default_factory=list)
     task: asyncio.Task[None] | None = None
@@ -70,6 +71,8 @@ class AgentRunRegistry:
         self._retention_seconds = retention_seconds
         self._clock = clock
         self._runs: dict[str, _AgentRun] = {}
+        # 公开接口只接受 session_id；映射仅用于把会话动作解析到内部运行。
+        self._latest_by_session: dict[str, str] = {}
         self._closing = False
 
     def start(
@@ -77,6 +80,7 @@ class AgentRunRegistry:
         runner: AgentRunner,
         params: AgentStartParams,
         *,
+        session_id: str,
         on_terminal: Callable[[AgentEvent], Awaitable[None]] | None = None,
     ) -> str:
         """分配运行编号并把 runner 放入后台执行，立即返回编号。"""
@@ -84,14 +88,29 @@ class AgentRunRegistry:
             raise RuntimeError("Agent 运行注册表正在关闭，无法创建新运行")
         self._prune_expired()
         run_id = uuid.uuid4().hex[:12]
-        run = _AgentRun(run_id=run_id, on_terminal=on_terminal)
+        run = _AgentRun(run_id=run_id, session_id=session_id, on_terminal=on_terminal)
         self._runs[run_id] = run
+        self._latest_by_session[session_id] = run_id
         run.task = asyncio.create_task(
             self._execute(run, runner, params),
             name=f"agent-run-{run_id}",
         )
-        logger.info("Agent 后台运行已创建 run=%s", run_id)
+        logger.info("Agent 后台运行已创建 session=%s run=%s", session_id, run_id)
         return run_id
+
+    async def get_session_events(
+        self,
+        session_id: str,
+        after_sequence: int,
+        *,
+        timeout_seconds: float,
+    ) -> tuple[list[StoredAgentEvent], bool]:
+        """按公开会话编号读取当前（或最近一轮）事件。"""
+        return await self.get_events(
+            self._get_session_run(session_id).run_id,
+            after_sequence,
+            timeout_seconds=timeout_seconds,
+        )
 
     async def get_events(
         self,
@@ -141,6 +160,10 @@ class AgentRunRegistry:
             logger.info("用户请求取消 Agent 运行 run=%s", run_id)
             run.task.cancel()
 
+    async def cancel_session(self, session_id: str) -> None:
+        """按公开会话编号幂等取消当前一轮。"""
+        await self.cancel(self._get_session_run(session_id).run_id)
+
     async def close(self) -> None:
         """应用关闭时取消并等待全部活动任务，避免遗留悬空协程。"""
         self._closing = True
@@ -150,6 +173,7 @@ class AgentRunRegistry:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         self._runs.clear()
+        self._latest_by_session.clear()
         logger.info("Agent 运行注册表已关闭，活动任务均已回收")
 
     async def _execute(
@@ -220,6 +244,15 @@ class AgentRunRegistry:
             raise NotFoundException("Agent 运行不存在或事件历史已过期")
         return run
 
+    def _get_session_run(self, session_id: str) -> _AgentRun:
+        """把公开会话编号解析为注册表内最近一轮运行。"""
+        self._prune_expired()
+        run_id = self._latest_by_session.get(session_id)
+        run = self._runs.get(run_id) if run_id else None
+        if run is None:
+            raise NotFoundException("会话没有可跟随或停止的运行")
+        return run
+
     def _prune_expired(self) -> None:
         """惰性清理超过保留期的终态运行；活动运行永不在这里删除。"""
         cutoff = self._clock() - self._retention_seconds
@@ -229,7 +262,9 @@ class AgentRunRegistry:
             if run.completed_at is not None and run.completed_at <= cutoff
         ]
         for run_id in expired:
-            del self._runs[run_id]
+            run = self._runs.pop(run_id)
+            if self._latest_by_session.get(run.session_id) == run_id:
+                del self._latest_by_session[run.session_id]
         if expired:
             logger.info("已清理 %d 条过期 Agent 运行历史", len(expired))
 

@@ -1,11 +1,3 @@
-agent runs cancel
-agent sessions compact
-agent sessions delete
-agent sessions list
-agent sessions rename
-agent sessions show
-agent sessions truncate
-agent start
 app restart
 app set
 app show
@@ -47,6 +39,8 @@ channels weixin bindings start
 channels weixin bindings status
 channels weixin bindings verify
 discover browse-collection
+discover filter-options
+discover filter-titles
 discover get-title-details
 discover list-collections
 dl add
@@ -151,6 +145,14 @@ search presets list
 search presets update
 search titles
 search torrents
+session compact-context
+session delete
+session get-transcript
+session list
+session rename
+session retry
+session start
+session stop
 site add
 site catalog
 site delete
@@ -168,6 +170,7 @@ subscriptions get
 subscriptions list
 subscriptions list-active-downloads
 subscriptions list-activities
+subscriptions list-today-arrivals
 subscriptions preview-download-routing
 subscriptions search-missing-resources
 subscriptions set-follow-future

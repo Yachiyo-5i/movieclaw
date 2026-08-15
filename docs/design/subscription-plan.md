@@ -11,7 +11,7 @@
 详情页点「订阅」
   → 把 Discover title_ref 原样交给订阅域
   → POST /api/subscriptions/title-preview  ① 建档/复用媒体条目，返回季集结构
-  → 前端弹层：季选择 + 追新开关 + 规则组     ② 用户决策
+  → 前端弹层：季选择 + 自动续订开关 + 规则组 ② 用户决策
   → POST /api/subscriptions                 ③ 服务端解析引用、预检路由、创建订阅与 wanted
 ```
 
@@ -26,7 +26,7 @@
    精确命中（全自动无感知）→ ② 标题+年份搜索，多候选返回弹层让用户确认 → ③ 仍失败不建
    无锚条目，中文提示"该条目暂无法订阅"。豆瓣详情能力未补齐前暂时全部走②；收敛后
    `douban_id` 留存在条目上，与 `site_torrent.douban_id` 构成精确匹配通道。
-3. **用户选择**：剧集 = 勾选季（默认全选已播季）+「持续追新」开关；电影无选项。
+3. **用户选择**：剧集 = 勾选季（默认全选已播季）+「自动续订」开关；电影无选项。
    规则组默认选中系统默认组，可换。
 4. **wanted 生成**：按 E 的定义展开——**勾选季贡献该季全部已知集**（勾了就是要整季，
    含未播集）；**follow_future 贡献"订阅时刻之后播出"的一切集**（含未勾季的未来集、
@@ -35,7 +35,7 @@
    - **补旧工单**（内容已播出/已上映）：`next_search_at=now` 立即排队真实 PT 搜索。
      不查本地缓存——缓存是 t0 前向跟随，对旧内容覆盖不完整，偶然命中给出的是
      残缺候选集，既做不了选优又会造成"已满足"错觉；
-   - **追新工单**（尚未播出，由追新开关和 F3 产生）：`next_search_at = air_date + 宽限期
+   - **追新工单**（尚未播出，由自动续订开关和 F3 产生）：`next_search_at = air_date + 宽限期
      （如 48h）`——新种子天然流入缓存，被动匹配是主通道，绝大多数工单在到点前已满足；
      真到点仍缺的，worker 捞起即漏抓兜底，无需任何状态翻转机制。未定档集才用
      `NULL`（不可调度，F3 定档时回填）。
@@ -169,7 +169,7 @@ tick → SELECT wanted WHERE status='wanted' AND next_search_at<=now
 | `media_item` | kind+tmdb_id 唯一锚、imdb/douban_id、title/original_title/year、aliases JSON、status、poster/backdrop、next_refresh_at | 设计稿 1.3 |
 | `media_season` | media_item_id+season_number 唯一、air_date、episode_count、episodes JSON | 集不单独建表（设计稿 1.6） |
 | `rule_set` | name(唯一)、is_default、spec JSON（RuleSetSpec：resolutions 顺序即偏好/编码/HDR 三态+DV 三态(正交，DV 单独控)/制作组黑白名单/仅free/做种下限/体积区间(整季包按每集均摊)/HR 三态策略；预留 sites、cutoff_resolution） | 纯参数包，判断逻辑在 matcher；订阅只持引用不做 override；被引用禁删；修改不追溯已 grabbed；评分公式第一版内置不暴露权重 |
-| `subscription` | media_item_id(唯一——重复订阅幂等)、kind 冗余、selected_seasons JSON、follow_future、rule_set_id、status(active/paused/completed，派生可重算) | E 的定义：E = 勾选季全部已知集 ∪（follow_future ? 订阅后播出的一切集(含新季) : ∅） |
+| `subscription` | media_item_id(唯一——重复订阅幂等)、kind 冗余、selected_seasons JSON、follow_future、rule_set_id、status(active/paused/completed，派生可重算)、last_activity_at | E 的定义：E = 勾选季全部已知集 ∪（follow_future ? 订阅后播出的一切集(含新季) : ∅）；`last_activity_at` 由活动插入触发器原子推进，海报墙直接走固定字段索引倒序，不在读取时动态聚合 |
 | `wanted_item` | subscription_id、media_item_id(冗余，被动匹配直达索引)、season/episode(**NOT NULL，电影=(0,0) 哨兵**——SQLite 唯一索引对 NULL 失效，不变量①需 DB 兜底)、in_scope、status(wanted/grabbed/downloaded)、air_date 快照、priority、next_search_at/search_attempts/last_search_at、release_forecast JSON、grabbed_at | 物化的是"单元身份+当前范围+满足状态"：`in_scope` 表达当前订阅意图，`status` 表达不可逆现实进度；取消季只退出范围、不删除身份与投递历史。只有 `in_scope=true AND status=wanted` 才是缺口。`release_forecast` 是可重算的单集调度快照，原始观测仍只在 `site_torrent`；详见 [subscription-release-forecast.md](subscription-release-forecast.md)。**不存 quality 快照**——洗版所需质量从 match_record→site_torrent.attrs 回溯，不冗余第二真相 |
 | `subscription_activity` ✅ | subscription_id、wanted_item_id(SET NULL 保历史)、type(created/adjusted/paused/resumed/completed/reopened + P4 的 searched/match_accepted/match_rejected/grabbed/dispatch_failed/wanted_added)、message(**写入时渲染成完整中文句子**)、payload JSON(结构化细节) | 统一活动流水：订阅透明化的落点，详情页时间线数据源。**原 match_record 方案并入本表**——文中提到的 match_record 记录（accepted/rejected/dispatch_failed）均以活动形式落此表；grabbed payload 另冻结资源发布/首次索引/提交时间及覆盖单元，用于逐集展示实际拉取耗时 |
 

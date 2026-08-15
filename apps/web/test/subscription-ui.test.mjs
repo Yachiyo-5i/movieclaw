@@ -1,7 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { subscriptionFollowRibbon } from "../lib/subscription-ui.ts";
+import {
+  groupTodayArrivals,
+  subscriptionCollectionMeta,
+  subscriptionFollowRibbon,
+  todayArrivalPresentation,
+} from "../lib/subscription-ui.ts";
 
 function subscription({
   kind = "tv",
@@ -10,10 +15,17 @@ function subscription({
   grabbed = 0,
   downloaded = 0,
   imported = 0,
+  status = "active",
+  mediaStatus = "Returning Series",
+  selectedSeasons = [],
+  seasons = [],
 } = {}) {
   return {
-    media: { kind },
+    media: { kind, status: mediaStatus },
+    status,
+    selected_seasons: selectedSeasons,
     follow_future: followFuture,
+    season_collection: seasons,
     progress: {
       total: wanted + grabbed + downloaded + imported,
       wanted,
@@ -24,13 +36,10 @@ function subscription({
   };
 }
 
-test("有未入库或在途剧集时显示追新中", () => {
-  assert.equal(subscriptionFollowRibbon(subscription({ wanted: 2 })), "追新中");
-  assert.equal(subscriptionFollowRibbon(subscription({ grabbed: 1 })), "追新中");
-  assert.equal(subscriptionFollowRibbon(subscription({ downloaded: 1 })), "追新中");
-});
-
-test("已知剧集全部入库后显示自动续订", () => {
+test("自动续订角标不再随工单阶段变成追新中", () => {
+  assert.equal(subscriptionFollowRibbon(subscription({ wanted: 2 })), "自动续订");
+  assert.equal(subscriptionFollowRibbon(subscription({ grabbed: 1 })), "自动续订");
+  assert.equal(subscriptionFollowRibbon(subscription({ downloaded: 1 })), "自动续订");
   assert.equal(subscriptionFollowRibbon(subscription({ imported: 12 })), "自动续订");
 });
 
@@ -38,7 +47,247 @@ test("创建时内容已在库且没有工单也显示自动续订", () => {
   assert.equal(subscriptionFollowRibbon(subscription()), "自动续订");
 });
 
-test("关闭持续追新或电影订阅不显示角标", () => {
+test("关闭自动续订或电影订阅不显示角标", () => {
   assert.equal(subscriptionFollowRibbon(subscription({ followFuture: false })), undefined);
   assert.equal(subscriptionFollowRibbon(subscription({ kind: "movie" })), undefined);
+});
+
+function season(seasonNumber, episodeCount, airedCount, ownedCount) {
+  return {
+    season_number: seasonNumber,
+    name: `第 ${seasonNumber} 季`,
+    air_date: null,
+    episode_count: episodeCount,
+    aired_count: airedCount,
+    owned_count: ownedCount,
+  };
+}
+
+test("在播剧只展示最新一季的低密度收录进度", () => {
+  const result = subscriptionCollectionMeta(
+    subscription({
+      selectedSeasons: [1, 2],
+      seasons: [season(1, 10, 10, 10), season(2, 7, 5, 5)],
+    }),
+  );
+  assert.deepEqual(result, { label: "第 2 季", value: "5 / 7", tracking: true });
+});
+
+test("完结多季已收齐时聚合为季数和总集数", () => {
+  const seasons = Array.from({ length: 8 }, (_, index) => {
+    const count = index === 7 ? 10 : 9;
+    return season(index + 1, count, count, count);
+  });
+  const result = subscriptionCollectionMeta(
+    subscription({
+      status: "completed",
+      mediaStatus: "Ended",
+      selectedSeasons: seasons.map((row) => row.season_number),
+      seasons,
+    }),
+  );
+  assert.deepEqual(result, { label: "共 8 季", value: "73 集全", tracking: false });
+});
+
+test("完结剧补旧时聚合显示已收录和总集数", () => {
+  const result = subscriptionCollectionMeta(
+    subscription({
+      mediaStatus: "Ended",
+      selectedSeasons: [1, 2, 3],
+      seasons: [
+        season(1, 10, 10, 8),
+        season(2, 10, 10, 8),
+        season(3, 10, 10, 8),
+        season(4, 10, 10, 10),
+      ],
+    }),
+  );
+  assert.deepEqual(result, { label: "共 3 季", value: "24 / 30", tracking: false });
+});
+
+test("最新一季尚未播出时不展示零进度", () => {
+  const result = subscriptionCollectionMeta(
+    subscription({
+      selectedSeasons: [3],
+      seasons: [season(3, 10, 0, 0)],
+    }),
+  );
+  assert.deepEqual(result, { label: "第 3 季", value: "待播出", tracking: true });
+});
+
+test("追更绿点只由未完结订阅的 active 状态控制", () => {
+  const paused = subscriptionCollectionMeta(
+    subscription({
+      status: "paused",
+      selectedSeasons: [2],
+      seasons: [season(2, 7, 5, 5)],
+    }),
+  );
+  const disabled = subscriptionCollectionMeta(
+    subscription({
+      followFuture: false,
+      selectedSeasons: [2],
+      seasons: [season(2, 7, 5, 5)],
+    }),
+  );
+
+  assert.equal(paused.tracking, false);
+  assert.equal(disabled.tracking, true);
+});
+
+test("电影不展示收录摘要", () => {
+  assert.equal(
+    subscriptionCollectionMeta(subscription({ kind: "movie", seasons: [season(1, 1, 1, 1)] })),
+    undefined,
+  );
+});
+
+function todayArrival(overrides = {}) {
+  return {
+    subscription_id: 1,
+    wanted_id: 10,
+    media_title: "测试剧集",
+    season_number: 2,
+    episode_number: 5,
+    status: "wanted",
+    air_date: "2030-01-01",
+    release_forecast: null,
+    next_probe_at: null,
+    info_hash: null,
+    grabbed_at: null,
+    downloaded_at: null,
+    estimated_release_to_import_minutes: 60,
+    estimated_download_to_import_minutes: 10,
+    ...overrides,
+  };
+}
+
+test("待播集只展示按历史耗时换算后的预计入库时间", () => {
+  const now = new Date("2030-01-01T10:00:00Z");
+  const predictedAt = "2030-01-01T12:00:00Z";
+  const result = todayArrivalPresentation(
+    todayArrival({
+      release_forecast: {
+        predicted_at: predictedAt,
+        window_end: "2030-01-01T14:00:00Z",
+      },
+    }),
+    undefined,
+    now,
+  );
+  const expectedClock = new Intl.DateTimeFormat("zh-CN", {
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).format(new Date("2030-01-01T13:00:00Z"));
+  assert.equal(result.statusLabel, "预计入库");
+  assert.equal(result.timeLabel, `约 ${expectedClock}`);
+});
+
+test("首个预计入库时间过期后滚动到下一探测点", () => {
+  const now = new Date("2030-01-01T13:10:00Z");
+  const result = todayArrivalPresentation(
+    todayArrival({
+      release_forecast: {
+        predicted_at: "2030-01-01T12:00:00Z",
+        window_end: "2030-01-01T14:00:00Z",
+      },
+      next_probe_at: "2030-01-01T13:30:00Z",
+    }),
+    undefined,
+    now,
+  );
+
+  assert.equal(result.statusLabel, "等待资源");
+  assert.equal(result.estimatedAt, Date.parse("2030-01-01T14:30:00Z"));
+});
+
+test("所有探测点对应的入库时间都过期后不展示旧时间", () => {
+  const result = todayArrivalPresentation(
+    todayArrival({
+      release_forecast: {
+        predicted_at: "2030-01-01T12:00:00Z",
+        window_end: "2030-01-01T14:00:00Z",
+      },
+    }),
+    undefined,
+    new Date("2030-01-01T14:00:00Z"),
+  );
+
+  assert.equal(result.statusLabel, "等待资源");
+  assert.equal(result.timeLabel, "时间待更新");
+  assert.equal(result.estimatedAt, null);
+});
+
+test("下载中不展示进度，只用实时 ETA 更新预计入库时间", () => {
+  const now = new Date("2030-01-01T10:00:00Z");
+  const result = todayArrivalPresentation(
+    todayArrival({ status: "grabbed", info_hash: "abc" }),
+    { state: "downloading", eta_seconds: 20 * 60 },
+    now,
+  );
+  assert.equal(result.statusLabel, "下载中");
+  assert.equal(result.estimatedAt, now.getTime() + 30 * 60 * 1000);
+  assert.equal("progress" in result, false);
+});
+
+test("下载完成后首页收敛为整理中", () => {
+  const result = todayArrivalPresentation(todayArrival({ status: "downloaded" }));
+  assert.equal(result.statusLabel, "整理中");
+  assert.equal(result.timeLabel, "即将完成");
+});
+
+function presented(
+  arrival,
+  presentation = { statusLabel: "预计入库", timeLabel: "时间待更新", estimatedAt: null },
+) {
+  return { arrival, presentation };
+}
+
+test("同一部剧同日连续更新多集时合并为一个范围", () => {
+  const groups = groupTodayArrivals([
+    presented(todayArrival({ wanted_id: 16, episode_number: 16 })),
+    presented(todayArrival({ wanted_id: 17, episode_number: 17 })),
+    presented(todayArrival({ wanted_id: 20, episode_number: 20 })),
+    presented(todayArrival({ wanted_id: 18, episode_number: 18 })),
+    presented(todayArrival({ wanted_id: 19, episode_number: 19 })),
+  ]);
+
+  assert.equal(groups.length, 1);
+  assert.equal(groups[0].episodeLabel, "S02E16–E20");
+  assert.equal(groups[0].episodeCount, 5);
+});
+
+test("非连续集数和跨季更新不会被误写成连续范围", () => {
+  const groups = groupTodayArrivals([
+    presented(todayArrival({ episode_number: 16 })),
+    presented(todayArrival({ wanted_id: 12, episode_number: 18 })),
+    presented(todayArrival({ wanted_id: 13, season_number: 3, episode_number: 1 })),
+    presented(todayArrival({ wanted_id: 14, season_number: 3, episode_number: 2 })),
+  ]);
+
+  assert.equal(groups[0].episodeLabel, "S02E16、E18 · S03E01–E02");
+});
+
+test("合并行使用尚未完成且预计最晚的一集作为整体状态", () => {
+  const groups = groupTodayArrivals([
+    presented(todayArrival({ wanted_id: 10, status: "downloaded" }), {
+      statusLabel: "整理中",
+      timeLabel: "即将完成",
+      estimatedAt: 100,
+    }),
+    presented(todayArrival({ wanted_id: 11, episode_number: 6, status: "grabbed" }), {
+      statusLabel: "下载中",
+      timeLabel: "约 20:00",
+      estimatedAt: 200,
+    }),
+    presented(todayArrival({ wanted_id: 12, episode_number: 7 }), {
+      statusLabel: "等待资源",
+      timeLabel: "时间待更新",
+      estimatedAt: null,
+    }),
+  ]);
+
+  assert.equal(groups[0].presentation.statusLabel, "等待资源");
+  assert.equal(groups[0].presentation.timeLabel, "时间待更新");
 });

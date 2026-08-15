@@ -409,7 +409,7 @@ body::before {
   animation: page-scrim-in 240ms ease both;
 }
 /* 沉浸路由标记（immersive-route）：layout.tsx 的内联脚本在首帧绘制前打上、
-   AppShell 在客户端路由切换时同步。/runs 下背景大图的伪元素整个不渲染
+   AppShell 在客户端路由切换时同步。/sessions/[id] 下背景大图的伪元素整个不渲染
    （不渲染 = 浏览器不会下载这张图），纯色层直接实底、不做淡入——
    强刷对话页时不会闪出背景图。 */
 html.immersive-route body::before {

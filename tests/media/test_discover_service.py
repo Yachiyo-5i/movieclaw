@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import date
 from typing import Any
 
 import pytest
@@ -122,12 +123,13 @@ async def test_hero_requires_backdrop_and_overview() -> None:
 
 
 async def test_ranked_row_limits_to_top10() -> None:
-    """今日热榜行是 Top 10 排名行：ranked=True 且最多 10 条。"""
+    """今日热榜预览是排名行，发现页最多展示 10 条。"""
     trending_day = {"results": [_movie(i) for i in range(1, 15)]}
     svc = _service({"trending/movie/day": trending_day})
     top = await svc.discover_row(MediaKind.MOVIE, "trending-day")
 
     assert top is not None
+    assert top.title == "今日热榜"
     assert top.ranked is True
     assert len(top.items) == 10
 
@@ -142,6 +144,7 @@ async def test_layout_lists_all_configured_rows_in_order() -> None:
 
     tv_layout = svc.layout(MediaKind.TV)
     assert [r.id for r in tv_layout.rows] == [s.row_id for s in _tv_rows()]
+    assert tv_layout.rows[0].title == "今日热榜"
     assert tv_layout.rows[0].ranked
 
     client: StubTmdbClient = svc._client  # type: ignore[assignment]
@@ -195,6 +198,89 @@ async def test_row_and_hero_are_cached() -> None:
     await svc.discover_row(MediaKind.MOVIE, "popular")
     await svc.discover_hero(MediaKind.MOVIE)
     assert len(client.calls) == calls_after_first
+
+
+def test_p0_dynamic_rows_and_tv_update_rows_have_expected_tmdb_params() -> None:
+    """P0 专题必须是可随日期滚动的 discover 查询，今日/本周使用官方端点。"""
+    today = date(2026, 8, 15)
+    movies = {row.row_id: row for row in _movie_rows("CN", today)}
+    assert movies["recent-acclaimed"].params["primary_release_date.gte"] == "2024-08-15"
+    assert movies["this-year"].params["primary_release_year"] == 2026
+    assert movies["short-runtime"].params["with_runtime.lte"] == 90
+
+    tv = {row.row_id: row for row in _tv_rows(today, "Asia/Shanghai")}
+    assert tv["airing-today"].path == "tv/airing_today"
+    assert tv["airing-today"].params["timezone"] == "Asia/Shanghai"
+    assert tv["on-the-air"].title == "本周更新"
+    assert tv["completed-miniseries"].params["with_type"] == 2
+    assert tv["completed-miniseries"].params["with_status"] == 3
+
+
+def test_invalid_timezone_falls_back_for_tv_row_params() -> None:
+    """非法部署时区不仅要让日期可算，还必须把 TMDB 查询参数同步回退。"""
+    svc = MediaDiscoverService(
+        StubTmdbClient({}),
+        image_base_url=_IMAGE_BASE,
+        timezone="Invalid/Timezone",
+    )
+
+    rows = {row.row_id: row for row in svc._row_specs(MediaKind.TV)}
+
+    assert rows["airing-today"].params["timezone"] == "Asia/Shanghai"
+
+
+async def test_collection_page_uses_tmdb_native_pagination_and_cache() -> None:
+    svc = _service(
+        {
+            "movie/popular": {
+                "page": 2,
+                "total_pages": 9,
+                "total_results": 171,
+                "results": [_movie(i) for i in range(21, 25)],
+            }
+        }
+    )
+    page = await svc.discover_page(MediaKind.MOVIE, "popular", 2)
+    assert page is not None
+    assert (page.page, page.total_pages, page.total_results) == (2, 9, 171)
+    client: StubTmdbClient = svc._client  # type: ignore[assignment]
+    assert ("movie/popular", {"language": "zh-CN", "page": 2}) in client.calls
+    calls_after_first = len(client.calls)
+    await svc.discover_page(MediaKind.MOVIE, "popular", 2)
+    assert len(client.calls) == calls_after_first
+
+
+async def test_filtered_discovery_maps_all_six_dimensions() -> None:
+    svc = _service(
+        {
+            "discover/movie": {
+                "page": 3,
+                "total_pages": 4,
+                "total_results": 66,
+                "results": [_movie(31)],
+            }
+        }
+    )
+    result = await svc.discover_filtered(
+        MediaKind.MOVIE,
+        genre_ids=[878, 28],
+        origin_country="JP",
+        year=2025,
+        rating_gte=7,
+        runtime_lte=90,
+        sort="rating",
+        page=3,
+    )
+    assert (result.page, result.total_pages, result.total_results) == (3, 4, 66)
+    client: StubTmdbClient = svc._client  # type: ignore[assignment]
+    _, params = next(call for call in client.calls if call[0] == "discover/movie")
+    assert params["with_genres"] == "878|28"
+    assert params["with_origin_country"] == "JP"
+    assert params["primary_release_year"] == 2025
+    assert params["vote_average.gte"] == 7
+    assert params["with_runtime.lte"] == 90
+    assert params["sort_by"] == "vote_average.desc"
+    assert params["vote_count.gte"] == 50
 
 
 # ---------------------------------------------------------------------------
@@ -312,6 +398,31 @@ async def test_movie_detail_fields() -> None:
     assert detail.facts.language == "英语"
     assert detail.facts.network is None
     assert len(detail.related) == 10  # 相似推荐截断到 10 部
+
+
+async def test_movie_detail_loads_and_orders_full_collection() -> None:
+    detail_response = {
+        **_MOVIE_DETAIL,
+        "belongs_to_collection": {"id": 2344, "name": "矩阵系列"},
+    }
+    svc = _service(
+        {
+            "movie/603": detail_response,
+            "collection/2344": {
+                "id": 2344,
+                "name": "黑客帝国系列",
+                "parts": [
+                    _movie(605, release_date="2003-11-05"),
+                    _movie(603, release_date="1999-03-30"),
+                    _movie(604, release_date="2003-05-15"),
+                ],
+            },
+        }
+    )
+    detail = await svc.media_detail(MediaKind.MOVIE, 603)
+    assert detail.collection is not None
+    assert detail.collection.name == "黑客帝国系列"
+    assert [card.id for card in detail.collection.items] == ["603", "604", "605"]
 
 
 async def test_detail_images_mapping() -> None:

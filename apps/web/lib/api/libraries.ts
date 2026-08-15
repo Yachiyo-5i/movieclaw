@@ -19,16 +19,17 @@ async function unwrap<T>(promise: Promise<ApiEnvelope<T>>): Promise<T> {
  * "入库到哪个库"确定保存路径（主根/标题 (年份)）。
  */
 export interface LibraryStats {
-  /** 已识别的媒体条目数 */
+  /** 在位且已识别的媒体条目数 */
   item_count: number;
-  /** 在账文件总数（含待识别） */
+  /** 在位文件总数（含待识别） */
   file_count: number;
+  /** 在位文件的逻辑大小总和 */
   total_size_bytes: number;
-  /** 待识别文件数（不含已忽略） */
+  /** 在位待识别文件数（不含已忽略） */
   unidentified_count: number;
   /** 标记 missing 的文件数（缺失清单入口） */
   missing_count: number;
-  /** 用户忽略过的文件数（不再参与识别，可在已忽略清单恢复） */
+  /** 在位且已忽略的文件数（不再参与识别，可在已忽略清单恢复） */
   ignored_count: number;
 }
 
@@ -56,7 +57,7 @@ export interface MediaLibrary {
   match_rules: MatchRule[];
   /** 扫描后自动清理已确认丢失的库存记录（只删台账不动磁盘，不可恢复） */
   auto_clear_missing: boolean;
-  /** 库存统计（library_file 台账聚合） */
+  /** 库存统计快照（台账变化时重算，列表查询不扫描文件台账） */
   stats: LibraryStats;
   /** 是否正在扫描 */
   scanning: boolean;

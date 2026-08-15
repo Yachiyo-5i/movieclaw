@@ -81,6 +81,8 @@ class Principal:
       超管创建，等价管理员（PAT 创建接口已收口为管理员专属，防止成员提权）；
     - ``member``：kind == "member" 时携带已加载的成员行（验签时顺路查库拿到），
       供能力开关判定（allow_subscribe 等）免二次查库。
+    - ``agent_session_id``：kind == "agent" 时携带令牌所属会话，供会话级
+      自保护授权使用；其他主体恒为 None。
 
     ``__str__`` 返回与旧字符串身份一致的格式，日志归因处零改造。
     """
@@ -90,6 +92,8 @@ class Principal:
     member_id: int | None = None
     is_admin: bool = True
     member: Member | None = None
+    #: 仅 Agent 工作区短时令牌携带，用于阻止当前 Agent 停止承载自己的会话。
+    agent_session_id: str | None = None
 
     def __str__(self) -> str:  # pragma: no cover - 纯格式化
         return self.name
@@ -497,7 +501,13 @@ async def verify_bearer_token(token: str) -> Principal:
     if isinstance(payload, dict) and payload.get("aud") == "agent":
         if int(payload.get("exp", 0)) < time.time():
             raise UnauthorizedException("Agent 令牌已过期，请重新发起 Agent 运行")
-        return Principal(kind="agent", name=f"agent:{payload.get('sid', '')}", is_admin=True)
+        agent_session_id = str(payload.get("sid", ""))
+        return Principal(
+            kind="agent",
+            name=f"agent:{agent_session_id}",
+            is_admin=True,
+            agent_session_id=agent_session_id,
+        )
 
     provided_hash = _hash_token(token)
     for record in await list_api_tokens():

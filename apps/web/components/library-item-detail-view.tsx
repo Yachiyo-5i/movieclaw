@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
 
@@ -80,10 +80,17 @@ export function LibraryItemDetailView({
   libraryId,
   mediaItemId,
   returnTo,
+  fromRecent = false,
+  initialSeason,
+  initialEpisode,
 }: {
   libraryId: number;
   mediaItemId: number;
   returnTo?: string;
+  /** 从媒体库首页最近观看进入：左上角返回首页，而不是条目所在的单库库存页。 */
+  fromRecent?: boolean;
+  initialSeason?: number;
+  initialEpisode?: number;
 }) {
   const { canManageLibraries } = usePermissions();
   const router = useRouter();
@@ -168,32 +175,31 @@ export function LibraryItemDetailView({
 
   // 兜底态（加载中/失败）的顶栏：条目标题未知，末项留空——渲染 PageNav 是为了
   // 向外壳登记「本页自带顶栏」，否则移动端全局顶栏（☰ + logo）会先显示再消失，
-  // 顶部闪一下；同时转圈期间就有返回键可点。祖先链路与正文的 trail 保持一致。
-  const fallbackTrail = discoveryReturnPath
-    ? [{ label: "发现详情", href: discoveryReturnPath }, { label: "" }]
-    : [
-        { label: "媒体库", href: "/library" as Route },
-        { label: library?.name ?? "库存", href: `/library/${libraryId}` as Route },
-        { label: "" },
-      ];
+  // 顶部闪一下；同时转圈期间就有返回键可点。加载态与正文共用同一兜底目标。
+  const navFallback = discoveryReturnPath
+    ? { label: "发现详情", href: discoveryReturnPath }
+    : fromRecent
+      ? { label: "媒体库", href: "/library" as Route }
+      : { label: library?.name ?? "库存", href: `/library/${libraryId}` as Route };
 
   if (failed) {
     return (
       // ambient-fallback：同 MediaDetailView——本页豁免全局蒙版，兜底态没有沉浸
       // 背景可铺，文案会压在用户壁纸上，自己带一层底才读得清
       <div className="ambient-fallback flex h-full flex-col">
-        <PageNav items={fallbackTrail} />
+        <PageNav title="" fallback={navFallback} />
         <div className="flex flex-1 flex-col items-center justify-center gap-4 px-6 text-center">
           <p className="text-body-lg font-semibold text-[var(--text)]">未能加载该条目</p>
           <p className="max-w-sm text-ui leading-6 text-[var(--text-muted)]">
-            条目可能已被删除或重新识别为其他作品，请回库存页查看。
+            条目可能已被删除或重新识别为其他作品，请返回后查看。
           </p>
           <Link
-            href={`/library/${libraryId}` as Route}
+            href={navFallback.href}
+            replace
             className="btn-glass flex items-center gap-2 px-4 py-2 text-ui font-medium text-[var(--text)]"
           >
             <ArrowLeftIcon className="size-4" />
-            回到库存页
+            返回{navFallback.label}
           </Link>
         </div>
       </div>
@@ -203,7 +209,7 @@ export function LibraryItemDetailView({
   if (!detail) {
     return (
       <div className="ambient-fallback flex h-full flex-col">
-        <PageNav items={fallbackTrail} />
+        <PageNav title="" fallback={navFallback} />
         <div className="flex flex-1 items-center justify-center gap-2.5 text-ui text-[var(--text-muted)]">
           <span className="size-4 animate-spin rounded-full border-2 border-white/20 border-t-white/70" />
           正在读取本地刮削信息…
@@ -222,14 +228,6 @@ export function LibraryItemDetailView({
       const probed = detail.files.find((f) => f.duration_seconds)?.duration_seconds;
       return probed ? Math.round(probed / 60) : null;
     })();
-
-  const trail = discoveryReturnPath
-    ? [{ label: "发现详情", href: discoveryReturnPath }, { label: detail.title }]
-    : [
-        { label: "媒体库", href: "/library" as Route },
-        { label: library?.name ?? "库存", href: `/library/${libraryId}` as Route },
-        { label: detail.title },
-      ];
 
   const runMetadataRefresh = async () => {
     // 重操作先确认：单条目刷新是 force 语义（图片覆盖重下），说清再动手
@@ -265,7 +263,8 @@ export function LibraryItemDetailView({
           直出、零边界。顶栏首屏只有一颗圆形返回键浮在剧照上（吸顶蒙版
           此时全透明），页面顶部不再有大面积色块 —— */}
       <PageNav
-        items={trail}
+        title={detail.title}
+        fallback={navFallback}
         actions={
           canManageLibraries ? (
             <ItemActionsMenu
@@ -405,6 +404,8 @@ export function LibraryItemDetailView({
           <SeasonEpisodesSection
             libraryId={libraryId}
             detail={detail}
+            initialSeason={initialSeason}
+            initialEpisode={initialEpisode}
             onDeleteFile={canManageLibraries ? setDeleteFileTarget : undefined}
             onChanged={reload}
           />
@@ -1008,11 +1009,15 @@ function seasonLabel(season: number, owned: boolean): string {
 function SeasonEpisodesSection({
   libraryId,
   detail,
+  initialSeason,
+  initialEpisode,
   onDeleteFile,
   onChanged,
 }: {
   libraryId: number;
   detail: LibraryItemDetail;
+  initialSeason?: number;
+  initialEpisode?: number;
   onDeleteFile?: (file: LibraryItemFile) => void;
   onChanged?: () => void;
 }) {
@@ -1026,12 +1031,16 @@ function SeasonEpisodesSection({
   );
   // 默认落在第一个在库的季，而不是季号最小的那一季：只存了第 5、6 季的剧，
   // 打开详情页就停在满屏置灰的第 1 季，第一眼像"我的片子没了"
-  const [season, setSeason] = useState(
-    () => seasons.find((s) => ownedSeasons.has(s)) ?? seasons[0],
-  );
+  const defaultSeason = seasons.find((s) => ownedSeasons.has(s)) ?? seasons[0];
+  // 最近观看入口只有在目标季仍有在位文件时才采纳；记录过期则回退普通详情。
+  const requestedSeason =
+    initialSeason != null && ownedSeasons.has(initialSeason) ? initialSeason : undefined;
+  const [season, setSeason] = useState(() => requestedSeason ?? defaultSeason);
   const [data, setData] = useState<SeasonEpisodes | null>(null);
   const [failed, setFailed] = useState(false);
   const [selected, setSelected] = useState<number | null>(null);
+  const sectionRef = useRef<HTMLElement>(null);
+  const initialEpisodeScrolled = useRef(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -1041,8 +1050,14 @@ function SeasonEpisodesSection({
       .then((result) => {
         if (cancelled) return;
         setData(result);
-        // 默认选中第一个在库的集（都不在库时选第一集，仍可看简介）
-        const first = result.episodes.find((e) => e.owned) ?? result.episodes[0];
+        // 最近观看入口优先选中目标集；目标已不在库时安全回退到第一集在库内容。
+        const requested =
+          season === requestedSeason && initialEpisode != null
+            ? result.episodes.find(
+                (episode) => episode.episode_number === initialEpisode && episode.owned,
+              )
+            : undefined;
+        const first = requested ?? result.episodes.find((e) => e.owned) ?? result.episodes[0];
         setSelected(first?.episode_number ?? null);
       })
       .catch(() => {
@@ -1054,7 +1069,34 @@ function SeasonEpisodesSection({
     // detail.file_count：单文件删除后详情重拉，分集的 owned/file_ids 也要
     // 跟着刷新（用文件数而不是整个 detail 做依赖——刮削轮询也会换 detail
     // 对象，不该每轮都重拉分集）
-  }, [libraryId, detail.media_item_id, detail.file_count, season]);
+  }, [
+    libraryId,
+    detail.media_item_id,
+    detail.file_count,
+    season,
+    requestedSeason,
+    initialEpisode,
+  ]);
+
+  // 分集数据异步到达后，把最近观看对应的集卡横向滚到中间；只执行一次，
+  // 后续用户手动换季/选集不抢滚动位置。
+  useEffect(() => {
+    if (
+      initialEpisodeScrolled.current ||
+      season !== requestedSeason ||
+      selected == null ||
+      selected !== initialEpisode
+    ) {
+      return;
+    }
+    const frame = window.requestAnimationFrame(() => {
+      sectionRef.current
+        ?.querySelector<HTMLElement>(`[data-episode-number="${selected}"]`)
+        ?.scrollIntoView({ behavior: "smooth", inline: "center", block: "nearest" });
+      initialEpisodeScrolled.current = true;
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [initialEpisode, requestedSeason, season, selected]);
 
   const filesById = useMemo(
     () => new Map(detail.files.map((f) => [f.id, f])),
@@ -1067,7 +1109,7 @@ function SeasonEpisodesSection({
   const ownedCount = data ? data.episodes.filter((e) => e.owned).length : 0;
 
   return (
-    <section>
+    <section ref={sectionRef}>
       <div className="mb-3 flex items-center gap-3">
         <h2 className="text-on-image text-body-lg font-semibold tracking-[-0.01em] text-[var(--text)]">
           分集
@@ -1220,6 +1262,7 @@ function EpisodeCard({
   return (
     <button
       type="button"
+      data-episode-number={episode.episode_number}
       onClick={onSelect}
       aria-pressed={selected}
       className={`w-[200px] shrink-0 rounded-xl text-left outline-none transition ${

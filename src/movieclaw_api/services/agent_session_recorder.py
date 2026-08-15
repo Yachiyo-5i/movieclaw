@@ -1,6 +1,6 @@
 """会话记录器：把一次 Agent 运行的定稿消息接进 JSONL 存储与 DB 索引。
 
-一次运行一个实例，由 /agent/start 编排层创建并挂到两个钩子上：
+一次运行一个实例，由 `POST /sessions` 编排层创建并挂到两个钩子上：
 - ``AgentRunner(on_message=...)``——每条定稿消息（assistant / tool）落盘
   并刷新索引（先文件后 DB，见 agent_sessions 模块的写入顺序约定）；
 - ``AgentRunRegistry.start(on_terminal=...)``——运行终态时收尾：停心跳、
@@ -80,11 +80,11 @@ class AgentSessionRecorder:
                 name=f"agent-session-heartbeat-{self._session_id}",
             )
 
-    async def record_user_input(self, text: str) -> str:
-        """落盘本轮用户输入，刷新标题（仅首条）与最后提示预览，返回 entry uuid。
+    async def record_user_message(self, text: str) -> str:
+        """落盘 user message，刷新标题（仅首条）与最后提示预览，返回 message id。
 
-        uuid 要回给前端：本轮的「改写重问」需要它当截断锚点，而刚发起的这一轮
-        还没经历过回放，前端手里除此之外没有任何指向这条转录记录的把手。
+        内部仍以 uuid 存储，API 将它作为 message_id 返回；刚提交的消息还没
+        经历 transcript 回放，调用方需要该编号作为 retry 锚点。
         """
         entry = self._store.append(self._session_id, ChatMessage(role="user", content=text))
         self._entry_count += 1

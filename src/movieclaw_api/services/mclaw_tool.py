@@ -51,10 +51,13 @@ _DOMAIN_LINES = {
     "体积和制作组等条件及默认规则组）",
     "search": "search   统一搜索（titles 搜 TMDB/豆瓣影视条目，torrents 跨 PT 站点搜种子并可把"
     "结果行号交给 download，library-items 搜已入库内容；另可管理搜索预设和历史结果）",
+    "session": "session  用户与智能体的会话管理（发起新对话或继续已有对话，按指定用户消息"
+    "重新提问，读取并分析完整 message/compaction 轨迹；也可重命名、压缩上下文、跟随或"
+    "停止处理，以及删除会话）",
     "site": "site     PT 资源站点（查看支持目录/鉴权要求，配置、验证、启停站点，查看本地种子"
     "缓存统计；Cookie 可由 extension 同步）",
     "subscriptions": "subscriptions  电影/剧集订阅与自动追更（持续追踪新资源，按规则自动搜索、"
-    "下载并整理入库；create 消费 discover 返回的 title_ref，还可调整选季/追新、立即搜索缺失"
+    "下载并整理入库；create 消费 discover 返回的 title_ref，还可调整选季/自动续订、立即搜索缺失"
     "资源、下载人工选中的种子、设置追踪状态、查看活动/在途下载及检查自动化链路）",
     "ui": "ui       Web 界面质感与显示偏好（读取或整体保存各页面的布局、显示和样式设置）",
     "watch": "watch    监听导入（监控已完成且稳定的下载，自动识别、标准命名并转移到目标媒体库；"
@@ -71,14 +74,13 @@ _TOP_LEVEL_LINES = [
 ]
 
 # 不进目录的域：
-# - agent：被工具硬闸禁止（递归），目录里出现只会误导模型；
 # - logs：对 Agent 是 bash 的弱化重复——日志就是同容器内的本地文件（路径已写进
 #   系统提示词环境段），grep/tail 能力更强；且 logs tail -f 永不退出，模型误用
 #   会干等到工具超时。CLI 命令保留，服务远程管理的人类用户。
 # - members：成员管理是高敏感操作（建号、重置密码、启停、改权限），属于
 #   部署者本人的账号治理，绝不该由对话式 Agent 代劳（Agent 令牌是超管级，
 #   放进目录等于把开号/改权限的能力交给模型）。CLI 命令保留给人类管理员。
-_EXCLUDED_DOMAINS = {"agent", "logs", "members"}
+_EXCLUDED_DOMAINS = {"logs", "members"}
 
 
 def spec_domains() -> set[str]:

@@ -6,17 +6,25 @@ import asyncio
 import hashlib
 import json
 import os
+from io import BytesIO
 from pathlib import Path
 
 import httpx
 import pytest
 from fastapi.testclient import TestClient
+from PIL import Image
 
 from movieclaw_api.core.config import get_settings
 from movieclaw_api.services import image_proxy as image_proxy_module
 from movieclaw_api.services.auth import reset_auth_state
 from movieclaw_api.services.image_cache import ImageCache, reset_image_cache
 from movieclaw_api.services.image_proxy import ImageProxy
+from movieclaw_api.services.image_variants import (
+    ImageVariant,
+    ImageVariantService,
+    local_source_version,
+    reset_image_variant_service,
+)
 from movieclaw_api.settings.store import reset_setting_store
 from movieclaw_db.crypto import reset_secret_box
 
@@ -117,6 +125,48 @@ async def test_purge_evicts_least_recently_used(tmp_path: Path) -> None:
     assert again.path.read_bytes() == b"x" * 100
 
 
+async def test_variant_is_webp_cached_and_never_upscales(tmp_path: Path) -> None:
+    """横卡派生按 480×270 封顶；小于目标的分集图保持原尺寸且二次命中缓存。"""
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500)
+
+    cache = _make_cache(tmp_path, handler)
+    service = ImageVariantService(cache)
+
+    large = tmp_path / "large.jpg"
+    Image.new("RGB", (1600, 900), "#224466").save(large, "JPEG", quality=95)
+    first = await service.get_or_create(
+        large,
+        source_key="asset:large.jpg",
+        source_version=local_source_version(large),
+        variant=ImageVariant.LANDSCAPE_CARD,
+    )
+    with Image.open(first.path) as image:
+        assert image.format == "WEBP"
+        assert image.size == (480, 270)
+    assert first.path.stat().st_size < large.stat().st_size
+
+    second = await service.get_or_create(
+        large,
+        source_key="asset:large.jpg",
+        source_version=local_source_version(large),
+        variant=ImageVariant.LANDSCAPE_CARD,
+    )
+    assert second.path == first.path
+
+    small = tmp_path / "small.jpg"
+    Image.new("RGB", (300, 169), "#664422").save(small, "JPEG")
+    derived_small = await service.get_or_create(
+        small,
+        source_key="asset:small.jpg",
+        source_version=local_source_version(small),
+        variant=ImageVariant.LANDSCAPE_CARD,
+    )
+    with Image.open(derived_small.path) as image:
+        assert image.size == (300, 169), "小分集图不应为凑 480px 被强行放大"
+
+
 # ---------------------------------------------------------------------------
 # 路由集成：登录 → /images/proxy → 缓存落盘 → FileResponse + 长缓存头
 # ---------------------------------------------------------------------------
@@ -128,21 +178,30 @@ def client(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("SECRET_KEY_FILE", str(tmp_path / ".secret_key"))
     monkeypatch.setenv("SCHEDULER_ENABLED", "false")
     monkeypatch.setenv("IMAGE_CACHE_DIR", str(tmp_path / "img-cache"))
+    monkeypatch.setenv("METADATA_DIR", str(tmp_path / "metadata"))
     get_settings.cache_clear()
     reset_setting_store()
     reset_secret_box()
     reset_auth_state()
     reset_image_cache()
+    reset_image_variant_service()
+    valid_image = BytesIO()
+    Image.new("RGB", (1600, 900), "#335577").save(valid_image, "JPEG", quality=95)
+
+    def image_handler(request: httpx.Request) -> httpx.Response:
+        content = (
+            valid_image.getvalue()
+            if request.url.path.endswith("/valid.jpg")
+            else b"route-jpeg"
+        )
+        return httpx.Response(200, headers={"Content-Type": "image/jpeg"}, content=content)
+
     # 把共享代理单例替换成 Mock 传输 + 静态 DNS，用例不出网
     monkeypatch.setattr(
         image_proxy_module,
         "_proxy",
         ImageProxy(
-            transport=httpx.MockTransport(
-                lambda _request: httpx.Response(
-                    200, headers={"Content-Type": "image/jpeg"}, content=b"route-jpeg"
-                )
-            ),
+            transport=httpx.MockTransport(image_handler),
             resolver=_fake_resolver,
         ),
     )
@@ -155,6 +214,7 @@ def client(tmp_path: Path, monkeypatch):
         yield c
 
     reset_image_cache()
+    reset_image_variant_service()
     reset_setting_store()
     reset_secret_box()
     reset_auth_state()
@@ -173,3 +233,35 @@ def test_proxy_route_serves_cached_image(client: TestClient, tmp_path: Path) -> 
     assert (tmp_path / "img-cache" / digest[:2] / digest).is_file()
     # 二次访问命中缓存，同样成功
     assert client.get("/api/v1/images/proxy", params={"url": url}).status_code == 200
+
+
+def test_remote_and_local_routes_share_landscape_variant(
+    client: TestClient, tmp_path: Path
+) -> None:
+    """远程原图与本地 metadata 资产都能请求同一个受控横卡预设。"""
+    remote = client.get(
+        "/api/v1/images/proxy",
+        params={
+            "url": "https://img.host-a.com/valid.jpg",
+            "variant": "landscape-card",
+        },
+    )
+    assert remote.status_code == 200
+    assert remote.headers["content-type"] == "image/webp"
+    assert "immutable" in remote.headers["cache-control"]
+    with Image.open(BytesIO(remote.content)) as image:
+        assert image.size == (480, 270)
+
+    asset = tmp_path / "metadata" / "images" / "14" / "backdrop.jpg"
+    asset.parent.mkdir(parents=True)
+    Image.new("RGB", (1920, 1080), "#775533").save(asset, "JPEG", quality=95)
+    version = str(int(asset.stat().st_mtime))
+    local = client.get(
+        "/api/v1/images/assets/14/backdrop.jpg",
+        params={"v": version, "variant": "landscape-card"},
+    )
+    assert local.status_code == 200
+    assert local.headers["content-type"] == "image/webp"
+    assert "immutable" in local.headers["cache-control"]
+    with Image.open(BytesIO(local.content)) as image:
+        assert image.size == (480, 270)

@@ -19,7 +19,7 @@
 2. **令牌隔离（安全升级）**：MOVIECLAW_TOKEN 只注入 mclaw 工具的子进程，
    **不再进 bash 的环境**——bash 里 `env`/`echo $MOVIECLAW_TOKEN` 从此拿不到
    凭证，泄漏面从「整个 shell」收窄到「一个不透传环境的专用工具」。
-3. **硬闸位点**：递归禁令（不允许在工具里再调 `mclaw agent ...`）从提示词
+3. **硬闸位点**：递归禁令（不允许在工具里调用 `session start/retry/follow`）从提示词
    软约束升级为工具 handler 里的代码硬闸，模型绕不过去。
 
 ---
@@ -60,10 +60,9 @@ def make_mclaw_tool(
   ——没有管道/重定向/变量展开，注入面为零；需要组合处理输出时，模型把
   JSON 结果交给 bash/read 等其他工具，职责分明。
 - 子进程环境 = 进程环境 + extra_env（令牌仅此处注入）；cwd = 工作区。
-- **硬闸**：`args` 的首个 token 为 `agent` 时直接返回错误文本
-  「不能在工具里调用 mclaw agent——那是你自己的运行入口（禁止递归）。
-  请直接在当前会话完成任务」，不执行子进程。`login`/`logout` 同样拦截
-  （授权已配置，执行只会破坏凭证状态）。
+- **硬闸**：`session start/retry/follow` 不执行子进程，防止当前 Agent
+  递归创建或嵌套跟随会话；`login`/`logout` 同样拦截。任何 `--server` 参数
+  也被拒绝，避免把短时令牌发往其他服务器。
 - 输出组装（复用 bash 工具的截断实现）：
 
 ```
@@ -77,6 +76,8 @@ def make_mclaw_tool(
   中文解读（0 不标注；1 业务错误看 stderr；2 用法错误先 --help；3 授权失效
   应停止并报告用户；5 需要 --yes；6 等待超时任务仍在后台；7 歧义待选）。
   模型即使没读过任何文档，也能从工具结果本身学会正确的下一步。
+  唯一例外是 `session get-transcript`：它返回未经工具层截断的完整轨迹，
+  description 明确提醒长会话结果可能很大，由模型自行决定是否读取和如何使用。
 
 ## 2. 工具 description（评审点 ②：产品能力地图 + 使用协议）
 
@@ -118,6 +119,9 @@ movieclaw 的官方命令行工具。用于从 TMDB 和豆瓣发现实时热点�
   体积和制作组等条件及默认规则组）
 - search   统一搜索（titles 搜 TMDB/豆瓣影视条目，torrents 跨 PT 站点搜种子并可把
   结果行号交给 download，library-items 搜已入库内容；另可管理搜索预设和历史结果）
+- session  用户与智能体的会话管理（发起新对话或继续已有对话，按指定用户消息重新提问，
+  读取并分析完整 message/compaction 轨迹；也可重命名、压缩上下文、跟随或停止处理，
+  以及删除会话）
 - site     PT 资源站点（查看支持目录/鉴权要求，配置、验证、启停站点，查看本地种子
   缓存统计；Cookie 可由 extension 同步）
 - sub      电影/剧集订阅与自动追更（持续追踪新资源，按规则自动搜索、下载并整理
@@ -198,15 +202,15 @@ def get_agent_tools(cli_env: dict[str, str]) -> list[AgentTool]:
 
 | 防线 | 位置 | 拦什么 |
 |---|---|---|
-| 工具 handler 硬闸 | `make_mclaw_tool` | `agent` 子命令（递归）、`login/logout`（破坏凭证） |
-| 服务端硬闸 | `agent.start` 路由 | 持 `agent:` 身份令牌的再发起（防绕过工具直接 curl） |
+| 工具 handler 硬闸 | `make_mclaw_tool` | `session start/retry/follow`（递归）、`login/logout`、`--server` |
+| 服务端硬闸 | `session.start/retry/stop` 路由 | 持 `agent:` 身份令牌开始、继续或重试会话，以及停止自身会话 |
 | 令牌收窄 | 只注入 mclaw 工具子进程 | bash 里 `env` 再也看不到 MOVIECLAW_TOKEN |
 
 服务端硬闸实现（同前版设计）：
 
 ```python
-async def start_agent(payload, identity: str = Depends(require_login), ...):
-    if identity.startswith("agent:"):
+async def start_session(payload, identity: Principal = Depends(require_login), ...):
+    if identity.kind == "agent":
         raise BadRequestException("Agent 工作区内不能再发起新的 Agent 运行（禁止递归）")
 ```
 
@@ -224,8 +228,8 @@ async def start_agent(payload, identity: str = Depends(require_login), ...):
 1. **description 快照测试**：完整工具描述（含渲染目录）全文快照——描述是
    模型行为的一部分，改动必须显式过评审；
 2. **目录同步守护**：service_map 覆盖的域集合 == spec 非 hidden 域集合；
-3. **硬闸测试**：`args="agent run xx"` / `args="login"` 返回拒绝文本且未起
-   子进程；服务端 agent 令牌调 start → 400；
+3. **硬闸测试**：`session start/retry/follow`、`login` 与 `--server` 返回拒绝
+   文本且未起子进程；服务端 agent 令牌开始会话/发送消息或停止自身会话 → 400；
 4. **令牌隔离测试**：bash 子进程 `echo $MOVIECLAW_TOKEN` 为空，mclaw 工具
    子进程能成功调用（e2e：真实 uvicorn + 真实 mclaw）；
 5. **退出码标注测试**：构造 5/7 退出码场景，断言工具结果含对应中文解读；

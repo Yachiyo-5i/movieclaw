@@ -24,7 +24,7 @@ from movieclaw_api.api.deps import (
     require_direct_download_capability,
     require_login,
 )
-from movieclaw_api.api.routes.agent import router as agent_router
+from movieclaw_api.api.routes.agent import router as session_router
 from movieclaw_api.api.routes.app_config import router as app_config_router
 from movieclaw_api.api.routes.app_update import router as app_update_router
 from movieclaw_api.api.routes.appearance import router as appearance_router
@@ -49,6 +49,7 @@ from movieclaw_api.api.routes.logs import router as logs_router
 from movieclaw_api.api.routes.members import router as members_router
 from movieclaw_api.api.routes.network import router as network_router
 from movieclaw_api.api.routes.people import router as people_router
+from movieclaw_api.api.routes.playback import router as playback_router
 from movieclaw_api.api.routes.rule_sets import router as rule_sets_router
 from movieclaw_api.api.routes.search import router as search_router
 from movieclaw_api.api.routes.sites import router as sites_router
@@ -83,6 +84,7 @@ _MEMBER_ROUTERS = [
     subscriptions_router,
     libraries_router,
     people_router,
+    playback_router,
 ]
 for _router in _MEMBER_ROUTERS:
     api_router.include_router(_router, dependencies=[Depends(require_login)])
@@ -104,7 +106,7 @@ _ADMIN_ROUTERS = [
     system_notices_router,
     downloaders_router,
     llm_router,
-    agent_router,
+    session_router,
     channels_router,
     channels_im_router,
     import_watch_router,

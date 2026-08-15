@@ -233,6 +233,83 @@ def test_items_counts_endpoint(client: TestClient, seeded: dict) -> None:
         assert key in body
 
 
+def test_jellyfin_counts_read_persisted_library_snapshot(
+    client: TestClient, seeded: dict, tmp_path
+) -> None:
+    """Jellyfin 库卡片与全服统计共用预计算快照。"""
+    import sqlite3
+
+    with sqlite3.connect(tmp_path / "jf.db") as connection:
+        connection.execute(
+            """
+            UPDATE library
+            SET stats_item_count = 7, stats_episode_count = 0
+            WHERE id = ?
+            """,
+            (seeded["movie_lib"],),
+        )
+        connection.execute(
+            """
+            UPDATE library
+            SET stats_item_count = 4, stats_episode_count = 22
+            WHERE id = ?
+            """,
+            (seeded["tv_lib"],),
+        )
+
+    token = jf_login(client)
+    views = client.get("/UserViews", params={"ApiKey": token}).json()["Items"]
+    by_name = {view["Name"]: view for view in views}
+    assert by_name["电影"]["ChildCount"] == 7
+    assert by_name["剧集"]["ChildCount"] == 4
+    assert by_name["剧集"]["RecursiveItemCount"] == 22
+
+    counts = client.get("/Items/Counts", params={"ApiKey": token}).json()
+    assert counts["MovieCount"] == 7
+    assert counts["SeriesCount"] == 4
+    assert counts["EpisodeCount"] == 22
+    assert counts["ItemCount"] == 33
+
+
+def test_jellyfin_counts_dedupe_same_series_across_tv_libraries(
+    client: TestClient, seeded: dict, tmp_path
+) -> None:
+    """同一剧跨库时不能盲加每库快照；要保持 Jellyfin 去重口径。"""
+    import sqlite3
+
+    with sqlite3.connect(tmp_path / "jf.db") as connection:
+        connection.execute(
+            """
+            INSERT INTO library (
+                created_at, updated_at, name, kind, root_paths, is_default,
+                stats_item_count, stats_episode_count, stats_file_count,
+                stats_total_size_bytes
+            ) VALUES (?, ?, ?, 'tv', '[]', 0, 1, 1, 1, 1024)
+            """,
+            ("2026-08-15", "2026-08-15", "剧集备份库"),
+        )
+        extra_library_id = connection.execute(
+            "SELECT id FROM library WHERE name = '剧集备份库'"
+        ).fetchone()[0]
+        # 新库收藏的仍是已有剧集的 S01E01；每库快照都是 1，
+        # 但全服 SeriesCount 和 EpisodeCount 都不应增加。
+        connection.execute(
+            """
+            INSERT INTO library_file (
+                created_at, updated_at, library_id, media_item_id,
+                season_number, episode_number, file_path, size_bytes, source
+            ) VALUES (?, ?, ?, ?, 1, 1, '/backup/S01E01.mkv', 1024, 'scanned')
+            """,
+            ("2026-08-15", "2026-08-15", extra_library_id, seeded["show"]),
+        )
+
+    token = jf_login(client)
+    counts = client.get("/Items/Counts", params={"ApiKey": token}).json()
+    assert counts["MovieCount"] == 1
+    assert counts["SeriesCount"] == 1
+    assert counts["EpisodeCount"] == 3
+
+
 def test_library_cover_is_server_rendered_collage(client: TestClient, seeded: dict) -> None:
     """库封面 = 服务端渲染的氛围光货架拼贴，Jellyfin 与控制台双端同一张图。"""
     token = jf_login(client)
