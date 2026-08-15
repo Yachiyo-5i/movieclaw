@@ -219,6 +219,8 @@ class LibraryFileRepository:
         existing.bit_depth = row.bit_depth
         existing.duration_seconds = row.duration_seconds
         existing.bit_rate = row.bit_rate
+        existing.frame_rate = row.frame_rate
+        existing.color_space = row.color_space
         existing.audio_streams = row.audio_streams
         existing.subtitle_streams = row.subtitle_streams
         existing.external_subtitles = row.external_subtitles

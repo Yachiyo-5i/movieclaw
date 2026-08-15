@@ -43,8 +43,11 @@ import type { Subscription } from "@/lib/api/subscriptions";
 import { publicEnv } from "@/lib/env";
 import { formatBytes } from "@/lib/format";
 import { imageUrl } from "@/lib/image-proxy";
+import { libraryInventoryAction } from "@/lib/library-inventory-summary";
 import type { MediaItem, MediaType } from "@/lib/media-types";
 import { usePermissions } from "@/lib/permissions";
+import { buildRecentAdditionOverlay } from "@/lib/recent-addition";
+import { formatRelativeTime } from "@/lib/time";
 import { useVisiblePolling } from "@/lib/use-visible-polling";
 import { useScrollRestoration } from "@/lib/use-scroll-restoration";
 
@@ -165,20 +168,13 @@ function routingOverlapWarnings(libraries: MediaLibrary[]): string[] {
 }
 
 /**
- * 库存条目的悬浮操作三分支（库首页「最近添加」行与单库库存墙共用）：
- *   - 在播剧 → 订阅追新（还会有新集，转化价值最高；已订阅时卡片自动显「已订阅」）；
- *   - 完结剧且已播集有缺口 → 补齐缺集（整季没下过的内容不在文件台账里，
- *     「缺失重下」够不着，建订阅是唯一补齐路径；订阅按 E−H 只补缺的集）。
- *     缺口按跨库判定：同一部剧的集分散在多个库时任一库有即算拥有，与订阅
- *     生成工单的口径一致，否则会出现「提示补齐但订阅一个工单都不生成」；
- *   - 其余（电影 / 完结齐全 / 播出状态未知）→ 不显示悬浮操作。媒体库语境已经
- *     明确表示内容在库，再展示「已入库」只会增加一次无价值的触摸展开。
+ * 库存条目的悬浮操作与本卡 hover 的完整度文案同源：季或集有一项未齐就
+ * 「补齐缺集」；当前已知季集全部在库则「自动续订」，等待未来出现的新季。
+ * 已在“我的订阅”中的条目由 PosterCardVisual 统一隐藏操作，不再显示
+ * 没有决策价值的“已订阅”按钮。
  */
 export function libraryCardAction(item: LibraryItem): PosterCardAction {
-  if (item.kind !== "tv") return "none";
-  if (item.air_status === "airing") return "follow";
-  if (item.air_status === "ended" && item.missing_episode_count > 0) return "backfill";
-  return "none";
+  return libraryInventoryAction(item.kind, item.inventory_summary);
 }
 
 /**
@@ -354,16 +350,13 @@ export function LibraryView() {
   }, [highlightId, libraries]);
 
   // 每个非空库一行「最近添加」：服务端已按最近入账倒序给到前 20，复用发现页的
-  // 横滚海报行；悬浮动作按条目三分支（追新/补齐/无操作，见 libraryCardAction）
+  // 横滚海报行。这里只呈现入库上下文，订阅/补齐操作留在单库页，避免 hover
+  // 被“已订阅”等与最近添加无关的状态占据。
   const recentRows = useMemo(
     () =>
       (libraries ?? [])
         .map((library) => {
           const recent = itemsByLibrary.get(library.id) ?? [];
-          // MediaItem.id 即 tmdb_id 字符串，库类型固定故同行内唯一，可作动作映射键
-          const actions = new Map(
-            recent.map((it) => [String(it.tmdb_id), libraryCardAction(it)]),
-          );
           // 已在库的条目点击进**媒体库条目详情**（本地刮削信息 + 片源规格 +
           // 条目操作），与单库页库存格同一目标，不再跳发现页的 TMDB 详情
           const hrefs = new Map(
@@ -375,7 +368,6 @@ export function LibraryView() {
           return {
             library,
             items: recent.map(libraryItemToMediaItem),
-            actionOf: (m: MediaItem) => actions.get(m.id) ?? ("none" as const),
             hrefOf: (m: MediaItem) => hrefs.get(m.id),
           };
         })
@@ -522,7 +514,7 @@ export function LibraryView() {
       {/* —— 最近添加：Emby 首页式分区，每个非空库一行横滚海报 —— */}
       {recentRows.length > 0 && (
         <div className="mt-10 space-y-8">
-          {recentRows.map(({ library, items, actionOf, hrefOf }) => (
+          {recentRows.map(({ library, items, hrefOf }) => (
             <MediaRow
               key={library.id}
               row={{
@@ -532,7 +524,7 @@ export function LibraryView() {
               }}
               moreHref={`/library/${library.id}` as Route}
               moreLabel="查看全部"
-              cardAction={actionOf}
+              cardAction="none"
               cardHref={hrefOf}
             />
           ))}
@@ -566,17 +558,15 @@ export function LibraryView() {
 
 /**
  * 库存条目 → 发现页海报卡的数据形态。点击走 /media/{type}/{tmdb_id} 详情
- * （与单库页库存格同一目标）；副行只放剧集规模——文件大小对浏览海报墙
- * 没有决策价值，不展示（点进条目详情能看到）。海报保持干净，不打清晰度徽章。
+ * （与单库页库存格同一目标）。卡片底部只留片名与年份；本批季集范围和入库
+ * 时间进入 hover，不能拿累计库存季集数冒充新增内容。海报不打清晰度徽章。
  */
 function libraryItemToMediaItem(item: LibraryItem): MediaItem {
-  let extent = "";
-  if (item.kind === "tv" && item.episode_count > 0) {
-    extent =
-      item.seasons.length === 1
-        ? `第 ${item.seasons[0]} 季 · ${item.episode_count} 集`
-        : `${item.seasons.length} 季 · ${item.episode_count} 集`;
-  }
+  const overlayDetails = buildRecentAdditionOverlay(
+    item.kind,
+    item.recent_addition,
+    item.added_at ? `${formatRelativeTime(item.added_at)}入库` : null,
+  );
   return {
     id: String(item.tmdb_id),
     source: "tmdb",
@@ -586,9 +576,10 @@ function libraryItemToMediaItem(item: LibraryItem): MediaItem {
     year: item.year ?? 0,
     rating: 0,
     genres: [],
-    extent,
+    extent: "",
     badges: [],
     overview: "",
+    overlayDetails,
     // 海报可能是本地刮削资产的相对路径（/images/assets/...），也可能是
     // TMDB 图床绝对地址——统一经 imageUrl 解析（补 API base / 走缓存代理）
     posterUrl: imageUrl(item.poster_url),

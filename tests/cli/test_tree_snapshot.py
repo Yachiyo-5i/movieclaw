@@ -50,6 +50,7 @@ KNOWN_NON_GENERATED = {
     "dl.torrent.replace",  # 任务中心无进度下载的就地换源动作，仅供 Web 使用
     "dl.torrent.delete",  # 任务中心 Web 操作；删除数据时具有破坏性，不开放给 CLI
     "ui.discovery.get",  # Web 专用展示编排；CLI 使用 discover 领域命令
+    "discover.get-person-details",  # 发现页演职员下钻；CLI 暂无人物页消费场景
     "ui.subscriptions.preview-title",
 }
 

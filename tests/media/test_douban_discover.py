@@ -141,6 +141,12 @@ async def test_detail_maps_mobile_fields_to_shared_detail_model() -> None:
             # 豆瓣的 avatar 形态不稳定：这里覆盖「字典」与「字符串」两种，
             # 以及 character 带「饰 」前缀的情况
             "celebrities:26266893": {
+                "directors": [
+                    {
+                        "name": "郭帆",
+                        "avatar": {"large": "https://img.douban.test/director.jpg"},
+                    }
+                ],
                 "actors": [
                     {
                         "name": f"演员{i}",
@@ -160,6 +166,9 @@ async def test_detail_maps_mobile_fields_to_shared_detail_model() -> None:
     assert detail.card.original_title == "The Wandering Earth"
     assert detail.card.extent == "125分钟"
     assert detail.facts.directors == ["郭帆"]
+    assert detail.facts.director_credits[0].avatar_url == (
+        "https://img.douban.test/director.jpg"
+    )
     # 演职员整段带回（上限 16），角色名去掉豆瓣的「饰 」前缀，两种 avatar 形态都能取到
     assert len(detail.facts.cast) == 7
     assert detail.facts.cast[0].name == "演员1"
@@ -184,6 +193,7 @@ async def test_detail_falls_back_to_plain_actor_names_when_celebrities_unavailab
                 "year": "2019",
                 "rating": {"value": 7.9},
                 "cover_url": "https://img3.doubanio.com/a.jpg",
+                "directors": [{"name": "郭帆"}],
                 "actors": [{"name": "吴京"}, {"name": "屈楚萧"}],
             },
             "celebrities:26266893": DoubanError("访问豆瓣演职员表失败，请稍后重试"),
@@ -191,6 +201,8 @@ async def test_detail_falls_back_to_plain_actor_names_when_celebrities_unavailab
     )
     detail = await DoubanDiscoverService(client).media_detail("26266893")  # type: ignore[arg-type]
 
+    assert detail.facts.directors == ["郭帆"]
+    assert detail.facts.director_credits[0].avatar_url is None
     assert [person.name for person in detail.facts.cast] == ["吴京", "屈楚萧"]
     assert detail.facts.cast[0].avatar_url is None
 

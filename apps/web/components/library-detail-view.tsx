@@ -62,6 +62,8 @@ import {
 } from "@/components/claim-panels";
 import { listSubscriptions, type Subscription } from "@/lib/api/subscriptions";
 import { formatBytes } from "@/lib/format";
+import { formatLibraryInventorySummary } from "@/lib/library-inventory-summary";
+import { activeWallInitialAtViewport, wallInitialAtOffset } from "@/lib/library-wall-index";
 import { formatRelativeTime } from "@/lib/time";
 import { cachedImageUrl, imageUrl } from "@/lib/image-proxy";
 import { keepIfEqual, reconcileList } from "@/lib/poll-reconcile";
@@ -111,9 +113,19 @@ export function LibraryDetailView({ libraryId }: { libraryId: number }) {
   const restoredFromSnapshot = useRef(initialSnapshot !== undefined);
   const { canManageLibraries } = usePermissions();
   const { activeJobs } = useJobs();
-  const scrollRef = useScrollRestoration(`library:${libraryId}`, {
+  const restoreScrollRef = useScrollRestoration(`library:${libraryId}`, {
     anchorAttribute: "data-library-item-id",
   });
+  const [scrollElement, setScrollElement] = useState<HTMLDivElement | null>(null);
+  // 滚动位置恢复与字母索引联动共用同一个真实滚动容器，合并 callback ref
+  // 避免两套监听器各自猜测 window/document。
+  const scrollRef = useCallback(
+    (node: HTMLDivElement | null) => {
+      restoreScrollRef(node);
+      setScrollElement(node);
+    },
+    [restoreScrollRef],
+  );
   const confirm = useConfirm();
   const [libraries, setLibraries] = useState<MediaLibrary[] | null>(initialSnapshot?.libraries ?? null);
   const [items, setItems] = useState<LibraryItem[]>(initialSnapshot?.items ?? []);
@@ -129,6 +141,9 @@ export function LibraryDetailView({ libraryId }: { libraryId: number }) {
   // 当前窗口在整份排序里的起点：0 = 从头开始；点字母跳转后是该档的 offset。
   // 轮询要按这个起点重拉，否则每 3 秒把用户拽回墙首
   const [wallStart, setWallStart] = useState(initialSnapshot?.wallStart ?? 0);
+  // 与分页窗口起点分离：wallStart 只决定服务端从哪里取；活动字母要跟随
+  // 用户在已加载窗口里的真实滚动位置。
+  const [activeWallInitial, setActiveWallInitial] = useState<string | null>(null);
   const [unidentified, setUnidentified] = useState<UnidentifiedGroup[]>(initialSnapshot?.unidentified ?? []);
   const [review, setReview] = useState<ReviewGroup[]>(initialSnapshot?.review ?? []);
   const [ignored, setIgnored] = useState<UnidentifiedGroup[]>(initialSnapshot?.ignored ?? []);
@@ -313,6 +328,7 @@ export function LibraryDetailView({ libraryId }: { libraryId: number }) {
   // 海报墙顶部的锚：跳字母后滚回墙首，否则用户停在原来的滚动位置上，
   // 看到的是新一批的中间，像是"点了没反应"
   const wallTop = useRef<HTMLDivElement>(null);
+  const wallGrid = useRef<HTMLDivElement>(null);
   /**
    * 跳到某个首字母档：换掉整个窗口（而不是继续往后追加），此后照常向下滚动加载。
    * offset=0 即回到墙首，索引条的「全部」走的也是这条路。
@@ -439,6 +455,46 @@ export function LibraryDetailView({ libraryId }: { libraryId: number }) {
   const probing = Boolean(
     library?.scanning && library.scan_progress?.phase === "probing",
   );
+  const initialByOffset = useMemo(
+    () => new Map(wallIndex.map((entry) => [entry.offset, entry.initial])),
+    [wallIndex],
+  );
+
+  // 用户滚动时，用每个字母首部影片的 DOM 锚点更新活动字母。滚动事件用
+  // requestAnimationFrame 合帧；每帧最多读取 27 个锚点，与已加载影片数无关。
+  useEffect(() => {
+    const fallback = wallInitialAtOffset(wallIndex, wallStart);
+    setActiveWallInitial(fallback);
+    if (!scrollElement || probing) return;
+
+    let frame = 0;
+    const update = () => {
+      frame = 0;
+      const grid = wallGrid.current;
+      if (!grid) return;
+      const markers = Array.from(
+        grid.querySelectorAll<HTMLElement>("[data-wall-initial]"),
+        (marker) => ({
+          initial: marker.dataset.wallInitial ?? "",
+          top: marker.getBoundingClientRect().top,
+        }),
+      ).filter((marker) => marker.initial !== "");
+      const viewportTop = scrollElement.getBoundingClientRect().top + 1;
+      const next = activeWallInitialAtViewport(markers, viewportTop, fallback);
+      setActiveWallInitial((current) => (current === next ? current : next));
+    };
+    const schedule = () => {
+      if (!frame) frame = requestAnimationFrame(update);
+    };
+
+    scrollElement.addEventListener("scroll", schedule, { passive: true });
+    schedule();
+    return () => {
+      scrollElement.removeEventListener("scroll", schedule);
+      if (frame) cancelAnimationFrame(frame);
+    };
+  }, [items.length, probing, scrollElement, wallIndex, wallStart]);
+
   // 排序切换是**服务端**的事（墙是分页的，本地排只能排到已加载的那几屏）：
   // 阶段一变就换排序键重拉第一页，回到首屏看的就是正在处理的那几部
   useEffect(() => {
@@ -617,13 +673,9 @@ export function LibraryDetailView({ libraryId }: { libraryId: number }) {
             </span>
           )}
         </div>
-        <p
-          className="text-on-image mt-1.5 truncate text-ui text-[var(--text-muted)] max-md:text-sub"
-          title={library.root_paths.join("\n")}
-        >
+        <p className="text-on-image mt-1.5 truncate text-ui text-[var(--text-muted)] max-md:text-sub">
           {meta.label}库 · {stats.item_count} 部作品 · {stats.file_count} 个文件 ·{" "}
           {formatBytes(stats.total_size_bytes)}
-          {library.primary_root ? ` · ${library.primary_root}` : ""}
         </p>
         {library.last_scan && !busy && (
           <p className="mt-1 text-sub text-white/45">
@@ -792,12 +844,16 @@ export function LibraryDetailView({ libraryId }: { libraryId: number }) {
           <div ref={wallTop} className={pending.length > 0 ? "mt-4" : "mt-6 max-md:mt-4"}>
             {/* 索引条与墙并排：条固定在视口右侧（sticky），墙照常滚 */}
             <div className="flex items-start gap-2 px-6 max-md:gap-1 max-md:px-4">
-              <div className="grid flex-1 gap-x-4 gap-y-7 [grid-template-columns:repeat(auto-fill,minmax(148px,1fr))] max-md:gap-x-3 max-md:gap-y-5 max-md:[grid-template-columns:repeat(auto-fill,minmax(140px,1fr))]">
-                {items.map((item) => (
+              <div
+                ref={wallGrid}
+                className="grid flex-1 gap-x-4 gap-y-7 [grid-template-columns:repeat(auto-fill,minmax(148px,1fr))] max-md:gap-x-3 max-md:gap-y-5 max-md:[grid-template-columns:repeat(auto-fill,minmax(140px,1fr))]"
+              >
+                {items.map((item, index) => (
                   <InventoryCell
                     key={item.media_item_id}
                     item={item}
                     libraryId={libraryId}
+                    wallInitial={initialByOffset.get(wallStart + index)}
                     workingLabel={
                       refreshPhaseById.get(item.media_item_id) ??
                       jobPhaseById.get(item.media_item_id) ??
@@ -807,7 +863,9 @@ export function LibraryDetailView({ libraryId }: { libraryId: number }) {
                 ))}
               </div>
               {/* 补探阶段排序不是拼音序，字母跳转会跳错位置——那几分钟里收起来 */}
-              {!probing && <WallIndexBar index={wallIndex} start={wallStart} onJump={jumpTo} />}
+              {!probing && (
+                <WallIndexBar index={wallIndex} active={activeWallInitial} onJump={jumpTo} />
+              )}
             </div>
           </div>
           <WallLoadMore
@@ -1017,13 +1075,20 @@ function MetadataRefreshPanel({
 const InventoryCell = memo(function InventoryCell({
   item,
   libraryId,
+  wallInitial,
   workingLabel,
 }: {
   item: LibraryItem;
   libraryId: number;
+  /** 该格是否为某个拼音首字母档的第一部影片；滚动联动只标记这些锚点。 */
+  wallInitial?: string;
   /** 这一格正被后台处理（整库刷新的阶段 / 扫描补探）时的文案；不在处理为 undefined */
   workingLabel?: string;
 }) {
+  const inventoryLabel =
+    item.kind === "tv" && item.inventory_summary
+      ? formatLibraryInventorySummary(item.inventory_summary)
+      : null;
   const visual: PosterVisualItem = {
     id: String(item.tmdb_id),
     source: "tmdb",
@@ -1031,30 +1096,24 @@ const InventoryCell = memo(function InventoryCell({
     title: item.title,
     year: item.year ?? undefined,
     rating: 0,
+    overlayDetails: inventoryLabel ? { primary: inventoryLabel } : undefined,
     // 海报可能是本地刮削资产的相对路径（断网可用），也可能是 TMDB 图床地址
     posterUrl: imageUrl(item.poster_url),
   };
-  // 格下只说剧集规模与异常；单部的大小/清晰度规格对浏览海报墙没有决策
-  // 价值，不展示（点进条目详情能看到），总大小看库头部
-  const parts: string[] = [];
-  if (item.kind === "tv" && item.seasons.length > 0) {
-    parts.push(
-      item.seasons.length === 1
-        ? `第 ${item.seasons[0]} 季 · ${item.episode_count} 集`
-        : `${item.seasons.length} 季 · ${item.episode_count} 集`,
-    );
-  }
   // 文件全部缺失的"死条目"：海报置灰，一眼与在位内容区分
   const dead = item.file_count > 0 && item.missing_count >= item.file_count;
-  // 库存墙里的东西本来就都在库里，「已入库」不值一行；只有缺失这类异常才点灯
-  const abnormal = dead || item.missing_count > 0;
-  if (dead) parts.splice(0, parts.length, "文件已全部缺失");
-  else if (item.missing_count > 0) parts.push(`${item.missing_count} 个文件缺失`);
+  // 卡片下方只保留片名与年份；缺失是需要常显的异常，作为唯一例外单独点灯。
+  const abnormalLabel = dead
+    ? "文件已全部缺失"
+    : item.missing_count > 0
+      ? `${item.missing_count} 个文件缺失`
+      : null;
   return (
     // content-visibility：视口外的格子跳过布局与绘制，大库海报墙的滚动/更新
     // 成本只与可见格数相关；intrinsic-size 占住尺寸，滚动条不跳
     <div
       data-library-item-id={item.media_item_id}
+      data-wall-initial={wallInitial}
       className="[contain-intrinsic-size:auto_270px] [content-visibility:auto]"
     >
       {/* 后台正在处理的那一格自己点亮：进度面板/胶囊列的是总数或片名，
@@ -1065,6 +1124,7 @@ const InventoryCell = memo(function InventoryCell({
             item={visual}
             href={`/library/${libraryId}/item/${item.media_item_id}` as Route}
             action={libraryCardAction(item)}
+            revealInfoOnTouch
           />
         </div>
         {workingLabel && (
@@ -1078,14 +1138,12 @@ const InventoryCell = memo(function InventoryCell({
           </>
         )}
       </div>
-      {parts.length > 0 && (
+      {abnormalLabel && (
         <p className="text-on-image mt-1.5 flex items-center gap-1.5 truncate text-caption text-[var(--text-muted)]">
-          {abnormal && (
-            <span
-              className={`size-1.5 shrink-0 rounded-full ${dead ? "bg-white/30" : "bg-[#f5c451]"}`}
-            />
-          )}
-          <span className="truncate">{parts.join(" · ")}</span>
+          <span
+            className={`size-1.5 shrink-0 rounded-full ${dead ? "bg-white/30" : "bg-[#f5c451]"}`}
+          />
+          <span className="truncate">{abnormalLabel}</span>
         </p>
       )}
     </div>
@@ -1166,20 +1224,15 @@ const WALL_INDEX_HEIGHT = `min(${WALL_INDEX_MAX_HEIGHT}px, 72dvh)`;
  */
 function WallIndexBar({
   index,
-  start,
+  active,
   onJump,
 }: {
   index: LibraryIndexEntry[];
-  /** 当前窗口起点，用来高亮"现在停在哪一档" */
-  start: number;
+  /** 当前视口所在档位；由海报墙滚动锚点实时更新。 */
+  active: string | null;
   onJump: (offset: number) => void;
 }) {
   const byInitial = useMemo(() => new Map(index.map((e) => [e.initial, e])), [index]);
-  // 当前档 = 起点落在哪一档的区间里
-  const active = useMemo(
-    () => index.findLast((e) => e.offset <= start)?.initial ?? null,
-    [index, start],
-  );
   const barRef = useRef<HTMLDivElement>(null);
   // 正在滑选的字母（气泡预览 + 高亮）；null = 没在按压
   const [preview, setPreview] = useState<string | null>(null);

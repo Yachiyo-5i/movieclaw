@@ -255,6 +255,32 @@ class LibraryIndexEntryView(BaseModel):
     )
 
 
+class LibraryRecentAdditionView(BaseModel):
+    """让条目进入「最近添加」的最后一批剧集的紧凑摘要。"""
+
+    season_count: int
+    episode_count: int
+    season_number: int | None = Field(description="仅涉及一季时的季号；跨季为 NULL")
+    first_episode_number: int | None = Field(description="同季连续批次的起始集；否则 NULL")
+    last_episode_number: int | None = Field(description="同季连续批次的结束集；否则 NULL")
+    complete_season: bool = Field(description="本批是否完整覆盖该季 TMDB 已知集数")
+
+
+class LibraryInventorySummaryView(BaseModel):
+    """剧集库海报 hover 的在位库存完整度摘要。"""
+
+    season_count: int = Field(description="在位正季数；仅特别篇时为 0")
+    episode_count: int = Field(description="摘要覆盖的在位去重集数")
+    season_number: int | None = Field(
+        description="只覆盖一季时的季号（0=特别篇）；多季为 NULL"
+    )
+    total_episode_count: int | None = Field(
+        description="摘要所覆盖季的 TMDB 已知总集数；任一季未知时为 NULL"
+    )
+    all_seasons_owned: bool = Field(description="是否覆盖 TMDB 已知的全部正季")
+    all_episodes_owned: bool = Field(description="摘要所覆盖的每一季是否都已收齐")
+
+
 class LibraryItemView(BaseModel):
     """库内一个媒体条目的库存聚合（单库海报墙的一格）。"""
 
@@ -284,6 +310,14 @@ class LibraryItemView(BaseModel):
     )
     added_at: datetime | None = Field(
         default=None, description="最近一次文件入账时间（首页「最近添加」排序依据）"
+    )
+    recent_addition: LibraryRecentAdditionView | None = Field(
+        default=None,
+        description="最近一次可追溯入库批次的剧集摘要；NULL=电影或迁移前旧台账",
+    )
+    inventory_summary: LibraryInventorySummaryView | None = Field(
+        default=None,
+        description="本库在位剧集相对 TMDB 季集结构的完整度摘要；电影或无有效集号为 NULL",
     )
     probe_pending_count: int = Field(
         default=0,
@@ -368,6 +402,8 @@ class LibraryFileView(BaseModel):
     bit_depth: int | None
     duration_seconds: int | None
     bit_rate: int | None
+    frame_rate: float | None
+    color_space: str | None
     media_source: str | None
     release_group: str | None
     source: str = Field(description="imported（入库管线）/ scanned（存量扫描）")
@@ -400,6 +436,14 @@ class ActorView(BaseModel):
     )
 
 
+class DirectorView(BaseModel):
+    """库内人物关系表中的一位导演。"""
+
+    name: str
+    thumb_url: str | None = Field(default=None, description="头像地址（TMDB 图床 URL）")
+    tmdb_person_id: int = Field(description="TMDB 影人 ID；用于人物页链接")
+
+
 class LocalMetaView(BaseModel):
     """条目的展示元数据：本地 NFO > 库内刮削档案 > TMDB 实时兜底；
     三个来源都拉不到时整体为 null（docs/design/metadata.md 第 5 节）。"""
@@ -409,6 +453,10 @@ class LocalMetaView(BaseModel):
     runtime_minutes: int | None = None
     genres: list[str] = Field(default_factory=list)
     directors: list[str] = Field(default_factory=list)
+    director_credits: list[DirectorView] = Field(
+        default_factory=list,
+        description="从 person 关系表读取的结构化导演；空列表时前端回退 directors 姓名",
+    )
     actors: list[ActorView] = Field(default_factory=list)
     nfo_name: str = Field(default="", description="来源 NFO 文件名（source=nfo 时给出）")
     source: Literal["nfo", "db", "tmdb"] = Field(
@@ -428,6 +476,7 @@ class LibraryItemDetailView(BaseModel):
     kind: MediaKind
     tmdb_id: int
     imdb_id: str | None
+    douban_id: str | None
     title: str
     original_title: str
     year: int | None

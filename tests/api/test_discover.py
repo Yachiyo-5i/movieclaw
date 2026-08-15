@@ -15,11 +15,13 @@ from movieclaw_media.models import (
     DiscoverLayout,
     DiscoverRowStub,
     MediaCard,
+    MediaCastMember,
     MediaCollection,
     MediaDetail,
     MediaFacts,
     MediaKind,
     MediaPage,
+    MediaPersonDetail,
     MediaRow,
     MediaSearchItem,
     MediaSource,
@@ -162,8 +164,32 @@ class _StubTmdbService(_StubService):
         series_card.id = "43"
         return MediaDetail(
             card=card,
-            facts=MediaFacts(aliases=["示例别名"], source_url="https://www.themoviedb.org/"),
+            facts=MediaFacts(
+                directors=["示例导演"],
+                director_credits=[
+                    MediaCastMember(
+                        name="示例导演",
+                        avatar_url="https://image.tmdb.org/t/p/w185/director.jpg",
+                        tmdb_person_id=99,
+                    )
+                ],
+                aliases=["示例别名"],
+                source_url="https://www.themoviedb.org/",
+            ),
             collection=MediaCollection(id="7", name="示例系列", items=[card, series_card]),
+        )
+
+    async def person_detail(self, tmdb_person_id: int) -> MediaPersonDetail:
+        movie = _sample_card()
+        tv = _sample_card()
+        tv.id = "77"
+        tv.type = MediaKind.TV
+        tv.title = "示例剧集"
+        return MediaPersonDetail(
+            tmdb_person_id=tmdb_person_id,
+            name="示例影人",
+            avatar_url="https://image.tmdb.org/t/p/w300/person.jpg",
+            credits=[movie, tv],
         )
 
 
@@ -356,10 +382,36 @@ def test_get_title_details_consumes_title_ref(client: TestClient, monkeypatch) -
     data = resp.json()["data"]
     assert data["title"]["title_ref"] == "tmdb:movie:438631"
     assert data["metadata"]["aliases"] == ["示例别名"]
+    assert data["metadata"]["director_credits"] == [
+        {
+            "name": "示例导演",
+            "role": None,
+            "avatar_url": "https://image.tmdb.org/t/p/w185/director.jpg",
+            "tmdb_person_id": 99,
+        }
+    ]
     assert data["collection"]["name"] == "示例系列"
     assert [item["title_ref"] for item in data["collection"]["titles"]] == [
         "tmdb:movie:438631",
         "tmdb:movie:43",
+    ]
+
+
+def test_get_person_details_returns_complete_tmdb_titles(
+    client: TestClient, monkeypatch
+) -> None:
+    _patch_title_discovery_providers(monkeypatch)
+
+    resp = client.get("/api/v1/discover/people/9340")
+
+    assert resp.status_code == 200, resp.text
+    data = resp.json()["data"]
+    assert data["tmdb_person_id"] == 9340
+    assert data["name"] == "示例影人"
+    assert data["avatar_url"].endswith("/w300/person.jpg")
+    assert [item["title_ref"] for item in data["titles"]] == [
+        "tmdb:movie:42",
+        "tmdb:tv:77",
     ]
 
 

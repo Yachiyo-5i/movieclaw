@@ -505,6 +505,7 @@ _MEMBER_ALLOWLIST = {
     ("GET", "/api/v1/discover/titles"),
     ("POST", "/api/v1/search/titles"),
     ("GET", "/api/v1/discover/titles/{title_ref}"),
+    ("GET", "/api/v1/discover/people/{tmdb_person_id}"),
     ("GET", "/api/v1/people/{tmdb_person_id}"),
     ("GET", "/api/v1/images/assets/{path}"),
     ("GET", "/api/v1/images/proxy"),

@@ -1115,6 +1115,9 @@ async def _ingest_entry(
     # 只保存本次作业实际新增的条目内相对文件名，供任务中心展示本轮成果；
     # 已在库而跳过的旧文件不计入，也不暴露监听目录或媒体库的绝对路径。
     imported_files: list[str] = []
+    # 同一个监听条目本轮成功搬入的文件属于一个用户可理解的入库批次；增量
+    # 季包下一轮再补进来的集会拿新批次号，首页因此只摘要最后一次变化。
+    added_batch_id = uuid4().hex
 
     async def conclude(status: IngestStatus, message: str, imported: int = 0) -> IngestEntry:
         if status is IngestStatus.IMPORTED and item is not None and item.id is not None:
@@ -1439,11 +1442,14 @@ async def _ingest_entry(
                 bit_depth=file_spec.bit_depth if file_spec else None,
                 duration_seconds=file_spec.duration_seconds if file_spec else None,
                 bit_rate=file_spec.bit_rate if file_spec else None,
+                frame_rate=file_spec.frame_rate if file_spec else None,
+                color_space=file_spec.color_space if file_spec else None,
                 audio_streams=list(file_spec.audio_streams) if file_spec else None,
                 subtitle_streams=list(file_spec.subtitle_streams) if file_spec else None,
                 media_source=release_attrs.media_source,
                 release_group=release_attrs.release_group,
                 source=FileSource.IMPORTED,
+                added_batch_id=added_batch_id,
             )
         )
         imported += 1

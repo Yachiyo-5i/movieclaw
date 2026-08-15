@@ -168,6 +168,10 @@ class DiscoveredTitleMetadata(BaseModel):
     """影视条目详情中的作品资料与演职员。"""
 
     directors: list[str] = Field(default_factory=list)
+    director_credits: list[MediaCastMember] = Field(
+        default_factory=list,
+        description="带头像和人物 ID 的导演/主创；缺失时前端回退 directors 姓名",
+    )
     cast: list[MediaCastMember] = Field(default_factory=list)
     country: str = ""
     language: str = ""
@@ -195,6 +199,18 @@ class DiscoveredTitleDetailsView(BaseModel):
     collection: DiscoveredTitleCollectionView | None = None
     recommendations: list[DiscoveredTitleView] = Field(default_factory=list)
     library_links: list[MediaLibraryLink] = Field(default_factory=list)
+
+
+class DiscoveredPersonDetailsView(BaseModel):
+    """发现页影人档案：TMDB 中的全部影视作品及本地库存状态。"""
+
+    tmdb_person_id: int
+    name: str
+    avatar_url: str | None = None
+    titles: list[DiscoveredTitleView] = Field(
+        default_factory=list,
+        description="参演与幕后作品合并去重后的完整 TMDB 影视履历",
+    )
 
 
 class DiscoveryPresentation(StrEnum):

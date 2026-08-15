@@ -23,6 +23,12 @@ export interface MediaLibraryLink {
   mediaItemId: number;
 }
 
+/** 海报 hover 的两行紧凑上下文；用于补充卡片底部不常显的信息。 */
+export interface MediaOverlayDetails {
+  primary: string;
+  secondary?: string;
+}
+
 export interface MediaItem {
   /** 服务端签发的稳定引用；站内跳详情时优先原样使用。 */
   titleRef?: string;
@@ -46,6 +52,8 @@ export interface MediaItem {
   badges: string[];
   /** 一句话简介（卡片 hover 与 Hero 横幅展示） */
   overview: string;
+  /** hover 专用的紧凑上下文，不进入海报下方的常显元信息。 */
+  overlayDetails?: MediaOverlayDetails;
   posterUrl: string;
   /** 仅 Hero 精选项需要的宽幅背景图 */
   backdropUrl?: string;

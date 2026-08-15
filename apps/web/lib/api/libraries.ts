@@ -219,6 +219,29 @@ export interface LibraryItem {
   missing_episode_count: number;
   /** 最近一次文件入账时间（ISO 字符串），首页「最近添加」排序依据 */
   added_at: string | null;
+  /** 最近一次可追溯入库批次；旧台账和电影为 null */
+  recent_addition: {
+    season_count: number;
+    episode_count: number;
+    /** 仅涉及一季时有值 */
+    season_number: number | null;
+    /** 仅同季连续批次有值 */
+    first_episode_number: number | null;
+    last_episode_number: number | null;
+    complete_season: boolean;
+  } | null;
+  /** 本库在位剧集相对 TMDB 季集结构的完整度摘要；电影为 null */
+  inventory_summary: {
+    /** 在位正季数；仅特别篇时为 0 */
+    season_count: number;
+    episode_count: number;
+    /** 只覆盖一季时有值；0 表示特别篇 */
+    season_number: number | null;
+    /** 摘要覆盖季的官方总集数；元数据不完整时为 null */
+    total_episode_count: number | null;
+    all_seasons_owned: boolean;
+    all_episodes_owned: boolean;
+  } | null;
   /** 在位但尚未探出介质规格的文件数——扫描补探阶段据此把「还在处理」的条目排到墙前面 */
   probe_pending_count: number;
 }
@@ -839,6 +862,8 @@ export interface LibraryItemFile {
   bit_depth: number | null;
   duration_seconds: number | null;
   bit_rate: number | null;
+  frame_rate: number | null;
+  color_space: string | null;
   media_source: string | null;
   release_group: string | null;
   /** imported（入库管线）/ scanned（存量扫描） */
@@ -864,6 +889,13 @@ export interface LocalActor {
   tmdb_person_id: number | null;
 }
 
+/** 从库内人物关系表读取的一位导演，与 Jellyfin People 数据同源。 */
+export interface LocalDirector {
+  name: string;
+  thumb_url: string | null;
+  tmdb_person_id: number;
+}
+
 /** 条目的展示元数据：本地 NFO > 库内刮削档案 > TMDB 实时兜底。 */
 export interface LocalMeta {
   plot: string | null;
@@ -871,6 +903,8 @@ export interface LocalMeta {
   runtime_minutes: number | null;
   genres: string[];
   directors: string[];
+  /** 旧条目未建立人物关系时为空，页面回退 directors 姓名占位。 */
+  director_credits: LocalDirector[];
   actors: LocalActor[];
   /** 来源 NFO 文件名（source=nfo 时给出） */
   nfo_name: string;
@@ -888,6 +922,7 @@ export interface LibraryItemDetail {
   kind: MediaType;
   tmdb_id: number;
   imdb_id: string | null;
+  douban_id: string | null;
   title: string;
   original_title: string;
   year: number | null;

@@ -64,8 +64,8 @@ function RecentWatchCard({ item }: { item: RecentWatchItem }) {
     item.kind === "tv"
       ? item.episode_title
       : item.year
-        ? `${item.year} · 电影`
-        : "电影";
+        ? String(item.year)
+        : "";
   const progress = item.played ? 100 : item.progress_percent;
   const isEpisode = item.kind === "tv";
   const artworkUrl = isEpisode ? item.episode_still_url : item.backdrop_url;

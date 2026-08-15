@@ -271,6 +271,9 @@ async def test_scan_identifies_by_name_and_flags_unknown(db, tmp_path) -> None:
         identified = [f for f in files if f.media_item_id is not None]
         assert {(f.season_number, f.episode_number) for f in identified} == {(1, 1), (1, 2)}
         assert all(f.source == "scanned" for f in files)
+        # 同轮首次发现的文件共享批次号，首页才能只摘要这轮新增内容。
+        assert len({f.added_batch_id for f in files}) == 1
+        assert files[0].added_batch_id is not None
         unknown = [f for f in files if f.media_item_id is None]
         assert len(unknown) == 1 and unknown[0].file_path.endswith("zzqx.mkv")
 

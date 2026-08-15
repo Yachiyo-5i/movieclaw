@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime, timedelta
 
 import pytest_asyncio
 from sqlmodel import select
@@ -12,7 +12,14 @@ from movieclaw_api.core.config import get_settings
 from movieclaw_api.schemas.library import derive_air_status
 from movieclaw_db.engine import dispose_db, get_database, init_db
 from movieclaw_db.migrations import run_migrations
-from movieclaw_db.models import FileSource, LibraryFile, MediaEpisode, MediaItem, utcnow
+from movieclaw_db.models import (
+    FileSource,
+    LibraryFile,
+    MediaEpisode,
+    MediaItem,
+    MediaSeason,
+    utcnow,
+)
 from movieclaw_db.repositories.library_repo import LibraryRepository
 
 
@@ -42,9 +49,16 @@ def _season(item_id: int, number: int, air_dates: list[str | None]) -> list[Medi
 
 
 def _file(
-    library_id: int, item_id: int, season: int, episode: int, *, missing: bool = False
+    library_id: int,
+    item_id: int,
+    season: int,
+    episode: int,
+    *,
+    missing: bool = False,
+    added_batch_id: str | None = None,
+    created_at: datetime | None = None,
 ) -> LibraryFile:
-    return LibraryFile(
+    row = LibraryFile(
         library_id=library_id,
         media_item_id=item_id,
         season_number=season,
@@ -52,8 +66,13 @@ def _file(
         file_path=f"/tv{library_id}/{item_id}/S{season:02d}E{episode:02d}.mkv",
         size_bytes=1,
         source=FileSource.SCANNED,
+        added_batch_id=added_batch_id,
         missing_since=utcnow() if missing else None,
     )
+    if created_at is not None:
+        row.created_at = created_at
+        row.updated_at = created_at
+    return row
 
 
 async def test_items_air_status_and_missing_episodes(db) -> None:
@@ -185,8 +204,6 @@ async def test_items_movie_and_unknown_status(db) -> None:
 
 async def test_items_sort_and_paging(db) -> None:
     """服务端排序 + 分页：按标题/最近入账各自有序，翻页不重不漏。"""
-    from datetime import timedelta
-
     from movieclaw_api.api.routes.libraries import list_library_item_ids
 
     async with db.session() as session:
@@ -243,6 +260,163 @@ async def test_items_sort_and_paging(db) -> None:
 
         id_resp = await list_library_item_ids(library.id, session=session)
         assert sorted(id_resp.data) == sorted(ids)
+
+
+async def test_items_recent_addition_uses_latest_ingest_batch(db) -> None:
+    """最近摘要只返回让条目置顶的最后一批单元，累计库存仍保持独立口径。"""
+    async with db.session() as session:
+        library = await LibraryRepository(session).create(
+            name="剧集库", kind="tv", root_paths=["/tv"]
+        )
+        current = MediaItem(kind="tv", tmdb_id=701, title="批次剧", original_title="Batch")
+        legacy = MediaItem(kind="tv", tmdb_id=702, title="旧台账剧", original_title="Legacy")
+        session.add_all([current, legacy])
+        await session.flush()
+        assert library.id and current.id and legacy.id
+
+        base = utcnow()
+        session.add_all(
+            [
+                MediaSeason(media_item_id=current.id, season_number=2, episode_count=3),
+                # 第一批已是历史库存，不能混进最新摘要。
+                _file(
+                    library.id,
+                    current.id,
+                    1,
+                    1,
+                    added_batch_id="old-batch",
+                    created_at=base - timedelta(hours=2),
+                ),
+                _file(
+                    library.id,
+                    current.id,
+                    1,
+                    2,
+                    added_batch_id="old-batch",
+                    created_at=base - timedelta(hours=2),
+                ),
+                # 最新批次完整覆盖官方已知的第二季三集。
+                *[
+                    _file(
+                        library.id,
+                        current.id,
+                        2,
+                        episode,
+                        added_batch_id="new-batch",
+                        created_at=base + timedelta(seconds=episode),
+                    )
+                    for episode in (1, 2, 3)
+                ],
+                # 迁移前旧行没有批次号，接口必须返回 None 让前端走时间兜底。
+                _file(library.id, legacy.id, 1, 1, created_at=base - timedelta(hours=1)),
+            ]
+        )
+        await session.flush()
+
+        response = await list_library_items(library.id, sort="added_at", session=session)
+        rows = {row.media_item_id: row for row in response.data}
+        recent = rows[current.id]
+
+        assert recent.episode_count == 5
+        assert recent.recent_addition is not None
+        assert recent.recent_addition.season_count == 1
+        assert recent.recent_addition.episode_count == 3
+        assert recent.recent_addition.season_number == 2
+        assert recent.recent_addition.first_episode_number == 1
+        assert recent.recent_addition.last_episode_number == 3
+        assert recent.recent_addition.complete_season is True
+        assert rows[legacy.id].recent_addition is None
+
+
+async def test_items_inventory_summary_uses_in_place_files_and_known_structure(db) -> None:
+    """季度覆盖与季内集数分别判断完整；缺失文件不能继续把摘要撑成“全”。"""
+    async with db.session() as session:
+        library = await LibraryRepository(session).create(
+            name="剧集库", kind="tv", root_paths=["/tv"]
+        )
+        full_seasons = MediaItem(
+            kind="tv", tmdb_id=711, title="全季缺集", original_title="All seasons"
+        )
+        partial_complete = MediaItem(
+            kind="tv", tmdb_id=712, title="部分整季", original_title="Partial complete"
+        )
+        single_gap = MediaItem(
+            kind="tv", tmdb_id=713, title="单季缺集", original_title="Single gap"
+        )
+        missing_file = MediaItem(
+            kind="tv", tmdb_id=714, title="文件缺失", original_title="Missing file"
+        )
+        session.add_all([full_seasons, partial_complete, single_gap, missing_file])
+        await session.flush()
+        assert (
+            library.id
+            and full_seasons.id
+            and partial_complete.id
+            and single_gap.id
+            and missing_file.id
+        )
+
+        season_rows: list[MediaSeason] = []
+        for item_id, season_numbers, episode_count in (
+            (full_seasons.id, (1, 2), 2),
+            (partial_complete.id, (1, 2, 3), 2),
+            (single_gap.id, (2,), 8),
+            (missing_file.id, (1,), 2),
+        ):
+            season_rows.extend(
+                MediaSeason(
+                    media_item_id=item_id,
+                    season_number=season_number,
+                    episode_count=episode_count,
+                )
+                for season_number in season_numbers
+            )
+        session.add_all(
+            [
+                *season_rows,
+                # 两个已知季都有文件，但 S2 少一集：季度全、集数不全。
+                *[_file(library.id, full_seasons.id, 1, episode) for episode in (1, 2)],
+                _file(library.id, full_seasons.id, 2, 1),
+                # 只收 S1/S3，但两季内部都完整：季度不全、所收季的集数全。
+                *[
+                    _file(library.id, partial_complete.id, season, episode)
+                    for season in (1, 3)
+                    for episode in (1, 2)
+                ],
+                *[_file(library.id, single_gap.id, 2, episode) for episode in range(1, 6)],
+                _file(library.id, missing_file.id, 1, 1),
+                _file(library.id, missing_file.id, 1, 2, missing=True),
+            ]
+        )
+        await session.flush()
+
+        response = await list_library_items(library.id, session=session)
+        rows = {row.media_item_id: row for row in response.data}
+
+        full = rows[full_seasons.id].inventory_summary
+        assert full is not None
+        assert (full.season_count, full.episode_count) == (2, 3)
+        assert full.season_number is None
+        assert full.total_episode_count == 4
+        assert full.all_seasons_owned is True
+        assert full.all_episodes_owned is False
+
+        partial = rows[partial_complete.id].inventory_summary
+        assert partial is not None
+        assert (partial.season_count, partial.episode_count) == (2, 4)
+        assert partial.all_seasons_owned is False
+        assert partial.all_episodes_owned is True
+
+        single = rows[single_gap.id].inventory_summary
+        assert single is not None
+        assert single.season_number == 2
+        assert (single.episode_count, single.total_episode_count) == (5, 8)
+        assert single.all_episodes_owned is False
+
+        available = rows[missing_file.id].inventory_summary
+        assert available is not None
+        assert (available.episode_count, available.total_episode_count) == (1, 2)
+        assert available.all_episodes_owned is False
 
 
 async def test_items_pinyin_order_and_index(db) -> None:

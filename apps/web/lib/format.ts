@@ -36,6 +36,38 @@ export function formatDuration(seconds: number): string {
   return `${Number.isInteger(hours) ? hours : hours.toFixed(1)} 小时`;
 }
 
+/**
+ * 影片分钟数 → 小时 + 分钟。电影详情需要保留精确分钟，不能复用上面的
+ * 小数小时格式，否则「2.1 小时」不如「2 小时 6 分钟」直观。
+ */
+export function formatRuntimeMinutes(minutes: number): string {
+  if (!Number.isFinite(minutes) || minutes <= 0) return "—";
+  const rounded = Math.round(minutes);
+  if (rounded < 60) return `${rounded} 分钟`;
+  const hours = Math.floor(rounded / 60);
+  const remainder = rounded % 60;
+  return remainder > 0 ? `${hours} 小时 ${remainder} 分钟` : `${hours} 小时`;
+}
+
+/**
+ * 探测层的垂直分辨率 → 消费级画质标签。1080p 不是 2K：常说的 2K/QHD
+ * 是 1440p，2160p 才对应电视与流媒体语境里的 4K。
+ */
+export function formatVideoResolution(resolution: string): string {
+  const normalized = resolution.trim().toLowerCase();
+  const key = /^\d+$/.test(normalized) ? `${normalized}p` : normalized;
+  const labels: Record<string, string> = {
+    "4320p": "8K",
+    "2160p": "4K",
+    "1440p": "2K",
+    "1080p": "1080p",
+    "720p": "720p",
+    "4k": "4K",
+    "2k": "2K",
+  };
+  return labels[key] ?? resolution;
+}
+
 /** 大数 → 中文紧凑格式，如 12345.6 →「1.2万」。用于魔力值这类可能到百万级的数。 */
 export function formatCompact(value: number): string {
   return new Intl.NumberFormat("zh-CN", {

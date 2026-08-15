@@ -21,6 +21,7 @@ from movieclaw_api.schemas.library import (
     ClaimBatchPayload,
     ClaimPayload,
     DetachPayload,
+    DirectorView,
     EpisodeView,
     IdentityReviewDecision,
     ItemDeleteResultView,
@@ -144,7 +145,9 @@ from movieclaw_db.models import (
     JobStatus,
     LibraryFile,
     MediaItem,
+    MediaItemPerson,
     MediaSeason,
+    Person,
     Subscription,
 )
 from movieclaw_db.repositories import MediaItemRepository
@@ -1686,6 +1689,8 @@ def _file_view(row: LibraryFile, external_subs: list[str]) -> LibraryFileView:
         bit_depth=row.bit_depth,
         duration_seconds=row.duration_seconds,
         bit_rate=row.bit_rate,
+        frame_rate=row.frame_rate,
+        color_space=row.color_space,
         media_source=row.media_source,
         release_group=row.release_group,
         source=row.source,
@@ -1761,12 +1766,35 @@ async def get_library_item(
         backdrop_url = f"{base}/w1280{item.backdrop_path}" if item.backdrop_path else None
     local_meta = None
     if bundle.local_meta is not None:
+        # Web 与 Jellyfin 共用 person 关系表：导演头像和人物链接不能再从
+        # directors: string[] 猜。旧条目尚未刷新、没有关系行时保留姓名兜底。
+        director_rows = (
+            await session.execute(
+                select(MediaItemPerson, Person)
+                .join(Person, Person.id == MediaItemPerson.person_id)
+                .where(
+                    MediaItemPerson.media_item_id == media_item_id,
+                    MediaItemPerson.department == "director",
+                )
+                .order_by(MediaItemPerson.credit_order, MediaItemPerson.id)
+            )
+        ).all()
         local_meta = LocalMetaView(
             plot=bundle.local_meta.plot,
             rating=bundle.local_meta.rating,
             runtime_minutes=bundle.local_meta.runtime_minutes,
             genres=bundle.local_meta.genres,
             directors=bundle.local_meta.directors,
+            director_credits=[
+                DirectorView(
+                    name=person.name,
+                    thumb_url=(
+                        f"{base}/w300{person.profile_path}" if person.profile_path else None
+                    ),
+                    tmdb_person_id=person.tmdb_person_id,
+                )
+                for _link, person in director_rows
+            ],
             actors=[
                 ActorView(
                     name=a.name, role=a.role, thumb_url=a.thumb, tmdb_person_id=a.tmdb_person_id
@@ -1806,6 +1834,7 @@ async def get_library_item(
             kind=MediaKind(item.kind),
             tmdb_id=item.tmdb_id,
             imdb_id=item.imdb_id,
+            douban_id=item.douban_id,
             title=item.title,
             original_title=item.original_title,
             year=item.year,

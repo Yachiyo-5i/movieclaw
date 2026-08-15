@@ -98,7 +98,15 @@ _ROUTES = {
                 {"id": 9101, "name": "线上演员甲", "character": "主角", "profile_path": "/a1.jpg"},
                 {"id": 9102, "name": "线上演员乙", "character": "", "profile_path": None},
             ],
-            "crew": [{"name": "线上导演", "job": "Director"}],
+            "crew": [
+                {
+                    "id": 9001,
+                    "name": "线上导演",
+                    "original_name": "Online Director",
+                    "job": "Director",
+                    "profile_path": "/d1.jpg",
+                }
+            ],
         },
         # 选图策略的候选（无文字背景 / 中文海报各一张，都会被选中）
         "images": {
@@ -209,6 +217,8 @@ def test_parse_probe_extracts_audio_and_subtitle_streams() -> None:
                 "width": 3840,
                 "height": 1600,
                 "color_transfer": "smpte2084",
+                "color_primaries": "bt2020",
+                "avg_frame_rate": "24000/1001",
                 "pix_fmt": "yuv420p10le",
             },
             {
@@ -238,6 +248,7 @@ def test_parse_probe_extracts_audio_and_subtitle_streams() -> None:
     }
     spec = _parse_probe(payload)
     assert spec.resolution == "2160p" and spec.hdr == "HDR10" and spec.bit_depth == 10
+    assert spec.frame_rate == 23.976 and spec.color_space == "BT.2020"
     assert [a["codec"] for a in spec.audio_streams] == ["dts", "ac3"]
     assert spec.audio_streams[0]["profile"] == "DTS-HD MA"
     assert spec.audio_streams[0]["channels"] == 8 and spec.audio_streams[0]["default"] is True
@@ -251,6 +262,29 @@ def test_parse_probe_extracts_audio_and_subtitle_streams() -> None:
             "default": False,
         }
     ]
+
+
+def test_parse_probe_prefers_dynamic_hdr_formats_over_pq_fallback() -> None:
+    """动态 HDR side data 必须压过 PQ 的普通 HDR10 兜底标签。"""
+    cases = [
+        ("DOVI configuration record", "Dolby Vision"),
+        ("HDR Dynamic Metadata SMPTE2094-40", "HDR10+"),
+    ]
+    for side_data_type, expected in cases:
+        spec = _parse_probe(
+            {
+                "format": {},
+                "streams": [
+                    {
+                        "codec_type": "video",
+                        "codec_name": "hevc",
+                        "color_transfer": "smpte2084",
+                        "side_data_list": [{"side_data_type": side_data_type}],
+                    }
+                ],
+            }
+        )
+        assert spec.hdr == expected
 
 
 def test_parse_probe_no_extra_streams_gives_empty_lists() -> None:
@@ -371,6 +405,8 @@ _FAKE_SPEC = MediaSpec(
     bit_depth=10,
     duration_seconds=7260,
     bit_rate=8_000_000,
+    frame_rate=23.976,
+    color_space="BT.2020",
     audio_streams=[
         {
             "codec": "eac3",
@@ -420,10 +456,14 @@ async def test_item_detail_assembles_local_scrape(db, tmp_path, monkeypatch) -> 
             .scalars()
             .one()
         )
+        item.douban_id = "1292052"
+        session.add(item)
+        await session.commit()
         resp = await get_library_item(library.id, item.id, _ADMIN, session)
         view = resp.data
 
     assert view.title == "某电影" and view.kind == "movie" and view.tmdb_id == 300
+    assert view.douban_id == "1292052"
     # 本地美术图优先：走 artwork 接口相对路径而非 TMDB 图床
     # URL 带 ?v=<mtime> 版本戳：换图是原地覆盖同一路径，不带版本浏览器
     # 会一直显示缓存里的旧图（实测踩过）
@@ -460,6 +500,7 @@ async def test_item_detail_assembles_local_scrape(db, tmp_path, monkeypatch) -> 
         file2 = resp2.data.files[0]
         assert file2.audio_streams is not None and file2.audio_streams[0].codec == "eac3"
         assert file2.audio_streams[0].channels == 6
+        assert file2.frame_rate == 23.976 and file2.color_space == "BT.2020"
         embedded2 = [s for s in file2.subtitle_streams if not s.external]
         assert embedded2[0].codec == "subrip" and embedded2[0].language == "chi"
 
@@ -549,6 +590,11 @@ async def test_item_detail_selfsufficient_after_scan(db, tmp_path) -> None:
     assert view.local_meta.plot == "一段来自 TMDB 的简介。"
     assert view.local_meta.rating == 7.2 and view.local_meta.runtime_minutes == 118
     assert view.local_meta.directors == ["线上导演"]
+    assert [d.name for d in view.local_meta.director_credits] == ["线上导演"]
+    assert view.local_meta.director_credits[0].tmdb_person_id == 9001
+    assert view.local_meta.director_credits[0].thumb_url and view.local_meta.director_credits[
+        0
+    ].thumb_url.endswith("/w300/d1.jpg")
     assert [(a.name, a.role) for a in view.local_meta.actors] == [
         ("线上演员甲", "主角"),
         ("线上演员乙", None),

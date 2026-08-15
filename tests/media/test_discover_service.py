@@ -342,6 +342,61 @@ async def test_search_is_cached() -> None:
 
 
 # ---------------------------------------------------------------------------
+# 影人作品
+# ---------------------------------------------------------------------------
+
+
+async def test_person_detail_keeps_and_deduplicates_all_tmdb_credits() -> None:
+    """参演与幕后履历合并去重；缺海报/日期的作品仍属于“全部作品”。"""
+    movie = _movie(10, media_type="movie", release_date="2025-03-01")
+    tv_without_artwork = {
+        "id": 20,
+        "media_type": "tv",
+        "name": "未定档剧集",
+        "original_name": "Coming Soon",
+        "first_air_date": "",
+        "poster_path": None,
+        "genre_ids": [16],
+        "vote_average": 8.24,
+    }
+    svc = _service(
+        {
+            "person/9340": {
+                "id": 9340,
+                "name": "示例影人",
+                "profile_path": "/person.jpg",
+                "combined_credits": {
+                    "cast": [movie, tv_without_artwork],
+                    # 同一部电影既参演又执导只展示一次；其他幕后岗位同样纳入履历。
+                    "crew": [
+                        {**movie, "job": "Director"},
+                        _movie(30, media_type="movie", release_date="2024-01-01"),
+                    ],
+                },
+            }
+        }
+    )
+
+    detail = await svc.person_detail(9340)
+
+    assert detail.name == "示例影人"
+    assert detail.avatar_url == f"{_IMAGE_BASE}/w300/person.jpg"
+    assert [(card.type.value, card.id) for card in detail.credits] == [
+        ("movie", "10"),
+        ("movie", "30"),
+        ("tv", "20"),
+    ]
+    assert detail.credits[0].genres == ["科幻", "动作"]
+    assert detail.credits[-1].year == 0
+    assert detail.credits[-1].poster_url == ""
+
+    client: StubTmdbClient = svc._client  # type: ignore[assignment]
+    calls_after_first = len(client.calls)
+    await svc.person_detail(9340)
+    assert len(client.calls) == calls_after_first
+
+
+# ---------------------------------------------------------------------------
 # 条目详情
 # ---------------------------------------------------------------------------
 
@@ -354,7 +409,12 @@ _MOVIE_DETAIL = {
     "production_countries": [{"iso_3166_1": "US", "name": "United States of America"}],
     "credits": {
         "crew": [
-            {"name": "莉莉·沃卓斯基", "job": "Director"},
+            {
+                "id": 9340,
+                "name": "莉莉·沃卓斯基",
+                "job": "Director",
+                "profile_path": "/director.jpg",
+            },
             {"name": "某制片", "job": "Producer"},
         ],
         # 演职员：带头像与角色名，且刻意给一个缺 profile_path 的人（头像取不到
@@ -386,6 +446,10 @@ async def test_movie_detail_fields() -> None:
 
     assert detail.card.extent == "136 分钟"
     assert detail.facts.directors == ["莉莉·沃卓斯基"]
+    assert detail.facts.director_credits[0].avatar_url == (
+        f"{_IMAGE_BASE}/w185/director.jpg"
+    )
+    assert detail.facts.director_credits[0].tmdb_person_id == 9340
     # 演职员条：按 TMDB 给的主次顺序整段带回（上限 16），姓名/角色/头像齐全
     assert len(detail.facts.cast) == 9
     assert detail.facts.cast[0].name == "演员0"
@@ -459,7 +523,9 @@ async def test_tv_detail_fields() -> None:
         "number_of_seasons": 3,
         "original_language": "ja",
         "origin_country": ["JP"],
-        "created_by": [{"name": "主创A"}],
+        "created_by": [
+            {"id": 42, "name": "主创A", "profile_path": "/creator.jpg"}
+        ],
         "networks": [{"name": "TV Tokyo"}],
         "credits": {"cast": [{"name": "声优1"}]},
         "recommendations": {"results": []},
@@ -470,6 +536,10 @@ async def test_tv_detail_fields() -> None:
     assert detail.card.extent == "3 季"
     assert detail.card.year == 2024
     assert detail.facts.directors == ["主创A"]
+    assert detail.facts.director_credits[0].avatar_url == (
+        f"{_IMAGE_BASE}/w185/creator.jpg"
+    )
+    assert detail.facts.director_credits[0].tmdb_person_id == 42
     assert detail.facts.country == "日本"
     assert detail.facts.language == "日语"
     assert detail.facts.network == "TV Tokyo"

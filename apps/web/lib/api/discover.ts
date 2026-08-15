@@ -138,6 +138,7 @@ interface MediaCastMemberDto {
 
 interface DiscoveredTitleMetadataDto {
   directors: string[];
+  director_credits: MediaCastMemberDto[];
   cast: MediaCastMemberDto[];
   country: string;
   language: string;
@@ -166,6 +167,13 @@ interface DiscoveredTitleDetailsDto {
   } | null;
   recommendations: DiscoveredTitleDto[];
   library_links?: MediaLibraryLinkDto[];
+}
+
+interface DiscoveredPersonDetailsDto {
+  tmdb_person_id: number;
+  name: string;
+  avatar_url: string | null;
+  titles: DiscoveredTitleDto[];
 }
 
 export interface DiscoveryPageSection {
@@ -432,6 +440,7 @@ export interface MediaCastMember {
 
 export interface MediaDetailInfo {
   directors: string[];
+  directorCredits: MediaCastMember[];
   cast: MediaCastMember[];
   country: string;
   language: string;
@@ -458,12 +467,29 @@ export interface MediaDetailData {
   libraryLinks: MediaLibraryLink[];
 }
 
+export interface DiscoveredPersonDetailsData {
+  tmdbPersonId: number;
+  name: string;
+  avatarUrl: string;
+  items: MediaItem[];
+}
+
 function toImage(dto: MediaImageDto): MediaImage {
   return {
     previewUrl: cachedImageUrl(dto.preview_url),
     fullUrl: cachedImageUrl(dto.full_url),
     width: dto.width,
     height: dto.height,
+  };
+}
+
+/** 统一转换演员与导演人物；头像都走同一份图片缓存，人物 ID 保持可选。 */
+function toCastMember(member: MediaCastMemberDto): MediaCastMember {
+  return {
+    name: member.name,
+    role: member.role ?? undefined,
+    avatarUrl: member.avatar_url ? cachedImageUrl(member.avatar_url) : undefined,
+    tmdbPersonId: member.tmdb_person_id ?? undefined,
   };
 }
 
@@ -482,13 +508,9 @@ export async function fetchDiscoveredTitleDetails(
     item: toItem(dto.title),
     info: {
       directors: dto.metadata.directors,
-      cast: dto.metadata.cast.map((member) => ({
-        name: member.name,
-        role: member.role ?? undefined,
-        // 豆瓣头像需要代理 Referer，其他来源也统一复用图片缓存。
-        avatarUrl: member.avatar_url ? cachedImageUrl(member.avatar_url) : undefined,
-        tmdbPersonId: member.tmdb_person_id ?? undefined,
-      })),
+      // 豆瓣头像需要代理 Referer，TMDB 头像也统一复用图片缓存。
+      directorCredits: dto.metadata.director_credits.map(toCastMember),
+      cast: dto.metadata.cast.map(toCastMember),
       country: dto.metadata.country,
       language: dto.metadata.language,
       released: dto.metadata.released,
@@ -507,6 +529,25 @@ export async function fetchDiscoveredTitleDetails(
       : undefined,
     related: dto.recommendations.map(toItem),
     libraryLinks: (dto.library_links ?? []).map(toLibraryLink),
+  };
+}
+
+/** 读取发现页影人的完整 TMDB 影视履历；条目已包含当前账号可见的库存状态。 */
+export async function fetchDiscoveredPersonDetails(
+  tmdbPersonId: number | string,
+  init?: RequestInit,
+): Promise<DiscoveredPersonDetailsData> {
+  const dto = await unwrap(
+    request<ApiEnvelope<DiscoveredPersonDetailsDto>>(
+      `/discover/people/${tmdbPersonId}`,
+      init,
+    ),
+  );
+  return {
+    tmdbPersonId: dto.tmdb_person_id,
+    name: dto.name,
+    avatarUrl: dto.avatar_url ? cachedImageUrl(dto.avatar_url) : "",
+    items: dto.titles.map(toItem),
   };
 }
 

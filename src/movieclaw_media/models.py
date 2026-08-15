@@ -76,6 +76,19 @@ class MediaCard(BaseModel):
     )
 
 
+class MediaPersonDetail(BaseModel):
+    """TMDB 影人档案与完整影视履历。
+
+    ``credits`` 合并参演和幕后作品，并按 movie/tv + TMDB ID 去重；即使条目
+    没有海报或上映日期也会保留，避免“全部作品”因展示素材不完整而漏项。
+    """
+
+    tmdb_person_id: int
+    name: str
+    avatar_url: str | None = Field(default=None, description="TMDB 头像；无照片为 null")
+    credits: list[MediaCard] = Field(default_factory=list, description="TMDB 全部影视作品")
+
+
 class MediaRow(BaseModel):
     """发现页里一行横滚海报（如「热门电影」「高分经典」）。"""
 
@@ -133,15 +146,15 @@ class MediaSearchItem(BaseModel):
 
 
 class MediaCastMember(BaseModel):
-    """演职员表的一行：姓名 + 饰演角色 + 头像。
+    """演职员表的一位人物：姓名 + 可选角色 + 头像。
 
     发现页详情要按「演职员横滚条」呈现（与媒体库条目详情同一套版式），
-    只有姓名撑不起那个版式，因此比原先的 ``list[str]`` 多带角色与头像。
-    头像在数据源里常常缺失（小众条目、配音演员），前端按占位渲染，
+    导演与演员都需要结构化头像和人物 ID；演员额外携带角色名。头像在数据源
+    里常常缺失（小众条目、配音演员），前端按占位渲染，
     不必为此过滤掉这个人——名字与角色本身就是有效信息。
     """
 
-    name: str = Field(description="演员姓名")
+    name: str = Field(description="人物姓名")
     role: str | None = Field(default=None, description="饰演角色；数据源未提供为空")
     avatar_url: str | None = Field(default=None, description="头像地址；数据源未提供为空")
     tmdb_person_id: int | None = Field(
@@ -154,6 +167,10 @@ class MediaFacts(BaseModel):
     """详情页「词条信息」卡的字段（豆瓣式条目档案）。"""
 
     directors: list[str] = Field(default_factory=list, description="导演（剧集为主创）")
+    director_credits: list[MediaCastMember] = Field(
+        default_factory=list,
+        description="结构化导演/主创；头像或人物 ID 缺失时对应字段为空",
+    )
     cast: list[MediaCastMember] = Field(
         default_factory=list,
         description="演职员（按数据源给出的主次顺序，最多 _CAST_LIMIT 位）",

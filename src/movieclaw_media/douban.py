@@ -238,16 +238,16 @@ class DoubanClient:
         await self._client.aclose()
 
 
-def _cast_members(actors: Any) -> list[MediaCastMember]:
-    """豆瓣条目的演职员数组 → 演职员条（演职员表接口与详情接口的两种形态都吃）。
+def _people_members(people: Any) -> list[MediaCastMember]:
+    """豆瓣人物数组 → 结构化演职员（演职员表与详情接口的两种形态都吃）。
 
     豆瓣这个字段的形态不稳定：avatar 有时是字符串，有时是 {small,normal,large}
-    的字典；character 常带「饰 」前缀（如「饰 老东家」），去掉前缀交给前端统一
-    加，中文角色名后缀的原文（「安迪·杜佛兰 Andy Dufresne」）在窄卡片里只会被
-    截断，一并去掉。取不到头像的人照样保留——名字与角色本身就是信息。
+    的字典；演员的 character 常带「饰 」前缀（如「饰 老东家」），去掉前缀交给
+    前端统一加，中文角色名后缀的原文（「安迪·杜佛兰 Andy Dufresne」）在窄卡片里
+    只会被截断，一并去掉。导演没有 character，也复用同一转换保留头像。
     """
     members: list[MediaCastMember] = []
-    for person in (actors or [])[:_CAST_LIMIT]:
+    for person in (people or [])[:_CAST_LIMIT]:
         if not isinstance(person, dict):
             continue
         name = (person.get("name") or "").strip()
@@ -448,17 +448,17 @@ class DoubanDiscoverService:
             lambda: self._build_detail(douban_id),
         )
 
-    async def _celebrity_actors(self, douban_id: str) -> list[Any]:
-        """取带头像的演员名单；这一跳失败只降级演职员条，不影响详情页其余部分。"""
+    async def _celebrity_people(self, douban_id: str) -> dict[str, Any]:
+        """取带头像的导演和演员；这一跳失败只降级演职员条，不影响其余详情。"""
         try:
-            return (await self._client.celebrities(douban_id)).get("actors") or []
+            return await self._client.celebrities(douban_id)
         except DoubanError as exc:
             logger.warning(
-                "豆瓣演职员表不可用：%s（%s），退回详情接口里的演员姓名（无头像）",
+                "豆瓣演职员表不可用：%s（%s），退回详情接口里的人物信息",
                 douban_id,
                 exc,
             )
-            return []
+            return {}
 
     async def _build_detail(self, douban_id: str) -> MediaDetail:
         data = await self._client.detail(douban_id)
@@ -490,17 +490,21 @@ class DoubanDiscoverService:
             overview=(data.get("intro") or "").strip(),
             poster_url=cover,
         )
-        directors = [person.get("name") for person in data.get("directors") or []]
-        # 演职员优先用带头像的完整名单；该接口不可用时退回详情里的姓名列表，
-        # 只是没有头像和角色——不能因为多打的这一跳失败就让整个详情页失败。
-        actors = await self._celebrity_actors(douban_id) or data.get("actors")
+        # 演职员优先用带头像的完整名单；该接口不可用时分别退回详情里的导演和
+        # 演员信息。不能因为多打的这一跳失败就让整个详情页失败。
+        celebrities = await self._celebrity_people(douban_id)
+        director_credits = _people_members(
+            celebrities.get("directors") or data.get("directors")
+        )[:3]
+        actors = celebrities.get("actors") or data.get("actors")
         pubdates = data.get("pubdate") or []
         released = data.get("release_date") or (pubdates[0] if pubdates else "")
         return MediaDetail(
             card=card,
             facts=MediaFacts(
-                directors=[name for name in directors if name][:3],
-                cast=_cast_members(actors),
+                directors=[person.name for person in director_credits],
+                director_credits=director_credits,
+                cast=_people_members(actors),
                 country=" / ".join(data.get("countries") or []),
                 language=" / ".join(data.get("languages") or []),
                 released=released,

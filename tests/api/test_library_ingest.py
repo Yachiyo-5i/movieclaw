@@ -45,6 +45,8 @@ _FAKE_SPEC = SimpleNamespace(
     bit_depth=10,
     duration_seconds=3600,
     bit_rate=None,
+    frame_rate=23.976,
+    color_space="BT.709",
     audio_streams=[],
     subtitle_streams=[],
 )
@@ -214,6 +216,7 @@ async def test_movie_hardlink_import_and_ledger(db, tmp_path, monkeypatch):
         records = list((await session.execute(select(IngestEntry))).scalars().all())
     assert [f.file_path for f in files] == [str(target)]
     assert files[0].resolution == "1080p"
+    assert files[0].added_batch_id is not None
     assert [r.status for r in records] == [IngestStatus.IMPORTED]
     assert records[0].imported_count == 1
 

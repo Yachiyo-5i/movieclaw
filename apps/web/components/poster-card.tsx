@@ -9,8 +9,12 @@ import { BellIcon, CheckIcon, DownloadIcon, PlusIcon, StarIcon } from "@/compone
 import { PosterImage } from "@/components/poster-image";
 import { useSubscribeEntry } from "@/components/subscribe-entry";
 import { useMediaDetail } from "@/lib/media-detail";
-import type { MediaItem, MediaLibraryStatus, MediaType } from "@/lib/media-types";
-import { usePermissions } from "@/lib/permissions";
+import type {
+  MediaItem,
+  MediaLibraryStatus,
+  MediaOverlayDetails,
+  MediaType,
+} from "@/lib/media-types";
 import { useMediaQuery } from "@/lib/use-media-query";
 import { useTapGuard } from "@/lib/use-tap-guard";
 
@@ -38,15 +42,14 @@ export interface PosterCardProps {
 /**
  * 悬浮层操作区的形态，按内容与用户的关系选择：
  * - subscribe：还没拥有（发现页/搜索），给「订阅影片」入口；
- * - follow：已在库的在播剧（还会有新集），给「订阅追新」入口；
- * - backfill：已在库的完结剧但已播集有缺口，给「补齐缺集」入口
+ * - follow：当前已知季集全部在库，给「自动续订」入口；
+ * - backfill：当前已知季集尚未收齐，给「补齐缺集」入口
  *   （订阅创建按 E−H 跳过库里已有的集，只为缺的集生成工单）；
  * - owned：已在媒体库且无后续动作（电影/完结齐全剧），静态「在库」标识；
  * - none：已订阅但尚未落地（单库页「追踪中」），再给订阅按钮是重复操作，不显示。
  *
- * 前三种都是订阅入口，仅文案/图标不同；该影片已存在订阅时自动切换为
- * 「已订阅」状态徽标（点击进入订阅管理弹层），状态来自 SubscribeEntryProvider
- * 的全站订阅列表，卡片自身不发请求。
+ * 前三种都是订阅入口，仅文案/图标不同；该影片已存在订阅时完全隐藏操作，
+ * 状态来自 SubscribeEntryProvider 的全站订阅列表，卡片自身不发请求。
  */
 export type PosterCardAction = "subscribe" | "follow" | "backfill" | "owned" | "none";
 
@@ -55,7 +58,7 @@ export type PosterCardAction = "subscribe" | "follow" | "backfill" | "owned" | "
  *  不能用播放三角：它承诺的是「点了就能看」，会误导用户以为是播放键。 */
 const SUBSCRIBE_ACTION_META = {
   subscribe: { label: "订阅影片", Icon: PlusIcon },
-  follow: { label: "订阅追新", Icon: BellIcon },
+  follow: { label: "自动续订", Icon: BellIcon },
   backfill: { label: "补齐缺集", Icon: DownloadIcon },
 } as const;
 
@@ -77,12 +80,18 @@ export interface PosterVisualItem {
   genres?: string[];
   extent?: string;
   badges?: string[];
-  /** 海报右上角的斜向特征标，只承载需要常显的正向能力（如「自动续订」）。 */
+  /** 海报角上的斜向常显标签（如「自动续订」「已入库」「已订阅」）。 */
   ribbon?: string;
+  /** 人物作品页使用更小的左上角斜标；缺省保持订阅墙现有样式。 */
+  ribbonVariant?: "compact-left";
+  /** 人物作品页斜标的语义色：已入库为绿色，已订阅为蓝色。 */
+  ribbonTone?: "owned" | "subscribed";
   /** 海报底部常显的一行左右信息；订阅墙用来承载剧集范围与收录进度。 */
   posterFooter?: { label: string; value: string; tracking?: boolean };
   /** 悬浮层的一行紧凑元信息；长内容截断，完整值保留在 title 中。 */
   overlayMeta?: string;
+  /** 悬浮层的两行紧凑上下文；不占用海报下方的常显元信息。 */
+  overlayDetails?: MediaOverlayDetails;
   overview?: string;
   libraryStatus?: MediaLibraryStatus | null;
 }
@@ -111,12 +120,21 @@ export function PosterCardVisual({
   /** 触摸端首次点按是否先展开纯信息层；默认仍单击直达详情。 */
   revealInfoOnTouch?: boolean;
 }) {
-  const { canSubscribe } = usePermissions();
+  const { canSubscribe, subscriptionOf } = useSubscribeEntry();
   const hasSubscribeAction =
     action === "subscribe" || action === "follow" || action === "backfill";
-  const showOverlayAction = action === "owned" || (hasSubscribeAction && canSubscribe);
+  // 媒体库的补齐/续订按钮在条目进入“我的订阅”后完全隐藏；发现页原本的
+  // “订阅影片 → 已订阅”状态反馈仍保留，不能被这条库存规则误伤。
+  const hideSubscribedLibraryAction =
+    (action === "follow" || action === "backfill") && Boolean(subscriptionOf(item));
+  const showOverlayAction =
+    action === "owned" || (hasSubscribeAction && canSubscribe && !hideSubscribedLibraryAction);
   const showOverlay = Boolean(
-    item.genres?.length || item.overlayMeta?.trim() || item.overview?.trim() || showOverlayAction,
+    item.overlayDetails?.primary.trim() ||
+      item.genres?.length ||
+      item.overlayMeta?.trim() ||
+      item.overview?.trim() ||
+      showOverlayAction,
   );
   // 默认只有可点击的次级操作需要「首次展开」；订阅墙可显式要求纯信息层
   // 也先展开，让没有 hover 的手机仍能读到选季与配置流向。
@@ -176,6 +194,8 @@ export function PosterCardVisual({
     const accessibilityDetails = [
       item.ribbon,
       item.posterFooter ? `${item.posterFooter.label}，收录 ${item.posterFooter.value}` : undefined,
+      item.overlayDetails?.primary,
+      item.overlayDetails?.secondary,
       item.genres?.join("、"),
       item.overlayMeta,
     ].filter(Boolean);
@@ -221,8 +241,15 @@ function PosterCardContent({
 }) {
   const badges = item.badges ?? [];
   const genres = item.genres ?? [];
+  const overlayPrimary = item.overlayDetails?.primary.trim() ?? "";
+  const overlaySecondary = item.overlayDetails?.secondary?.trim() ?? "";
   const overlayMeta = item.overlayMeta?.trim() ?? "";
   const overview = item.overview ?? "";
+  const compactLeftRibbon = item.ribbonVariant === "compact-left";
+  const compactRibbonTone =
+    item.ribbonTone === "owned"
+      ? "from-emerald-500 via-green-500 to-teal-500 shadow-[0_2px_8px_rgba(16,185,129,0.38)]"
+      : "from-sky-500 via-blue-500 to-indigo-500 shadow-[0_2px_8px_rgba(59,130,246,0.38)]";
   return (
     <>
       {/* 海报区（自身 relative：徽章与 hover 信息层都绝对定位在它内部） */}
@@ -241,12 +268,16 @@ function PosterCardContent({
             {badges[0]}
           </span>
         )}
-        {/* 右上斜标只展示已启用的长期特征；关闭态不渲染，避免每张海报
-            都堆一枚没有决策价值的否定标签。 */}
+        {/* 作品状态用紧凑左上斜标，宽度随海报缩放且不遮评分；其余调用方
+            沿用右侧规格。无状态不渲染，避免海报墙过吵。 */}
         {item.ribbon && (
           <span
-            aria-label={`已开启${item.ribbon}`}
-            className="pointer-events-none absolute -right-8 top-4 z-10 w-28 rotate-45 border-y border-white/25 bg-gradient-to-r from-cyan-500 via-sky-500 to-violet-500 py-1 text-center text-[10px] font-bold tracking-[0.12em] text-white shadow-[0_3px_14px_rgba(14,165,233,0.45)]"
+            aria-label={item.ribbon}
+            className={
+              compactLeftRibbon
+                ? `pointer-events-none absolute -left-[18%] top-2 z-10 w-[62%] -rotate-45 border-y border-white/20 bg-gradient-to-r py-0.5 text-center text-[9px] font-bold leading-[11px] tracking-[0.08em] text-white ${compactRibbonTone}`
+                : "pointer-events-none absolute -right-8 top-4 z-10 w-28 rotate-45 border-y border-white/25 bg-gradient-to-r from-cyan-500 via-sky-500 to-violet-500 py-1 text-center text-[10px] font-bold tracking-[0.12em] text-white shadow-[0_3px_14px_rgba(14,165,233,0.45)]"
+            }
           >
             {item.ribbon}
           </span>
@@ -254,7 +285,7 @@ function PosterCardContent({
         {/* 右上：评分徽章（暂无评分时不渲染，避免展示 0.0） */}
         {item.rating > 0 && (
           <span
-            className={`tnum absolute right-2 flex items-center gap-1 rounded-md bg-black/70 px-1.5 py-0.5 text-caption font-semibold text-white ${item.ribbon ? "top-12" : "top-2"}`}
+            className={`tnum absolute right-2 flex items-center gap-1 rounded-md bg-black/70 px-1.5 py-0.5 text-caption font-semibold text-white ${item.ribbon && !compactLeftRibbon ? "top-12" : "top-2"}`}
           >
             <StarIcon className="size-3 text-[#f5c451]" />
             {item.rating.toFixed(1)}
@@ -287,15 +318,29 @@ function PosterCardContent({
             不拦截主导航——手机单击直接进入详情。 */}
         {showOverlay && (
           <div className="absolute inset-x-0 bottom-0 translate-y-3 bg-gradient-to-t from-black/90 via-black/60 to-transparent px-3 pb-3 pt-10 opacity-0 transition-all duration-300 ease-out group-hover/card:translate-y-0 group-hover/card:opacity-100 group-focus-visible/card:translate-y-0 group-focus-visible/card:opacity-100 group-data-[revealed=true]/card:translate-y-0 group-data-[revealed=true]/card:opacity-100">
+            {overlayPrimary && (
+              <div>
+                <p className="text-caption font-semibold text-[var(--accent-2)]">
+                  {overlayPrimary}
+                </p>
+                {overlaySecondary && (
+                  <p className="mt-1 text-caption leading-4 text-white/75">
+                    {overlaySecondary}
+                  </p>
+                )}
+              </div>
+            )}
             {genres.length > 0 && (
-              <p className="text-caption font-medium text-[var(--accent-2)]">
+              <p
+                className={`${overlayPrimary ? "mt-1" : ""} text-caption font-medium text-[var(--accent-2)]`}
+              >
                 {genres.join(" · ")}
               </p>
             )}
             {overlayMeta && (
               <p
                 title={overlayMeta}
-                className={`${genres.length > 0 ? "mt-1" : ""} truncate text-caption leading-4 text-white/75`}
+                className={`${overlayPrimary || genres.length > 0 ? "mt-1" : ""} truncate text-caption leading-4 text-white/75`}
               >
                 {overlayMeta}
               </p>
@@ -351,7 +396,6 @@ function PosterCardActionButton({
   action: PosterCardAction;
 }) {
   const { canSubscribe, open: openSubscribe, subscriptionOf } = useSubscribeEntry();
-  // 订阅入口类动作（subscribe/follow/backfill）才需要判断订阅状态；owned/none 不查询
   const subscribeMeta =
     action === "subscribe" || action === "follow" || action === "backfill"
       ? SUBSCRIBE_ACTION_META[action]
@@ -371,7 +415,9 @@ function PosterCardActionButton({
       </span>
     );
   }
-  if (!canSubscribe) return null;
+  // 媒体库动作已有订阅时由外层直接移除；这里再守一道，避免未来新的调用点
+  // 绕过 showOverlayAction。发现页 subscribe 仍显示“已订阅”反馈。
+  if (!canSubscribe || (existingSub && action !== "subscribe")) return null;
 
   const label = existingSub
     ? `管理《${item.title}》的订阅`

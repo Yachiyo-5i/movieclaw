@@ -14,9 +14,9 @@ import { PAGE_NAV_BUTTON_CLASS, PageNav } from "@/components/page-nav";
 import { HScroller } from "@/components/h-scroller";
 import {
   ArrowLeftIcon,
+  ChevronRightIcon,
   FolderIcon,
   MoreIcon,
-  StarIcon,
   TrashIcon,
 } from "@/components/icons";
 import { useConfirm } from "@/components/feedback";
@@ -48,17 +48,24 @@ import {
 } from "@/lib/api/libraries";
 import { SubtitleGenPanel } from "@/components/subtitle-gen-panel";
 import { SubtitlePreviewDialog } from "@/components/subtitle-preview-dialog";
-import { useBackdrop } from "@/lib/backdrop";
 import { getDiscoveryReturnPath } from "@/lib/discovery-return-path";
-import { formatBytes } from "@/lib/format";
+import { formatBytes, formatRuntimeMinutes, formatVideoResolution } from "@/lib/format";
+import { useDoubanAppHref } from "@/lib/douban-app-link";
 import { resolveRequestUrl } from "@/lib/http";
 import { cachedImageUrl } from "@/lib/image-proxy";
 import { invalidateLibraryDetailSnapshot } from "@/lib/library-detail-snapshot";
 import { refreshItemConfirm } from "@/lib/library-confirm";
 import { usePermissions } from "@/lib/permissions";
-import { formatRelativeTime } from "@/lib/time";
+import { formatDateTime, formatRelativeTime } from "@/lib/time";
 import { usePageTitle } from "@/lib/use-page-title";
 import { useVisiblePolling } from "@/lib/use-visible-polling";
+
+/** 剧集详情页当前选中的分集上下文，供 Hero 与分集区共享同一份数据。 */
+interface SelectedEpisodeContext {
+  seasonNumber: number;
+  episode: LibraryEpisode;
+  files: LibraryItemFile[];
+}
 
 /**
  * 媒体库条目详情页（/library/[id]/item/[mediaItemId]）——与发现页详情
@@ -66,11 +73,11 @@ import { useVisiblePolling } from "@/lib/use-visible-polling";
  * 「**我拥有的这份拷贝**是什么」，全部信息来自本地刮削成果与文件本体：
  *
  *   1. Hero 背景优先条目目录里的 fanart（本地美术图接口），其次 TMDB 剧照；
- *   2. 简介 / 评分 / 片长 / 演职员来自条目目录的 NFO（TMM/Emby 刮削产物）；
- *   3. 片源规格来自 ffprobe 对文件本体的探测（分辨率/编码/HDR/音轨/字幕），
- *      电影多版本（1080p 与 2160p 并存）用版本切换器合并展示；
- *   4. 底部文件区列出原始文件名 + 尺寸，悬浮看物理路径——识别错了
- *      用户要能立刻知道"这是哪个文件"；
+ *   2. 简介 / 风格 / 片长 / 演职员来自条目目录的 NFO（TMM/Emby 刮削产物）；
+ *   3. 片源规格来自 ffprobe 对文件本体的探测；基础信息展示当前文件的音轨 / 字幕，
+ *      底部文件区按物理文件折叠尺寸 / 视频 / 码率，剧集只展示当前选中集；
+ *   4. 底部文件区默认只列原始文件名，悬浮看物理路径——识别错了
+ *      用户要能立刻知道"这是哪个文件"，同时不让技术信息压过影片本身；
  *   5. 条目级操作：重新识别（识别器升级后的翻案通道）与删除（唯一会
  *      真删磁盘的入口，整个刮削目录一起清，二次确认）。文件行与分集
  *      文件卡上另有单文件删除（多版本洗掉一个 / 删某集重下，同样二次
@@ -119,6 +126,11 @@ export function LibraryItemDetailView({
   const [deleteFileTarget, setDeleteFileTarget] = useState<LibraryItemFile | null>(null);
   // 转移到其他库的弹窗（选库 → 预览 → 执行 → 进度 → 结论）
   const [transferOpen, setTransferOpen] = useState(false);
+  // 剧集详情的 Hero 与分集区必须指向同一集；电影保持为 null。
+  const [selectedSeriesEpisode, setSelectedSeriesEpisode] =
+    useState<SelectedEpisodeContext | null>(null);
+  // 顶部文件选择器由父级控制，分辨率才能与音轨、字幕同步切换。
+  const [selectedTrackFileId, setSelectedTrackFileId] = useState<number | null>(null);
 
   const handleTransferFinished = useCallback(
     (targetLibraryId: number) => {
@@ -144,21 +156,14 @@ export function LibraryItemDetailView({
   useEffect(() => {
     setDetail(null);
     setRefreshError(null);
+    setSelectedSeriesEpisode(null);
+    setSelectedTrackFileId(null);
     reload();
   }, [reload]);
 
   usePageTitle(detail?.title);
-
-  // 沉浸模式：进入详情页把全站背景（body 大图 + 玻璃折射纹理）临时换成
-  // 该片剧照，玻璃 UI 整体染上影片氛围；离开页面自动恢复用户配置的背景。
-  // 依赖 URL 字符串而非 detail 对象：刮削轮询刷新 detail 时背景不重挂
-  const { setOverrideBackdrop } = useBackdrop();
-  const immersiveUrl = detail ? imageUrl(detail.backdrop_url ?? detail.poster_url) : "";
-  useEffect(() => {
-    if (!immersiveUrl) return;
-    setOverrideBackdrop(immersiveUrl);
-    return () => setOverrideBackdrop(null);
-  }, [immersiveUrl, setOverrideBackdrop]);
+  // 与发现详情页保持同一外链行为：移动端优先唤起豆瓣 App，桌面回落网页。
+  const doubanAppHref = useDoubanAppHref(detail?.douban_id);
 
   // 刮削进行中就轮询到它结束——状态在服务端（detail.scraping），所以
   // **无论刷新是从这个页面发起的、还是别处发起后你才打开这一页**，都会
@@ -220,7 +225,7 @@ export function LibraryItemDetailView({
 
   const isMovie = detail.kind === "movie";
   const meta = detail.local_meta;
-  const posterUrl = imageUrl(detail.poster_url);
+  const itemBackdropUrl = imageUrl(detail.backdrop_url ?? detail.poster_url);
   // 片长：NFO 的 runtime 优先，其次任意文件的实测时长
   const runtimeMinutes =
     meta?.runtime_minutes ??
@@ -228,6 +233,60 @@ export function LibraryItemDetailView({
       const probed = detail.files.find((f) => f.duration_seconds)?.duration_seconds;
       return probed ? Math.round(probed / 60) : null;
     })();
+  const trackFiles = isMovie
+    ? detail.files
+    : (selectedSeriesEpisode?.files ?? []);
+  const availableTrackFiles = trackFiles.filter((file) => !file.missing);
+  const selectedTrackFile =
+    availableTrackFiles.find((file) => file.id === selectedTrackFileId) ??
+    availableTrackFiles[0] ??
+    null;
+  // 电影和剧集共用同一套基础信息层级：标题行只保留年份、片长、分辨率、HDR；
+  // 帧率、编码、文件大小等技术细节留在文件区。电影概览全部在位版本，
+  // 剧集只显示当前集当前文件的画面规格，并随文件选择器同步变化。
+  const resolutionSources = isMovie
+    ? detail.files.filter((file) => !file.missing)
+    : selectedTrackFile
+      ? [selectedTrackFile]
+      : [];
+  const itemResolutions = [
+    ...new Set(
+      resolutionSources
+        .map((file) => file.resolution)
+        .filter((resolution): resolution is string => Boolean(resolution)),
+    ),
+  ]
+    .sort((a, b) => b.localeCompare(a, undefined, { numeric: true }))
+    .map(formatVideoResolution);
+  const itemHdrFormats = [
+    ...new Set(
+      resolutionSources.map((file) => file.hdr).filter((hdr): hdr is string => Boolean(hdr)),
+    ),
+  ].sort((a, b) => {
+    const priority = ["Dolby Vision", "HDR10+", "HDR10", "HLG", "HDR"];
+    const aIndex = priority.indexOf(a);
+    const bIndex = priority.indexOf(b);
+    return (aIndex < 0 ? priority.length : aIndex) -
+      (bIndex < 0 ? priority.length : bIndex);
+  });
+  const itemFacts = [
+    detail.year ? String(detail.year) : null,
+    runtimeMinutes != null ? formatRuntimeMinutes(runtimeMinutes) : null,
+  ].filter((fact): fact is string => Boolean(fact));
+  const directorCast =
+    meta
+      ? meta.director_credits?.length > 0
+        ? meta.director_credits.map((director) => ({
+            name: director.name,
+            credit: "导演",
+            avatarUrl: director.thumb_url ? cachedImageUrl(director.thumb_url) : null,
+            tmdbPersonId: director.tmdb_person_id,
+          }))
+        : [...new Set(meta.directors)].map((name) => ({ name, credit: "导演" }))
+      : [];
+  const itemPlot = isMovie
+    ? meta?.plot
+    : (selectedSeriesEpisode?.episode.overview ?? meta?.plot);
 
   const runMetadataRefresh = async () => {
     // 重操作先确认：单条目刷新是 force 语义（图片覆盖重下），说清再动手
@@ -250,18 +309,32 @@ export function LibraryItemDetailView({
   };
 
   return (
-    // rounded-2xl + overflow 裁切：内容渐变到底部是近实色的深色板，方角
+    // rounded-2xl + overflow 裁切：顶部剧照渐变到纯黑内容板，方角
     // 会与全站"浮起圆角卡片"的形状语言冲突——按侧栏同规格圆角收尾。
     // max-md:rounded-none：这套圆角只在桌面成立——桌面外壳有 p-3.5 的留白，
     // 圆角落在留白里、背景大图从四周透出，才是一张"浮起的卡片"。窄屏是通栏
     // 满屏布局，没有留白，圆角直接压在屏幕边上：顶栏的吸顶雾层被这层
     // overflow 一裁，就成了贴在屏幕顶上的一块圆角色块（手机上肉眼可见的
     // 两个缺角），底边同理被 Home 指示条切掉。手机上一律方角、真通栏。
-    <div className="scroll-thin scroll-safe h-full overflow-y-auto rounded-2xl max-md:rounded-none">
-      {/* —— 顶部：不再有任何 hero 卡片图层——全站背景此刻就是本片剧照
-          （沉浸覆盖 + 本页豁免全局蒙版，见 app-shell 的 isHome），大图
-          直出、零边界。顶栏首屏只有一颗圆形返回键浮在剧照上（吸顶蒙版
-          此时全透明），页面顶部不再有大面积色块 —— */}
+    <div className="scroll-thin scroll-safe relative isolate h-full overflow-y-auto rounded-2xl bg-black max-md:rounded-none">
+      {/* 背景只属于顶部 Hero：有限高度、随页面滚走；cover 始终等比例缩放，
+          只裁切超出的边缘，不改变图片宽高比。图片自身先在较长区间内淡出到
+          完全透明，真正的容器底边因此只剩下同色黑底，不会形成一条切边。 */}
+      {itemBackdropUrl && (
+        <div
+          aria-hidden="true"
+          className="pointer-events-none absolute inset-x-0 top-0 z-0 h-[calc(30vh+360px)] min-h-[540px] bg-cover bg-center bg-no-repeat max-md:h-[calc(22vh+340px)] max-md:min-h-[460px]"
+          style={{
+            backgroundImage: `url(${JSON.stringify(itemBackdropUrl)})`,
+            WebkitMaskImage:
+              "linear-gradient(to bottom,#000 0%,#000 50%,rgba(0,0,0,.92) 60%,rgba(0,0,0,.65) 72%,rgba(0,0,0,.3) 84%,rgba(0,0,0,.08) 93%,transparent 98%,transparent 100%)",
+            maskImage:
+              "linear-gradient(to bottom,#000 0%,#000 50%,rgba(0,0,0,.92) 60%,rgba(0,0,0,.65) 72%,rgba(0,0,0,.3) 84%,rgba(0,0,0,.08) 93%,transparent 98%,transparent 100%)",
+          }}
+        />
+      )}
+
+      {/* 顶栏首屏只有返回键与操作入口浮在局部剧照上。 */}
       <PageNav
         title={detail.title}
         fallback={navFallback}
@@ -272,6 +345,7 @@ export function LibraryItemDetailView({
               searchHref={`/search?q=${encodeURIComponent(detail.title)}` as Route}
               onReidentify={() => setReidentifyOpen(true)}
               onRefreshMetadata={runMetadataRefresh}
+              onChangeArtwork={() => setArtworkOpen(true)}
               onTransfer={() => setTransferOpen(true)}
               onDelete={() => setDeleteOpen(true)}
             />
@@ -282,75 +356,61 @@ export function LibraryItemDetailView({
       {/* 氛围留白：这一段什么都不放，让剧照完整呼吸 */}
       <div className="h-[30vh] min-h-[180px] max-md:h-[22vh] max-md:min-h-[120px]" />
 
-      {/* —— 内容层：从全透明渐入页面底色，与背景之间没有任何接缝 —— */}
-      <div className="bg-[linear-gradient(180deg,rgba(7,9,14,0)_0,rgba(7,9,14,0.66)_130px,rgba(7,9,14,0.88)_360px,rgba(7,9,14,0.93)_100%)] pb-12">
+      {/* 内容遮罩与图片透明衰减交叠：用更多低跨度色阶缓慢落黑，避免在某个
+          固定高度突然结束渐变；音轨附近已经接近纯黑，下面则保持全黑。 */}
+      <div className="relative z-10 -mt-28 bg-[linear-gradient(180deg,rgba(0,0,0,0)_0,rgba(0,0,0,0.16)_42px,rgba(0,0,0,0.34)_78px,rgba(0,0,0,0.55)_120px,rgba(0,0,0,0.73)_165px,rgba(0,0,0,0.87)_210px,rgba(0,0,0,0.96)_255px,#000_315px,#000_100%)] pb-12 pt-28">
       {/* —— 头部信息区 —— */}
-      <div className="relative z-10 flex items-end gap-7 px-12 pt-6 max-md:gap-4 max-md:px-4 max-md:pt-3">
-        {/* 海报：悬浮浮出「更换图片」——选图入口放在它作用的对象上
-            （Emby/Plex 同款位置），不必再进顶栏的 ⋯ 菜单绕一圈 */}
-        <div className="group/poster relative w-[186px] shrink-0 overflow-hidden rounded-xl bg-[#141824] shadow-[0_26px_60px_rgba(0,0,0,0.6)] ring-1 ring-white/15 max-md:w-[104px]">
-          <PosterImage
-            src={posterUrl}
-            alt={`${detail.title} 海报`}
-            className="aspect-[2/3] w-full object-cover"
-          />
-          {canManageLibraries && (
-            <button
-              type="button"
-              onClick={() => setArtworkOpen(true)}
-              className="touch-reveal absolute inset-x-0 bottom-0 flex h-11 items-center justify-center bg-black/70 text-sub font-medium text-white opacity-0 backdrop-blur-sm transition group-hover/poster:opacity-100 max-md:h-8 max-md:text-caption"
-            >
-              更换图片
-            </button>
-          )}
-        </div>
-
-        <div className="min-w-0 flex-1 pb-1">
-          <p className="text-caption font-semibold uppercase tracking-[0.22em] text-[var(--accent-2)]">
-            已入库 · {isMovie ? "电影" : "剧集"}
-            {meta && meta.genres.length > 0 ? ` · ${meta.genres.join(" / ")}` : ""}
-          </p>
-          <h1 className="text-on-image mt-2 text-[38px] font-bold leading-[1.1] tracking-[-0.02em] text-white max-md:mt-1 max-md:text-[21px]">
+      <div className="relative z-10 px-12 pt-6 max-md:px-4 max-md:pt-3">
+        <div className="min-w-0 max-w-5xl pb-1">
+          <h1 className="text-on-image text-[42px] font-bold leading-[1.1] tracking-[-0.02em] text-white max-md:text-[28px]">
             {detail.title}
           </h1>
-          {detail.original_title && detail.original_title !== detail.title && (
-            <p className="text-on-image mt-1.5 truncate text-body text-white/55">
-              {detail.original_title}
+          {!isMovie && selectedSeriesEpisode && (
+            <p className="text-on-image mt-2 text-body text-white/65 max-md:mt-1.5 max-md:text-ui">
+              {`第 ${selectedSeriesEpisode.seasonNumber} 季 第 ${selectedSeriesEpisode.episode.episode_number} 集${
+                selectedSeriesEpisode.episode.name
+                  ? ` - ${selectedSeriesEpisode.episode.name}`
+                  : ""
+              }`}
             </p>
           )}
-
-          <div className="tnum mt-3.5 flex flex-wrap items-center gap-x-3.5 gap-y-2 text-ui text-white/80 max-md:mt-2 max-md:gap-x-2.5 max-md:gap-y-1 max-md:text-sub">
-            {meta?.rating != null && (
-              <span className="flex items-center gap-1.5">
-                <StarIcon className="size-4 text-[#f5c451]" />
-                <span className="text-title-sm font-bold text-white">{meta.rating.toFixed(1)}</span>
-              </span>
-            )}
-            {detail.year && <span>{detail.year}</span>}
-            {runtimeMinutes != null && <span>{runtimeMinutes} 分钟</span>}
-            {meta && meta.directors.length > 0 && (
-              <span className="text-white/65">导演 {meta.directors.join(" / ")}</span>
-            )}
-            {detail.total_size_bytes > 0 && <span>{formatBytes(detail.total_size_bytes)}</span>}
-            <QualityBadges files={detail.files} />
-          </div>
-
-          {/* 外部信息源：识别结果对应的站点词条，用于人工核对刮削是否配错片。
-              刻意压到元信息行下方的小字，不与主操作争视觉权重 */}
-          <div className="mt-3 flex flex-wrap items-center gap-x-3.5 gap-y-1">
-            {detail.tmdb_id > 0 && (
-              <SourceLink
-                href={`https://www.themoviedb.org/${detail.kind}/${detail.tmdb_id}`}
-                label="TMDB"
-              />
-            )}
-            {detail.imdb_id && (
-              <SourceLink
-                href={`https://www.imdb.com/title/${detail.imdb_id}/`}
-                label="IMDb"
-              />
-            )}
-          </div>
+          {(itemFacts.length > 0 ||
+            itemResolutions.length > 0 ||
+            itemHdrFormats.length > 0) && (
+            <div className="tnum mt-3.5 flex flex-wrap items-center gap-x-3 gap-y-2 text-ui text-white/80 max-md:mt-2 max-md:gap-x-2 max-md:text-sub">
+              {itemFacts.map((fact, index) => (
+                <span key={fact} className="flex items-center gap-3 max-md:gap-2">
+                  {index > 0 && <span aria-hidden="true">·</span>}
+                  <span>{fact}</span>
+                </span>
+              ))}
+              {itemResolutions.length > 0 && (
+                <span className="flex items-center gap-3 max-md:gap-2">
+                  {itemFacts.length > 0 && <span aria-hidden="true">·</span>}
+                  <span>{itemResolutions.join(" / ")}</span>
+                </span>
+              )}
+              {itemHdrFormats.length > 0 && (
+                <span className="flex items-center gap-3 max-md:gap-2">
+                  {(itemFacts.length > 0 || itemResolutions.length > 0) && (
+                    <span aria-hidden="true">·</span>
+                  )}
+                  <span>{itemHdrFormats.join(" / ")}</span>
+                </span>
+              )}
+            </div>
+          )}
+          {meta && meta.genres.length > 0 && (
+            <p className="text-on-image mt-3 text-ui leading-6 text-white/72 max-md:mt-2 max-md:text-sub">
+              {meta.genres.join(" · ")}
+            </p>
+          )}
+          <MediaTrackRows
+            files={trackFiles}
+            selectedFileId={selectedTrackFile?.id ?? null}
+            onSelectedFileIdChange={setSelectedTrackFileId}
+            onChanged={reload}
+          />
 
           {/* 刮削进行中的状态条：与库页的整库刷新面板同一套语言（阶段文案
               也同源），状态在服务端——离开页面/刷新浏览器回来照样看得到 */}
@@ -376,29 +436,14 @@ export function LibraryItemDetailView({
         </div>
       </div>
 
+      {/* 简介承接标题、类型与介质轨信息；电影与剧集保持同一阅读路径。 */}
+      {itemPlot && (
+        <div className="mt-4 px-12 max-md:px-4">
+          <ExpandablePlot text={itemPlot} />
+        </div>
+      )}
+
       <div className="mt-9 space-y-8 px-12 max-md:mt-6 max-md:space-y-6 max-md:px-4">
-        {/* —— 片源规格：电影多版本合并切换（剧集走下方分集区逐集展示）—— */}
-        {isMovie && detail.files.length > 0 && <MovieVersionSpecs files={detail.files} onChanged={reload} />}
-
-        {/* —— 剧情简介（本地 NFO 优先，TMDB 兜底）—— */}
-        {meta?.plot && (
-          <section>
-            <h2 className="text-on-image mb-3 text-body-lg font-semibold tracking-[-0.01em] text-[var(--text)]">
-              剧情简介
-              <span className="ml-2 text-caption font-normal text-[var(--text-faint)]">
-                {meta.source === "nfo"
-                  ? `信息来自本地刮削（${meta.nfo_name}）`
-                  : meta.source === "db"
-                    ? "信息来自本地档案"
-                    : "信息来自 TMDB"}
-              </span>
-            </h2>
-            <p className="text-on-image max-w-3xl text-body leading-7 text-white/78">
-              {meta.plot}
-            </p>
-          </section>
-        )}
-
         {/* —— 剧集分集区：季选择 + 分集横滚卡 + 选中集的简介/规格/文件 —— */}
         {!isMovie && detail.seasons.length > 0 && (
           <SeasonEpisodesSection
@@ -406,8 +451,7 @@ export function LibraryItemDetailView({
             detail={detail}
             initialSeason={initialSeason}
             initialEpisode={initialEpisode}
-            onDeleteFile={canManageLibraries ? setDeleteFileTarget : undefined}
-            onChanged={reload}
+            onEpisodeChange={setSelectedSeriesEpisode}
           />
         )}
 
@@ -416,31 +460,64 @@ export function LibraryItemDetailView({
             TMDB 本就没有照片的人渲染姓名首字占位 —— */}
         {meta && (
           <CastRow
-            cast={meta.actors.map((a) => ({
-              name: a.name,
-              role: a.role,
-              avatarUrl: a.thumb_url ? cachedImageUrl(a.thumb_url) : null,
-              tmdbPersonId: a.tmdb_person_id,
-            }))}
+            cast={[
+              // 导演与 Jellyfin People 同源；旧条目没有人物关系时才退回姓名占位。
+              ...directorCast,
+              ...meta.actors.map((actor) => ({
+                name: actor.name,
+                role: actor.role,
+                avatarUrl: actor.thumb_url ? cachedImageUrl(actor.thumb_url) : null,
+                tmdbPersonId: actor.tmdb_person_id,
+              })),
+            ]}
           />
         )}
 
-        {/* —— 文件区：电影列全部文件；剧集只列没归到集的零散文件 —— */}
+        {/* 文件区固定收尾：电影列全部版本；剧集只列当前选中集的全部版本。
+            两者共用同一套弱化、默认折叠样式，未入库集自然不渲染。 */}
         {(() => {
-          const files = isMovie
-            ? detail.files
-            : detail.files.filter((f) => f.episode_number === 0);
+          const files = isMovie ? detail.files : (selectedSeriesEpisode?.files ?? []);
           if (files.length === 0) return null;
           return (
             <FileSection
               files={files}
-              isMovie={isMovie}
-              title={isMovie ? "文件" : "其他文件"}
+              title="文件"
               onDeleteFile={canManageLibraries ? setDeleteFileTarget : undefined}
-              onChanged={reload}
             />
           );
         })()}
+
+        {/* 外部词条像友情链接一样固定在文件区之后，继续使用原有的新窗口跳转；
+            豆瓣在移动端沿用 App 唤起逻辑。 */}
+        {(detail.tmdb_id > 0 || detail.imdb_id || detail.douban_id) && (
+          <nav
+            aria-label="外部词条"
+            className="flex flex-wrap items-center gap-x-4 gap-y-2 border-t border-white/[0.04] pt-4 text-caption"
+          >
+            <span className="text-[var(--text-faint)]">相关链接</span>
+            {detail.tmdb_id > 0 && (
+              <SourceLink
+                href={`https://www.themoviedb.org/${detail.kind}/${detail.tmdb_id}`}
+                label="TMDB"
+              />
+            )}
+            {detail.imdb_id && (
+              <SourceLink
+                href={`https://www.imdb.com/title/${detail.imdb_id}/`}
+                label="IMDb"
+              />
+            )}
+            {detail.douban_id && (
+              <SourceLink
+                href={
+                  doubanAppHref ??
+                  `https://movie.douban.com/subject/${detail.douban_id}/`
+                }
+                label="豆瓣"
+              />
+            )}
+          </nav>
+        )}
       </div>
       </div>
 
@@ -513,7 +590,7 @@ export function LibraryItemDetailView({
 }
 
 /**
- * 条目操作 ⋯ 菜单：修正识别结果 / 刷新元数据 / 转移到其他库 / 删除影片。
+ * 条目操作 ⋯ 菜单：修正识别结果 / 刷新元数据 / 更换图片 / 转移 / 删除。
  *
  * 这几个都是低频且不可逆（改身份锚、重下全套图、搬目录、删文件）的操作，
  * 摆成常驻大按钮既压着正文，又把「误点」的成本摊在最显眼的位置。收进顶栏
@@ -531,6 +608,7 @@ function ItemActionsMenu({
   searchHref,
   onReidentify,
   onRefreshMetadata,
+  onChangeArtwork,
   onTransfer,
   onDelete,
 }: {
@@ -539,6 +617,7 @@ function ItemActionsMenu({
   searchHref: Route;
   onReidentify: () => void;
   onRefreshMetadata: () => void;
+  onChangeArtwork: () => void;
   onTransfer: () => void;
   onDelete: () => void;
 }) {
@@ -587,6 +666,9 @@ function ItemActionsMenu({
             className={itemClass}
           >
             {scraping ? "正在刷新元数据…" : "刷新元数据"}
+          </DropdownMenu.Item>
+          <DropdownMenu.Item onSelect={onChangeArtwork} className={itemClass}>
+            更换图片…
           </DropdownMenu.Item>
           <DropdownMenu.Item onSelect={onTransfer} className={itemClass}>
             转移到其他库…
@@ -702,6 +784,22 @@ function audioLabel(stream: AudioStream): string {
     .join(" · ");
 }
 
+/** 音轨常显也只保留语言首字，编码、声道与默认状态统一交给 Tooltip。 */
+function audioCompactLabel(stream: AudioStream): string {
+  const name = languageLabel(stream.language) ?? stream.title?.trim();
+  if (name) return Array.from(name)[0]?.toUpperCase() ?? "音";
+  const codec = stream.codec
+    ? (AUDIO_CODEC_LABELS[stream.codec.toLowerCase()] ?? stream.codec.toUpperCase())
+    : null;
+  return codec ? Array.from(codec)[0]!.toUpperCase() : "音";
+}
+
+function audioTooltip(stream: AudioStream): string {
+  return [audioLabel(stream), stream.title, stream.default ? "默认" : null]
+    .filter(Boolean)
+    .join(" · ");
+}
+
 /** 字幕 → 一行徽章文案：语言/标题 · 格式 (+ 强制/外挂标记在徽章样式上体现)。 */
 function generatedSubtitleLabel(stream: SubtitleStream): string | null {
   const title = stream.title?.toLowerCase();
@@ -727,6 +825,113 @@ function subtitleLabel(stream: SubtitleStream): string {
   return parts.join(" · ") || "未知字幕";
 }
 
+/**
+ * 字幕常显只保留语言首字，完整语言 / 格式 / 属性交给 Tooltip。
+ * 双语 AI 字幕保留两个首字，避免都缩成一个「简」后无法区分。
+ */
+function subtitleCompactLabel(stream: SubtitleStream): string {
+  const name =
+    generatedSubtitleLabel(stream) ?? languageLabel(stream.language) ?? stream.title?.trim();
+  if (name) {
+    return name
+      .split(/\s*\+\s*/)
+      .map((part) => Array.from(part.trim())[0]?.toUpperCase())
+      .filter(Boolean)
+      .join("+");
+  }
+  const codec = stream.codec
+    ? (SUBTITLE_CODEC_LABELS[stream.codec.toLowerCase()] ?? stream.codec.toUpperCase())
+    : null;
+  return codec ? Array.from(codec)[0]!.toUpperCase() : "字";
+}
+
+function subtitleTooltip(stream: SubtitleStream): string {
+  const location = externalSubtitleSuffix(stream) ?? "内封";
+  return [subtitleLabel(stream), location, stream.default ? "默认" : null, stream.file_name]
+    .filter(Boolean)
+    .join(" · ");
+}
+
+/** 字幕色块只承担格式识别，颜色刻意保持低饱和，避免重新变成徽章墙。 */
+enum SubtitleBadgeTone {
+  Srt = "srt",
+  Ass = "ass",
+  Pgs = "pgs",
+  VobSub = "vobsub",
+  Text = "text",
+  Ai = "ai",
+  Other = "other",
+}
+
+const SUBTITLE_BADGE_TONE_CLASS: Record<SubtitleBadgeTone, string> = {
+  [SubtitleBadgeTone.Srt]: "bg-sky-300/[0.1] text-sky-100/90 hover:bg-sky-300/[0.17]",
+  [SubtitleBadgeTone.Ass]:
+    "bg-violet-300/[0.1] text-violet-100/90 hover:bg-violet-300/[0.17]",
+  [SubtitleBadgeTone.Pgs]:
+    "bg-amber-300/[0.1] text-amber-100/90 hover:bg-amber-300/[0.17]",
+  [SubtitleBadgeTone.VobSub]:
+    "bg-orange-300/[0.1] text-orange-100/90 hover:bg-orange-300/[0.17]",
+  [SubtitleBadgeTone.Text]:
+    "bg-cyan-300/[0.1] text-cyan-100/90 hover:bg-cyan-300/[0.17]",
+  // AI 产物沿用主按钮的冷银色，但保持与其他字幕色块一致的轻量层级。
+  [SubtitleBadgeTone.Ai]:
+    "bg-[#cdd6e6]/[0.1] text-[#eef2f8]/90 hover:bg-[#cdd6e6]/[0.17]",
+  [SubtitleBadgeTone.Other]: "bg-white/[0.065] text-white/75 hover:bg-white/[0.12]",
+};
+
+function subtitleBadgeTone(stream: SubtitleStream): SubtitleBadgeTone {
+  const title = stream.title?.toLowerCase() ?? "";
+  const fileTokens = stream.file_name?.toLowerCase().split(".") ?? [];
+  if (
+    title.startsWith("ai-") ||
+    fileTokens.some((token) => token === "ai" || token.startsWith("ai-"))
+  ) {
+    return SubtitleBadgeTone.Ai;
+  }
+  switch (stream.codec?.toLowerCase()) {
+    case "subrip":
+    case "srt":
+      return SubtitleBadgeTone.Srt;
+    case "ass":
+    case "ssa":
+      return SubtitleBadgeTone.Ass;
+    case "hdmv_pgs_subtitle":
+    case "sup":
+      return SubtitleBadgeTone.Pgs;
+    case "dvd_subtitle":
+    case "sub":
+      return SubtitleBadgeTone.VobSub;
+    case "mov_text":
+    case "webvtt":
+    case "vtt":
+      return SubtitleBadgeTone.Text;
+    default:
+      return SubtitleBadgeTone.Other;
+  }
+}
+
+/** 音轨与字幕共用低饱和色系，颜色只帮助快速区分常见编码族。 */
+function audioBadgeTone(stream: AudioStream): SubtitleBadgeTone {
+  switch (stream.codec?.toLowerCase()) {
+    case "aac":
+    case "mp3":
+      return SubtitleBadgeTone.Srt;
+    case "truehd":
+      return SubtitleBadgeTone.Ass;
+    case "ac3":
+    case "eac3":
+      return SubtitleBadgeTone.Pgs;
+    case "dts":
+      return SubtitleBadgeTone.VobSub;
+    case "flac":
+    case "opus":
+    case "vorbis":
+      return SubtitleBadgeTone.Text;
+    default:
+      return SubtitleBadgeTone.Other;
+  }
+}
+
 function externalSubtitleSuffix(stream: SubtitleStream): string | undefined {
   if (!stream.external) return undefined;
   const tokens = stream.file_name?.toLowerCase().split(".") ?? [];
@@ -735,192 +940,126 @@ function externalSubtitleSuffix(stream: SubtitleStream): string | undefined {
   return "外挂";
 }
 
+/** 字幕预览接口使用的中性轨引用：内封按序号，外挂按文件名。 */
+function subtitleTrack(stream: SubtitleStream, index: number): string | null {
+  if (!stream.external) return `embedded:${index}`;
+  return stream.file_name ? `external:${stream.file_name}` : null;
+}
+
 function videoCodecLabel(codec: string | null): string | null {
   if (!codec) return null;
   return VIDEO_CODEC_LABELS[codec.toLowerCase()] ?? codec.toUpperCase();
 }
 
-/** 一个文件的视频规格徽章集合（详情各处共用同一套语言）。 */
-function videoBadges(file: LibraryItemFile): string[] {
-  const badges: (string | null)[] = [
-    file.resolution,
-    videoCodecLabel(file.video_codec),
-    file.hdr,
-    file.bit_depth && file.bit_depth > 8 ? `${file.bit_depth}bit` : null,
-    file.bit_rate ? `${(file.bit_rate / 1_000_000).toFixed(1)} Mbps` : null,
-    file.container ? file.container.toUpperCase() : null,
-    file.media_source,
-    file.release_group,
-  ];
-  return badges.filter((b): b is string => Boolean(b));
+/** ffprobe 小数帧率保留行业常用精度，如 23.976 / 29.97 / 59.94 fps。 */
+function frameRateLabel(frameRate: number | null): string | null {
+  if (frameRate == null || frameRate <= 0) return null;
+  return `${Math.round(frameRate * 1000) / 1000} fps`;
 }
 
 /* ------------------------------------------------------------------------ */
 /* 子组件                                                                     */
 /* ------------------------------------------------------------------------ */
 
-/** 头部元信息行的质量徽章：全部文件去重后的分辨率/HDR 概览。 */
-function QualityBadges({ files }: { files: LibraryItemFile[] }) {
-  const labels = useMemo(() => {
-    const set = new Set<string>();
-    for (const f of files) {
-      if (f.resolution) set.add(f.resolution);
-      if (f.hdr) set.add(f.hdr);
-    }
-    return [...set];
-  }, [files]);
-  if (labels.length === 0) return null;
-  return (
-    <span className="flex gap-1.5">
-      {labels.map((b) => (
-        <span
-          key={b}
-          className="rounded border border-white/25 px-1.5 py-px text-micro font-semibold tracking-wide text-white/85"
-        >
-          {b}
-        </span>
-      ))}
-    </span>
-  );
-}
-
 /**
- * 电影片源规格：多版本（1080p 与 2160p 并存）合并成切换器，选中版本
- * 展开视频 / 音轨 / 字幕三组真实规格（探测自文件本体，不来自种子名）。
+ * 电影和剧集共用的介质轨摘要。音轨和字幕分别保持一行语义；多文件时先选
+ * 物理文件，再查看该文件的轨道，避免不同版本或不同集的语言与格式混在一起。
  */
-function MovieVersionSpecs({
+function MediaTrackRows({
   files,
+  selectedFileId,
+  onSelectedFileIdChange,
   onChanged,
 }: {
   files: LibraryItemFile[];
+  selectedFileId: number | null;
+  onSelectedFileIdChange: (fileId: number) => void;
   onChanged?: () => void;
 }) {
-  // 在位版本优先、分辨率高在前
-  const versions = useMemo(
-    () =>
-      [...files].sort((a, b) => {
-        if (a.missing !== b.missing) return a.missing ? 1 : -1;
-        return (b.resolution ?? "").localeCompare(a.resolution ?? "") || b.size_bytes - a.size_bytes;
-      }),
-    [files],
-  );
-  const [activeId, setActiveId] = useState(versions[0]?.id);
-  const active = versions.find((f) => f.id === activeId) ?? versions[0];
-  if (!active) return null;
-
-  const versionLabel = (f: LibraryItemFile) =>
-    [f.resolution ?? f.container?.toUpperCase() ?? "未知规格", videoCodecLabel(f.video_codec), formatBytes(f.size_bytes)]
-      .filter(Boolean)
-      .join(" · ");
-
-  return (
-    <section>
-      <div className="mb-3 flex items-center gap-3">
-        <h2 className="text-on-image text-body-lg font-semibold tracking-[-0.01em] text-[var(--text)]">
-          片源规格
-        </h2>
-        {versions.length > 1 && (
-          <div className="flex flex-wrap gap-1.5">
-            {versions.map((f) => (
-              <button
-                key={f.id}
-                type="button"
-                aria-pressed={f.id === active.id}
-                onClick={() => setActiveId(f.id)}
-                className={`tnum rounded-full px-3 py-1 text-sub font-medium transition-colors ${
-                  f.id === active.id
-                    ? "bg-white/[0.14] text-white"
-                    : "text-[var(--text-muted)] hover:bg-white/[0.07] hover:text-[var(--text)]"
-                }`}
-              >
-                {versionLabel(f)}
-                {f.missing ? "（缺失）" : ""}
-              </button>
-            ))}
-          </div>
-        )}
-      </div>
-      <div className="rounded-2xl border border-white/[0.07] bg-[rgba(14,16,22,0.45)] p-6 backdrop-blur-xl">
-        <SpecRows key={active.id} file={active} onChanged={onChanged} />
-      </div>
-    </section>
-  );
-}
-
-/** 一个文件的规格三行：视频 / 音频 / 字幕（文件区逐集展开时共用）。 */
-function SpecRows({
-  file,
-  onChanged,
-}: {
-  file: LibraryItemFile;
-  onChanged?: () => void;
-}) {
+  const availableFiles = files.filter((file) => !file.missing);
   const [previewTarget, setPreviewTarget] = useState<{
+    file: LibraryItemFile;
     stream: SubtitleStream;
     track: string;
     label: string;
   } | null>(null);
 
+  if (availableFiles.length === 0) return null;
+  const multipleVersions = availableFiles.length > 1;
+  // 文件刷新或删除后，若原选择已不存在，直接派生回第一项，无需额外 effect。
+  const selectedFile =
+    availableFiles.find((file) => file.id === selectedFileId) ?? availableFiles[0];
+  const fileOptionLabel = (file: LibraryItemFile) => {
+    const resolution = file.resolution ? formatVideoResolution(file.resolution) : null;
+    return resolution ? `${resolution} — ${file.file_name}` : file.file_name;
+  };
+
   return (
     <>
-      <div className="space-y-4">
-        <SpecRow label="视频">
-          {videoBadges(file).length > 0 ? (
-            videoBadges(file).map((b) => <SpecBadge key={b} text={b} />)
-          ) : (
-            <span className="text-sub text-[var(--text-muted)]">
-              未能探测（ffprobe 缺失或文件不可达）
-            </span>
-          )}
-        </SpecRow>
-        <SpecRow label="音频">
-          {file.audio_streams === null ? (
-            <span className="text-sub text-[var(--text-muted)]">
-              尚未探测——在媒体库页对本库执行「重新扫描」即可补齐规格；
-              扫描后仍为空请检查文件是否可达，以及（源码部署时）是否装了 ffmpeg
-            </span>
-          ) : file.audio_streams.length === 0 ? (
+      <div className="mt-4 max-w-4xl space-y-2.5">
+        {multipleVersions && (
+          <select
+            aria-label="选择视频文件"
+            value={selectedFile.id}
+            onChange={(event) => onSelectedFileIdChange(Number(event.target.value))}
+            className="w-full rounded-xl border border-white/[0.08] bg-white/[0.055] px-3.5 py-2 text-sub text-white/90 outline-none transition focus:border-white/25 focus:bg-white/[0.08] [&>option]:bg-[#181c28]"
+          >
+            {availableFiles.map((file) => (
+              <option key={file.id} value={file.id}>
+                {fileOptionLabel(file)}
+              </option>
+            ))}
+          </select>
+        )}
+        <SpecRow label="音轨">
+          {selectedFile.audio_streams === null ? (
+            <span className="text-sub text-[var(--text-muted)]">尚未探测</span>
+          ) : selectedFile.audio_streams.length === 0 ? (
             <span className="text-sub text-[var(--text-muted)]">文件内没有音轨</span>
           ) : (
-            file.audio_streams.map((a, i) => (
-              <SpecBadge key={i} text={audioLabel(a)} accent={a.default} />
+            selectedFile.audio_streams.map((audio, index) => (
+              <SpecBadge
+                key={`${selectedFile.id}:audio:${index}`}
+                text={audioCompactLabel(audio)}
+                variant="subtitle"
+                subtitleTone={audioBadgeTone(audio)}
+                tooltip={audioTooltip(audio)}
+              />
             ))
           )}
         </SpecRow>
         <SpecRow label="字幕">
-          {file.subtitle_streams.length === 0 ? (
+          {selectedFile.subtitle_streams.length === 0 ? (
             <span className="text-sub text-[var(--text-muted)]">无内封或外挂字幕</span>
           ) : (
-            file.subtitle_streams.map((s, i) => {
-              const label = subtitleLabel(s);
-              const track = s.external
-                ? s.file_name
-                  ? `external:${s.file_name}`
-                  : null
-                : `embedded:${i}`;
+            selectedFile.subtitle_streams.map((subtitle, index) => {
+              const label = subtitleLabel(subtitle);
+              const track = subtitleTrack(subtitle, index);
               return (
                 <SpecBadge
-                  key={track ?? `external:${i}`}
-                  text={label}
-                  suffix={
-                    externalSubtitleSuffix(s)
-                  }
+                  key={`${selectedFile.id}:${track ?? `external:${index}`}`}
+                  text={subtitleCompactLabel(subtitle)}
+                  variant="subtitle"
+                  subtitleTone={subtitleBadgeTone(subtitle)}
+                  tooltip={subtitleTooltip(subtitle)}
+                  tooltipDisabled={previewTarget !== null}
                   onClick={
-                    track ? () => setPreviewTarget({ stream: s, track, label }) : undefined
+                    track
+                      ? () =>
+                          setPreviewTarget({ file: selectedFile, stream: subtitle, track, label })
+                      : undefined
                   }
                 />
               );
             })
           )}
-          {/* AI 入口也是一种“将要产生的字幕”，与已有字幕徽章使用同一布局；
-              key 隔离不同片源的预检与确认状态，切版本不会串任务。 */}
-          <SubtitleGenPanel key={file.id} file={file} onChanged={onChanged} />
+          <SubtitleGenPanel key={selectedFile.id} file={selectedFile} onChanged={onChanged} />
         </SpecRow>
       </div>
       {previewTarget && (
         <SubtitlePreviewDialog
           open
-          file={file}
+          file={previewTarget.file}
           stream={previewTarget.stream}
           track={previewTarget.track}
           label={previewTarget.label}
@@ -943,20 +1082,33 @@ function SpecRow({ label, children }: { label: string; children: React.ReactNode
 
 function SpecBadge({
   text,
-  accent = false,
   suffix,
+  tooltip,
+  tooltipDisabled = false,
+  variant = "default",
+  subtitleTone = SubtitleBadgeTone.Other,
   onClick,
 }: {
   text: string;
-  accent?: boolean;
   suffix?: string;
+  tooltip?: string;
+  tooltipDisabled?: boolean;
+  variant?: "default" | "subtitle";
+  subtitleTone?: SubtitleBadgeTone;
   onClick?: () => void;
 }) {
-  const className = `tnum inline-flex items-center gap-1 rounded-md border px-2 py-0.5 text-caption ${
-    accent
-      ? "border-white/30 bg-white/[0.1] text-white"
-      : "border-white/[0.12] bg-white/[0.04] text-white/80"
-  } ${onClick ? "cursor-pointer transition hover:border-white/25 hover:bg-white/[0.09] hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent-2)]" : ""}`;
+  const className =
+    variant === "subtitle"
+      ? "tnum inline-flex h-7 min-w-6 items-center justify-center rounded-[5px] " +
+        "px-1.5 text-caption font-semibold leading-none backdrop-blur-md " +
+        "shadow-[inset_0_1px_0_rgba(255,255,255,0.055)] " +
+        "transition-[transform,background-color,box-shadow,color] hover:-translate-y-px " +
+        "hover:shadow-[0_4px_12px_rgba(0,0,0,0.16)] " +
+        `${SUBTITLE_BADGE_TONE_CLASS[subtitleTone]} ` +
+        `focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent-2)] ${
+          onClick ? "cursor-pointer" : ""
+        }`
+      : `tnum inline-flex items-center gap-1 rounded-md border border-white/[0.12] bg-white/[0.04] px-2 py-0.5 text-caption text-white/80 ${onClick ? "cursor-pointer transition hover:border-white/25 hover:bg-white/[0.09] hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent-2)]" : ""}`;
   const content = (
     <>
       {text}
@@ -965,14 +1117,89 @@ function SpecBadge({
       )}
     </>
   );
-  if (onClick) {
-    return (
-      <button type="button" onClick={onClick} className={className} title={`预览字幕：${text}`}>
-        {content}
-      </button>
-    );
-  }
-  return <span className={className}>{content}</span>;
+  const badge = onClick ? (
+    <button
+      type="button"
+      onClick={onClick}
+      className={className}
+      aria-label={tooltip ? `预览字幕：${tooltip}` : `预览字幕：${text}`}
+    >
+      {content}
+    </button>
+  ) : (
+    <span className={className}>{content}</span>
+  );
+  return tooltip ? (
+    <Tooltip
+      content={tooltip}
+      maxWidth={460}
+      disabled={tooltipDisabled}
+      dismissOnReferencePress
+    >
+      {badge}
+    </Tooltip>
+  ) : (
+    badge
+  );
+}
+
+/**
+ * 电影与分集简介共用的四行摘要。只有真实发生溢出时才出现展开入口；剧集
+ * 切换分集会先恢复折叠，再按新文案重新测量，避免沿用上一集的展开状态。
+ */
+function ExpandablePlot({ text }: { text: string }) {
+  const paragraphRef = useRef<HTMLParagraphElement>(null);
+  const [expanded, setExpanded] = useState(false);
+  const [hasOverflow, setHasOverflow] = useState(false);
+
+  useEffect(() => {
+    setExpanded(false);
+    setHasOverflow(false);
+  }, [text]);
+
+  useEffect(() => {
+    if (expanded) return;
+    const paragraph = paragraphRef.current;
+    if (!paragraph) return;
+
+    const measure = () => {
+      setHasOverflow(paragraph.scrollHeight > paragraph.clientHeight + 1);
+    };
+    const frame = window.requestAnimationFrame(measure);
+    const observer =
+      typeof ResizeObserver === "undefined" ? null : new ResizeObserver(measure);
+    observer?.observe(paragraph);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      observer?.disconnect();
+    };
+  }, [expanded, text]);
+
+  return (
+    <div className="max-w-3xl">
+      <p
+        ref={paragraphRef}
+        className={`text-on-image text-body-lg leading-7 text-white/78 ${
+          expanded ? "" : "line-clamp-4"
+        }`}
+      >
+        {text}
+      </p>
+      {(hasOverflow || expanded) && (
+        <button
+          type="button"
+          aria-expanded={expanded}
+          onClick={() => setExpanded((value) => !value)}
+          className="mt-1.5 inline-flex items-center gap-1 text-sub font-medium text-white/55 transition hover:text-white/85 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent-2)]"
+        >
+          {expanded ? "收起" : "展开全文"}
+          <ChevronRightIcon
+            className={`size-3.5 transition-transform ${expanded ? "-rotate-90" : "rotate-90"}`}
+          />
+        </button>
+      )}
+    </div>
+  );
 }
 
 /** 外部信息源链接：新窗口打开站点词条，样式与「在 TMDB 打开核对」保持一致。 */
@@ -1002,24 +1229,21 @@ function seasonLabel(season: number, owned: boolean): string {
 
 /**
  * 剧集分集区（播放器式）：季选择器 + 分集横滚缩略图卡（剧照 + 集名，
- * 缺集置灰），点选一集在下方展开该集的简介、真实规格与物理文件——
- * 剧集的浏览心智是"看这季有哪些集、这集是什么规格"，与电影的版本切换
- * 是两套逻辑。分集信息本地刮削（分集 NFO/缩略图）优先，TMDB 分季兜底。
+ * 缺集置灰）。本区只负责选择，当前集的简介与轨道回到 Hero，物理文件回到
+ * 页面底部的统一折叠文件区。分集信息本地刮削优先，TMDB 分季兜底。
  */
 function SeasonEpisodesSection({
   libraryId,
   detail,
   initialSeason,
   initialEpisode,
-  onDeleteFile,
-  onChanged,
+  onEpisodeChange,
 }: {
   libraryId: number;
   detail: LibraryItemDetail;
   initialSeason?: number;
   initialEpisode?: number;
-  onDeleteFile?: (file: LibraryItemFile) => void;
-  onChanged?: () => void;
+  onEpisodeChange?: (selection: SelectedEpisodeContext | null) => void;
 }) {
   const seasons = detail.seasons;
   // 季选择器列的是「元数据的季 ∪ 库里实有的季」，本地没有的季也在里面（看得到
@@ -1102,11 +1326,32 @@ function SeasonEpisodesSection({
     () => new Map(detail.files.map((f) => [f.id, f])),
     [detail.files],
   );
-  const current = data?.episodes.find((e) => e.episode_number === selected) ?? null;
-  const currentFiles = (current?.file_ids ?? [])
-    .map((id) => filesById.get(id))
-    .filter((f): f is LibraryItemFile => Boolean(f));
+  const current =
+    data?.season_number === season
+      ? (data.episodes.find((e) => e.episode_number === selected) ?? null)
+      : null;
+  const currentFiles = useMemo(
+    () =>
+      (current?.file_ids ?? [])
+        .map((id) => filesById.get(id))
+        .filter((f): f is LibraryItemFile => Boolean(f)),
+    [current, filesById],
+  );
   const ownedCount = data ? data.episodes.filter((e) => e.owned).length : 0;
+
+  // Hero 的简介、文件、分辨率和轨道必须与分集区保持同一选择；数据加载或
+  // 换季期间先清空，避免短暂显示上一季上一集的信息。
+  useEffect(() => {
+    onEpisodeChange?.(
+      current
+        ? {
+            seasonNumber: season,
+            episode: current,
+            files: currentFiles,
+          }
+        : null,
+    );
+  }, [current, currentFiles, onEpisodeChange, season]);
 
   return (
     <section ref={sectionRef}>
@@ -1148,102 +1393,19 @@ function SeasonEpisodesSection({
         </div>
       )}
 
+      {/* 分集横滚卡：16:9 剧照 + "N. 集名"；缺集置灰，选中亮环。
+          走 HScroller 以复用发现页海报行的左右翻页钮，避免用户看不出这行可横滑。 */}
       {data && (
-        <>
-          {/* 分集横滚卡：16:9 剧照 + "N. 集名"；缺集置灰，选中亮环。
-              走 HScroller 以复用发现页海报行的左右翻页钮，避免用户看不出这行可横滑 */}
-          <HScroller className="-mx-1 gap-3 px-1 pb-1 pt-1">
-            {data.episodes.map((episode) => (
-              <EpisodeCard
-                key={episode.episode_number}
-                episode={episode}
-                selected={episode.episode_number === selected}
-                onSelect={() => setSelected(episode.episode_number)}
-              />
-            ))}
-          </HScroller>
-
-          {/* 选中集面板：简介 + 该集文件的真实规格与物理位置 */}
-          {current && (
-            <div className="mt-4 rounded-2xl border border-white/[0.07] bg-[rgba(14,16,22,0.45)] p-6 backdrop-blur-xl">
-              <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
-                <h3 className="text-body font-semibold text-[var(--text)]">
-                  第 {current.episode_number} 集{current.name ? ` · ${current.name}` : ""}
-                </h3>
-                {current.air_date && (
-                  <span className="tnum text-sub text-[var(--text-faint)]">
-                    {current.air_date} 播出
-                  </span>
-                )}
-                {!current.owned && (
-                  <span className="rounded border border-[#f5c451]/40 px-1.5 py-px text-micro font-semibold text-[#f5c451]">
-                    不在库中
-                  </span>
-                )}
-              </div>
-              {current.overview && (
-                <p className="mt-2.5 max-w-3xl text-ui leading-6 text-white/70">
-                  {current.overview}
-                </p>
-              )}
-              {currentFiles.length > 0 ? (
-                <div className="mt-4 space-y-4">
-                  {currentFiles.map((file) => (
-                    <div
-                      key={file.id}
-                      className="group/epfile rounded-xl border border-white/[0.06] bg-white/[0.03] p-4"
-                    >
-                      <div className="flex items-center gap-4">
-                        <Tooltip
-                          content={
-                            <span className="tnum break-all font-mono text-caption leading-5">
-                              {file.file_path}
-                            </span>
-                          }
-                          maxWidth={520}
-                        >
-                          <p className="min-w-0 flex-1 truncate text-ui text-[var(--text)]">
-                            {file.file_name}
-                          </p>
-                        </Tooltip>
-                        {file.missing && (
-                          <span className="shrink-0 rounded border border-[#f5c451]/40 px-1.5 py-px text-micro font-semibold text-[#f5c451]">
-                            文件缺失
-                          </span>
-                        )}
-                        <span className="shrink-0 rounded border border-white/[0.14] px-1.5 py-px text-micro text-white/55">
-                          {file.source === "imported" ? "入库管线" : "扫描发现"}
-                        </span>
-                        <span className="tnum shrink-0 text-sub text-[var(--text-muted)]">
-                          {formatBytes(file.size_bytes)}
-                        </span>
-                        <span className="tnum shrink-0 text-caption text-[var(--text-faint)]">
-                          {formatRelativeTime(file.added_at)}
-                        </span>
-                        {onDeleteFile && <button
-                          type="button"
-                          aria-label="删除此文件"
-                          title="删除此文件"
-                          onClick={() => onDeleteFile(file)}
-                          className="touch-reveal shrink-0 rounded-md p-1.5 text-[var(--text-faint)] opacity-0 transition group-hover/epfile:opacity-100 hover:bg-white/[0.06] hover:text-[#ff9f9f]"
-                        >
-                          <TrashIcon className="size-4" />
-                        </button>}
-                      </div>
-                      <div className="mt-3.5">
-                        <SpecRows file={file} onChanged={onChanged} />
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              ) : (
-                <p className="mt-3 text-sub text-[var(--text-muted)]">
-                  本集不在库中——可通过订阅追踪自动补齐。
-                </p>
-              )}
-            </div>
-          )}
-        </>
+        <HScroller className="-mx-1 gap-3 px-1 pb-1 pt-1">
+          {data.episodes.map((episode) => (
+            <EpisodeCard
+              key={episode.episode_number}
+              episode={episode}
+              selected={episode.episode_number === selected}
+              onSelect={() => setSelected(episode.episode_number)}
+            />
+          ))}
+        </HScroller>
       )}
     </section>
   );
@@ -1303,95 +1465,87 @@ function EpisodeCard({
   );
 }
 
+/** 从完整文件路径提取保存目录，同时兼容 NAS/POSIX 与 Windows 分隔符。 */
+function fileDirectory(filePath: string): string {
+  const normalized = filePath.replace(/[\\/]+$/, "");
+  const separatorIndex = Math.max(
+    normalized.lastIndexOf("/"),
+    normalized.lastIndexOf("\\"),
+  );
+  if (separatorIndex < 0) return "—";
+  if (separatorIndex === 0) return normalized.slice(0, 1);
+  return normalized.slice(0, separatorIndex);
+}
+
 /**
- * 文件区：这份库存到底是哪些物理文件。原始文件名 + 尺寸常显，悬浮文件名
- * 看完整物理路径（识别错挂时用户第一时间要知道"这是哪个文件"）；
- * 电影列全部文件，剧集只列没归到集的零散文件。
+ * 文件区：详情正文的最后一块。电影与剧集当前集完全共用一套弱化样式，
+ * 默认只露出文件名，点击后按物理文件展开尺寸、视频与码率。
  */
 function FileSection({
   files,
-  isMovie,
   title,
   onDeleteFile,
-  onChanged,
 }: {
   files: LibraryItemFile[];
-  isMovie: boolean;
   title: string;
   onDeleteFile?: (file: LibraryItemFile) => void;
-  onChanged?: () => void;
 }) {
-  // 剧集按季分组；电影全部落在 0 组
-  const groups = useMemo(() => {
-    const bySeason = new Map<number, LibraryItemFile[]>();
-    for (const f of files) {
-      const list = bySeason.get(f.season_number) ?? [];
-      list.push(f);
-      bySeason.set(f.season_number, list);
-    }
-    return [...bySeason.entries()].sort((a, b) => a[0] - b[0]);
-  }, [files]);
-
   return (
     <section>
-      <h2 className="text-on-image mb-3 text-body-lg font-semibold tracking-[-0.01em] text-[var(--text)]">
+      <h2 className="mb-3 text-ui font-medium tracking-[-0.01em] text-[var(--text-muted)]">
         {title}{" "}
-        <span className="tnum text-ui font-normal text-[var(--text-muted)]">{files.length}</span>
+        <span className="tnum text-caption font-normal text-[var(--text-faint)]">
+          {files.length}
+        </span>
       </h2>
-      <div className="overflow-hidden rounded-2xl border border-white/[0.07] bg-[rgba(14,16,22,0.45)] backdrop-blur-xl">
-        {groups.map(([season, groupFiles]) => (
-          <div key={season}>
-            {!isMovie && groups.length > 1 && (
-              <p className="border-b border-white/[0.05] px-5 pb-2 pt-3.5 text-sub font-semibold text-[var(--text-muted)]">
-                {season === 0 ? "未归集" : `第 ${season} 季`} · {groupFiles.length} 个文件
-              </p>
-            )}
-            {groupFiles.map((file) => (
-              <FileRow
-                key={file.id}
-                file={file}
-                isMovie={isMovie}
-                onDelete={onDeleteFile ? () => onDeleteFile(file) : undefined}
-                onChanged={onChanged}
-              />
-            ))}
-          </div>
+      <div className="overflow-hidden rounded-xl border border-white/[0.04] bg-white/[0.015]">
+        {files.map((file) => (
+          <FileRow
+            key={file.id}
+            file={file}
+            onDelete={onDeleteFile ? () => onDeleteFile(file) : undefined}
+          />
         ))}
       </div>
-      <p className="mt-2 text-caption text-[var(--text-faint)]">
-        悬浮文件名可查看物理路径。规格探测自文件本体（ffprobe），不来自资源命名。
-      </p>
     </section>
   );
 }
 
 function FileRow({
   file,
-  isMovie,
   onDelete,
-  onChanged,
 }: {
   file: LibraryItemFile;
-  isMovie: boolean;
   onDelete?: () => void;
-  onChanged?: () => void;
 }) {
-  // 剧集行可展开看逐集完整规格（电影已有片源规格区，这里保持单行紧凑）
+  // 每个物理文件独立展开，多版本无需再维护额外的版本切换状态。
   const [expanded, setExpanded] = useState(false);
-  const badges = videoBadges(file).slice(0, 4);
-  const audioSummary =
-    file.audio_streams && file.audio_streams.length > 0
-      ? audioLabel(file.audio_streams[0]) +
-        (file.audio_streams.length > 1 ? ` 等 ${file.audio_streams.length} 轨` : "")
-      : null;
+  const pictureInfo = [
+    file.resolution ? formatVideoResolution(file.resolution) : null,
+    file.hdr,
+  ]
+    .filter((value): value is string => Boolean(value))
+    .join(" · ");
+  const codec = videoCodecLabel(file.video_codec);
+  const frameRate = frameRateLabel(file.frame_rate);
+  const bitRate = file.bit_rate
+    ? `${(file.bit_rate / 1_000_000).toFixed(1)} Mbps`
+    : "尚未探测";
+  const detailsId = `file-details-${file.id}`;
 
   return (
-    <div className="border-b border-white/[0.05] last:border-b-0">
-      <div
-        className={`group/filerow flex items-center gap-4 px-5 py-3 ${!isMovie ? "cursor-pointer hover:bg-white/[0.03]" : ""}`}
-        onClick={!isMovie ? () => setExpanded((v) => !v) : undefined}
-      >
-        <div className="min-w-0 flex-1">
+    <div className="border-b border-white/[0.035] last:border-b-0">
+      <div className="group/filerow flex items-center gap-2 px-4 py-2.5 transition-colors hover:bg-white/[0.025]">
+        <button
+          type="button"
+          aria-expanded={expanded}
+          aria-controls={detailsId}
+          onClick={() => setExpanded((value) => !value)}
+          className="flex min-w-0 flex-1 items-center gap-2.5 text-left text-[var(--text-muted)] outline-none transition-colors hover:text-[var(--text)] focus-visible:text-[var(--text)]"
+        >
+          <ChevronRightIcon
+            className={`size-3.5 shrink-0 transition-transform ${expanded ? "rotate-90" : ""}`}
+          />
           <Tooltip
             content={
               <span className="tnum break-all font-mono text-caption leading-5">
@@ -1400,54 +1554,66 @@ function FileRow({
             }
             maxWidth={520}
           >
-            <p className="truncate text-ui text-[var(--text)]">
-              {!isMovie && (file.episode_number > 0 || file.season_number > 0) && (
-                <span className="tnum mr-2 text-sub font-semibold text-[var(--accent-2)]">
-                  S{String(file.season_number).padStart(2, "0")}E
-                  {String(file.episode_number).padStart(2, "0")}
-                </span>
-              )}
-              {file.file_name}
-            </p>
+            <span className="min-w-0 truncate text-sub">{file.file_name}</span>
           </Tooltip>
-          <p className="mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-caption text-[var(--text-muted)]">
-            {badges.length > 0 && <span className="tnum">{badges.join(" · ")}</span>}
-            {audioSummary && <span className="tnum">{audioSummary}</span>}
-            {file.subtitle_streams.length > 0 && (
-              <span>{file.subtitle_streams.length} 条字幕</span>
-            )}
-          </p>
-        </div>
+        </button>
         {file.missing && (
-          <span className="shrink-0 rounded border border-[#f5c451]/40 px-1.5 py-px text-micro font-semibold text-[#f5c451]">
+          <span className="shrink-0 rounded border border-[#f5c451]/30 px-1.5 py-px text-micro text-[#f5c451]/80">
             文件缺失
           </span>
         )}
-        <span className="shrink-0 rounded border border-white/[0.14] px-1.5 py-px text-micro text-white/55">
-          {file.source === "imported" ? "入库管线" : "扫描发现"}
-        </span>
-        <span className="tnum w-20 shrink-0 text-right text-sub text-[var(--text-muted)]">
-          {formatBytes(file.size_bytes)}
-        </span>
-        <span className="tnum w-20 shrink-0 text-right text-caption text-[var(--text-faint)]">
-          {formatRelativeTime(file.added_at)}
-        </span>
-        {onDelete && <button
-          type="button"
-          aria-label="删除此文件"
-          title="删除此文件"
-          onClick={(e) => {
-            e.stopPropagation(); // 剧集行点击是展开规格，别让删除误触发展开
-            onDelete();
-          }}
-          className="touch-reveal shrink-0 rounded-md p-1.5 text-[var(--text-faint)] opacity-0 transition group-hover/filerow:opacity-100 hover:bg-white/[0.06] hover:text-[#ff9f9f]"
-        >
-          <TrashIcon className="size-4" />
-        </button>}
+        {onDelete && (
+          <button
+            type="button"
+            aria-label="删除此文件"
+            title="删除此文件"
+            onClick={onDelete}
+            className="touch-reveal shrink-0 rounded-md p-1.5 text-[var(--text-faint)] opacity-0 transition group-hover/filerow:opacity-100 hover:bg-white/[0.05] hover:text-[#ff9f9f]"
+          >
+            <TrashIcon className="size-4" />
+          </button>
+        )}
       </div>
-      {expanded && !isMovie && (
-        <div className="border-t border-white/[0.04] bg-white/[0.02] px-5 py-4">
-          <SpecRows file={file} onChanged={onChanged} />
+      {expanded && (
+        <div
+          id={detailsId}
+          className="border-t border-white/[0.035] bg-black/[0.08] px-10 py-4 max-md:px-4"
+        >
+          <dl className="grid max-w-2xl grid-cols-[72px_minmax(0,1fr)] gap-x-5 gap-y-3 text-sub max-md:grid-cols-[64px_minmax(0,1fr)]">
+            <dt className="text-[var(--text-faint)]">保存目录</dt>
+            <dd className="min-w-0 break-all font-mono text-caption leading-5 text-[var(--text-muted)]">
+              {fileDirectory(file.file_path)}
+            </dd>
+            <dt className="text-[var(--text-faint)]">入库时间</dt>
+            <dd className="tnum text-[var(--text-muted)]">
+              {formatDateTime(file.added_at)}
+              <span className="ml-2 text-[var(--text-faint)]">
+                · {formatRelativeTime(file.added_at)}
+              </span>
+            </dd>
+            <dt className="text-[var(--text-faint)]">文件尺寸</dt>
+            <dd className="tnum text-[var(--text-muted)]">{formatBytes(file.size_bytes)}</dd>
+            <dt className="text-[var(--text-faint)]">片源</dt>
+            <dd className="text-[var(--text-muted)]">{file.media_source || "未识别"}</dd>
+            <dt className="text-[var(--text-faint)]">画面规格</dt>
+            <dd className="tnum text-[var(--text-muted)]">
+              {pictureInfo || "未能探测（文件不可达或尚未扫描）"}
+            </dd>
+            <dt className="text-[var(--text-faint)]">视频编码</dt>
+            <dd className="tnum text-[var(--text-muted)]">{codec || "尚未探测"}</dd>
+            <dt className="text-[var(--text-faint)]">色深</dt>
+            <dd className="tnum text-[var(--text-muted)]">
+              {file.bit_depth ? `${file.bit_depth}-bit` : "尚未探测"}
+            </dd>
+            <dt className="text-[var(--text-faint)]">帧率</dt>
+            <dd className="tnum text-[var(--text-muted)]">{frameRate || "尚未探测"}</dd>
+            <dt className="text-[var(--text-faint)]">色彩空间</dt>
+            <dd className="tnum text-[var(--text-muted)]">
+              {file.color_space || "尚未探测"}
+            </dd>
+            <dt className="text-[var(--text-faint)]">视频码率</dt>
+            <dd className="tnum text-[var(--text-muted)]">{bitRate}</dd>
+          </dl>
         </div>
       )}
     </div>

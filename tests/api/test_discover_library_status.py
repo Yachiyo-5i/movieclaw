@@ -22,6 +22,7 @@ from movieclaw_media.models import (
     MediaDetail,
     MediaFacts,
     MediaKind,
+    MediaPersonDetail,
     MediaRow,
     MediaSource,
 )
@@ -289,6 +290,17 @@ class _TmdbDiscoverStub:
             related=[_card("7", kind=MediaKind.TV, title="示例剧集")],
         )
 
+    async def person_detail(self, tmdb_person_id: int) -> MediaPersonDetail:
+        return MediaPersonDetail(
+            tmdb_person_id=tmdb_person_id,
+            name="示例影人",
+            credits=[
+                _card("42"),
+                _card("7", kind=MediaKind.TV, title="示例剧集"),
+                _card("100", title="不在库作品"),
+            ],
+        )
+
 
 class _DoubanDiscoverStub:
     def layout(self, kind: MediaKind) -> DiscoverLayout:
@@ -352,6 +364,11 @@ def test_discover_endpoints_serialize_summary_and_detail_links(
     ]
     assert tmdb_detail["recommendations"][0]["library_status"]["media_item_id"] == ids["tv"]
     assert "library_links" not in tmdb_detail["recommendations"][0]
+
+    person = client.get("/api/v1/discover/people/9340").json()["data"]
+    assert person["titles"][0]["library_status"]["media_item_id"] == ids["movie"]
+    assert person["titles"][1]["library_status"]["media_item_id"] == ids["tv"]
+    assert person["titles"][2]["library_status"] is None
 
     douban_detail = client.get("/api/v1/discover/titles/douban:db-42").json()["data"]
     assert douban_detail["library_links"] == [

@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
@@ -35,6 +36,7 @@ from movieclaw_media.models import (
     MediaImage,
     MediaKind,
     MediaPage,
+    MediaPersonDetail,
     MediaRow,
     MediaSearchItem,
     MediaSource,
@@ -46,6 +48,7 @@ logger = logging.getLogger("movieclaw_media.service")
 _PAGE_TTL = 30 * 60
 _GENRE_TTL = 24 * 60 * 60
 _DETAIL_TTL = 6 * 60 * 60
+_PERSON_TTL = 6 * 60 * 60
 _SEARCH_TTL = 10 * 60
 # Hero 轮播的精选数量
 _HERO_COUNT = 6
@@ -535,6 +538,98 @@ class MediaDiscoverService:
         )
 
     # ------------------------------------------------------------------
+    # 影人作品
+    # ------------------------------------------------------------------
+
+    async def person_detail(self, tmdb_person_id: int) -> MediaPersonDetail:
+        """读取 TMDB 影人档案及完整 combined credits，缓存口径与条目详情一致。"""
+        return await self._cache.get_or_set(
+            f"person:{tmdb_person_id}",
+            _PERSON_TTL,
+            lambda: self._build_person_detail(tmdb_person_id),
+        )
+
+    async def _build_person_detail(self, tmdb_person_id: int) -> MediaPersonDetail:
+        """一次读取影人与全部作品；电影/剧集类型表并发补齐中文类型名。"""
+        data, movie_genres, tv_genres = await asyncio.gather(
+            self._client.get(
+                f"person/{tmdb_person_id}",
+                {
+                    "language": self._language,
+                    "append_to_response": "combined_credits",
+                },
+            ),
+            self._genre_map(MediaKind.MOVIE),
+            self._genre_map(MediaKind.TV),
+        )
+        name = (data.get("name") or "").strip()
+        if not name:
+            raise TmdbError("该影人在 TMDB 中缺少姓名，无法展示")
+
+        # 同一作品可能同时出现在 cast 与 crew，幕后也可能因多个 job 重复；
+        # 人物页回答“有哪些作品”，所以只按媒体类型 + TMDB ID 保留一张海报。
+        credits = data.get("combined_credits") or {}
+        cards: dict[tuple[MediaKind, str], tuple[str, MediaCard]] = {}
+        genre_maps = {MediaKind.MOVIE: movie_genres, MediaKind.TV: tv_genres}
+        for raw in [*(credits.get("cast") or []), *(credits.get("crew") or [])]:
+            mapped = self._person_credit_card(raw, genre_maps)
+            if mapped is None:
+                continue
+            release_date, card = mapped
+            key = (card.type, card.id)
+            existing = cards.get(key)
+            if existing is None or release_date > existing[0]:
+                cards[key] = (release_date, card)
+
+        ordered = [
+            card
+            for _release_date, card in sorted(
+                cards.values(),
+                key=lambda entry: (entry[0], entry[1].rating),
+                reverse=True,
+            )
+        ]
+        profile = data.get("profile_path")
+        return MediaPersonDetail(
+            tmdb_person_id=tmdb_person_id,
+            name=name,
+            avatar_url=f"{self._image_base}/w300{profile}" if profile else None,
+            credits=ordered,
+        )
+
+    def _person_credit_card(
+        self,
+        raw: dict[str, Any],
+        genre_maps: dict[MediaKind, dict[int, str]],
+    ) -> tuple[str, MediaCard] | None:
+        """combined credit → 海报卡；缺海报或日期仍保留，确保履历完整。"""
+        media_type = raw.get("media_type")
+        if media_type not in (MediaKind.MOVIE.value, MediaKind.TV.value):
+            return None
+        external_id = raw.get("id")
+        title = (raw.get("title") or raw.get("name") or "").strip()
+        if not external_id or not title:
+            return None
+
+        kind = MediaKind(media_type)
+        release_date = raw.get("release_date") or raw.get("first_air_date") or ""
+        poster = raw.get("poster_path")
+        backdrop = raw.get("backdrop_path")
+        genre_map = genre_maps[kind]
+        return release_date, MediaCard(
+            id=str(external_id),
+            type=kind,
+            title=title,
+            original_title=raw.get("original_title") or raw.get("original_name") or title,
+            year=int(release_date[:4]) if release_date[:4].isdigit() else 0,
+            rating=round(float(raw.get("vote_average") or 0), 1),
+            genres=[genre_map[g] for g in raw.get("genre_ids") or [] if g in genre_map][:3],
+            overview=(raw.get("overview") or "").strip(),
+            poster_url=f"{self._image_base}/w500{poster}" if poster else "",
+            backdrop_url=f"{self._image_base}/w1280{backdrop}" if backdrop else None,
+        )
+
+    # ------------------------------------------------------------------
     # 条目详情
     # ------------------------------------------------------------------
 
@@ -689,13 +784,40 @@ class MediaDiscoverService:
             )
         return members
 
+    def _director_credits(
+        self, data: dict[str, Any], kind: MediaKind
+    ) -> list[MediaCastMember]:
+        """把电影导演或剧集主创转换为结构化人物，供详情页合并进演职员条。"""
+        if kind is MediaKind.MOVIE:
+            people = [
+                person
+                for person in (data.get("credits") or {}).get("crew", [])
+                if person.get("job") == "Director"
+            ]
+        else:
+            people = data.get("created_by") or []
+
+        members: list[MediaCastMember] = []
+        for person in people[:3]:
+            name = (person.get("name") or "").strip()
+            if not name:
+                continue
+            profile = person.get("profile_path")
+            members.append(
+                MediaCastMember(
+                    name=name,
+                    avatar_url=f"{self._image_base}/w185{profile}" if profile else None,
+                    tmdb_person_id=person.get("id"),
+                )
+            )
+        return members
+
     def _facts(self, data: dict[str, Any], kind: MediaKind) -> MediaFacts:
         credits = data.get("credits") or {}
+        director_credits = self._director_credits(data, kind)
         if kind is MediaKind.MOVIE:
-            directors = [c["name"] for c in credits.get("crew", []) if c.get("job") == "Director"]
             country_codes = [c.get("iso_3166_1", "") for c in data.get("production_countries", [])]
         else:
-            directors = [c["name"] for c in data.get("created_by", [])]
             country_codes = data.get("origin_country") or [
                 c.get("iso_3166_1", "") for c in data.get("production_countries", [])
             ]
@@ -703,7 +825,8 @@ class MediaDiscoverService:
         networks = data.get("networks") or []
         original_language = data.get("original_language") or ""
         return MediaFacts(
-            directors=directors[:3],
+            directors=[person.name for person in director_credits],
+            director_credits=director_credits,
             cast=self._cast(credits),
             country=" / ".join(_COUNTRY_NAMES.get(c, c) for c in country_codes if c),
             language=_LANGUAGE_NAMES.get(original_language, original_language),

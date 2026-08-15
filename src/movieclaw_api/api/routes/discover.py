@@ -21,6 +21,7 @@ from movieclaw_api.exceptions import (
     UpstreamUnreachableException,
 )
 from movieclaw_api.schemas.discover import (
+    DiscoveredPersonDetailsView,
     DiscoveredTitleDetailsView,
     DiscoveryCollectionListView,
     DiscoveryCollectionTitlesView,
@@ -270,6 +271,26 @@ async def get_discovered_title_details(
     except ValueError as exc:
         raise BadRequestException(str(exc)) from exc
     except (TmdbError, DoubanError) as exc:
+        raise _translate(exc) from exc
+    return ok(result)
+
+
+@router.get(
+    "/people/{tmdb_person_id}",
+    response_model=ApiResponse[DiscoveredPersonDetailsView],
+    summary="获取 TMDB 影人的完整影视履历及本地状态",
+    operation_id="discover.get-person-details",
+    openapi_extra={"x-cli-hidden": True},
+)
+async def get_discovered_person_details(
+    tmdb_person_id: int,
+    service: TitleDiscoveryService = Depends(get_title_discovery_service),
+    projection: DiscoverLibraryProjectionService = Depends(get_projection),
+) -> ApiResponse[DiscoveredPersonDetailsView]:
+    """返回参演与幕后作品的去重全集；库存状态按当前主体可见媒体库投影。"""
+    try:
+        result = await service.get_person_details(tmdb_person_id, projection=projection)
+    except TmdbError as exc:
         raise _translate(exc) from exc
     return ok(result)
 

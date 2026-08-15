@@ -47,6 +47,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass, field, replace
 from enum import StrEnum
 from pathlib import Path
+from uuid import uuid4
 
 from sqlalchemy import or_
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -772,6 +773,9 @@ async def _scan(
         episodes_cache: dict[Path, int | None] = {}
         # 下载线索：手动下载提交时锚定的「条目目录 → 副标题」（拼音名种子的救赎）
         hints = await _load_hints(session)
+        # 一轮扫描里首次发现的所有文件共享批次号。已存在/回归的台账行不会
+        # 覆盖原批次，因此「最近添加」只描述真正的新入账，不把重扫冒充新增。
+        added_batch_id = uuid4().hex
 
         async def recover_failed_session() -> None:
             """单文件失败后的会话急救。失败若发生在半截事务里（如写台账时
@@ -971,6 +975,7 @@ async def _scan(
                     hint=_hint_for(file, hints),
                     existing=existing,
                     dir_names=dir_files.get(str(file.parent)),
+                    added_batch_id=added_batch_id,
                 )
             except Exception as exc:  # noqa: BLE001 -- 单文件失败不断整轮
                 await recover_failed_session()
@@ -1955,6 +1960,8 @@ async def _merge_same_file_rows(
         "bit_depth",
         "duration_seconds",
         "bit_rate",
+        "frame_rate",
+        "color_space",
         "audio_streams",
         "subtitle_streams",
         "external_subtitles",
@@ -2077,6 +2084,8 @@ async def _refresh_known_row(
                 row.bit_depth = spec.bit_depth
                 row.duration_seconds = spec.duration_seconds
                 row.bit_rate = spec.bit_rate
+                row.frame_rate = spec.frame_rate
+                row.color_space = spec.color_space
                 row.audio_streams = list(spec.audio_streams)
                 row.subtitle_streams = list(spec.subtitle_streams)
                 row.updated_at = utcnow()
@@ -2101,6 +2110,7 @@ async def _ingest_file(
     hint: _SubtitleHint | None = None,
     existing: LibraryFile | None = None,
     dir_names: list[str] | None = None,
+    added_batch_id: str,
 ) -> None:
     """把一个文件识别并写入台账。``existing`` 是该路径已有的台账行：
     在位但待识别 → 本次是识别重试；标记过 missing → 文件回归。"""
@@ -2217,12 +2227,15 @@ async def _ingest_file(
             bit_depth=spec.bit_depth if spec else None,
             duration_seconds=spec.duration_seconds if spec else None,
             bit_rate=spec.bit_rate if spec else None,
+            frame_rate=spec.frame_rate if spec else None,
+            color_space=spec.color_space if spec else None,
             audio_streams=list(spec.audio_streams) if spec else None,
             subtitle_streams=list(spec.subtitle_streams) if spec else None,
             external_subtitles=external_subtitles,
             media_source=attrs.media_source,
             release_group=attrs.release_group,
             source=FileSource.SCANNED,
+            added_batch_id=added_batch_id,
             unidentified_reason=None if item_id is not None else unidentified_reason,
             unidentified_code=None if item_id is not None else unidentified_code,
             unidentified_candidates=None if item_id is not None else (candidates or None),

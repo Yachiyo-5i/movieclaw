@@ -37,7 +37,12 @@ from sqlalchemy import and_, func, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
-from movieclaw_api.schemas.library import LibraryItemView, derive_air_status
+from movieclaw_api.schemas.library import (
+    LibraryInventorySummaryView,
+    LibraryItemView,
+    LibraryRecentAdditionView,
+    derive_air_status,
+)
 from movieclaw_api.services.library.bluray import (
     enrich_spec_with_clpi,
     read_clpi_languages,
@@ -53,7 +58,7 @@ from movieclaw_api.services.library.nfo import (
 from movieclaw_api.services.library.sort_key import title_initial, title_sort_key
 from movieclaw_api.services.media_probe import probe_media
 from movieclaw_api.services.media_scrape import asset_version, file_version
-from movieclaw_db.models import Library, LibraryFile, MediaItem, utcnow
+from movieclaw_db.models import Library, LibraryFile, MediaItem, MediaSeason, utcnow
 from movieclaw_db.repositories.library_repo import LibraryRepository
 from movieclaw_media.models import MediaKind
 
@@ -145,7 +150,7 @@ def _external_subtitles(video: Path) -> list[str]:
 
 
 class _FileFacts(NamedTuple):
-    """海报墙聚合用到的七个台账字段（顺序与查询列一致）。
+    """海报墙聚合用到的八个台账字段（顺序与查询列一致）。
 
     代码读起来与整行取时一模一样，只是不再拖着四十列（含三列 JSON）走。"""
 
@@ -155,8 +160,67 @@ class _FileFacts(NamedTuple):
     resolution: str | None
     missing_since: datetime | None
     created_at: datetime
+    added_batch_id: str | None
     # 尚未探出介质规格（audio_streams IS NULL 在 SQL 里算好，不取 JSON 本体）
     unprobed: bool
+
+
+def _build_inventory_summary(
+    units: set[tuple[int, int]],
+    season_episode_counts: dict[int, int | None],
+) -> LibraryInventorySummaryView | None:
+    """按本库在位单元与 TMDB 季结构计算 hover 完整度，不把“连续”猜成“全”。
+
+    正季与特别篇不混算：只要有正季，摘要就聚焦正季；只有 S00 时才展示
+    “特别篇”。季度完整表示已覆盖 TMDB 已知的所有正季，集数完整则要求
+    当前摘要覆盖的每一季都精确拥有 E01..EN。任何官方集数未知时都不写“全”。
+    """
+    regular_by_season: dict[int, set[int]] = {}
+    specials: set[int] = set()
+    for season_number, episode_number in units:
+        if episode_number <= 0:
+            continue
+        if season_number > 0:
+            regular_by_season.setdefault(season_number, set()).add(episode_number)
+        elif season_number == 0:
+            specials.add(episode_number)
+
+    if regular_by_season:
+        by_season = regular_by_season
+        season_count = len(by_season)
+        known_regular_seasons = {
+            season_number for season_number in season_episode_counts if season_number > 0
+        }
+        all_seasons_owned = bool(known_regular_seasons) and (
+            set(by_season) == known_regular_seasons
+        )
+    elif specials:
+        by_season = {0: specials}
+        season_count = 0
+        all_seasons_owned = False
+    else:
+        return None
+
+    total_episode_count: int | None = 0
+    all_episodes_owned = True
+    for season_number, episodes in by_season.items():
+        expected = season_episode_counts.get(season_number)
+        if expected is None or expected <= 0:
+            total_episode_count = None
+            all_episodes_owned = False
+            break
+        total_episode_count += expected
+        if episodes != set(range(1, expected + 1)):
+            all_episodes_owned = False
+
+    return LibraryInventorySummaryView(
+        season_count=season_count,
+        episode_count=sum(len(episodes) for episodes in by_season.values()),
+        season_number=next(iter(by_season)) if len(by_season) == 1 else None,
+        total_episode_count=total_episode_count,
+        all_seasons_owned=all_seasons_owned,
+        all_episodes_owned=all_episodes_owned,
+    )
 
 
 WallSort = Literal["title", "added_at", "probing"]
@@ -328,6 +392,7 @@ async def _aggregate_wall_views(
                 LibraryFile.resolution,
                 LibraryFile.missing_since,
                 LibraryFile.created_at,
+                LibraryFile.added_batch_id,
                 # strm 占位文件永远探不出规格，不算「待补探」
                 and_(
                     LibraryFile.audio_streams.is_(None),  # type: ignore[union-attr]
@@ -361,6 +426,21 @@ async def _aggregate_wall_views(
     tv_item_ids = [i for i, (item, _) in grouped.items() if item.kind == "tv"]
     aired_by_item = await MediaItemRepository(session).aired_units_many(tv_item_ids)
     owned_by_item = await LibraryFileRepository(session).owned_units_many(tv_item_ids)
+    # 季集完整度判定只取季号与官方集数：本地恰好覆盖 E01..EN 才能写「全 N 集」，
+    # 不能因为文件看起来连续就猜一季已经完整（在播季后面可能还有集）。保留
+    # episode_count=NULL 的季行：季度覆盖仍然可判断，但集数未知时不能声称“全”。
+    season_episode_counts_by_item: dict[int, dict[int, int | None]] = {}
+    season_rows = (
+        await session.execute(
+            select(
+                MediaSeason.media_item_id,
+                MediaSeason.season_number,
+                MediaSeason.episode_count,
+            ).where(MediaSeason.media_item_id.in_(tv_item_ids))  # type: ignore[attr-defined]
+        )
+    ).all()
+    for item_id, season_number, episode_count in season_rows:
+        season_episode_counts_by_item.setdefault(item_id, {})[season_number] = episode_count
 
     base = get_settings().tmdb_image_base_url.rstrip("/")
     # 海报优先本地刮削资产（断网可用），没有资产的回落 TMDB 图床
@@ -377,7 +457,50 @@ async def _aggregate_wall_views(
     }
     by_id: dict[int, LibraryItemView] = {}
     for item, files in grouped.values():
+        season_episode_counts = season_episode_counts_by_item.get(item.id, {})  # type: ignore[arg-type]
         units = {(f.season_number, f.episode_number) for f in files}
+        available_units = {
+            (f.season_number, f.episode_number) for f in files if f.missing_since is None
+        }
+        latest_file = max(files, key=lambda file: file.created_at)
+        recent_addition: LibraryRecentAdditionView | None = None
+        if item.kind == "tv" and latest_file.added_batch_id is not None:
+            recent_units = sorted(
+                {
+                    (file.season_number, file.episode_number)
+                    for file in files
+                    if file.added_batch_id == latest_file.added_batch_id
+                }
+            )
+            recent_by_season: dict[int, list[int]] = {}
+            for season_number, episode_number in recent_units:
+                recent_by_season.setdefault(season_number, []).append(episode_number)
+            single_season = (
+                next(iter(recent_by_season.items())) if len(recent_by_season) == 1 else None
+            )
+            if single_season is None:
+                season_number = first_episode = last_episode = None
+                complete_season = False
+            else:
+                season_number, episodes = single_season
+                first_episode, last_episode = episodes[0], episodes[-1]
+                consecutive = episodes == list(range(first_episode, last_episode + 1))
+                if not consecutive:
+                    first_episode = last_episode = None
+                expected = season_episode_counts.get(season_number)
+                complete_season = (
+                    expected is not None
+                    and expected > 0
+                    and episodes == list(range(1, expected + 1))
+                )
+            recent_addition = LibraryRecentAdditionView(
+                season_count=len(recent_by_season),
+                episode_count=len(recent_units),
+                season_number=season_number,
+                first_episode_number=first_episode,
+                last_episode_number=last_episode,
+                complete_season=complete_season,
+            )
         if item.kind == "tv":
             missing_episodes = len(
                 aired_by_item.get(item.id, set()) - owned_by_item.get(item.id, set())  # type: ignore[arg-type]
@@ -405,7 +528,13 @@ async def _aggregate_wall_views(
             missing_count=sum(1 for f in files if f.missing_since is not None),
             air_status=derive_air_status(item.status) if item.kind == "tv" else None,
             missing_episode_count=missing_episodes,
-            added_at=max(f.created_at for f in files),
+            added_at=latest_file.created_at,
+            recent_addition=recent_addition,
+            inventory_summary=(
+                _build_inventory_summary(available_units, season_episode_counts)
+                if item.kind == "tv"
+                else None
+            ),
             # 缺失文件不算「待补探」：文件都不在了，探不是「还没轮到」而是「探不了」
             probe_pending_count=sum(1 for f in files if f.unprobed and f.missing_since is None),
         )
@@ -890,7 +1019,7 @@ async def backfill_streams(
     on_processed: Callable[[], bool | Awaitable[bool]] | None = None,
     on_checkpoint: Callable[[], None | Awaitable[None]] | None = None,
 ) -> int:
-    """补齐没探过的流，并为存量 BDMV 回填 CLPI 语言；返回实际 ffprobe 数。
+    """补齐未探测的介质详情，并为存量 BDMV 回填 CLPI 语言；返回 ffprobe 数。
 
     这是「ffprobe 后装」和「旧 BDMV 尚未读取 CLPI」的统一补救路径——扫描对
     已识别且在位的行整体秒过，不会在主循环回头重探。**只由扫描的补探阶段
@@ -933,7 +1062,14 @@ async def backfill_streams(
         needs_clpi = row.container == "bluray" and not streams_have_clpi_metadata(
             row.audio_streams, row.subtitle_streams
         )
-        if (row.audio_streams is not None and not needs_clpi) or row.missing_since is not None:
+        # 新增帧率/色彩空间后，历史行两列同时为空时允许整库扫描补探一次。
+        # 正常视频至少能取得其中一项，避免个别元数据缺失的文件每轮重复 ffprobe。
+        needs_visual_details = row.frame_rate is None and row.color_space is None
+        if (
+            row.audio_streams is not None
+            and not needs_clpi
+            and not needs_visual_details
+        ) or row.missing_since is not None:
             if not await keep_going():
                 break
             continue
@@ -966,10 +1102,13 @@ async def backfill_streams(
             # 顺手回填缺失的视频规格（同一次探测的免费产出，不覆盖已有值）
             row.resolution = row.resolution or spec.resolution
             row.video_codec = row.video_codec or spec.video_codec
-            row.hdr = row.hdr or spec.hdr
+            # 新探测能把历史上笼统的 HDR10 细化成 Dolby Vision/HDR10+。
+            row.hdr = spec.hdr or row.hdr
             row.bit_depth = row.bit_depth or spec.bit_depth
             row.duration_seconds = row.duration_seconds or spec.duration_seconds
             row.bit_rate = row.bit_rate or spec.bit_rate
+            row.frame_rate = row.frame_rate or spec.frame_rate
+            row.color_space = row.color_space or spec.color_space
             if row.file_mtime_ns is None:
                 # 播放 ETag 用的 mtime 顺手回填（文件刚探测过，stat 是热的）
                 with contextlib.suppress(OSError):

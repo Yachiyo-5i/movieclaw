@@ -19,6 +19,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from movieclaw_api.schemas.discover import (
+    DiscoveredPersonDetailsView,
     DiscoveredTitleCollectionView,
     DiscoveredTitleDetailsView,
     DiscoveredTitleMetadata,
@@ -296,6 +297,23 @@ class TitleDiscoveryService:
             await projection.apply_detail(detail)
         return title_details_from_legacy(detail, provider=provider)
 
+    async def get_person_details(
+        self,
+        tmdb_person_id: int,
+        *,
+        projection: DiscoverLibraryProjectionService | None = None,
+    ) -> DiscoveredPersonDetailsView:
+        """读取 TMDB 影人的完整影视履历，并按当前主体可见库补齐库存状态。"""
+        detail = await self._tmdb_factory().person_detail(tmdb_person_id)
+        if projection is not None:
+            await projection.apply_cards(detail.credits)
+        return DiscoveredPersonDetailsView(
+            tmdb_person_id=detail.tmdb_person_id,
+            name=detail.name,
+            avatar_url=detail.avatar_url,
+            titles=[title_from_card(card) for card in detail.credits],
+        )
+
     def _provider(
         self, provider: MediaSource
     ) -> MediaDiscoverService | DoubanDiscoverService:
@@ -388,6 +406,7 @@ def title_details_from_legacy(
         title=title_from_card(detail.card, provider=provider),
         metadata=DiscoveredTitleMetadata(
             directors=facts.directors,
+            director_credits=facts.director_credits,
             cast=facts.cast,
             country=facts.country,
             language=facts.language,

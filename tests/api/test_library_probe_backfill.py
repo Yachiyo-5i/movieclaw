@@ -35,6 +35,8 @@ _SPEC = MediaSpec(
     bit_depth=10,
     duration_seconds=5400,
     bit_rate=8_000_000,
+    frame_rate=23.976,
+    color_space="BT.709",
     audio_streams=[{"codec": "eac3", "channels": 6, "language": "chi", "default": True}],
     subtitle_streams=[{"codec": "subrip", "language": "chi"}],
 )
@@ -334,6 +336,8 @@ async def test_backfill_enriches_existing_bluray_once_by_pid(db, tmp_path, monke
         bit_depth=8,
         duration_seconds=7200,
         bit_rate=20_000_000,
+        frame_rate=24.0,
+        color_space="BT.709",
         audio_streams=[{"codec": "truehd", "pid": 0x1100, "language": None}],
         subtitle_streams=[{"codec": "hdmv_pgs_subtitle", "pid": 0x1200, "language": None}],
     )

@@ -17,6 +17,7 @@ import { useRouter } from "next/navigation";
 import { Modal } from "@/components/modal";
 import { LlmCapabilityGate } from "@/components/llm-gate";
 import { Tooltip } from "@/components/tooltip";
+import { SparkIcon } from "@/components/icons";
 import { useAgentConversations } from "@/lib/agent-conversations";
 import type { LibraryItemFile } from "@/lib/api/libraries";
 import {
@@ -67,17 +68,18 @@ function isAiSubtitle(filename: string | null): boolean {
     .some((part) => part === "ai" || part.startsWith("ai-"));
 }
 
+// 发现页 Banner 主按钮的紧凑变体：保留胶囊比例与连续文案，但不撑高字幕规格行。
 const AI_BADGE_BASE =
-  "tnum inline-flex items-center gap-1.5 rounded-md border px-2 py-0.5 text-caption " +
-  "font-semibold transition disabled:pointer-events-none disabled:opacity-50";
-const AI_BADGE_IDLE =
-  "border-[#7dd3fc]/45 bg-[#7dd3fc]/[0.12] text-[#a9e2ff] hover:border-[#7dd3fc]/70 hover:bg-[#7dd3fc]/[0.2]";
+  "tnum inline-flex h-8 shrink-0 items-center gap-1.5 rounded-full px-3.5 text-sub " +
+  "font-semibold transition-[background-color,color,box-shadow] " +
+  "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent-ring)] " +
+  "disabled:pointer-events-none disabled:opacity-50";
+// 生成入口是真实操作按钮，使用主按钮银色与普通字幕类型标签拉开层级。
+const AI_BADGE_SILVER = "btn-accent";
 const AI_BADGE_RUNNING =
-  "border-[#7dd3fc]/50 bg-[#7dd3fc]/[0.16] text-[#b9e8ff] hover:bg-[#7dd3fc]/[0.22]";
-const AI_BADGE_DONE =
-  "border-[#4ade80]/35 bg-[#4ade80]/[0.1] text-[#7cf0a4] hover:bg-[#4ade80]/[0.16]";
+  "bg-[#7dd3fc]/[0.14] text-[#b9e8ff] hover:bg-[#7dd3fc]/[0.21] hover:shadow-[0_4px_12px_rgba(0,0,0,0.16)]";
 const AI_BADGE_FAILED =
-  "border-[#ff9f9f]/35 bg-[#ff9f9f]/[0.09] text-[#ffb4b4] hover:bg-[#ff9f9f]/[0.14]";
+  "bg-[#ff9f9f]/[0.08] text-[#ffb4b4] hover:bg-[#ff9f9f]/[0.14] hover:shadow-[0_4px_12px_rgba(0,0,0,0.16)]";
 const CANCEL_BUTTON =
   "rounded-lg border border-white/10 bg-white/[0.06] px-4 py-2 text-ui text-white/80 " +
   "transition hover:bg-white/[0.1] disabled:pointer-events-none disabled:opacity-40";
@@ -583,24 +585,23 @@ export function SubtitleGenPanel({
     !pgsConversion?.language_confirmation_required || Boolean(pgsOcrLanguage);
   const canConvertPgs = canPreparePgs && pgsLanguageReady;
 
-  let badgeClass = AI_BADGE_IDLE;
-  let badgeSuffix = generated || jobSucceeded ? "新建版本" : "生成";
+  let badgeClass = AI_BADGE_SILVER;
+  let badgeText = generated || jobSucceeded ? "新建 AI 版本" : "AI 生成";
   if (previewing) {
-    badgeSuffix = "正在检查";
+    badgeText = "正在检查";
   } else if (running) {
     badgeClass = AI_BADGE_RUNNING;
-    badgeSuffix = runningBadgeText(progress);
+    badgeText = runningBadgeText(progress);
   } else if (generated || jobSucceeded) {
-    badgeClass = AI_BADGE_DONE;
+    badgeClass = AI_BADGE_SILVER;
   } else if (hasTerminalIssue) {
     badgeClass = AI_BADGE_FAILED;
-    badgeSuffix = "AI 未完成";
+    badgeText = "AI 未完成";
   }
   const runningTarget = progress?.target_language || targetLanguage;
   const runningSecondary = progress?.secondary_language ?? null;
   const activeOutputLabel = outputLabel(runningTarget, runningSecondary);
-  const badgeMain = running ? activeOutputLabel : "AI 字幕";
-  const badgeLabel = `${badgeMain} · ${badgeSuffix}`;
+  const badgeLabel = running ? `${activeOutputLabel} · ${badgeText}` : badgeText;
 
   const runningTooltip = running && progress ? <ProgressDetails progress={progress} compact /> : null;
 
@@ -612,11 +613,12 @@ export function SubtitleGenPanel({
       aria-label={running ? `${badgeLabel}，${progress?.message || "正在运行"}` : badgeLabel}
       onClick={openAction}
     >
-      {running && <span className="size-1.5 animate-pulse rounded-full bg-current" />}
-      <span>{badgeMain}</span>
-      <span className="rounded-sm border border-white/20 bg-white/[0.07] px-1 text-micro leading-4">
-        {badgeSuffix}
-      </span>
+      {running ? (
+        <span className="size-1.5 animate-pulse rounded-full bg-current" />
+      ) : (
+        <SparkIcon className="size-3.5" />
+      )}
+      <span>{badgeLabel}</span>
     </button>
   );
 

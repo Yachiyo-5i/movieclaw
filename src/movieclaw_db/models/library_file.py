@@ -145,6 +145,11 @@ class LibraryFile(TimestampMixin, table=True):
     bit_depth: int | None = Field(default=None, description="位深：8/10/12")
     duration_seconds: int | None = Field(default=None, description="时长（秒）")
     bit_rate: int | None = Field(default=None, description="总码率（bps）")
+    frame_rate: float | None = Field(default=None, description="视频帧率（fps）")
+    color_space: str | None = Field(
+        default=None,
+        description="用户可识别的色彩空间：BT.2020/BT.709/Display P3/…",
+    )
     # 音轨/内封字幕轨（ffprobe 全量流信息，条目详情页展示）。
     # 三态：NULL=未探测（旧数据/探测失败，详情页按需补探），[]=探测过但没有该类流。
     # 元素结构见 media_probe 的 _audio_stream_info / _subtitle_stream_info
@@ -177,6 +182,13 @@ class LibraryFile(TimestampMixin, table=True):
     source: str = Field(index=True, description="imported（入库管线）/ scanned（存量扫描）")
     site_id: str | None = Field(default=None, description="入库来源站点；scanned 为 NULL")
     torrent_id: str | None = Field(default=None, description="入库来源种子；scanned 为 NULL")
+    # 同一次监听入库或存量扫描新发现的文件共享批次号。「最近添加」据此只展示
+    # 让条目本次置顶的季集变化，而不是把条目名下全部历史库存误写成新增内容。
+    # NULL 是迁移前旧台账；旧应用回退后新增的行也自然落 NULL，由界面退回时间。
+    added_batch_id: str | None = Field(
+        default=None,
+        description="首次入账批次；NULL=旧数据或旧版本写入",
+    )
 
     missing_since: datetime | None = Field(
         default=None, description="对账发现文件消失的时间；NULL=在位"
