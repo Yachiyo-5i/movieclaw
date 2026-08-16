@@ -526,6 +526,7 @@ export function LibraryView() {
               moreLabel="查看全部"
               cardAction="none"
               cardHref={hrefOf}
+              cardRevealInfoOnTouch
             />
           ))}
         </div>
