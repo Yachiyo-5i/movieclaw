@@ -108,10 +108,11 @@ def build_lifespan(settings: Settings):
 
         await rebuild_agent_session_index()
         # 扩充属性重算：提取器升级（ENRICH_VERSION +1）后，把存量种子行按新
-        # 逻辑重算——纯本地推导秒级完成，失败不阻断启动（内部自吞异常）
-        from movieclaw_api.services.enrich_backfill import reenrich_stale_torrents
+        # 逻辑重算。enrich 含 NER 推理，大库重算可达分钟级——排成后台任务，
+        # 不占启动就绪窗口（硬约束与并发权衡见 enrich_backfill 模块注释）
+        from movieclaw_api.services.enrich_backfill import start_enrich_backfill
 
-        await reenrich_stale_torrents()
+        start_enrich_backfill()
         # 旧版更新提醒清场：更新提醒曾写进「待处理事项」，现已改为侧栏常驻徽标，
         # 存量告警行再无任何路径去消退它，会永远挂在告警面板上（见函数注释）
         from movieclaw_api.services.app_update import (
@@ -161,8 +162,8 @@ def build_lifespan(settings: Settings):
         from movieclaw_api.services.library.watch import init_library_watcher
 
         await init_library_watcher()
-        # 下载监听导入：监听目录文件事件 → 去抖 → 完成检测 → 硬链/复制入库；
-        # 同样在 watchdog 缺失时降级为仅兜底巡检
+        # 下载监听导入：监听目录文件事件 → 去抖 → 完成检测 → 创建持久化 Job；
+        # 同样在 watchdog 缺失时降级为仅兜底巡检，实际搬运由 Job 执行器恢复。
         from movieclaw_api.services.library.ingest import init_ingest_watcher
 
         await init_ingest_watcher()
@@ -180,6 +181,19 @@ def build_lifespan(settings: Settings):
         from movieclaw_jellyfin.udp import start_discovery
 
         await start_discovery(settings.jellyfin_public_port)
+        # 持久化 Job 在所有业务依赖就绪后启动。先导入各领域模块完成处理器
+        # 注册；从此 API、CLI、前端共享数据库里的同一状态源。显式 import
+        # 不能依赖“某条路由碰巧加载过模块”，否则升级后恢复中的任务可能因
+        # 路由拆分而找不到 handler。
+        from movieclaw_api.services import media_scrape as media_scrape_jobs  # noqa: F401
+        from movieclaw_api.services.jobs import init_job_dispatcher
+        from movieclaw_api.services.library import ingest as ingest_jobs  # noqa: F401
+        from movieclaw_api.services.library import organize as organize_jobs  # noqa: F401
+        from movieclaw_api.services.library import scan as scan_jobs  # noqa: F401
+        from movieclaw_api.services.library import transfer as transfer_jobs  # noqa: F401
+        from movieclaw_api.services.subtitle_gen import tasks as subtitle_tasks  # noqa: F401
+
+        await init_job_dispatcher()
         logger.info("应用启动完成，数据库就绪")
         try:
             yield
@@ -200,8 +214,17 @@ def build_lifespan(settings: Settings):
             from movieclaw_api.services.im_channel import close_im_channels
 
             await close_im_channels()
+            # 持久化任务先在安全边界暂停并退回数据库队列，必须早于 LLM 与
+            # 数据库释放；下次启动会由租约与领域检查点直接继续。
+            from movieclaw_api.services.jobs import close_job_dispatcher
+
+            await close_job_dispatcher()
             # 先停止 Agent，避免它在下游 HTTP 客户端和数据库开始释放后继续工作。
             await close_agent_run_registry()
+            # 取消后台的扩充属性重算（须在数据库释放前；已提交批次保留，下次续算）
+            from movieclaw_api.services.enrich_backfill import close_enrich_backfill
+
+            await close_enrich_backfill()
             if settings.scheduler_enabled:
                 from movieclaw_api.services.app_update import close_startup_check
 

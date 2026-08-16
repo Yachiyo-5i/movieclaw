@@ -50,6 +50,14 @@ class TorrentAttrs(BaseModel):
 
     # -- 音频与发布 ---------------------------------------------------------
     audio: list[str] = []              # 音频编码：TrueHD / Atmos / DTS-HD MA / DDP ...
-    # 字幕语言用 BCP 47 标签；只记录标题/副标题明确声明的语言，泛称「中字」不猜简繁
-    subtitle_languages: list[str] = []  # 当前识别 zh-Hans（简体中文）
+    # 字幕语言用 BCP 47 标签；只记录标题/副标题明确声明的语言，泛称「中字」不猜简繁。
+    # 模型通道（torrent-ner v2+ 的 SUBTITLE/AUDIO span + lang_decl 微解析）覆盖
+    # 完整语言集；旧模型部署下回落正则通道（仅 zh-Hans）
+    subtitle_languages: list[str] = []
+    # 字幕载体：embedded（内封/软）/ hardcoded（内嵌/硬）/ external（外挂）。
+    # 仅模型通道产出；正则回落路径下保持空
+    subtitle_carriers: list[str] = []
+    # 音轨语言（BCP 47：cmn=国语/普通话、yue=粤语…），含配音与原声语言声明。
+    # 仅模型通道产出
+    audio_languages: list[str] = []
     release_group: str | None = None   # 压制组/发布组

@@ -32,6 +32,7 @@ from movieclaw_db.models import (
     MediaSeason,
     Person,
 )
+from movieclaw_db.repositories.library_repo import LibraryRepository
 
 
 @pytest.fixture
@@ -244,6 +245,7 @@ def seeded(tmp_path: Path, media_root: Path, monkeypatch) -> dict:
                 ]
             )
             await session.commit()
+            await LibraryRepository(session).refresh_stats([movie_lib.id, tv_lib.id])
             ids.update(
                 {
                     "movie_lib": movie_lib.id,

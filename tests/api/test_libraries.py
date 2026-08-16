@@ -7,6 +7,8 @@
 
 from __future__ import annotations
 
+import sqlite3
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -20,14 +22,22 @@ def client(tmp_path, monkeypatch):
     # 每个测试用独立临时 SQLite 库
     monkeypatch.setenv("DATABASE_URL", f"sqlite+aiosqlite:///{tmp_path / 'test.db'}")
     monkeypatch.setenv("SECRET_KEY_FILE", str(tmp_path / ".secret_key"))
+    monkeypatch.setenv("SCHEDULER_ENABLED", "false")
     get_settings.cache_clear()
 
     from movieclaw_api.api.deps import require_login
+    from movieclaw_api.api.routes import libraries as library_routes
     from movieclaw_api.app import create_app
+    from movieclaw_api.services.auth import Principal
+
+    async def skip_initial_scan(*_args, **_kwargs) -> None:  # noqa: ANN002, ANN003
+        """配置接口用例不执行异步扫描；扫描与持久作业由各自专项测试覆盖。"""
+
+    monkeypatch.setattr(library_routes, "enqueue_scan_job", skip_initial_scan)
 
     app = create_app()
     # 本文件只测媒体库业务，登录鉴权用依赖覆盖绕过（鉴权本身在 test_auth 覆盖）
-    app.dependency_overrides[require_login] = lambda: "tester"
+    app.dependency_overrides[require_login] = lambda: Principal(kind="admin", name="tester")
     with TestClient(app) as c:  # with 块内触发 lifespan：迁移
         yield c
     get_settings.cache_clear()
@@ -35,9 +45,7 @@ def client(tmp_path, monkeypatch):
 
 def _create(client, *, name: str, kind: str, root: str) -> dict:
     """建库辅助：POST /libraries 并返回创建的库视图（断言 200）。"""
-    r = client.post(
-        "/api/v1/libraries", json={"name": name, "kind": kind, "root_paths": [root]}
-    )
+    r = client.post("/api/v1/libraries", json={"name": name, "kind": kind, "root_paths": [root]})
     assert r.status_code == 200
     return r.json()["data"]
 
@@ -50,6 +58,35 @@ def _create(client, *, name: str, kind: str, root: str) -> dict:
 def test_first_start_has_no_libraries(client) -> None:
     # 系统不预置任何默认库：首次部署库表为空，由前端空态引导用户创建
     assert client.get("/api/v1/libraries").json()["data"] == []
+
+
+def test_list_reads_precomputed_stats_without_inventory_rows(client, tmp_path) -> None:
+    """列表统计来自 library 快照，而不是请求时重新扫描 library_file。"""
+    library = _create(client, name="电影库", kind="movie", root="/media/movies")
+    with sqlite3.connect(tmp_path / "test.db") as connection:
+        connection.execute(
+            """
+            UPDATE library
+            SET stats_item_count = 12,
+                stats_file_count = 15,
+                stats_total_size_bytes = 1099511627776,
+                stats_unidentified_count = 2,
+                stats_missing_count = 3,
+                stats_ignored_count = 1
+            WHERE id = ?
+            """,
+            (library["id"],),
+        )
+
+    rows = client.get("/api/v1/libraries").json()["data"]
+    assert rows[0]["stats"] == {
+        "item_count": 12,
+        "file_count": 15,
+        "total_size_bytes": 1099511627776,
+        "unidentified_count": 2,
+        "missing_count": 3,
+        "ignored_count": 1,
+    }
 
 
 def test_scanning_response_always_carries_phase(client) -> None:
@@ -78,7 +115,7 @@ def test_second_library_not_default_until_set(client) -> None:
     anime = _create(client, name="动漫库", kind="tv", root="/media/anime")
     assert anime["is_default"] is False  # 该 kind 已有默认（先建的剧集库）
 
-    r = client.post(f"/api/v1/libraries/{anime['id']}/default")
+    r = client.post(f"/api/v1/libraries/{anime['id']}/default-selection")
     assert r.json()["data"]["is_default"] is True
     rows = client.get("/api/v1/libraries", params={"kind": "tv"}).json()["data"]
     defaults = [x for x in rows if x["is_default"]]
@@ -153,7 +190,7 @@ def test_root_overlap_update_excludes_self(client) -> None:
         f"/api/v1/libraries/{lib['id']}",
         json={"name": "综艺", "kind": "tv", "root_paths": ["/media/综艺剧集", "/mnt/综艺"]},
     )
-    assert r.status_code == 200
+    assert r.status_code == 200, r.text
     # 改成盖住别的库的根：拒绝
     r = client.put(
         f"/api/v1/libraries/{lib['id']}",
@@ -178,11 +215,124 @@ def test_update_name_and_paths(client) -> None:
     assert data["root_paths"] == ["/media/movies", "/mnt/disk2/movies"]
 
 
+def test_update_root_scan_receives_previous_roots(client, monkeypatch) -> None:
+    """改根的持久扫描作业必须带上修改前根列表，不能从历史台账反推。"""
+    from movieclaw_api.api.routes import libraries as library_routes
+
+    calls: list[tuple[int, str, dict]] = []
+
+    async def fake_enqueue(_session, library_id: int, library_name: str, **kwargs) -> None:  # noqa: ANN003
+        calls.append((library_id, library_name, kwargs))
+
+    monkeypatch.setattr(library_routes, "enqueue_scan_job", fake_enqueue)
+    library_id = _create(client, name="电影库", kind="movie", root="/media/movies")["id"]
+    calls.clear()  # 建库本身也会排一次普通扫描
+
+    response = client.put(
+        f"/api/v1/libraries/{library_id}",
+        json={
+            "name": "电影库",
+            "kind": "movie",
+            "root_paths": ["/mnt/movies"],
+        },
+    )
+
+    assert response.status_code == 200
+    assert calls == [
+        (
+            library_id,
+            "电影库",
+            {
+                "origin": "web",
+                "reconcile_root_change": True,
+                "previous_root_paths": ["/media/movies"],
+            },
+        )
+    ]
+
+
+def test_path_reconcile_preview_and_start_require_removed_and_current_roots(
+    client, monkeypatch
+) -> None:
+    """历史修复先只读预览，确认后才创建带旧/新根范围的扫描作业。"""
+    from movieclaw_api.api.routes import libraries as library_routes
+    from movieclaw_api.services.library.scan import RootPathReconcilePreview
+
+    library_id = _create(client, name="电影库", kind="movie", root="/media/movies")["id"]
+    preview_calls: list[tuple[int, str, str]] = []
+    enqueue_calls: list[tuple[int, str, dict]] = []
+
+    async def fake_preview(session, library, *, old_root: str, new_root: str):  # noqa: ANN001
+        del session
+        preview_calls.append((library.id, old_root, new_root))
+        return RootPathReconcilePreview(
+            library_id=library.id,
+            old_root=old_root,
+            new_root=new_root,
+            same_path_candidates=3,
+            safe_merges=2,
+            marked_missing=1,
+            old_rows_to_delete_from_ledger=2,
+        )
+
+    class Created:
+        created = True
+
+        class job:
+            id = "path-reconcile-job"
+
+    async def fake_enqueue(_session, library_id: int, library_name: str, **kwargs) -> Created:  # noqa: ANN003
+        enqueue_calls.append((library_id, library_name, kwargs))
+        return Created()
+
+    async def fake_assert_not_busy(_session, _library_name: str, _library_id: int) -> None:  # noqa: ANN001
+        # 建库会自动排入一条普通扫描；这里隔离它，专项只验证修复入口本身
+        # 会走同一个锁检查（生产中不会绕过）。
+        return None
+
+    monkeypatch.setattr(library_routes, "preview_root_path_reconcile", fake_preview)
+    monkeypatch.setattr(library_routes, "enqueue_scan_job", fake_enqueue)
+    monkeypatch.setattr(library_routes, "_assert_not_busy", fake_assert_not_busy)
+    payload = {"old_root": "/strm/movies/", "new_root": "/media/movies/"}
+
+    preview = client.post(
+        f"/api/v1/libraries/{library_id}/path-reconciliation-preview", json=payload
+    )
+    assert preview.status_code == 200
+    assert preview.json()["data"]["safe_merges"] == 2
+    assert preview.json()["data"]["disk_files_to_delete"] == 0
+    assert preview_calls == [(library_id, "/strm/movies", "/media/movies")]
+
+    started = client.post(f"/api/v1/libraries/{library_id}/path-reconciliations", json=payload)
+    assert started.status_code == 202
+    assert started.json()["data"]["job_id"] == "path-reconcile-job"
+    assert enqueue_calls == [
+        (
+            library_id,
+            "电影库",
+            {
+                "origin": "web",
+                "reconcile_root_change": True,
+                "previous_root_paths": ["/strm/movies"],
+                "reconcile_new_root_paths": ["/media/movies"],
+            },
+        )
+    ]
+
+    invalid = client.post(
+        f"/api/v1/libraries/{library_id}/path-reconciliation-preview",
+        json={"old_root": "/media/movies", "new_root": "/media/movies"},
+    )
+    assert invalid.status_code == 400
+    assert "仍在当前媒体库配置" in invalid.json()["message"]
+
+
 def test_delete_default_hands_over_within_kind(client) -> None:
     tv_default = _create(client, name="剧集库", kind="tv", root="/media/tv")
     anime = _create(client, name="动漫库", kind="tv", root="/media/anime")
     assert tv_default["is_default"] is True and anime["is_default"] is False
-    assert client.delete(f"/api/v1/libraries/{tv_default['id']}").status_code == 200
+    deleted = client.delete(f"/api/v1/libraries/{tv_default['id']}")
+    assert deleted.status_code == 200, deleted.text
     rows = client.get("/api/v1/libraries", params={"kind": "tv"}).json()["data"]
     assert [x["id"] for x in rows] == [anime["id"]]
     assert rows[0]["is_default"] is True  # 默认交接给同 kind 剩下的库
@@ -203,7 +353,8 @@ def test_reorder_changes_list_order_and_new_library_goes_last(client) -> None:
     assert ids == [a["id"], b["id"], c["id"]]  # 未排过序时保持创建顺序
 
     r = client.put(
-        "/api/v1/libraries/order", json={"ordered_ids": [c["id"], a["id"], b["id"]]}
+        "/api/v1/libraries/display-order",
+        json={"ordered_ids": [c["id"], a["id"], b["id"]]},
     )
     assert r.status_code == 200
     ids = [x["id"] for x in client.get("/api/v1/libraries").json()["data"]]
@@ -218,7 +369,9 @@ def test_reorder_rejects_partial_duplicate_or_unknown_ids(client) -> None:
     """排序列表必须与现存库集合完全一致：漏库/重复/不存在的 id 都拒绝。"""
     a = _create(client, name="电影库", kind="movie", root="/media/movies")
     b = _create(client, name="剧集库", kind="tv", root="/media/tv")
-    put = lambda ids: client.put("/api/v1/libraries/order", json={"ordered_ids": ids})  # noqa: E731
+    put = lambda ids: client.put(  # noqa: E731
+        "/api/v1/libraries/display-order", json={"ordered_ids": ids}
+    )
     assert put([a["id"]]).status_code == 400  # 漏库
     assert put([a["id"], a["id"], b["id"]]).status_code == 400  # 重复
     assert put([a["id"], b["id"], 99999]).status_code == 400  # 不存在

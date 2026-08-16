@@ -1,4 +1,5 @@
 import { publicEnv } from "@/lib/env";
+import { clearBackdropCache } from "@/lib/backdrop-cache";
 
 export class HttpError extends Error {
   status: number;
@@ -60,6 +61,7 @@ export function redirectToLoginOn401(status: number): void {
     const path = window.location.pathname;
     if (path !== "/login" && path !== "/setup") {
       const next = encodeURIComponent(path + window.location.search);
+      clearBackdropCache();
       window.location.href = `/login?next=${next}`;
     }
   }

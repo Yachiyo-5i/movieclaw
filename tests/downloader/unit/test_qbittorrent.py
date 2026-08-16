@@ -14,6 +14,7 @@ from movieclaw_downloader.clients.qbittorrent import QBittorrentDownloader
 from movieclaw_downloader.exceptions import (
     DownloaderAuthError,
     DownloaderConnectError,
+    DownloaderDeleteError,
     DownloaderSubmitError,
 )
 from movieclaw_downloader.models import DownloaderConfig, DownloaderType, DownloadRequest
@@ -39,12 +40,16 @@ class FakeQbtClient:
 
     def __init__(self, add_response: str = "Ok."):
         self.store: dict[str, SimpleNamespace] = {}
+        self.files: dict[str, list[SimpleNamespace]] = {}
         self.add_response = add_response
         self.add_calls: list[dict] = []
+        self.delete_calls: list[dict] = []
         # 添加成功后自动登记到 store 的 (hash, name)，模拟下载器注册行为
         self.register_on_add: tuple[str, str] | None = (TORRENT_HASH, "test.mkv")
 
     def torrents_info(self, torrent_hashes=None):
+        if torrent_hashes is None:
+            return list(self.store.values())
         found = self.store.get(torrent_hashes)
         return [found] if found else []
 
@@ -54,6 +59,13 @@ class FakeQbtClient:
             info_hash, name = self.register_on_add
             self.store[info_hash] = SimpleNamespace(hash=info_hash, name=name)
         return self.add_response
+
+    def torrents_delete(self, **kwargs):
+        self.delete_calls.append(kwargs)
+        self.store.pop(kwargs["torrent_hashes"], None)
+
+    def torrents_files(self, *, torrent_hash):
+        return self.files.get(torrent_hash, [])
 
     def auth_log_in(self):
         pass
@@ -156,3 +168,87 @@ class TestConnection:
 
         with pytest.raises(DownloaderAuthError):
             await downloader.test_connection()
+
+
+class TestDeleteTorrent:
+    async def test_delete_keeps_downloaded_files_by_default(self):
+        fake = FakeQbtClient()
+
+        await make_downloader(fake).delete_torrent(TORRENT_HASH)
+
+        assert fake.delete_calls == [
+            {"torrent_hashes": TORRENT_HASH, "delete_files": False}
+        ]
+
+    async def test_delete_can_remove_downloaded_files(self):
+        fake = FakeQbtClient()
+
+        await make_downloader(fake).delete_torrent(TORRENT_HASH, delete_files=True)
+
+        assert fake.delete_calls == [
+            {"torrent_hashes": TORRENT_HASH, "delete_files": True}
+        ]
+
+    async def test_delete_error_translated(self):
+        fake = FakeQbtClient()
+
+        def raise_api(**kwargs):
+            raise qbittorrentapi.APIError("boom")
+
+        fake.torrents_delete = raise_api
+
+        with pytest.raises(DownloaderDeleteError, match="删除 qBittorrent 任务失败"):
+            await make_downloader(fake).delete_torrent(TORRENT_HASH)
+
+
+class TestListTorrents:
+    async def test_list_includes_task_center_progress_snapshot(self):
+        fake = FakeQbtClient()
+        fake.store[TORRENT_HASH] = SimpleNamespace(
+            hash=TORRENT_HASH,
+            name="Task.Center.Show",
+            content_path="/downloads/Task.Center.Show",
+            progress=0.42,
+            size=4096,
+            dlspeed=1024,
+            eta=120,
+            state="downloading",
+        )
+
+        rows = await make_downloader(fake).list_torrents()
+
+        assert rows[0].content_name == "Task.Center.Show"
+        assert rows[0].progress == 0.42
+        assert rows[0].dlspeed_bytes == 1024
+        assert rows[0].eta_seconds == 120
+        assert rows[0].state == "downloading"
+
+
+class TestGetTorrent:
+    async def test_file_snapshot_keeps_completed_bytes_and_selection(self):
+        fake = FakeQbtClient()
+        fake.store[TORRENT_HASH] = SimpleNamespace(
+            hash=TORRENT_HASH,
+            name="Partial.Show",
+            progress=0.5,
+            completed=150,
+            downloaded=80,
+            save_path="/downloads/tv",
+            size=300,
+            dlspeed=100,
+            eta=60,
+            state="downloading",
+        )
+        fake.files[TORRENT_HASH] = [
+            SimpleNamespace(name="Partial.Show/ep1.mkv", size=100, progress=1.0, priority=1),
+            SimpleNamespace(name="Partial.Show/ep2.mkv", size=200, progress=0.25, priority=1),
+            SimpleNamespace(name="Partial.Show/sample.mkv", size=20, progress=0.0, priority=0),
+        ]
+
+        status = await make_downloader(fake).get_torrent(TORRENT_HASH)
+
+        assert status is not None
+        assert status.completed_bytes == 150
+        assert status.downloaded_bytes == 80
+        assert [file.completed_bytes for file in status.files] == [100, 50, 0]
+        assert [file.selected for file in status.files] == [True, True, False]

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import re
+import shutil
 from pathlib import Path
 from uuid import uuid4
 
@@ -24,10 +25,11 @@ _EXT_CONTENT_TYPE: dict[str, str] = {ext: ct for ct, ext in _CONTENT_TYPE_EXT.it
 # ---------------------------------------------------------------------------
 # 存储模型：背景图「图库」
 #
-# 用户上传的背景图全部保留在 media_dir/backdrops/ 下，文件名 <id>.<ext>，
-# id 为 uuid4 的 32 位十六进制——同时充当对外的资源 id 与防路径穿越的白名单格式。
-# 「当前生效哪张」记录在图库目录下的 .active 纯文本标记文件里（内容就是 id）；
-# 标记不存在（或指向已删除的图）即表示使用内置默认背景。
+# 管理员上传的背景图保留在 media_dir/backdrops/；成员使用
+# media_dir/backdrops/members/<member_id>/。每个作用域里的文件名都是
+# <id>.<ext>，id 为 uuid4 的 32 位十六进制，同时充当资源 id 与防路径穿越
+# 的白名单格式。「当前生效哪张」记录在各自图库目录下的 .active 标记文件里；
+# 标记不存在（或指向已删除的图）即表示该账号使用内置默认背景。
 # 不引入数据库表：图库本身就是文件，标记文件与图同目录，Docker 卷一起持久化。
 # ---------------------------------------------------------------------------
 
@@ -52,12 +54,14 @@ def _media_dir() -> Path:
     return Path(get_settings().media_dir)
 
 
-def _gallery_dir() -> Path:
-    return _media_dir() / _GALLERY_DIR
+def _gallery_dir(member_id: int | None = None) -> Path:
+    """返回指定主体的图库目录；None 表示管理员沿用既有全局目录。"""
+    gallery = _media_dir() / _GALLERY_DIR
+    return gallery if member_id is None else gallery / "members" / str(member_id)
 
 
-def _marker_path() -> Path:
-    return _gallery_dir() / _ACTIVE_MARKER
+def _marker_path(member_id: int | None = None) -> Path:
+    return _gallery_dir(member_id) / _ACTIVE_MARKER
 
 
 def is_supported_content_type(content_type: str | None) -> bool:
@@ -75,12 +79,15 @@ def content_type_for(path: Path) -> str:
     return _EXT_CONTENT_TYPE.get(path.suffix.lower(), "application/octet-stream")
 
 
-def _migrate_legacy() -> None:
+def _migrate_legacy(member_id: int | None = None) -> None:
     """把旧版单槽位的 media_dir/backdrop.* 迁移进图库并设为当前生效图。
 
     旧版同一时刻只保留一张、且上传即生效，语义上等价于「图库里唯一一张 + 生效」。
     迁移是幂等的：旧文件搬走后不会再次触发。
     """
+    # 旧版背景属于管理员全局配置，成员个人目录绝不能触发或接管它。
+    if member_id is not None:
+        return
     media = _media_dir()
     if not media.is_dir():
         return
@@ -96,9 +103,9 @@ def _migrate_legacy() -> None:
         logger.info("已将旧版单张背景图迁移进图库：%s", target)
 
 
-def _write_active(backdrop_id: str | None) -> None:
+def _write_active(backdrop_id: str | None, member_id: int | None = None) -> None:
     """写入/清除生效标记。传 None 表示恢复内置默认背景。"""
-    marker = _marker_path()
+    marker = _marker_path(member_id)
     if backdrop_id is None:
         marker.unlink(missing_ok=True)
         return
@@ -106,11 +113,11 @@ def _write_active(backdrop_id: str | None) -> None:
     marker.write_text(backdrop_id, encoding="utf-8")
 
 
-def _find(backdrop_id: str) -> Path | None:
+def _find(backdrop_id: str, member_id: int | None = None) -> Path | None:
     """在图库中按 id 定位图片文件（不触发旧版迁移的内部版本）。"""
     if not is_valid_id(backdrop_id):
         return None
-    gallery = _gallery_dir()
+    gallery = _gallery_dir(member_id)
     if not gallery.is_dir():
         return None
     for path in gallery.glob(f"{backdrop_id}.*"):
@@ -119,78 +126,96 @@ def _find(backdrop_id: str) -> Path | None:
     return None
 
 
-def list_backdrops() -> list[Path]:
+def list_backdrops(member_id: int | None = None) -> list[Path]:
     """列出图库中的全部背景图，按上传时间（mtime）升序——新图排在末尾。"""
-    _migrate_legacy()
-    gallery = _gallery_dir()
+    _migrate_legacy(member_id)
+    gallery = _gallery_dir(member_id)
     if not gallery.is_dir():
         return []
     files = [p for p in gallery.iterdir() if p.is_file() and p.stem != "" and is_valid_id(p.stem)]
     return sorted(files, key=lambda p: (p.stat().st_mtime_ns, p.name))
 
 
-def find_backdrop(backdrop_id: str) -> Path | None:
+def find_backdrop(backdrop_id: str, member_id: int | None = None) -> Path | None:
     """按 id 查找背景图文件；不存在（或 id 非法）返回 None。"""
-    _migrate_legacy()
-    return _find(backdrop_id)
+    _migrate_legacy(member_id)
+    return _find(backdrop_id, member_id)
 
 
-def get_active_id() -> str | None:
+def get_active_id(member_id: int | None = None) -> str | None:
     """读取当前生效的背景图 id；未设置或指向已删除的图时返回 None（= 默认背景）。"""
-    _migrate_legacy()
-    marker = _marker_path()
+    _migrate_legacy(member_id)
+    marker = _marker_path(member_id)
     if not marker.is_file():
         return None
     backdrop_id = marker.read_text(encoding="utf-8").strip()
-    if _find(backdrop_id) is None:
+    if _find(backdrop_id, member_id) is None:
         return None
     return backdrop_id
 
 
-def save_backdrop(data: bytes, content_type: str) -> Path:
+def save_backdrop(data: bytes, content_type: str, member_id: int | None = None) -> Path:
     """把新背景图存入图库并设为当前生效图，返回落盘路径。
 
     调用方须先用 ``is_supported_content_type``、``MAX_BACKDROP_BYTES`` 与
     ``MAX_BACKDROP_COUNT`` 校验。旧图一律保留，供用户随时切换。
     """
-    _migrate_legacy()
+    _migrate_legacy(member_id)
     ext = _CONTENT_TYPE_EXT[content_type]
-    gallery = _gallery_dir()
+    gallery = _gallery_dir(member_id)
     gallery.mkdir(parents=True, exist_ok=True)
     backdrop_id = uuid4().hex
     target = gallery / f"{backdrop_id}{ext}"
     target.write_bytes(data)
-    _write_active(backdrop_id)
-    logger.info("已保存新背景图并设为生效：%s（%d 字节）", target, len(data))
+    _write_active(backdrop_id, member_id)
+    logger.info(
+        "已保存新背景图并设为生效：%s（%d 字节，主体=%s）",
+        target,
+        len(data),
+        member_id if member_id is not None else "管理员",
+    )
     return target
 
 
-def set_active(backdrop_id: str | None) -> bool:
+def set_active(backdrop_id: str | None, member_id: int | None = None) -> bool:
     """切换当前生效的背景图。
 
     传 None 切回内置默认背景（不删除任何图）。指定的 id 在图库中不存在时
     返回 False、不做任何修改。
     """
-    _migrate_legacy()
-    if backdrop_id is not None and _find(backdrop_id) is None:
+    _migrate_legacy(member_id)
+    if backdrop_id is not None and _find(backdrop_id, member_id) is None:
         return False
-    _write_active(backdrop_id)
-    logger.info("已切换背景图：%s", backdrop_id or "内置默认")
+    _write_active(backdrop_id, member_id)
+    logger.info(
+        "已切换背景图：%s（主体=%s）",
+        backdrop_id or "内置默认",
+        member_id if member_id is not None else "管理员",
+    )
     return True
 
 
-def remove_backdrop(backdrop_id: str) -> bool:
+def remove_backdrop(backdrop_id: str, member_id: int | None = None) -> bool:
     """从图库删除一张背景图；若删的是当前生效图，则回退到内置默认背景。
 
     返回是否确有文件被删除。
     """
-    _migrate_legacy()
-    path = _find(backdrop_id)
+    _migrate_legacy(member_id)
+    path = _find(backdrop_id, member_id)
     if path is None:
         return False
-    was_active = get_active_id() == backdrop_id
+    was_active = get_active_id(member_id) == backdrop_id
     path.unlink()
     if was_active:
-        _write_active(None)
+        _write_active(None, member_id)
     logger.info("已删除背景图：%s%s", path, "（原为生效图，已回退内置默认）" if was_active else "")
     return True
+
+
+def remove_member_gallery(member_id: int) -> None:
+    """删除成员的整套个人背景数据；仅在删除成员账号时调用。"""
+    gallery = _gallery_dir(member_id)
+    if not gallery.is_dir():
+        return
+    shutil.rmtree(gallery)
+    logger.info("已清理成员背景图库：member_id=%d", member_id)

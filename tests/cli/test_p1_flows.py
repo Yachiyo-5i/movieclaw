@@ -21,14 +21,14 @@ def _login(run_mclaw, live_server, admin) -> None:
 def test_dangerous_without_yes_exits_5(run_mclaw) -> None:
     """零交互原则：非 TTY 下危险操作缺 --yes 直接退出码 5，且不发请求
     （无需配置服务器也能得到明确指引）。"""
-    result = run_mclaw("sub", "delete", "1")
+    result = run_mclaw("subscriptions", "delete", "1")
     assert result.returncode == 5
     assert "--yes" in result.stderr
 
 
 def test_dangerous_with_yes_reaches_server(run_mclaw, live_server, admin) -> None:
     _login(run_mclaw, live_server, admin)
-    result = run_mclaw("sub", "delete", "999", "--yes")
+    result = run_mclaw("subscriptions", "delete", "999", "--yes")
     assert result.returncode == 1  # 到达服务器：订阅不存在的业务错误
     assert "错误" in result.stderr
 
@@ -66,11 +66,11 @@ def test_pat_token_channel(run_mclaw, live_server, admin, tmp_path) -> None:
         "MOVIECLAW_SERVER": live_server,
         "MOVIECLAW_TOKEN": token,
     }
-    result = run_mclaw("sub", "list", "-o", "json", env_extra=env)
+    result = run_mclaw("subscriptions", "list", "-o", "json", env_extra=env)
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout) == []
 
     revoked = run_mclaw("auth", "tokens", "revoke", payload["id"], "--yes")
     assert revoked.returncode == 0, revoked.stderr
-    result = run_mclaw("sub", "list", env_extra=env)
+    result = run_mclaw("subscriptions", "list", env_extra=env)
     assert result.returncode == 3

@@ -1,28 +1,21 @@
-"""投递救援巡检：照看订阅在途投递的种子，只救援、不搬运。
+"""订阅下载心跳与死种换源巡检。
 
-订阅止于投递（架构定稿）：投递记下 info_hash 后，下载完成的搬运由
-监听导入（按 info_hash 认领身份）或库扫描（原地入账）完成，工单的
-完成状态由库存对账关闭（wanted_fulfillment）。本任务只剩投递方
-自己的责任——**照看投递结果的死活**：
+下载器是实时状态事实源，本表只持久化“完成字节最后一次增长”的心跳：连续
+15 分钟不增长时提醒用户可立即换种，30 分钟时自动执行真实跨站搜索。旧源在
+替代源证明有真实进度前始终保留；暂停、排队、校验不计入死种时间，下载器
+不可达也只表示状态未知，不能误判成任务消失。
 
-- 种子在所有可用下载器中都查不到（被手动删除）→ 工单退回 wanted
-  短冷却后重新找资源；
-- 种子长期（STALLED_REQUEUE_DAYS）未完成 → 视为卡死，退回重新找
-  资源（旧种子若之后完成，库存对账照样关闭工单，不冲突）；
-- 种子已完成 → **落点核验**：把下载器上报的实际保存目录反向过路径
-  映射翻译回 movieclaw 视角，本地看不到种子内容（超过宽限期）说明
-  落进了 movieclaw 不可达的位置（映射缺失/卷未挂载/用户在下载器里
-  移动了文件）——记一条中文告警活动（去重只记一次），不退回重找
-  （数据真实存在，重找只会重复下载到同一个黑洞）；
-- 其余情况（下载中/已完成且落点可见待入库）不做任何事。
-
-失败语义沿用：每组独立处理，单组失败不拖垮整轮，中文活动可回放。
+完成后的搬运仍由监听导入/库扫描负责，库存对账负责关闭 wanted；本任务只
+观察投递、驱动换源，并核验已完成任务的落点与实际集数。若种子声明覆盖的
+剧集不在文件清单中，只把缺失部分退回重新寻找，已存在的集数照常等待入库。
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import re
+from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
 
@@ -30,13 +23,16 @@ from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
+from movieclaw_api.services.subscription import units_text
 from movieclaw_api.services.system_notice import resolve_notices, upsert_notice
 from movieclaw_db.engine import get_database
 from movieclaw_db.models import (
     ActivityType,
+    DownloadAttemptStatus,
     MediaItem,
-    Subscription,
+    SiteTorrent,
     SubscriptionActivity,
+    SubscriptionDownloadAttempt,
     WantedItem,
     WantedStatus,
     utcnow,
@@ -48,19 +44,17 @@ from movieclaw_db.models.system_notice import NoticeSeverity
 from movieclaw_db.repositories import SubscriptionRepository
 from movieclaw_db.repositories.downloader_repo import DownloaderRepository
 from movieclaw_downloader import DownloaderConfig, TorrentStatus, create_downloader
+from movieclaw_media.models import MediaKind
 from movieclaw_scheduler.registry import register_task
 
 logger = logging.getLogger("movieclaw_api.download_progress")
 
-# 巡检节奏：救援不追求秒级——5 分钟内发现"种子被删"足够灵敏
+# 五分钟采样一次；三次可达但查无任务，恰好对应 15 分钟提醒窗口。
 PROGRESS_TICK_SECONDS = 300
-
-# 种子被手动删除后工单退回 wanted 的冷却（给用户留出"删错了重新添加"的窗口）
-_MISSING_RETRY_MINUTES = 30
-
-# 卡死判定：投递后超过该天数仍未下载完成，退回重新找资源（大体积慢速种子
-# 也少有超过一周的；判错的代价只是多找一个候选，旧种子完成后照样入库）
-STALLED_REQUEUE_DAYS = 7
+STALLED_WARNING_MINUTES = 15
+AUTO_REPLACEMENT_MINUTES = 30
+TRIAL_TIMEOUT_MINUTES = 30
+MISSING_CONFIRMATIONS = 3
 
 _tick_lock = asyncio.Lock()
 
@@ -71,12 +65,13 @@ _IN_FLIGHT = (WantedStatus.GRABBED, WantedStatus.DOWNLOADED)
 
 @register_task(
     "check_download_progress",
-    title="投递救援巡检",
+    title="订阅下载换源巡检",
     trigger_type=TriggerType.INTERVAL,
     interval_seconds=PROGRESS_TICK_SECONDS,
     description=(
-        "照看订阅在途投递的种子：被手动删除或长期卡死的工单退回重新找资源；"
-        "已完成的核验落点，movieclaw 看不到文件时在时间线告警。"
+        "按完成字节心跳照看订阅种子：15 分钟无进度提醒，30 分钟自动跨站寻找"
+        "同品质替代源；旧源保留到新源证明可下载。已完成的同时核验落点，"
+        "movieclaw 看不到文件时告警，实际内容缺集时只退回缺失部分。"
         "下载完成后的入库由监听导入/库扫描完成，工单由库存对账关闭。"
     ),
 )
@@ -85,17 +80,50 @@ async def check_download_progress() -> None:
         db = get_database()
         async with db.session() as session:
             groups = await _pipeline_groups(session)
-            if not groups:
+            await _ensure_attempts(session, groups)
+            attempts = list(
+                (
+                    await session.execute(
+                        select(SubscriptionDownloadAttempt).where(
+                            SubscriptionDownloadAttempt.status.in_(  # type: ignore[attr-defined]
+                                (
+                                    DownloadAttemptStatus.ACTIVE,
+                                    DownloadAttemptStatus.REPLACEMENT_PENDING,
+                                    DownloadAttemptStatus.TRIAL,
+                                    DownloadAttemptStatus.CLEANUP_PENDING,
+                                    DownloadAttemptStatus.COMPLETED,
+                                )
+                            )
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            if not attempts:
                 return
             downloaders = await _usable_downloaders(session)
         if not downloaders:
-            logger.warning("有 %d 个在途种子等待照看，但没有可用的下载器", len(groups))
+            logger.warning("有 %d 个订阅下载等待照看，但没有可用的下载器", len(attempts))
             return
-        for subscription_id, info_hash in groups:
+        for attempt in attempts:
+            if attempt.id is None:
+                continue
             try:
-                await _rescue_group(subscription_id, info_hash, downloaders)
+                if attempt.status == DownloadAttemptStatus.CLEANUP_PENDING:
+                    from movieclaw_api.services.subscription import (
+                        reconcile_pending_cleanup,
+                    )
+
+                    await reconcile_pending_cleanup(attempt.id)
+                    continue
+                should_search = await _observe_attempt(attempt.id, downloaders)
+                if should_search:
+                    from movieclaw_api.services.subscription import run_replacement_search
+
+                    await run_replacement_search(attempt.id)
             except Exception:  # noqa: BLE001 -- 单组失败不拖垮整轮
-                logger.exception("种子 %s（订阅 #%s）的救援巡检失败", info_hash, subscription_id)
+                logger.exception("订阅下载尝试 #%s 的换源巡检失败", attempt.id)
 
 
 async def _pipeline_groups(
@@ -105,6 +133,7 @@ async def _pipeline_groups(
     result = await session.execute(
         select(WantedItem).where(
             WantedItem.status.in_(_IN_FLIGHT),  # type: ignore[attr-defined]
+            WantedItem.in_scope.is_(True),  # type: ignore[attr-defined]
             WantedItem.info_hash.is_not(None),  # type: ignore[union-attr]
         )
     )
@@ -139,6 +168,45 @@ async def _usable_downloaders(
     return usable
 
 
+@dataclass(frozen=True)
+class _TorrentLookup:
+    """一次跨下载器查询结果；可达数量用于区分“缺失”和“状态未知”。"""
+
+    match: tuple[DownloaderClient, TorrentStatus] | None
+    reachable_count: int
+
+
+async def _lookup_torrent(
+    info_hash: str,
+    downloaders: list[tuple[DownloaderClient, DownloaderConfig]],
+    *,
+    include_files: bool = True,
+    preferred_downloader_id: int | None = None,
+) -> _TorrentLookup:
+    """查询种子并保留可达性证据；优先查尝试实际投递到的下载器。"""
+    ordered = sorted(
+        downloaders,
+        key=lambda entry: 0 if entry[0].id == preferred_downloader_id else 1,
+    )
+    reachable_count = 0
+    for row, config in ordered:
+        adapter = create_downloader(config)
+        try:
+            status = await adapter.get_torrent(info_hash, include_files=include_files)
+            reachable_count += 1
+        except Exception as exc:  # noqa: BLE001 -- 单台不可达降级继续
+            logger.warning("查询下载器「%s」失败：%s", row.name, exc)
+            continue
+        finally:
+            try:
+                await adapter.close()
+            except Exception:  # noqa: BLE001 -- 关闭失败不改变本次查询事实
+                logger.warning("关闭下载器「%s」连接失败", row.name, exc_info=True)
+        if status is not None:
+            return _TorrentLookup((row, status), reachable_count)
+    return _TorrentLookup(None, reachable_count)
+
+
 async def _query_torrent(
     info_hash: str,
     downloaders: list[tuple[DownloaderClient, DownloaderConfig]],
@@ -150,18 +218,486 @@ async def _query_torrent(
     连同命中的下载器记录一起返回——落点核验需要它的路径映射做反向翻译。
     进度快照类的高频轮询传 ``include_files=False``，省掉文件清单的获取开销。
     """
-    for row, config in downloaders:
-        adapter = create_downloader(config)
-        try:
-            status = await adapter.get_torrent(info_hash, include_files=include_files)
-        except Exception as exc:  # noqa: BLE001 -- 单台不可达降级继续
-            logger.warning("查询下载器「%s」失败：%s", row.name, exc)
+    lookup = await _lookup_torrent(info_hash, downloaders, include_files=include_files)
+    return lookup.match
+
+
+async def _ensure_attempts(
+    session: AsyncSession,
+    groups: dict[tuple[int, str], list[WantedItem]],
+) -> None:
+    """给升级前已在途的 wanted 补安全保守的尝试台账。"""
+    if not groups:
+        return
+    normalized_groups = {
+        (subscription_id, info_hash.lower()): rows
+        for (subscription_id, info_hash), rows in groups.items()
+    }
+    existing_attempts = list(
+        (
+            await session.execute(select(SubscriptionDownloadAttempt))
+        ).scalars().all()
+    )
+    existing_rows = [
+        (row.subscription_id, row.info_hash, row) for row in existing_attempts
+    ]
+    existing = {
+        (subscription_id, info_hash.lower()): row
+        for subscription_id, info_hash, row in existing_rows
+    }
+    for key, rows in normalized_groups.items():
+        old = existing.get(key)
+        if old is None or old.status != DownloadAttemptStatus.CANCELLED:
             continue
-        finally:
-            await adapter.close()
-        if status is not None:
-            return row, status
-    return None
+        old.status = (
+            DownloadAttemptStatus.COMPLETED
+            if all(row.status == WantedStatus.DOWNLOADED for row in rows)
+            else DownloadAttemptStatus.ACTIVE
+        )
+        old.last_progress_at = utcnow()
+        old.missing_observations = 0
+        old.next_search_at = None
+        old.cleanup_note = None
+        session.add(old)
+    existing_keys = set(existing)
+    for subscription_id, info_hash in set(normalized_groups) - existing_keys:
+        rows = normalized_groups[(subscription_id, info_hash)]
+        now = utcnow()
+        started_at = max((row.grabbed_at or row.updated_at) for row in rows)
+        row_units = {(row.season_number, row.episode_number) for row in rows}
+        grabbed_activities = list(
+            (
+                await session.execute(
+                    select(SubscriptionActivity)
+                    .where(
+                        SubscriptionActivity.subscription_id == subscription_id,
+                        SubscriptionActivity.type == ActivityType.GRABBED,
+                    )
+                    .order_by(SubscriptionActivity.id.desc())  # type: ignore[attr-defined]
+                )
+            )
+            .scalars()
+            .all()
+        )
+        source_row = None
+        for activity in grabbed_activities:
+            payload = activity.payload or {}
+            # 旧版活动没有 infohash，多个并行种子覆盖相同单元时无法知道活动
+            # 属于哪一个。只有精确 hash 证据才允许恢复品质底线；否则保持未知，
+            # 后续 quality_not_lower 会禁止自动降级换源。
+            if str(payload.get("info_hash") or "").lower() != info_hash:
+                continue
+            activity_units = {
+                (int(unit[0]), int(unit[1]))
+                for unit in payload.get("units", [])
+                if isinstance(unit, list) and len(unit) == 2
+            }
+            if activity_units and not (activity_units & row_units):
+                continue
+            site_id = payload.get("site_id")
+            torrent_id = payload.get("torrent_id")
+            if not site_id or not torrent_id:
+                continue
+            source_row = (
+                await session.execute(
+                    select(SiteTorrent).where(
+                        SiteTorrent.site_id == str(site_id),
+                        SiteTorrent.torrent_id == str(torrent_id),
+                    )
+                )
+            ).scalar_one_or_none()
+            if source_row is not None:
+                break
+        session.add(
+            SubscriptionDownloadAttempt(
+                subscription_id=subscription_id,
+                info_hash=info_hash,
+                site_id=source_row.site_id if source_row is not None else None,
+                torrent_id=source_row.torrent_id if source_row is not None else None,
+                torrent_title=source_row.title if source_row is not None else "",
+                units=[[row.season_number, row.episode_number] for row in rows],
+                quality=(source_row.attrs or {}) if source_row is not None else {},
+                # 存量任务无法证明由 MovieClaw 首次创建，也无法证明没有 H&R；
+                # 两项都按未知处理，换源后只会保留，不会自动删用户数据。
+                owned_by_movieclaw=False,
+                hit_and_run=source_row.hit_and_run if source_row is not None else None,
+                status=DownloadAttemptStatus.ACTIVE,
+                last_progress_at=min(started_at, now),
+            )
+        )
+    await session.commit()
+
+
+async def _observe_attempt(
+    attempt_id: int,
+    downloaders: list[tuple[DownloaderClient, DownloaderConfig]],
+) -> bool:
+    """观察一次完成字节心跳；返回本轮是否应发起真实替代源搜索。"""
+    db = get_database()
+    async with db.session() as session:
+        attempt = await session.get(SubscriptionDownloadAttempt, attempt_id)
+        if attempt is None or attempt.status not in (
+            DownloadAttemptStatus.ACTIVE,
+            DownloadAttemptStatus.REPLACEMENT_PENDING,
+            DownloadAttemptStatus.TRIAL,
+            DownloadAttemptStatus.COMPLETED,
+        ):
+            return False
+        if attempt.status == DownloadAttemptStatus.TRIAL:
+            if not await _trial_has_open_target(session, attempt):
+                if await _cancel_attempt_if_out_of_scope(session, attempt):
+                    return False
+                from movieclaw_api.services.subscription import fail_trial
+
+                await fail_trial(session, attempt, reason="原订阅工单已由入库或其他流程满足")
+                return False
+        elif not await _attempt_wanted_rows(session, attempt):
+            if await _cancel_attempt_if_out_of_scope(session, attempt):
+                return False
+            # 库存对账已经关闭工单后，下载任务可继续由用户保种，但不再属于
+            # “需要救援的缺口”，否则会无意义地跨站重复下载已入库内容。
+            promoted_child = (
+                await session.execute(
+                    select(SubscriptionDownloadAttempt.id).where(
+                        SubscriptionDownloadAttempt.replaces_attempt_id == attempt.id,
+                        SubscriptionDownloadAttempt.status.in_(  # type: ignore[attr-defined]
+                            (DownloadAttemptStatus.ACTIVE, DownloadAttemptStatus.COMPLETED)
+                        ),
+                    )
+                )
+            ).first()
+            attempt.status = (
+                DownloadAttemptStatus.CLEANUP_PENDING
+                if promoted_child is not None
+                else DownloadAttemptStatus.IMPORTED
+            )
+            attempt.cleanup_note = (
+                "替代源已接管，等待恢复旧任务清理"
+                if promoted_child is not None
+                else "关联工单已完成入库，不再执行死种换源"
+            )
+            attempt.updated_at = utcnow()
+            session.add(attempt)
+            await session.commit()
+            return False
+        info_hash = attempt.info_hash
+        preferred_id = attempt.downloader_id
+
+    lookup = await _lookup_torrent(
+        info_hash,
+        downloaders,
+        preferred_downloader_id=preferred_id,
+    )
+    async with db.session() as session:
+        attempt = await session.get(SubscriptionDownloadAttempt, attempt_id)
+        if attempt is None or attempt.status not in (
+            DownloadAttemptStatus.ACTIVE,
+            DownloadAttemptStatus.REPLACEMENT_PENDING,
+            DownloadAttemptStatus.TRIAL,
+            DownloadAttemptStatus.COMPLETED,
+        ):
+            return False
+        if await _cancel_attempt_if_out_of_scope(session, attempt):
+            return False
+        now = utcnow()
+        attempt.last_observed_at = now
+
+        if lookup.reachable_count == 0:
+            # 所有下载器都不可达时没有“任务已消失”的证据，不动心跳和计数。
+            attempt.last_downloader_state = "unknown"
+            attempt.updated_at = now
+            session.add(attempt)
+            await session.commit()
+            return False
+
+        if lookup.match is None:
+            attempt.missing_observations += 1
+            attempt.last_downloader_state = "missing"
+            attempt.updated_at = now
+            session.add(attempt)
+            await session.commit()
+            if (
+                attempt.status == DownloadAttemptStatus.TRIAL
+                and attempt.missing_observations >= MISSING_CONFIRMATIONS
+            ):
+                from movieclaw_api.services.subscription import fail_trial
+
+                await fail_trial(session, attempt, reason="替代源连续三次未在可达下载器中找到")
+                return False
+            if attempt.missing_observations >= MISSING_CONFIRMATIONS:
+                if attempt.status == DownloadAttemptStatus.COMPLETED:
+                    # 已完成任务若在入库前连任务本身也消失，不能永久藏在 completed。
+                    # 文件可能仍在磁盘，因此仍沿用 15/30 分钟窗口寻找替代源，
+                    # 晋升时旧任务查询不到只会幂等收口，不会删除未知文件。
+                    attempt.status = DownloadAttemptStatus.ACTIVE
+                return await _handle_stalled_attempt(session, attempt, now)
+            return False
+
+        downloader, status = lookup.match
+        attempt.downloader_id = downloader.id
+        attempt.missing_observations = 0
+        attempt.last_downloader_state = status.state
+        current_bytes = status.completed_bytes
+
+        # 下载器在“完成”后可能因重新校验或文件损坏退回未完成；恢复成主源状态
+        # 重新计时，不能卡在只做落点核验的 completed。
+        if attempt.status == DownloadAttemptStatus.COMPLETED and not status.completed:
+            attempt.status = DownloadAttemptStatus.ACTIVE
+            attempt.last_progress_at = now
+            attempt.stalled_notified_at = None
+            attempt.next_search_at = None
+
+        if status.state in {"paused", "queued", "checking"}:
+            # 用户暂停、下载器排队和校验都不是死种；不断刷新计时基准，恢复后
+            # 必须重新经历完整 15/30 分钟窗口。
+            attempt.last_progress_at = now
+            attempt.stalled_notified_at = None
+            attempt.updated_at = now
+            session.add(attempt)
+            await session.commit()
+            return False
+
+        progressed = False
+        if current_bytes is not None:
+            if attempt.last_completed_bytes is None:
+                attempt.last_completed_bytes = current_bytes
+                if attempt.status != DownloadAttemptStatus.TRIAL:
+                    attempt.last_progress_at = now
+            elif current_bytes > attempt.last_completed_bytes:
+                attempt.last_completed_bytes = current_bytes
+                if attempt.status != DownloadAttemptStatus.TRIAL:
+                    attempt.last_progress_at = now
+                    attempt.stalled_notified_at = None
+                    progressed = True
+            elif current_bytes < attempt.last_completed_bytes:
+                # 下载器重新校验/重置数据后从新基线计时，不能沿用旧完成字节。
+                attempt.last_completed_bytes = current_bytes
+                attempt.baseline_completed_bytes = current_bytes
+                if attempt.status != DownloadAttemptStatus.TRIAL:
+                    attempt.last_progress_at = now
+                    attempt.stalled_notified_at = None
+
+        if attempt.status == DownloadAttemptStatus.TRIAL:
+            current_downloaded = getattr(status, "downloaded_bytes", None)
+            network_progressed = False
+            if current_downloaded is not None:
+                if attempt.last_downloaded_bytes is None:
+                    attempt.last_downloaded_bytes = current_downloaded
+                    if attempt.baseline_downloaded_bytes is None:
+                        attempt.baseline_downloaded_bytes = current_downloaded
+                elif current_downloaded > attempt.last_downloaded_bytes:
+                    attempt.last_downloaded_bytes = current_downloaded
+                    attempt.last_progress_at = now
+                    network_progressed = True
+                elif current_downloaded < attempt.last_downloaded_bytes:
+                    # 下载器重置统计计数后重新建立基线，不能把跨重置差值当流量。
+                    attempt.last_downloaded_bytes = current_downloaded
+                    attempt.baseline_downloaded_bytes = current_downloaded
+                    attempt.last_progress_at = now
+            baseline = attempt.baseline_downloaded_bytes
+            proven = (not attempt.owned_by_movieclaw and status.completed) or (
+                network_progressed
+                and baseline is not None
+                and current_downloaded is not None
+                and current_downloaded - baseline >= 1024 * 1024
+            )
+            attempt.updated_at = now
+            session.add(attempt)
+            await session.commit()
+            if proven:
+                from movieclaw_api.services.subscription import promote_trial
+
+                await promote_trial(session, attempt, status)
+                return False
+            if now - attempt.last_progress_at >= timedelta(minutes=TRIAL_TIMEOUT_MINUTES):
+                from movieclaw_api.services.subscription import fail_trial
+
+                await fail_trial(session, attempt, reason="替代源试用 30 分钟仍无真实下载进度")
+            return False
+
+        if status.completed:
+            attempt.status = DownloadAttemptStatus.COMPLETED
+            attempt.last_completed_bytes = current_bytes
+            attempt.updated_at = now
+            session.add(attempt)
+            await session.commit()
+            pending_trials = list(
+                (
+                    await session.execute(
+                        select(SubscriptionDownloadAttempt).where(
+                            SubscriptionDownloadAttempt.replaces_attempt_id == attempt.id,
+                            SubscriptionDownloadAttempt.status == DownloadAttemptStatus.TRIAL,
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            if pending_trials:
+                from movieclaw_api.services.subscription import fail_trial
+
+                for trial in pending_trials:
+                    await fail_trial(
+                        session,
+                        trial,
+                        reason="旧源已恢复并下载完成，无需继续试用替代源",
+                    )
+            rows = await _attempt_wanted_rows(session, attempt)
+            if rows:
+                await _verify_completed_download(
+                    session,
+                    rows,
+                    attempt.info_hash,
+                    downloader,
+                    status,
+                )
+            return False
+
+        attempt.updated_at = now
+        if progressed and attempt.status == DownloadAttemptStatus.REPLACEMENT_PENDING:
+            trial_exists = (
+                await session.execute(
+                    select(SubscriptionDownloadAttempt.id).where(
+                        SubscriptionDownloadAttempt.replaces_attempt_id == attempt.id,
+                        SubscriptionDownloadAttempt.status == DownloadAttemptStatus.TRIAL,
+                    )
+                )
+            ).first()
+            if trial_exists is None:
+                attempt.status = DownloadAttemptStatus.ACTIVE
+                attempt.next_search_at = None
+                attempt.search_attempts = 0
+        session.add(attempt)
+        await session.commit()
+        if progressed:
+            logger.debug("订阅种子 %s 完成字节继续增长", attempt.info_hash)
+            return False
+        return await _handle_stalled_attempt(session, attempt, now)
+
+
+async def _handle_stalled_attempt(
+    session: AsyncSession,
+    attempt: SubscriptionDownloadAttempt,
+    now,
+) -> bool:
+    """应用 15 分钟提醒和 30 分钟自动换源边界。"""
+    elapsed = now - attempt.last_progress_at
+    repo = SubscriptionRepository(session)
+    if (
+        elapsed >= timedelta(minutes=STALLED_WARNING_MINUTES)
+        and attempt.stalled_notified_at is None
+    ):
+        attempt.stalled_notified_at = now
+        attempt.updated_at = now
+        session.add(attempt)
+        await session.commit()
+        await repo.add_activity(
+            SubscriptionActivity(
+                subscription_id=attempt.subscription_id,
+                type=ActivityType.DOWNLOAD_STALLED,
+                message=(
+                    "下载已连续 15 分钟没有进度，可在任务中心立即换种；"
+                    "30 分钟时将自动寻找同品质替代源"
+                ),
+                payload={"info_hash": attempt.info_hash, "reason": "no_byte_progress"},
+            )
+        )
+    if elapsed < timedelta(minutes=AUTO_REPLACEMENT_MINUTES):
+        return False
+    if attempt.status == DownloadAttemptStatus.ACTIVE:
+        attempt.status = DownloadAttemptStatus.REPLACEMENT_PENDING
+        attempt.next_search_at = now
+        attempt.updated_at = now
+        session.add(attempt)
+        await session.commit()
+    return bool(attempt.next_search_at is not None and attempt.next_search_at <= now)
+
+
+async def _attempt_wanted_rows(
+    session: AsyncSession,
+    attempt: SubscriptionDownloadAttempt,
+) -> list[WantedItem]:
+    return list(
+        (
+            await session.execute(
+                select(WantedItem).where(
+                    WantedItem.subscription_id == attempt.subscription_id,
+                    WantedItem.info_hash == attempt.info_hash,
+                    WantedItem.status.in_(_IN_FLIGHT),  # type: ignore[attr-defined]
+                    WantedItem.in_scope.is_(True),  # type: ignore[attr-defined]
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+
+async def _cancel_attempt_if_out_of_scope(
+    session: AsyncSession,
+    attempt: SubscriptionDownloadAttempt,
+) -> bool:
+    """并发兜底：网络观察返回时目标若已退出范围，原地止损且不碰下载器。"""
+    source = attempt
+    if (
+        attempt.status == DownloadAttemptStatus.TRIAL
+        and attempt.replaces_attempt_id is not None
+    ):
+        parent = await session.get(SubscriptionDownloadAttempt, attempt.replaces_attempt_id)
+        if parent is None:
+            return False
+        source = parent
+    allowed = {
+        (int(unit[0]), int(unit[1]))
+        for unit in attempt.units
+        if isinstance(unit, list) and len(unit) == 2
+    }
+    historical = list(
+        (
+            await session.execute(
+                select(WantedItem).where(
+                    WantedItem.subscription_id == source.subscription_id,
+                    WantedItem.info_hash == source.info_hash,
+                    WantedItem.status.in_(_IN_FLIGHT),  # type: ignore[attr-defined]
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if allowed:
+        historical = [
+            row
+            for row in historical
+            if (row.season_number, row.episode_number) in allowed
+        ]
+    if not historical or any(row.in_scope for row in historical):
+        return False
+    attempt.status = DownloadAttemptStatus.CANCELLED
+    attempt.next_search_at = None
+    attempt.cleanup_note = "关联单元已退出当前订阅范围；保留下载器任务，不再观察或换源"
+    attempt.updated_at = utcnow()
+    session.add(attempt)
+    await session.commit()
+    return True
+
+
+async def _trial_has_open_target(
+    session: AsyncSession,
+    trial: SubscriptionDownloadAttempt,
+) -> bool:
+    if trial.replaces_attempt_id is None:
+        return False
+    old = await session.get(SubscriptionDownloadAttempt, trial.replaces_attempt_id)
+    if old is None:
+        return False
+    allowed = {
+        (int(unit[0]), int(unit[1]))
+        for unit in trial.units
+        if isinstance(unit, list) and len(unit) == 2
+    }
+    rows = await _attempt_wanted_rows(session, old)
+    return any((row.season_number, row.episode_number) in allowed for row in rows)
 
 
 async def _rescue_group(
@@ -169,11 +705,15 @@ async def _rescue_group(
     info_hash: str,
     downloaders: list[tuple[DownloaderClient, DownloaderConfig]],
 ) -> None:
+    """兼容旧调用入口：完成任务先核验内容，其余走统一心跳状态机。
+
+    定时巡检直接观察持久化尝试；这个入口仍供旧调用方和回归测试使用。
+    先经 ``_query_torrent`` 查询可保留旧桩接口，实际实现仍复用
+    ``_lookup_torrent``，不会形成第二套下载器语义。
+    """
     found = await _query_torrent(info_hash, downloaders)
-    downloader_row, status = found if found is not None else (None, None)
     db = get_database()
     async with db.session() as session:
-        # 组内工单在会话内重取（库存对账可能刚关闭了其中一部分）
         rows = list(
             (
                 await session.execute(
@@ -181,6 +721,7 @@ async def _rescue_group(
                         WantedItem.subscription_id == subscription_id,
                         WantedItem.info_hash == info_hash,
                         WantedItem.status.in_(_IN_FLIGHT),  # type: ignore[attr-defined]
+                        WantedItem.in_scope.is_(True),  # type: ignore[attr-defined]
                     )
                 )
             )
@@ -189,55 +730,53 @@ async def _rescue_group(
         )
         if not rows:
             return
-        subscription = await session.get(Subscription, subscription_id)
-        if subscription is None:
-            return
-        item = await session.get(MediaItem, subscription.media_item_id)
-        assert item is not None  # 外键保证
-        repo = SubscriptionRepository(session)
-
-        if status is None:
-            await _requeue(
+        if found is not None and found[1].completed:
+            downloader, status = found
+            await _verify_completed_download(
                 session,
-                repo,
-                item,
                 rows,
                 info_hash,
-                message=(
-                    f"投递的种子已不在下载器中（可能被手动删除），"
-                    f"{_MISSING_RETRY_MINUTES} 分钟后重新寻找资源"
-                ),
-                reason="torrent_missing",
+                downloader,
+                status,
             )
             return
-
-        if not status.completed and _stalled(rows):
-            await _requeue(
-                session,
-                repo,
-                item,
-                rows,
-                info_hash,
-                message=(
-                    f"「{status.name}」投递超过 {STALLED_REQUEUE_DAYS} 天仍未下载完成，"
-                    "退回重新寻找资源（原种子保留在下载器中，完成后仍会自动入库）"
-                ),
-                reason="stalled",
+        await _ensure_attempts(session, {(subscription_id, info_hash): rows})
+        attempt = (
+            await session.execute(
+                select(SubscriptionDownloadAttempt).where(
+                    SubscriptionDownloadAttempt.subscription_id == subscription_id,
+                    SubscriptionDownloadAttempt.info_hash == info_hash.lower(),
+                )
             )
-            return
-
-        if status.completed:
-            # 已完成：核验落点（movieclaw 侧看不到内容 → 告警活动），
-            # 搬运仍归监听导入/库扫描，工单仍归库存对账
-            assert downloader_row is not None  # found 非 None 时二者同源
-            await _verify_landing(session, repo, rows, info_hash, downloader_row, status)
-            return
-
-        logger.debug("《%s》的种子 %s：下载中", item.title, info_hash)
+        ).scalar_one()
+        assert attempt.id is not None
+        attempt_id = attempt.id
+    should_search = await _observe_attempt(attempt_id, downloaders)
+    if should_search:
+        from movieclaw_api.services.subscription import run_replacement_search
+        await run_replacement_search(attempt_id)
 
 
 # 落点核验宽限期：完成后给下载器归位文件/网络盘可见性留出的窗口
 _LANDING_GRACE_MINUTES = 10
+_MISSING_RETRY_MINUTES = 30
+
+
+async def _verify_completed_download(
+    session: AsyncSession,
+    rows: list[WantedItem],
+    info_hash: str,
+    downloader: DownloaderClient,
+    status: TorrentStatus,
+) -> None:
+    """完成任务先确认落点，再以物理文件清单核验承诺的季集范围。"""
+    repo = SubscriptionRepository(session)
+    landed = await _verify_landing(session, repo, rows, info_hash, downloader, status)
+    if not landed:
+        return
+    item = await session.get(MediaItem, rows[0].media_item_id)
+    if item is not None:
+        await _verify_content(session, repo, item, rows, info_hash, status)
 
 
 async def _verify_landing(
@@ -247,7 +786,7 @@ async def _verify_landing(
     info_hash: str,
     downloader: DownloaderClient,
     status,
-) -> None:
+) -> bool:
     """核验已完成种子的落点：movieclaw 侧看不到内容则记告警活动（去重）。
 
     判定：下载器上报的实际保存目录反向过路径映射翻译回 movieclaw 视角，
@@ -255,18 +794,21 @@ async def _verify_landing(
     文件落在 movieclaw 不可达的位置——映射缺失/卷未挂载/被人工移动，
     监听导入和库扫描永远等不到它，必须把问题亮到时间线上。
     不退回重找：数据真实存在，重找只会重复下载到同一个黑洞。
+
+    返回落点是否可见——只有确认可见（True）才有资格进入后续的内容核验；
+    宽限期内或证据不全一律返回 False（本轮不判，不代表落点有问题）。
     """
     from movieclaw_api.services.torrent_submit import translate_to_local
 
     # 宽限期内不判：刚完成的种子可能还在归位（qB 临时目录搬移等）
     threshold = utcnow() - timedelta(minutes=_LANDING_GRACE_MINUTES)
     if any((w.grabbed_at or w.updated_at) > threshold for w in rows):
-        return
+        return False
 
     local_dir = translate_to_local(status.save_path, downloader.path_mappings)
     root = status.files[0].path.split("/")[0] if status.files else status.name
     if not local_dir or not root:
-        return
+        return False
     if (Path(local_dir) / root).exists():
         # 落点可见，等监听导入/库扫描接管即可；此前若报过"看不到"（映射
         # 刚修好/卷刚挂上），问题已消失，红灯就地熄灭
@@ -274,7 +816,7 @@ async def _verify_landing(
             session,
             dedupe_key=f"subscription.landing:{rows[0].subscription_id}:{info_hash}",
         )
-        return
+        return True
 
     message = (
         f"「{status.name}」已下载完成，但 movieclaw 在 {local_dir} 看不到它——"
@@ -310,7 +852,7 @@ async def _verify_landing(
     for activity in existing:
         payload = activity.payload or {}
         if payload.get("info_hash") == info_hash and payload.get("reason") == "path_unreachable":
-            return
+            return False
 
     await repo.add_activity(
         SubscriptionActivity(
@@ -332,11 +874,126 @@ async def _verify_landing(
         local_dir,
         status.save_path,
     )
+    return False
 
 
-async def subscription_download_snapshot(
-    session: AsyncSession, subscription_id: int
-) -> list[dict]:
+# 种子内文件的季集声明：场景命名 SxxEyy。第二组抓整段集号串——连写
+# （E05E06）与区间简写（E05-E08）都收进来，展开规则见 _observed_units。
+# 裸数字段必须有分隔符引导（防止把 E05.1080p 的技术串吞进集号）
+_FILE_UNIT_RE = re.compile(r"[Ss](\d{1,2})((?:[Ee]\d{1,4})(?:(?:\s*[-~&+]\s*[Ee]?|[Ee])\d{1,4})*)")
+_FILE_EP_RE = re.compile(r"\d{1,4}")
+
+
+def _observed_units(files) -> set[tuple[int, int]]:
+    """种子文件清单里能认出的 (季, 集) 集合。
+
+    只认场景命名的 SxxEyy 高置信声明；恰好两个递增集号视为区间展开
+    （E05-E08 → 5..8，连写 E05E06 展开结果与列举一致），其余按列举。
+    季集识别的完整口径在库扫描侧（NER 模型），这里刻意不复用——救援
+    巡检要在无模型环境同样工作，而轻量正则的漏认只会让判定更保守
+    （认不出 → 不动），不会造成误退。
+    """
+    observed: set[tuple[int, int]] = set()
+    for file in files:
+        for match in _FILE_UNIT_RE.finditer(file.path):
+            season = int(match.group(1))
+            numbers = [int(n) for n in _FILE_EP_RE.findall(match.group(2))]
+            if len(numbers) == 2 and numbers[0] < numbers[1] <= numbers[0] + 200:
+                numbers = list(range(numbers[0], numbers[1] + 1))
+            observed.update((season, episode) for episode in numbers)
+    return observed
+
+
+async def _verify_content(
+    session: AsyncSession,
+    repo: SubscriptionRepository,
+    item: MediaItem,
+    rows: list[WantedItem],
+    info_hash: str,
+    status: TorrentStatus,
+) -> None:
+    """核验已完成种子的内容：承诺的集数不在文件清单里 → 缺失部分退回重找。
+
+    库存对账只认领真实存在的文件——种子里根本没有的集，扫多少轮都不会
+    入库，工单会以 grabbed 永远挂着，任务中心那条"等待入库"永不消失
+    （真实案例：全集包被判定覆盖特别篇 7 集，62 个文件全是正剧）。
+
+    判定刻意保守，证据不足一律不动：
+    - 电影不判（单元没有集号语义）；
+    - 文件清单为空（旧适配器不上报）不判；
+    - 清单里一个集数都认不出（原盘目录/非常规命名）不判——只有清单
+      "明确认得出集数、且明确没有这一集"时才断言缺失；
+    - 只退回缺失的工单，清单里存在的集数继续等对账正常关单。
+    """
+    if MediaKind(item.kind) is MediaKind.MOVIE:
+        return
+    if not status.files:
+        return
+    observed = _observed_units(status.files)
+    if not observed:
+        return
+    missing = [w for w in rows if (w.season_number, w.episode_number) not in observed]
+    if not missing:
+        return
+    await _requeue(
+        session,
+        repo,
+        item,
+        missing,
+        info_hash,
+        message=(
+            f"「{status.name}」已下载完成，但内容里没有 {units_text(missing)} 对应的"
+            f"文件（声明的覆盖范围与实际内容不符），这部分退回重新寻找资源；"
+            "种子内实际存在的集数不受影响，照常入库"
+        ),
+        reason="content_missing",
+    )
+
+
+async def _requeue(
+    session: AsyncSession,
+    repo: SubscriptionRepository,
+    item: MediaItem,
+    rows: list[WantedItem],
+    info_hash: str,
+    *,
+    message: str,
+    reason: str,
+) -> None:
+    """只把物理内容缺失的工单退回 wanted，保留同种子中实际存在的单元。"""
+    now = utcnow()
+    retry_at = now + timedelta(minutes=_MISSING_RETRY_MINUTES)
+    for row in rows:
+        await session.execute(
+            update(WantedItem)
+            .where(WantedItem.id == row.id)
+            .values(
+                status=WantedStatus.WANTED,
+                info_hash=None,
+                grabbed_at=None,
+                downloaded_at=None,
+                next_search_at=retry_at,
+                updated_at=now,
+            )
+        )
+    await session.commit()
+    await resolve_notices(
+        session,
+        dedupe_key=f"subscription.landing:{rows[0].subscription_id}:{info_hash}",
+    )
+    await repo.add_activity(
+        SubscriptionActivity(
+            subscription_id=rows[0].subscription_id,
+            wanted_item_id=rows[0].id,
+            type=ActivityType.DISPATCH_FAILED,
+            message=message,
+            payload={"info_hash": info_hash, "reason": reason},
+        )
+    )
+    logger.warning("《%s》的种子 %s 已退回缺失单元：%s", item.title, info_hash, reason)
+
+
+async def subscription_download_snapshot(session: AsyncSession, subscription_id: int) -> list[dict]:
     """订阅详情页的实时下载进度快照。
 
     把该订阅的在途工单按种子分组，逐个到可用下载器里查当前状态（速度/ETA/
@@ -350,6 +1007,7 @@ async def subscription_download_snapshot(
         select(WantedItem).where(
             WantedItem.subscription_id == subscription_id,
             WantedItem.status.in_(_IN_FLIGHT),  # type: ignore[attr-defined]
+            WantedItem.in_scope.is_(True),  # type: ignore[attr-defined]
             WantedItem.info_hash.is_not(None),  # type: ignore[union-attr]
         )
     )
@@ -404,52 +1062,3 @@ async def subscription_download_snapshot(
             }
         )
     return snapshots
-
-
-def _stalled(rows: list[WantedItem]) -> bool:
-    """整组工单是否已卡死：以最近一次状态推进的时间为基准。"""
-    threshold = utcnow() - timedelta(days=STALLED_REQUEUE_DAYS)
-    return all((w.grabbed_at or w.updated_at) < threshold for w in rows)
-
-
-async def _requeue(
-    session: AsyncSession,
-    repo: SubscriptionRepository,
-    item: MediaItem,
-    rows: list[WantedItem],
-    info_hash: str,
-    *,
-    message: str,
-    reason: str,
-) -> None:
-    """把一组在途工单退回 wanted：冷却后重新找资源，记中文活动。"""
-    now = utcnow()
-    retry_at = now + timedelta(minutes=_MISSING_RETRY_MINUTES)
-    for w in rows:
-        await session.execute(
-            update(WantedItem)
-            .where(WantedItem.id == w.id)
-            .values(
-                status=WantedStatus.WANTED,
-                info_hash=None,
-                grabbed_at=None,
-                downloaded_at=None,
-                next_search_at=retry_at,
-                updated_at=now,
-            )
-        )
-    await session.commit()
-    # 工单退回后旧种子的落点告警已无意义（重找会产生新种子/新告警）
-    await resolve_notices(
-        session, dedupe_key=f"subscription.landing:{rows[0].subscription_id}:{info_hash}"
-    )
-    await repo.add_activity(
-        SubscriptionActivity(
-            subscription_id=rows[0].subscription_id,
-            wanted_item_id=rows[0].id,
-            type=ActivityType.DISPATCH_FAILED,
-            message=message,
-            payload={"info_hash": info_hash, "reason": reason},
-        )
-    )
-    logger.warning("《%s》的种子 %s 已退回队列：%s", item.title, info_hash, reason)

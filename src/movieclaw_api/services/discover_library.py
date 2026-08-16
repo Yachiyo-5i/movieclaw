@@ -31,8 +31,16 @@ class DiscoverLibraryProjectionService:
     防止同名作品被误标为已入库。
     """
 
-    def __init__(self, session: AsyncSession) -> None:
+    def __init__(
+        self, session: AsyncSession, *, visible_library_ids: set[int] | None = None
+    ) -> None:
+        """``visible_library_ids``：成员的可见库集合（None=不受限，管理员语义）。
+
+        过滤在此层做而非路由层，避免"卡片显示已入库、点进库内深链却 404"
+        的割裂——徽标、计数与深链全部以可见库为口径。
+        """
         self._session = session
+        self._visible_library_ids = visible_library_ids
 
     async def apply_cards(self, cards: list[MediaCard]) -> None:
         """批量回填卡片库存摘要；无匹配卡片明确重置为 ``None``。
@@ -61,7 +69,8 @@ class DiscoverLibraryProjectionService:
 
     async def apply_detail(self, detail: MediaDetail) -> None:
         """回填详情主条目与相关推荐摘要，并为主条目生成媒体库深链。"""
-        await self.apply_cards([detail.card, *detail.related])
+        collection_cards = detail.collection.items if detail.collection is not None else []
+        await self.apply_cards([detail.card, *collection_cards, *detail.related])
         status = detail.card.library_status
         detail.library_links = [] if status is None else await self._links_for(status.media_item_id)
 
@@ -99,6 +108,11 @@ class DiscoverLibraryProjectionService:
                     LibraryFile.media_item_id.is_not(None),  # type: ignore[union-attr]
                     LibraryFile.missing_since.is_(None),  # type: ignore[union-attr]
                     or_(*identity_filters),
+                    *(
+                        [LibraryFile.library_id.in_(self._visible_library_ids)]
+                        if self._visible_library_ids is not None
+                        else []
+                    ),
                 )
                 .group_by(
                     MediaItem.id,
@@ -134,6 +148,11 @@ class DiscoverLibraryProjectionService:
                     LibraryFile.media_item_id == media_item_id,
                     LibraryFile.media_item_id.is_not(None),  # type: ignore[union-attr]
                     LibraryFile.missing_since.is_(None),  # type: ignore[union-attr]
+                    *(
+                        [LibraryFile.library_id.in_(self._visible_library_ids)]
+                        if self._visible_library_ids is not None
+                        else []
+                    ),
                 )
                 .group_by(Library.id, Library.name, Library.sort_order)
                 .order_by(Library.sort_order, Library.id)

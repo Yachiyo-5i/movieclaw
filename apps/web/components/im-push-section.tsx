@@ -17,8 +17,6 @@
 
 import { useCallback, useEffect, useState } from "react";
 
-import Link from "next/link";
-
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
 
 import {
@@ -29,7 +27,7 @@ import {
 } from "@/components/channel-bind-dialog";
 import { useConfirm, useToast } from "@/components/feedback";
 import { ChatIcon, PlusIcon } from "@/components/icons";
-import { useLlmConfigured } from "@/components/llm-gate";
+import { LlmSetupNotice, useLlmConfigured } from "@/components/llm-gate";
 import {
   type ChannelPushConfig,
   type ImChannelId,
@@ -166,18 +164,7 @@ function ChannelsTab() {
       </p>
 
       {/* 前置门禁：对话完全由模型驱动，未接入模型时隐藏新增入口并引导 */}
-      {llmConfigured === false && (
-        <div className="rounded-xl border border-[#f5c451]/30 bg-[#f5c451]/10 px-4 py-3 text-body text-[#f5c451]">
-          接入通道需要先完成 AI 模型配置——对话完全由模型驱动。请先前往
-          <Link
-            href="/settings/llm"
-            className="mx-1 font-medium underline underline-offset-2 hover:opacity-80"
-          >
-            设置 → AI 模型
-          </Link>
-          接入模型供应商。
-        </div>
-      )}
+      {llmConfigured === false && <LlmSetupNotice feature="通道中的 AI 对话能力" />}
 
       {error && (
         <div className="rounded-xl border border-[#ff6b6b]/30 bg-[#ff6b6b]/10 px-4 py-3 text-body text-[#ff6b6b]">

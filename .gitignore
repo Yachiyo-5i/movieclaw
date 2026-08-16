@@ -30,6 +30,7 @@ apps/extension/.output/
 apps/web/.env.local
 apps/web/.env.production.local
 apps/web/.env.development.local
+apps/web/tmp/
 
 # 编辑器与本地工具
 .idea/

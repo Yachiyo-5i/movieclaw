@@ -6,12 +6,13 @@ import type { Route } from "next";
 
 import { useToast } from "@/components/feedback";
 import { ImageLightbox } from "@/components/image-lightbox";
-import { LayersIcon, ListIcon, PhotoIcon } from "@/components/icons";
+import { LayersIcon, ListIcon, PhotoIcon, XIcon } from "@/components/icons";
+import { Modal } from "@/components/modal";
 import { PosterImage } from "@/components/poster-image";
 import { Tooltip } from "@/components/tooltip";
 import type { SearchScope } from "@/lib/categories";
 import {
-  fetchSearchSnapshot,
+  getTorrentSearchHistoryResults,
   streamSearchTorrents,
   type SiteSearchStatus,
   type TorrentAttrs,
@@ -23,9 +24,14 @@ import {
   submitRememberedTarget,
   type DownloadTargetRequest,
 } from "@/components/download-target-dialog";
-import { getSubscription, grabForSubscription } from "@/lib/api/subscriptions";
+import {
+  downloadSelectedTorrentForSubscription,
+  getSubscription,
+} from "@/lib/api/subscriptions";
 import { cachedImageUrl } from "@/lib/image-proxy";
+import { usePermissions } from "@/lib/permissions";
 import { formatDateTime, formatRelativeTime } from "@/lib/time";
+import { useScrollRestoration } from "@/lib/use-scroll-restoration";
 
 /**
  * 搜索结果页（主内容区）——消费 SSE 流式搜索，结果渐进渲染。
@@ -270,12 +276,56 @@ const SHEET_KEYS = [
 ] as const;
 type SheetKey = (typeof SHEET_KEYS)[number];
 
+// 语言值来自 movieclaw_enrich.lang_decl（BCP 47）；zh 是"中字"类泛称声明，
+// 刻意不猜简繁。未收录的语言码直接展示原值
 const SUBTITLE_LANGUAGE_LABELS: Record<string, string> = {
+  zh: "中文字幕（未标简繁）",
   "zh-Hans": "简体中文字幕",
+  "zh-Hant": "繁体中文字幕",
+  en: "英文字幕",
+  ja: "日文字幕",
+  ko: "韩文字幕",
+  yue: "粤语字幕",
 };
 
 function subtitleLanguageLabel(language: string): string {
   return SUBTITLE_LANGUAGE_LABELS[language] ?? language;
+}
+
+// —— 结果行紧凑徽标：多语言聚合成单徽标（"字幕 简·繁·英"），全称留给筛选弹层
+const SUB_LANG_SHORT: Record<string, string> = {
+  "zh-Hans": "简",
+  "zh-Hant": "繁",
+  zh: "中",
+  en: "英",
+  ja: "日",
+  ko: "韩",
+  yue: "粤",
+};
+const AUDIO_LANG_SHORT: Record<string, string> = {
+  cmn: "国",
+  yue: "粤",
+  en: "英",
+  ja: "日",
+  ko: "韩",
+};
+
+/** "字幕 简·繁·英［·硬］"；仅泛称时显示"中字"；无声明返回 null。 */
+function compactSubtitleBadge(attrs: TorrentAttrs): string | null {
+  let langs = attrs.subtitle_languages ?? [];
+  if (!langs.length) return null;
+  // 有具体简繁时泛称 zh 被蕴含，不重复展示
+  if (langs.some((v) => v.startsWith("zh-"))) langs = langs.filter((v) => v !== "zh");
+  const hard = (attrs.subtitle_carriers ?? []).includes("hardcoded") ? "·硬" : "";
+  if (langs.length === 1 && langs[0] === "zh") return `中字${hard}`;
+  return `字幕 ${langs.map((v) => SUB_LANG_SHORT[v] ?? v).join("·")}${hard}`;
+}
+
+/** "音轨 国·粤"；无声明返回 null。 */
+function compactAudioBadge(attrs: TorrentAttrs): string | null {
+  const langs = attrs.audio_languages ?? [];
+  if (!langs.length) return null;
+  return `音轨 ${langs.map((v) => AUDIO_LANG_SHORT[v] ?? v).join("·")}`;
 }
 
 function sheetSelectionCount(f: Filters): number {
@@ -355,9 +405,14 @@ const FILTER_DIMENSIONS: { dim: FilterDim; pass: (hit: TorrentHit, f: Filters) =
   },
   {
     dim: "subtitle",
+    // BCP 47 前缀语义与订阅选种规则一致：勾 "zh" 命中 zh/zh-Hans/zh-Hant，
+    // 勾 "zh-Hans" 只命中简体（泛称"中字"资源不算简体）
     pass: (hit, f) =>
       !f.subtitle.size ||
-      (hit.attrs?.subtitle_languages ?? []).some((v) => f.subtitle.has(v)),
+      (hit.attrs?.subtitle_languages ?? []).some((v) =>
+        f.subtitle.has(v) ||
+        [...f.subtitle].some((sel) => v.startsWith(`${sel}-`)),
+      ),
   },
   {
     dim: "group",
@@ -474,7 +529,14 @@ function collectFacetMaps(items: TorrentHit[], filters: Filters | null): FacetMa
     if (want("hdr")) for (const v of a.hdr) bump(maps.hdr, v);
     if (want("audio")) for (const v of a.audio) bump(maps.audio, v);
     if (want("subtitle")) {
-      for (const v of a.subtitle_languages ?? []) bump(maps.subtitles, v);
+      {
+        // 分面计数与前缀筛选语义对齐："中文（不限简繁）"的计数要涵盖
+        // 声明了 zh-Hans/zh-Hant 的资源（每条资源对每个分面键至多计一次）
+        const langs = a.subtitle_languages ?? [];
+        const keys = new Set(langs);
+        if (langs.some((v) => v.startsWith("zh-"))) keys.add("zh");
+        for (const v of keys) bump(maps.subtitles, v);
+      }
     }
     if (want("group") && a.release_group) bump(maps.groups, a.release_group);
   }
@@ -560,6 +622,9 @@ function collectEntities(items: TorrentHit[]): Map<string, EntityGroup> {
 }
 
 export function SearchResults({ query, onResearch, grabForSubscriptionId }: SearchResultsProps) {
+  const scrollRef = useScrollRestoration(
+    `search:torrent:${query.keyword}:${query.scope.label ?? "all"}:${query.scope.categories.join(",")}:${query.scope.siteIds.join(",")}:${query.snapshotId ?? "live"}`,
+  );
   const [phase, setPhase] = useState<Phase>("connecting");
   // 手动选种模式：拉一次订阅标题供横幅与按钮提示；订阅不存在则静默退出该模式
   const [grabTarget, setGrabTarget] = useState<{ id: number; title: string } | null>(null);
@@ -653,7 +718,7 @@ export function SearchResults({ query, onResearch, grabForSubscriptionId }: Sear
     // 快照预览：不打扰任何站点，直接加载历史留存的结果集一次性上屏。
     // 站点状态（含逐站耗时/失败原因）从快照回放，过程面板/进度条自然不出现。
     if (query.snapshotId != null) {
-      fetchSearchSnapshot(query.snapshotId, { signal: controller.signal })
+      getTorrentSearchHistoryResults(query.snapshotId, { signal: controller.signal })
         .then((snap) => {
           setItems(snap.items);
           setSiteProgress(
@@ -999,7 +1064,10 @@ export function SearchResults({ query, onResearch, grabForSubscriptionId }: Sear
       </header>
 
       {/* 主体：结果随 site_result 事件渐进出现，首批结果到达前保持骨架屏 */}
-      <div className="scroll-thin scroll-safe relative z-0 min-h-0 flex-1 overflow-y-auto px-6 pb-6 max-md:px-4">
+      <div
+        ref={scrollRef}
+        className="scroll-thin scroll-safe relative z-0 min-h-0 flex-1 overflow-y-auto px-6 pb-6 max-md:px-4"
+      >
         {streaming && items.length === 0 && (
           <SkeletonList siteCount={siteProgress.length} />
         )}
@@ -2141,15 +2209,26 @@ function seasonEpisodeChip(attrs: TorrentAttrs | null): { text: string; pack: bo
 // memo：与 TorrentRow 同理，流式进结果时已有卡片的 hit 引用不变，整卡跳过
 const TorrentPosterCard = memo(function TorrentPosterCard({ hit }: { hit: TorrentHit }) {
   const [viewerOpen, setViewerOpen] = useState(false);
+  const [actionsOpen, setActionsOpen] = useState(false);
   const size = hit.size ?? formatBytes(hit.size_bytes);
   const name = parsedName(hit);
   const seChip = seasonEpisodeChip(hit.attrs);
   // 灯箱图集：海报 + 全部图片（poster_url 通常是 image_urls 第一张，去重兜底）
   const gallery = Array.from(
     new Set([hit.poster_url, ...hit.image_urls].filter((u): u is string => !!u)),
-  ).map(cachedImageUrl);
+  ).map((url) => cachedImageUrl(url));
   return (
     <li className="group relative overflow-hidden rounded-xl border border-white/[0.08] bg-[rgba(14,16,22,0.75)] transition-colors hover:border-white/[0.2]">
+      {/* 手机/纯触摸设备把整张卡作为操作入口；窄屏桌面预览也走同一交互，
+          方便响应式调试。桌面鼠标环境下按钮不参与布局与命中。 */}
+      {(hit.detail_url || hit.download_url) && (
+        <button
+          type="button"
+          aria-label={`打开「${hit.title}」的资源操作`}
+          onClick={() => setActionsOpen(true)}
+          className="absolute inset-0 z-10 hidden cursor-pointer rounded-xl max-md:block [@media(hover:none)]:block"
+        />
+      )}
       <div
         role="button"
         tabIndex={0}
@@ -2213,12 +2292,10 @@ const TorrentPosterCard = memo(function TorrentPosterCard({ hit }: { hit: Torren
             {seChip.text}
           </span>
         )}
-        {/* hover：压暗 + 浮出操作（stopPropagation：点链接不触发灯箱）。
-            touch-reveal：触摸设备没有 hover，操作按钮改为常驻——此时压暗层
-            （group-hover:bg-black/35）不生效，按钮自带的深色底已足够在海报上
-            读清，海报本身也不会被一直压着。 */}
+        {/* 桌面 hover：压暗 + 浮出操作（stopPropagation：点链接不触发灯箱）。
+            手机端由整卡点击打开底部抽屉，不在海报上常驻操作。 */}
         {(hit.detail_url || hit.download_url) && (
-          <div className="touch-reveal absolute inset-0 flex items-center justify-center gap-2 bg-black/0 opacity-0 transition duration-200 group-hover:bg-black/35 group-hover:opacity-100">
+          <div className="absolute inset-0 flex items-center justify-center gap-2 bg-black/0 opacity-0 transition duration-200 group-hover:bg-black/35 group-hover:opacity-100 max-md:hidden [@media(hover:none)]:hidden">
             {hit.detail_url && (
               <a
                 href={hit.detail_url}
@@ -2281,6 +2358,19 @@ const TorrentPosterCard = memo(function TorrentPosterCard({ hit }: { hit: Torren
           onClose={() => setViewerOpen(false)}
         />
       )}
+      <TorrentActionsSheet
+        hit={hit}
+        open={actionsOpen}
+        onClose={() => setActionsOpen(false)}
+        onViewImages={
+          gallery.length > 0
+            ? () => {
+                setActionsOpen(false);
+                setViewerOpen(true);
+              }
+            : undefined
+        }
+      />
     </li>
   );
 });
@@ -2306,11 +2396,12 @@ const DOWNLOAD_LABEL: Record<DownloadState, string> = {
  * 供手选。提交结果回填在按钮文字上；失败可悬停看原因、点击重试。
  */
 function DownloadButton({ hit, className }: { hit: TorrentHit; className: string }) {
+  const { canDirectDownload } = usePermissions();
   const toast = useToast();
   const [state, setState] = useState<DownloadState>("idle");
   const [error, setError] = useState<string | null>(null);
   const [request, setRequest] = useState<DownloadTargetRequest | null>(null);
-  if (!hit.download_url) return null;
+  if (!canDirectDownload || !hit.download_url) return null;
 
   const settled = state === "done" || state === "exists";
 
@@ -2396,7 +2487,7 @@ const GRAB_LABEL: Record<GrabState, string> = {
 
 /**
  * 手动选种按钮：仅在选种模式（GrabContext 非空）出现在下载按钮旁。
- * 把当前搜索结果行原样回传给 sub.grab——跳过规则组过滤直接投递；
+ * 把当前搜索结果行原样交给 subscriptions.download-selected-torrent；
  * 身份对不上/没有可满足缺口时后端给可读中文错误，进 toast 并可重试。
  */
 function GrabButton({ hit, className }: { hit: TorrentHit; className: string }) {
@@ -2410,7 +2501,7 @@ function GrabButton({ hit, className }: { hit: TorrentHit; className: string }) 
     if (state === "submitting" || state === "done") return;
     setState("submitting");
     try {
-      const { units } = await grabForSubscription(grabFor.id, {
+      const { units } = await downloadSelectedTorrentForSubscription(grabFor.id, {
         site_id: hit.site_id,
         torrent_id: hit.torrent_id,
         title: hit.title,
@@ -2488,7 +2579,8 @@ function specSummary(attrs: TorrentAttrs): string | null {
     attrs.remux && "Remux",
     attrs.video_codec,
     ...attrs.hdr,
-    ...(attrs.subtitle_languages ?? []).map(subtitleLanguageLabel),
+    compactSubtitleBadge(attrs),
+    compactAudioBadge(attrs),
     ...attrs.audio.slice(0, 2),
     attrs.release_group,
   ].filter(Boolean);
@@ -2514,6 +2606,7 @@ const TorrentRow = memo(function TorrentRow({
   /** 列表模式直接展示站点原始种子名与副标题，不使用扩充层解析出的片名。 */
   showRawTitles?: boolean;
 }) {
+  const [actionsOpen, setActionsOpen] = useState(false);
   const size = hit.size ?? formatBytes(hit.size_bytes);
   const name = showRawTitles ? null : parsedName(hit);
   const complete = completeLabel(hit.attrs);
@@ -2526,6 +2619,16 @@ const TorrentRow = memo(function TorrentRow({
     // 背景，行底改用更实的半透明底色，观感几乎一致。content-visibility 让
     // 视口外的行跳过布局与绘制，长列表滚动/更新只付可见行的成本。
     <li className="group relative rounded-2xl border border-white/[0.06] bg-[rgba(16,18,25,0.82)] px-4 py-3.5 transition-all [contain-intrinsic-size:auto_72px] [content-visibility:auto] hover:-translate-y-px hover:border-white/[0.13] hover:bg-[rgba(22,25,33,0.9)] hover:shadow-[0_12px_30px_-18px_rgba(0,0,0,0.8)]">
+      {/* 移动端把整行作为一个轻量操作入口，不再让详情/下载常驻盖住正文。
+          按钮本身透明且只在窄屏存在，滚动手势仍交给浏览器原生处理。 */}
+      {(hit.detail_url || hit.download_url) && (
+        <button
+          type="button"
+          aria-label={`打开「${hit.title}」的资源操作`}
+          onClick={() => setActionsOpen(true)}
+          className="absolute inset-0 z-10 hidden cursor-pointer rounded-2xl max-md:block [@media(hover:none)]:block"
+        />
+      )}
       <div className="flex items-center gap-5">
         {/* 标题优先，来源和属性下沉为辅助信息，避免徽标抢走首屏注意力。 */}
         <div className="min-w-0 flex-1">
@@ -2596,9 +2699,9 @@ const TorrentRow = memo(function TorrentRow({
 
         {/* 操作区默认收起，hover 整行或键盘聚焦时再浮现：列表静止时专注内容，
             同时保留 focus-within，确保键盘用户可以访问操作。渐变遮罩覆盖下方指标列，
-            避免按钮出现时文字相互叠压。 */}
+            避免按钮出现时文字相互叠压。手机端统一使用底部操作抽屉。 */}
         {(hit.detail_url || hit.download_url) && (
-          <div className="touch-reveal pointer-events-none absolute inset-y-0 right-2 flex items-center gap-1.5 rounded-r-2xl bg-gradient-to-l from-[rgba(20,23,31,0.98)] from-65% to-transparent pl-16 pr-2 opacity-0 transition-opacity duration-150 group-hover:pointer-events-auto group-hover:opacity-100 group-focus-within:pointer-events-auto group-focus-within:opacity-100">
+          <div className="pointer-events-none absolute inset-y-0 right-2 flex items-center gap-1.5 rounded-r-2xl bg-gradient-to-l from-[rgba(20,23,31,0.98)] from-65% to-transparent pl-16 pr-2 opacity-0 transition-opacity duration-150 group-hover:pointer-events-auto group-hover:opacity-100 group-focus-within:pointer-events-auto group-focus-within:opacity-100 max-md:hidden [@media(hover:none)]:hidden">
             {hit.detail_url && (
               <a
                 href={hit.detail_url}
@@ -2620,9 +2723,105 @@ const TorrentRow = memo(function TorrentRow({
           </div>
         )}
       </div>
+      <TorrentActionsSheet
+        hit={hit}
+        open={actionsOpen}
+        onClose={() => setActionsOpen(false)}
+      />
     </li>
   );
 });
+
+/**
+ * 移动端单条种子的操作抽屉。列表正文只承担比较信息，详情、投给订阅和下载
+ * 收口到一次点按后的 bottom sheet；桌面端仍沿用行/海报 hover 操作层。
+ * 抽屉复用 Modal，因此遮罩关闭、Esc 与安全区处理和全站其他移动弹窗一致。
+ */
+function TorrentActionsSheet({
+  hit,
+  open,
+  onClose,
+  onViewImages,
+}: {
+  hit: TorrentHit;
+  open: boolean;
+  onClose: () => void;
+  /** 海报模式可从抽屉继续进入图片灯箱；列表模式不提供。 */
+  onViewImages?: () => void;
+}) {
+  const name = parsedName(hit);
+  const displayTitle = name?.primary ?? hit.title;
+  const secondaryTitle = name ? hit.title : hit.subtitle;
+  const size = hit.size ?? formatBytes(hit.size_bytes);
+
+  return (
+    <Modal open={open} onClose={onClose} label={`${displayTitle}的资源操作`}>
+      <div className="px-4 pb-5 pt-2">
+        <div className="mx-auto mb-3 h-1 w-10 rounded-full bg-white/20" aria-hidden="true" />
+        <div className="flex items-start gap-3">
+          <div className="min-w-0 flex-1">
+            <p className="truncate text-ui font-semibold text-[var(--text)]">{displayTitle}</p>
+            {secondaryTitle && (
+              <p className="mt-1 line-clamp-2 text-caption leading-5 text-[var(--text-muted)]">
+                {secondaryTitle}
+              </p>
+            )}
+            <p className="tnum mt-1 text-caption text-[var(--text-faint)]">
+              {[
+                hit.site_name,
+                size,
+                `${hit.seeders} 做种`,
+                hit.upload_time ? formatRelativeTime(hit.upload_time) : null,
+              ]
+                .filter(Boolean)
+                .join(" · ")}
+            </p>
+          </div>
+          <button
+            type="button"
+            aria-label="关闭资源操作"
+            onClick={onClose}
+            className="touch-target flex size-8 shrink-0 items-center justify-center rounded-full bg-white/[0.06] text-[var(--text-muted)]"
+          >
+            <XIcon className="size-4" />
+          </button>
+        </div>
+
+        <div className="mt-5 grid gap-2">
+          {onViewImages && (
+            <button
+              type="button"
+              onClick={onViewImages}
+              className="btn-glass flex h-11 w-full items-center justify-center gap-2 text-ui font-medium text-[var(--text)]"
+            >
+              <PhotoIcon className="size-4" />
+              浏览图片
+            </button>
+          )}
+          {hit.detail_url && (
+            <a
+              href={hit.detail_url}
+              target="_blank"
+              rel="noreferrer"
+              onClick={onClose}
+              className="btn-glass flex h-11 w-full items-center justify-center text-ui font-medium text-[var(--text)]"
+            >
+              查看详情
+            </a>
+          )}
+          <GrabButton
+            hit={hit}
+            className="flex h-11 w-full items-center justify-center rounded-full border border-[#6aa7ff]/50 bg-[#6aa7ff]/20 text-ui font-medium text-[#b9d4ff] transition-colors active:bg-[#6aa7ff]/35"
+          />
+          <DownloadButton
+            hit={hit}
+            className="btn-accent flex h-11 w-full items-center justify-center rounded-full text-ui font-medium"
+          />
+        </div>
+      </div>
+    </Modal>
+  );
+}
 
 /** 列表指标单元：固定标签 + 数值的两级层次，让密集数字仍然可快速扫读。 */
 function Metric({
@@ -2706,9 +2905,10 @@ function AttrBadges({ attrs }: { attrs: TorrentAttrs }) {
   if (attrs.resolution) chips.push({ text: attrs.resolution });
   if (attrs.remux) chips.push({ text: "Remux", cls: "text-[#9cc2ff]" });
   for (const v of attrs.hdr) chips.push({ text: v, cls: "text-[#c8a6ff]" });
-  for (const v of attrs.subtitle_languages ?? []) {
-    chips.push({ text: subtitleLanguageLabel(v), cls: "text-[#7ee2b8]" });
-  }
+  const subBadge = compactSubtitleBadge(attrs);
+  if (subBadge) chips.push({ text: subBadge, cls: "text-[#7ee2b8]" });
+  const audioBadge = compactAudioBadge(attrs);
+  if (audioBadge) chips.push({ text: audioBadge, cls: "text-[#ffd08a]" });
   if (attrs.release_group) chips.push({ text: attrs.release_group, cls: "text-[var(--accent)]" });
   if (attrs.media_source) chips.push({ text: attrs.media_source });
   if (attrs.video_codec) chips.push({ text: attrs.video_codec });

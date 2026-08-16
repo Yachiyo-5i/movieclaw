@@ -4,16 +4,26 @@
 启用停用、更新重测。真实的 create_downloader 被替换为假下载器，
 不发真实请求，使状态流转可确定性断言。
 """
+
 from __future__ import annotations
 
+import asyncio
 import sqlite3
+from datetime import timedelta
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlmodel import select
 
 import movieclaw_api.services.downloader_config as downloader_service
 from movieclaw_api.core.config import get_settings
-from movieclaw_downloader import DownloaderConnectError, DownloaderInfo
+from movieclaw_downloader import (
+    DownloaderConnectError,
+    DownloaderInfo,
+    TorrentBrief,
+    TorrentFile,
+    TorrentStatus,
+)
 from movieclaw_downloader.models import DownloaderConfig
 
 # 假下载器行为开关：url 含 "unreachable" 时模拟连不上
@@ -21,6 +31,9 @@ _UNREACHABLE_MARK = "unreachable"
 
 # 每次连接测试收到的 DownloaderConfig，供断言"传给适配器的密码已解密"
 _captured_configs: list[DownloaderConfig] = []
+_fake_torrents: list[TorrentBrief] = []
+_fake_statuses: dict[str, TorrentStatus] = {}
+_delete_calls: list[tuple[str, bool]] = []
 
 
 class _FakeDownloader:
@@ -34,6 +47,27 @@ class _FakeDownloader:
         if _UNREACHABLE_MARK in self.config.url:
             raise DownloaderConnectError("无法连接到 qBittorrent，请检查 WebUI 地址和端口")
         return DownloaderInfo(type=self.config.type, version="v5.0.2")
+
+    async def list_torrents(self) -> list[TorrentBrief]:
+        if "task-error" in self.config.url:
+            raise DownloaderConnectError("读取下载任务失败")
+        return list(_fake_torrents)
+
+    async def get_torrent(
+        self, info_hash: str, *, include_files: bool = True
+    ) -> TorrentStatus | None:
+        status = _fake_statuses.get(info_hash)
+        if status is None or include_files:
+            return status
+        return status.model_copy(update={"files": []})
+
+    async def delete_torrent(self, info_hash: str, *, delete_files: bool = False) -> None:
+        if "delete-error" in self.config.url:
+            raise DownloaderConnectError("删除种子时无法连接到下载器")
+        _delete_calls.append((info_hash, delete_files))
+        _fake_torrents[:] = [
+            torrent for torrent in _fake_torrents if torrent.info_hash != info_hash
+        ]
 
     async def close(self) -> None:
         pass
@@ -49,14 +83,21 @@ def client(tmp_path, monkeypatch):
 
     # 用假适配器替换真实下载器客户端
     _captured_configs.clear()
+    _fake_torrents.clear()
+    _fake_statuses.clear()
+    _delete_calls.clear()
     monkeypatch.setattr(downloader_service, "create_downloader", _FakeDownloader)
+    import movieclaw_api.services.download_tasks as download_tasks_service
+
+    monkeypatch.setattr(download_tasks_service, "create_downloader", _FakeDownloader)
 
     from movieclaw_api.api.deps import require_login
     from movieclaw_api.app import create_app
+    from movieclaw_api.services.auth import Principal
 
     app = create_app()
     # 本文件只测下载器配置业务，登录鉴权用依赖覆盖绕过（鉴权本身在 test_auth 覆盖）
-    app.dependency_overrides[require_login] = lambda: "tester"
+    app.dependency_overrides[require_login] = lambda: Principal(kind="admin", name="tester")
     with TestClient(app) as c:  # with 块内触发 lifespan：建库、迁移、初始化加密器
         yield c, db_file
     get_settings.cache_clear()
@@ -150,6 +191,798 @@ def test_list_returns_all(client) -> None:
     # 未填用户名密码的下载器同样能通过测试（未开鉴权场景）
     assert data[1]["username"] is None
     assert data[1]["status"] == "active"
+
+
+def test_task_center_aggregates_live_downloads_and_subscription_context(client) -> None:
+    """只返回活跃/仍待入库任务，并为订阅任务补齐媒体身份、海报与季集上下文。"""
+    from movieclaw_db.engine import get_database
+    from movieclaw_db.models import (
+        DownloadAttemptStatus,
+        MediaItem,
+        RuleSet,
+        Subscription,
+        SubscriptionDownloadAttempt,
+        WantedItem,
+        WantedStatus,
+        utcnow,
+    )
+
+    c, _ = client
+    downloader_id = c.post("/api/v1/downloaders", json=_PAYLOAD).json()["data"]["id"]
+    linked_hash = "a" * 40
+    external_hash = "b" * 40
+    old_seed_hash = "c" * 40
+    missing_hash = "d" * 40
+    media_identity: dict[str, int] = {}
+    _fake_torrents.extend(
+        [
+            TorrentBrief(
+                name="Subscription.Show.S01",
+                content_name="Subscription.Show.S01",
+                completed=True,
+                info_hash=linked_hash,
+                progress=1,
+                size_bytes=1024,
+                state="completed",
+            ),
+            TorrentBrief(
+                name="External.Movie",
+                content_name="External.Movie",
+                completed=False,
+                info_hash=external_hash,
+                progress=0.42,
+                dlspeed_bytes=2048,
+                state="downloading",
+            ),
+            TorrentBrief(
+                name="Old.Seed",
+                content_name="Old.Seed",
+                completed=True,
+                info_hash=old_seed_hash,
+                progress=1,
+                state="completed",
+            ),
+        ]
+    )
+
+    async def seed_subscription() -> None:
+        db = get_database()
+        async with db.session() as session:
+            rule = RuleSet(name="任务中心测试规则", is_default=True)
+            media = MediaItem(
+                kind="tv",
+                tmdb_id=98765,
+                title="聚合测试剧",
+                original_title="Task Center Show",
+                poster_path="/task-center-show.jpg",
+            )
+            session.add(rule)
+            session.add(media)
+            await session.flush()
+            assert rule.id is not None and media.id is not None
+            media_identity["id"] = media.id
+            subscription = Subscription(
+                media_item_id=media.id,
+                kind="tv",
+                selected_seasons=[1],
+                rule_set_id=rule.id,
+            )
+            session.add(subscription)
+            await session.flush()
+            assert subscription.id is not None
+            session.add_all(
+                [
+                    WantedItem(
+                        subscription_id=subscription.id,
+                        media_item_id=media.id,
+                        season_number=1,
+                        episode_number=1,
+                        status=WantedStatus.GRABBED,
+                        info_hash=linked_hash,
+                    ),
+                    WantedItem(
+                        subscription_id=subscription.id,
+                        media_item_id=media.id,
+                        season_number=1,
+                        episode_number=2,
+                        status=WantedStatus.GRABBED,
+                        info_hash=missing_hash,
+                    ),
+                ]
+            )
+            session.add(
+                SubscriptionDownloadAttempt(
+                    subscription_id=subscription.id,
+                    downloader_id=downloader_id,
+                    info_hash=missing_hash,
+                    torrent_title="Missing.Show.S01E02",
+                    units=[[1, 2]],
+                    quality={"resolution": "1080p", "media_source": "WEB-DL"},
+                    owned_by_movieclaw=True,
+                    hit_and_run=False,
+                    status=DownloadAttemptStatus.ACTIVE,
+                    last_progress_at=utcnow() - timedelta(minutes=16),
+                )
+            )
+            await session.commit()
+
+    asyncio.run(seed_subscription())
+
+    response = c.get("/api/v1/downloaders/tasks")
+    assert response.status_code == 200
+    payload = response.json()["data"]
+    by_hash = {item["info_hash"]: item for item in payload["items"]}
+    assert set(by_hash) == {linked_hash, external_hash, missing_hash}
+    assert by_hash[linked_hash]["source"] == "subscription"
+    assert by_hash[linked_hash]["state"] == "completed"
+    assert by_hash[linked_hash]["media_item_id"] == media_identity["id"]
+    assert by_hash[linked_hash]["media_title"] == "聚合测试剧"
+    assert by_hash[linked_hash]["poster_url"].endswith("/w342/task-center-show.jpg")
+    assert by_hash[linked_hash]["subscriptions"][0]["media_item_id"] == media_identity["id"]
+    assert (
+        by_hash[linked_hash]["subscriptions"][0]["poster_url"] == by_hash[linked_hash]["poster_url"]
+    )
+    assert by_hash[linked_hash]["subscriptions"][0]["units"] == [
+        {"season_number": 1, "episode_number": 1}
+    ]
+    assert by_hash[external_hash]["source"] == "external"
+    assert by_hash[external_hash]["progress"] == 0.42
+    assert by_hash[missing_hash]["state"] == "missing"
+    assert by_hash[missing_hash]["downloader_id"] == downloader_id
+    assert by_hash[missing_hash]["can_replace"] is True
+    assert by_hash[missing_hash]["no_progress_seconds"] >= 15 * 60
+    assert "立即换种" in by_hash[missing_hash]["rescue_message"]
+    # 同一剧集的多个资源带回同一个稳定媒体 ID，前端据此安全合并；不按标题猜测。
+    assert by_hash[missing_hash]["media_item_id"] == by_hash[linked_hash]["media_item_id"]
+    assert payload["sources"] == [
+        {
+            "id": downloader_id,
+            "name": _PAYLOAD["name"],
+            "client_type": "qbittorrent",
+            "status": "active",
+            "message": None,
+            "task_count": 2,
+        }
+    ]
+
+
+def test_task_center_degrades_single_downloader_failure(client) -> None:
+    """一台下载器读取失败只标记来源异常，不能拖垮其余下载器任务。"""
+    c, _ = client
+    c.post("/api/v1/downloaders", json=_PAYLOAD)
+    failed = c.post(
+        "/api/v1/downloaders",
+        json={
+            "name": "故障下载器",
+            "client_type": "transmission",
+            "url": "http://task-error:9091",
+        },
+    ).json()["data"]
+    _fake_torrents.append(
+        TorrentBrief(
+            name="Still.Visible",
+            content_name="Still.Visible",
+            completed=False,
+            info_hash="e" * 40,
+            progress=0.2,
+            state="downloading",
+        )
+    )
+
+    response = c.get("/api/v1/downloaders/tasks")
+
+    assert response.status_code == 200
+    payload = response.json()["data"]
+    assert [item["name"] for item in payload["items"]] == ["Still.Visible"]
+    sources = {source["id"]: source for source in payload["sources"]}
+    assert sources[failed["id"]]["status"] == "error"
+    assert "检查下载器连接" in sources[failed["id"]]["message"]
+
+
+def test_task_center_hides_completed_attempt_after_wanted_is_imported(client) -> None:
+    """入库关闭工单后，继续保种的任务不能永久显示成“等待入库”。"""
+    from movieclaw_db.engine import get_database
+    from movieclaw_db.models import (
+        DownloadAttemptStatus,
+        MediaItem,
+        RuleSet,
+        Subscription,
+        SubscriptionDownloadAttempt,
+        WantedItem,
+        WantedStatus,
+        utcnow,
+    )
+
+    c, _ = client
+    downloader_id = c.post("/api/v1/downloaders", json=_PAYLOAD).json()["data"]["id"]
+    info_hash = "7" * 40
+    _fake_torrents.append(
+        TorrentBrief(
+            name="Already.Imported",
+            content_name="Already.Imported",
+            completed=True,
+            info_hash=info_hash,
+            progress=1,
+            state="completed",
+        )
+    )
+
+    async def seed() -> None:
+        async with get_database().session() as session:
+            media = MediaItem(kind="movie", tmdb_id=778, title="已经入库", original_title="Done")
+            rule = RuleSet(name="已入库规则")
+            session.add_all([media, rule])
+            await session.flush()
+            subscription = Subscription(media_item_id=media.id, kind="movie", rule_set_id=rule.id)
+            session.add(subscription)
+            await session.flush()
+            session.add(
+                WantedItem(
+                    subscription_id=subscription.id,
+                    media_item_id=media.id,
+                    season_number=0,
+                    episode_number=0,
+                    status=WantedStatus.IMPORTED,
+                    info_hash=info_hash,
+                )
+            )
+            session.add(
+                SubscriptionDownloadAttempt(
+                    subscription_id=subscription.id,
+                    downloader_id=downloader_id,
+                    info_hash=info_hash,
+                    units=[[0, 0]],
+                    status=DownloadAttemptStatus.COMPLETED,
+                    last_progress_at=utcnow(),
+                )
+            )
+            await session.commit()
+
+    asyncio.run(seed())
+    assert c.get("/api/v1/downloaders/tasks").json()["data"]["items"] == []
+
+
+def test_immediate_replacement_rejects_ambiguous_shared_info_hash(client) -> None:
+    """同一 hash 关联多个订阅时应返回可读错误，不能 scalar_one 直接 500。"""
+    from movieclaw_db.engine import get_database
+    from movieclaw_db.models import (
+        DownloadAttemptStatus,
+        MediaItem,
+        RuleSet,
+        Subscription,
+        SubscriptionDownloadAttempt,
+        WantedItem,
+        WantedStatus,
+        utcnow,
+    )
+
+    c, _ = client
+    downloader_id = c.post("/api/v1/downloaders", json=_PAYLOAD).json()["data"]["id"]
+    info_hash = "6" * 40
+
+    async def seed() -> None:
+        async with get_database().session() as session:
+            for index in range(2):
+                media = MediaItem(
+                    kind="movie",
+                    tmdb_id=880 + index,
+                    title=f"共享任务 {index}",
+                    original_title=f"Shared {index}",
+                )
+                rule = RuleSet(name=f"共享规则 {index}")
+                session.add_all([media, rule])
+                await session.flush()
+                subscription = Subscription(
+                    media_item_id=media.id, kind="movie", rule_set_id=rule.id
+                )
+                session.add(subscription)
+                await session.flush()
+                session.add(
+                    WantedItem(
+                        subscription_id=subscription.id,
+                        media_item_id=media.id,
+                        season_number=0,
+                        episode_number=0,
+                        status=WantedStatus.GRABBED,
+                        info_hash=info_hash,
+                    )
+                )
+                session.add(
+                    SubscriptionDownloadAttempt(
+                        subscription_id=subscription.id,
+                        downloader_id=downloader_id,
+                        info_hash=info_hash,
+                        units=[[0, 0]],
+                        quality={"resolution": "1080p"},
+                        status=DownloadAttemptStatus.ACTIVE,
+                        last_progress_at=utcnow() - timedelta(minutes=16),
+                    )
+                )
+            await session.commit()
+
+    asyncio.run(seed())
+    response = c.post(f"/api/v1/downloaders/{downloader_id}/torrents/{info_hash}/replace")
+    assert response.status_code == 400
+    assert "多个订阅" in response.json()["message"]
+
+
+def test_task_center_can_request_immediate_replacement(client, monkeypatch) -> None:
+    """15 分钟提醒后的“立即换种”只受理后台搜索，旧工单保持 grabbed。"""
+    from movieclaw_db.engine import get_database
+    from movieclaw_db.models import (
+        DownloadAttemptStatus,
+        MediaItem,
+        RuleSet,
+        Subscription,
+        SubscriptionDownloadAttempt,
+        WantedItem,
+        WantedStatus,
+        utcnow,
+    )
+
+    c, _ = client
+    downloader_id = c.post("/api/v1/downloaders", json=_PAYLOAD).json()["data"]["id"]
+    info_hash = "1" * 40
+    attempt_identity: dict[str, int] = {}
+
+    async def seed() -> None:
+        async with get_database().session() as session:
+            media = MediaItem(kind="movie", tmdb_id=111, title="换源测试", original_title="Swap")
+            rule = RuleSet(name="换源规则")
+            session.add_all([media, rule])
+            await session.flush()
+            subscription = Subscription(
+                media_item_id=media.id,
+                kind="movie",
+                rule_set_id=rule.id,
+            )
+            session.add(subscription)
+            await session.flush()
+            session.add(
+                WantedItem(
+                    subscription_id=subscription.id,
+                    media_item_id=media.id,
+                    season_number=0,
+                    episode_number=0,
+                    status=WantedStatus.GRABBED,
+                    info_hash=info_hash,
+                )
+            )
+            attempt = SubscriptionDownloadAttempt(
+                subscription_id=subscription.id,
+                downloader_id=downloader_id,
+                info_hash=info_hash,
+                torrent_title="Swap.2026.1080p.WEB-DL",
+                units=[[0, 0]],
+                quality={"resolution": "1080p", "media_source": "WEB-DL"},
+                owned_by_movieclaw=True,
+                hit_and_run=False,
+                status=DownloadAttemptStatus.ACTIVE,
+                last_progress_at=utcnow() - timedelta(minutes=16),
+            )
+            session.add(attempt)
+            await session.commit()
+            attempt_identity["id"] = attempt.id
+
+    asyncio.run(seed())
+    searched: list[tuple[int, bool]] = []
+
+    async def fake_search(attempt_id: int, *, force: bool = False) -> bool:
+        searched.append((attempt_id, force))
+        return False
+
+    import movieclaw_api.services.subscription as subscription_services
+
+    monkeypatch.setattr(subscription_services, "run_replacement_search", fake_search)
+    response = c.post(
+        f"/api/v1/downloaders/{downloader_id}/torrents/{info_hash}/replace"
+    )
+
+    assert response.status_code == 200
+    assert response.json()["data"]["attempt_id"] == attempt_identity["id"]
+    assert searched == [(attempt_identity["id"], True)]
+
+    async def state() -> tuple[str, str, str | None]:
+        async with get_database().session() as session:
+            attempt = await session.get(SubscriptionDownloadAttempt, attempt_identity["id"])
+            wanted = (
+                await session.execute(select(WantedItem).where(WantedItem.info_hash == info_hash))
+            ).scalar_one()
+            return attempt.status, wanted.status, wanted.info_hash
+
+    assert asyncio.run(state()) == (
+        DownloadAttemptStatus.REPLACEMENT_PENDING,
+        WantedStatus.GRABBED,
+        info_hash,
+    )
+
+
+def test_delete_download_task_targets_downloader_and_keeps_files_by_default(client) -> None:
+    """任务中心按下载器 ID + infohash 删除；默认只删任务，不碰磁盘文件。"""
+    c, _ = client
+    downloader_id = c.post("/api/v1/downloaders", json=_PAYLOAD).json()["data"]["id"]
+    info_hash = "f" * 40
+    _fake_torrents.append(
+        TorrentBrief(
+            name="Delete.Me",
+            content_name="Delete.Me",
+            completed=False,
+            info_hash=info_hash,
+            progress=0.25,
+            state="downloading",
+        )
+    )
+
+    response = c.delete(f"/api/v1/downloaders/{downloader_id}/torrents/{info_hash}")
+
+    assert response.status_code == 200
+    assert response.json()["data"] == {
+        "downloader_id": downloader_id,
+        "info_hash": info_hash,
+        "delete_files": False,
+    }
+    assert _delete_calls == [(info_hash, False)]
+    assert c.get("/api/v1/downloaders/tasks").json()["data"]["items"] == []
+
+
+def test_cancelled_season_task_becomes_external_then_disappears_after_delete(client) -> None:
+    """取消季后不再合成订阅任务；下载器任务可见为外部，手删后彻底消失。"""
+    from movieclaw_db.engine import get_database
+    from movieclaw_db.models import (
+        DownloadAttemptStatus,
+        MediaItem,
+        RuleSet,
+        Subscription,
+        SubscriptionDownloadAttempt,
+        WantedItem,
+        WantedStatus,
+        utcnow,
+    )
+
+    c, _ = client
+    downloader_id = c.post("/api/v1/downloaders", json=_PAYLOAD).json()["data"]["id"]
+    info_hash = "e" * 40
+    _fake_torrents.append(
+        TorrentBrief(
+            name="Cancelled.Show.S01",
+            content_name="Cancelled.Show.S01",
+            completed=False,
+            info_hash=info_hash,
+            progress=0.3,
+            state="downloading",
+        )
+    )
+    attempt_id: dict[str, int] = {}
+
+    async def seed() -> None:
+        async with get_database().session() as session:
+            media = MediaItem(
+                kind="tv",
+                tmdb_id=1212,
+                title="已取消第一季",
+                original_title="Cancelled Season One",
+            )
+            rule = RuleSet(name="取消季规则")
+            session.add_all([media, rule])
+            await session.flush()
+            subscription = Subscription(
+                media_item_id=media.id,
+                kind="tv",
+                selected_seasons=[2],
+                rule_set_id=rule.id,
+            )
+            session.add(subscription)
+            await session.flush()
+            session.add(
+                WantedItem(
+                    subscription_id=subscription.id,
+                    media_item_id=media.id,
+                    season_number=1,
+                    episode_number=1,
+                    status=WantedStatus.GRABBED,
+                    info_hash=info_hash,
+                    in_scope=False,
+                )
+            )
+            attempt = SubscriptionDownloadAttempt(
+                subscription_id=subscription.id,
+                downloader_id=downloader_id,
+                info_hash=info_hash,
+                units=[[1, 1]],
+                status=DownloadAttemptStatus.CANCELLED,
+                last_progress_at=utcnow(),
+                cleanup_note="关联单元已退出当前订阅范围",
+            )
+            session.add(attempt)
+            await session.commit()
+            attempt_id["value"] = attempt.id
+
+    asyncio.run(seed())
+
+    before = c.get("/api/v1/downloaders/tasks").json()["data"]["items"]
+    assert len(before) == 1
+    assert before[0]["info_hash"] == info_hash
+    assert before[0]["source"] == "external"
+    assert before[0]["subscriptions"] == []
+
+    response = c.delete(f"/api/v1/downloaders/{downloader_id}/torrents/{info_hash}")
+    assert response.status_code == 200
+    assert c.get("/api/v1/downloaders/tasks").json()["data"]["items"] == []
+
+    async def attempt_status() -> str:
+        async with get_database().session() as session:
+            attempt = await session.get(SubscriptionDownloadAttempt, attempt_id["value"])
+            return attempt.status
+
+    assert asyncio.run(attempt_status()) == DownloadAttemptStatus.CANCELLED
+
+
+def test_delete_download_task_can_remove_data_files(client) -> None:
+    """用户显式选择后，删除文件参数必须完整透传到下载器。"""
+    c, _ = client
+    downloader_id = c.post("/api/v1/downloaders", json=_PAYLOAD).json()["data"]["id"]
+    info_hash = "a" * 40
+    _fake_torrents.append(
+        TorrentBrief(
+            name="Delete.Files.Too",
+            content_name="Delete.Files.Too",
+            completed=True,
+            info_hash=info_hash,
+            progress=1.0,
+            state="completed",
+        )
+    )
+
+    response = c.delete(
+        f"/api/v1/downloaders/{downloader_id}/torrents/{info_hash}",
+        params={"delete_files": True},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["data"] == {
+        "downloader_id": downloader_id,
+        "info_hash": info_hash,
+        "delete_files": True,
+    }
+    assert response.json()["message"] == "已删除种子任务和数据文件"
+    assert _delete_calls == [(info_hash, True)]
+
+
+def test_deleted_manual_download_does_not_reappear_as_missing(client) -> None:
+    """删掉手动任务时同步清锚，不能幽灵般重现或留下 90 天孤儿行。"""
+    from movieclaw_db.engine import get_database
+    from movieclaw_db.models import Library, ManualDownloadIntent, MediaItem
+
+    c, _ = client
+    downloader_id = c.post("/api/v1/downloaders", json=_PAYLOAD).json()["data"]["id"]
+    info_hash = "e" * 40
+    _fake_torrents.append(
+        TorrentBrief(
+            name="Manual.Delete.Me",
+            content_name="Manual.Delete.Me",
+            completed=False,
+            info_hash=info_hash,
+            progress=0.1,
+            state="downloading",
+        )
+    )
+
+    async def seed_manual_intent() -> None:
+        async with get_database().session() as session:
+            media = MediaItem(
+                kind="movie",
+                tmdb_id=12345,
+                title="手动下载测试",
+                original_title="Manual Download Test",
+            )
+            library = Library(name="手动下载测试库", kind="movie", root_paths=["/media"])
+            session.add_all([media, library])
+            await session.flush()
+            assert media.id is not None and library.id is not None
+            session.add(
+                ManualDownloadIntent(
+                    info_hash=info_hash,
+                    media_item_id=media.id,
+                    library_id=library.id,
+                )
+            )
+            await session.commit()
+
+    asyncio.run(seed_manual_intent())
+    before = c.get("/api/v1/downloaders/tasks").json()["data"]["items"]
+    assert before[0]["source"] == "manual"
+
+    assert c.delete(f"/api/v1/downloaders/{downloader_id}/torrents/{info_hash}").status_code == 200
+
+    assert c.get("/api/v1/downloaders/tasks").json()["data"]["items"] == []
+
+    async def intent_exists() -> bool:
+        async with get_database().session() as session:
+            return (
+                await session.execute(select(ManualDownloadIntent))
+            ).scalar_one_or_none() is not None
+
+    assert asyncio.run(intent_exists()) is False
+
+
+def test_completed_manual_download_is_reconciled_after_inplace_library_scan(client) -> None:
+    """历史原地下载已逐文件入账后，刷新任务中心会回收残留身份锚。"""
+    from movieclaw_db.engine import get_database
+    from movieclaw_db.models import Library, LibraryFile, ManualDownloadIntent, MediaItem
+
+    c, _ = client
+    c.post(
+        "/api/v1/downloaders",
+        json={
+            **_PAYLOAD,
+            "save_path": "/media",
+            "path_mappings": [{"local": "/media", "remote": "/mnt/media"}],
+        },
+    )
+    info_hash = "9" * 40
+    save_path = "/media/movies/已入库影片 (2026)"
+    file_path = f"{save_path}/release.mkv"
+    _fake_torrents.append(
+        TorrentBrief(
+            name="Finished.Release",
+            content_name="Finished.Release",
+            completed=True,
+            info_hash=info_hash,
+            progress=1,
+            state="completed",
+        )
+    )
+    _fake_statuses[info_hash] = TorrentStatus(
+        info_hash=info_hash,
+        name="Finished.Release",
+        progress=1,
+        completed=True,
+        # 下载器回报 remote 视角；对账必须先映射回上面的本地 save_path。
+        save_path="/mnt/media/movies/已入库影片 (2026)",
+        files=[TorrentFile(path="release.mkv", size_bytes=2048)],
+    )
+
+    async def seed() -> None:
+        async with get_database().session() as session:
+            media = MediaItem(
+                kind="movie", tmdb_id=2026, title="已入库影片", original_title="Finished"
+            )
+            library = Library(name="电影库", kind="movie", root_paths=["/media/movies"])
+            session.add_all([media, library])
+            await session.flush()
+            assert media.id is not None and library.id is not None
+            session.add(
+                ManualDownloadIntent(
+                    info_hash=info_hash,
+                    media_item_id=media.id,
+                    library_id=library.id,
+                )
+            )
+            await session.flush()
+            session.add(
+                LibraryFile(
+                    library_id=library.id,
+                    media_item_id=media.id,
+                    file_path=file_path,
+                    size_bytes=2048,
+                    source="scanned",
+                )
+            )
+            await session.commit()
+
+    asyncio.run(seed())
+
+    response = c.get("/api/v1/downloaders/tasks")
+
+    assert response.status_code == 200
+    assert response.json()["data"]["items"] == []
+
+    async def intent_exists() -> bool:
+        async with get_database().session() as session:
+            return (
+                await session.execute(select(ManualDownloadIntent))
+            ).scalar_one_or_none() is not None
+
+    assert asyncio.run(intent_exists()) is False
+
+
+def test_completed_tv_pack_waits_until_every_new_video_is_in_library(client) -> None:
+    """旧集和部分新集不能误证整包完成；全部视频入账前继续展示。"""
+    from movieclaw_db.engine import get_database
+    from movieclaw_db.models import Library, LibraryFile, ManualDownloadIntent, MediaItem
+
+    c, _ = client
+    c.post("/api/v1/downloaders", json=_PAYLOAD)
+    info_hash = "8" * 40
+    save_path = "/media/tv/谨慎对账 (2026)"
+    _fake_torrents.append(
+        TorrentBrief(
+            name="Careful.Show.S01",
+            content_name="Careful.Show.S01",
+            completed=True,
+            info_hash=info_hash,
+            progress=1,
+            state="completed",
+        )
+    )
+    _fake_statuses[info_hash] = TorrentStatus(
+        info_hash=info_hash,
+        name="Careful.Show.S01",
+        progress=1,
+        completed=True,
+        save_path=save_path,
+        files=[
+            TorrentFile(path="ep01.mkv", size_bytes=1001),
+            TorrentFile(path="ep02.mkv", size_bytes=1002),
+        ],
+    )
+
+    async def seed() -> None:
+        async with get_database().session() as session:
+            media = MediaItem(
+                kind="tv", tmdb_id=3026, title="谨慎对账", original_title="Careful"
+            )
+            library = Library(name="剧集库", kind="tv", root_paths=["/media/tv"])
+            session.add_all([media, library])
+            await session.flush()
+            assert media.id is not None and library.id is not None
+            # 旧库存先于本次身份锚存在；即便尺寸与缺失的新集相同也不能拿来抵数。
+            session.add(
+                LibraryFile(
+                    library_id=library.id,
+                    media_item_id=media.id,
+                    season_number=0,
+                    episode_number=1,
+                    file_path=f"{save_path}/old-episode.mkv",
+                    size_bytes=1002,
+                    source="scanned",
+                )
+            )
+            await session.commit()
+            session.add(
+                ManualDownloadIntent(
+                    info_hash=info_hash,
+                    media_item_id=media.id,
+                    library_id=library.id,
+                )
+            )
+            await session.commit()
+            # 本次季包只入账了第一集，第二集仍未被扫描确认。
+            session.add(
+                LibraryFile(
+                    library_id=library.id,
+                    media_item_id=media.id,
+                    season_number=1,
+                    episode_number=1,
+                    file_path=f"{save_path}/ep01.mkv",
+                    size_bytes=1001,
+                    source="scanned",
+                )
+            )
+            await session.commit()
+
+    asyncio.run(seed())
+
+    items = c.get("/api/v1/downloaders/tasks").json()["data"]["items"]
+
+    assert len(items) == 1
+    assert items[0]["info_hash"] == info_hash
+    assert items[0]["state"] == "completed"
+
+
+def test_delete_download_task_reports_missing_downloader_and_upstream_error(client) -> None:
+    c, _ = client
+    info_hash = "d" * 40
+    assert c.delete(f"/api/v1/downloaders/999/torrents/{info_hash}").status_code == 404
+
+    failed_id = c.post(
+        "/api/v1/downloaders",
+        json={**_PAYLOAD, "name": "删除失败", "url": "http://delete-error:8080"},
+    ).json()["data"]["id"]
+    response = c.delete(f"/api/v1/downloaders/{failed_id}/torrents/{info_hash}")
+    assert response.status_code == 502
+    assert response.json()["code"] == "UPSTREAM_ERROR"
+    assert "无法连接" in response.json()["message"]
 
 
 def test_enable_disable_toggles_usable(client) -> None:

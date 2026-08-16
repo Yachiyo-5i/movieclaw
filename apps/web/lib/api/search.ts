@@ -1,5 +1,15 @@
 import { HttpError, redirectToLoginOn401, request, resolveRequestUrl } from "@/lib/http";
+import {
+  toDiscoveredSearchItem,
+  toSearchItem,
+  type MediaSearchItem,
+  type MediaSearchItemDto,
+  type TitleSearchData,
+  type TitleSearchDto,
+} from "@/lib/api/discover";
+import type { LibrarySearchGroup } from "@/lib/api/libraries";
 import type { SearchScope, SearchTab, TorrentCategory } from "@/lib/categories";
+import type { MediaSource } from "@/lib/media-types";
 
 /** 后端统一响应信封（见 movieclaw_api.schemas.response.ApiResponse） */
 interface ApiEnvelope<T> {
@@ -45,8 +55,12 @@ export interface TorrentAttrs {
   remux: boolean;
   /** 音频编码：TrueHD / Atmos / DTS-HD MA / DDP ... */
   audio: string[];
-  /** 标题/副标题明确声明的字幕语言（BCP 47；当前可识别 zh-Hans） */
+  /** 标题/副标题明确声明的字幕语言（BCP 47；zh=泛称"中字"不猜简繁） */
   subtitle_languages: string[];
+  /** 字幕载体：embedded（内封/软）/ hardcoded（内嵌/硬）/ external（外挂） */
+  subtitle_carriers?: string[];
+  /** 音轨语言（BCP 47：cmn=国语、yue=粤语…），含配音与原声声明 */
+  audio_languages?: string[];
   release_group: string | null;
 }
 
@@ -111,8 +125,8 @@ export interface SearchResponse {
 export interface SearchHistoryItem {
   id: number;
   keyword: string;
-  /** 搜索垂直：torrent=站点资源 / media=影视条目（豆瓣）。混排列表据此区分展示与回放 */
-  vertical: "torrent" | "media";
+  /** 搜索垂直；公开契约使用与 CLI 一致的领域名。 */
+  vertical: "titles" | "torrents";
   /** 展示名快照（分类中文名/预设名）；null=全部 */
   label: string | null;
   /** 分类组合快照（已排序去重）；空=不限分类 */
@@ -129,15 +143,16 @@ export interface SearchHistoryItem {
   poster_mode: boolean;
 }
 
-/** 获取最近的搜索历史（按最近搜索时间倒序，同关键词+分类已合并）。 */
-export function fetchSearchHistory(limit = 10, init?: RequestInit): Promise<SearchHistoryItem[]> {
+/** 获取最近的统一搜索历史（按最近搜索时间倒序，同关键词+范围已合并）。 */
+export function listSearchHistory(limit = 10, init?: RequestInit): Promise<SearchHistoryItem[]> {
   return unwrap(
     request<ApiEnvelope<SearchHistoryItem[]>>(`/search/history?limit=${limit}`, init),
   );
 }
 
-/** 某条搜索历史的结果快照（见 schemas.search.SearchSnapshotView），与 SearchResponse 同构。 */
-export interface SearchSnapshotView {
+/** 一次历史 PT 资源搜索保存的完整结果。 */
+export interface TorrentSearchHistoryResults {
+  vertical: "torrents";
   history_id: number;
   keyword: string;
   label: string | null;
@@ -153,47 +168,53 @@ export interface SearchSnapshotView {
 }
 
 /** 读取某条搜索历史的结果快照；历史不存在或尚无快照报 404（HttpError.status）。 */
-export function fetchSearchSnapshot(
+export async function getTorrentSearchHistoryResults(
   historyId: number,
   init?: RequestInit,
-): Promise<SearchSnapshotView> {
-  return unwrap(
-    request<ApiEnvelope<SearchSnapshotView>>(`/search/history/${historyId}/snapshot`, init),
+): Promise<TorrentSearchHistoryResults> {
+  const result = await unwrap(
+    request<ApiEnvelope<SearchHistoryResults>>(`/search/history/${historyId}/results`, init),
   );
+  if (result.vertical !== "torrents") throw new Error("该历史记录不是 PT 种子搜索");
+  return result;
 }
 
-/** 媒体搜索历史的结果快照（见 schemas.search.MediaSearchSnapshotView）。 */
-export interface MediaSearchSnapshotView {
+/** 一次历史影视条目搜索保存的完整结果。 */
+interface TitleSearchHistoryResultsDto {
+  vertical: "titles";
   history_id: number;
   keyword: string;
   /** 快照生成时间（带时区的 ISO 串），提示条用 lib/time.ts 换算相对时间 */
   snapshot_at: string;
   total: number;
-  /** 豆瓣条目快照（后端原始字段名，poster_url 尚未代理，展示前需 proxyImageUrl） */
-  items: {
-    id: string;
-    source: "douban";
-    title: string;
-    rating: number;
-    poster_url: string;
-  }[];
+  items: MediaSearchItemDto[];
 }
 
-/** 读取某条媒体搜索历史的结果快照；历史不存在/不是媒体搜索/尚无快照均报 404。 */
-export function fetchMediaSearchSnapshot(
+export interface TitleSearchHistoryResults {
+  vertical: "titles";
+  history_id: number;
+  keyword: string;
+  snapshot_at: string;
+  total: number;
+  items: MediaSearchItem[];
+}
+
+type SearchHistoryResults = TorrentSearchHistoryResults | TitleSearchHistoryResultsDto;
+
+/** 读取影视条目历史结果；路由与 PT 结果统一，由 vertical 做类型守卫。 */
+export async function getTitleSearchHistoryResults(
   historyId: number,
   init?: RequestInit,
-): Promise<MediaSearchSnapshotView> {
-  return unwrap(
-    request<ApiEnvelope<MediaSearchSnapshotView>>(
-      `/search/history/${historyId}/media-snapshot`,
-      init,
-    ),
+): Promise<TitleSearchHistoryResults> {
+  const result = await unwrap(
+    request<ApiEnvelope<SearchHistoryResults>>(`/search/history/${historyId}/results`, init),
   );
+  if (result.vertical !== "titles") throw new Error("该历史记录不是影视条目搜索");
+  return { ...result, items: result.items.map(toSearchItem) };
 }
 
 /** 删除单条搜索历史。 */
-export function deleteSearchHistory(id: number): Promise<null> {
+export function deleteSearchHistoryEntry(id: number): Promise<null> {
   return unwrap(request<ApiEnvelope<null>>(`/search/history/${id}`, { method: "DELETE" }));
 }
 
@@ -202,28 +223,64 @@ export function clearSearchHistory(): Promise<null> {
   return unwrap(request<ApiEnvelope<null>>(`/search/history`, { method: "DELETE" }));
 }
 
-/** 搜索偏好视图（见 schemas.search.SearchPreferencesView）：全量标签的有序列表。 */
-interface SearchPreferencesView {
-  tabs: SearchTab[];
+/** 资源搜索预设视图：内置分类与自定义站点组合的完整有序列表。 */
+interface SearchPresetListView {
+  presets: SearchTab[];
 }
 
-/** 读取搜索偏好：全量标签（含隐藏项）的有序混排列表，存服务端、跨设备一致。 */
-export async function fetchSearchPreferences(init?: RequestInit): Promise<SearchTab[]> {
+/** 列出资源搜索预设；含隐藏的内置分类。 */
+export async function listSearchPresets(init?: RequestInit): Promise<SearchTab[]> {
   const view = await unwrap(
-    request<ApiEnvelope<SearchPreferencesView>>("/search/preferences", init),
+    request<ApiEnvelope<SearchPresetListView>>("/search/presets", init),
   );
-  return view.tabs;
+  return view.presets;
 }
 
-/** 整体覆盖式保存搜索偏好，返回后端规范化后的完整列表。 */
-export async function updateSearchPreferences(tabs: SearchTab[]): Promise<SearchTab[]> {
+/** 整体覆盖式保存资源搜索预设，返回后端规范化后的完整列表。 */
+export async function updateSearchPresets(presets: SearchTab[]): Promise<SearchTab[]> {
   const view = await unwrap(
-    request<ApiEnvelope<SearchPreferencesView>>("/search/preferences", {
+    request<ApiEnvelope<SearchPresetListView>>("/search/presets", {
       method: "PUT",
-      body: JSON.stringify({ tabs }),
+      body: JSON.stringify({ presets }),
     }),
   );
-  return view.tabs;
+  return view.presets;
+}
+
+/** 搜索一个或全部影视来源；每个来源的成功/失败状态独立返回。 */
+export async function searchTitles(
+  query: string,
+  options?: { provider?: MediaSource | "all"; saveHistory?: boolean },
+  init?: RequestInit,
+): Promise<TitleSearchData> {
+  const dto = await unwrap(
+    request<ApiEnvelope<TitleSearchDto>>("/search/titles", {
+      ...init,
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...init?.headers },
+      body: JSON.stringify({
+        query,
+        provider: options?.provider ?? "all",
+        save_history: options?.saveHistory ?? false,
+      }),
+    }),
+  );
+  return {
+    items: dto.titles.map(toDiscoveredSearchItem),
+    providers: dto.providers.map((status) => ({
+      provider: status.provider,
+      success: status.success,
+      resultCount: status.result_count,
+      message: status.message ?? undefined,
+    })),
+    historyId: dto.history_id ?? undefined,
+  };
+}
+
+/** 搜索本地全部可见媒体库中的已入库条目。 */
+export function searchLibraryItems(keyword: string): Promise<LibrarySearchGroup[]> {
+  const query = new URLSearchParams({ keyword });
+  return unwrap(request<ApiEnvelope<LibrarySearchGroup[]>>(`/search/library-items?${query}`));
 }
 
 export interface SearchParams {
@@ -242,7 +299,10 @@ export function searchTorrents(
   init?: RequestInit,
 ): Promise<SearchResponse> {
   return unwrap(
-    request<ApiEnvelope<SearchResponse>>(`/search?${searchParamsOf({ keyword, scope, page })}`, init),
+    request<ApiEnvelope<SearchResponse>>(
+      `/search/torrents?${searchParamsOf({ keyword, scope, page })}`,
+      init,
+    ),
   );
 }
 
@@ -259,7 +319,7 @@ function searchParamsOf({ keyword, scope, page }: SearchParams): URLSearchParams
   return params;
 }
 
-/* —— SSE 流式搜索（GET /search/stream） —— */
+/* —— SSE 流式搜索（GET /search/torrents/stream） —— */
 
 /** `start` 事件的站点清单项 / `site_start` 事件的载荷（见 schemas.search.SearchStreamSite）。 */
 export interface SearchStreamSite {
@@ -321,7 +381,7 @@ export async function streamSearchTorrents(
   onEvent: (event: SearchStreamEvent) => void,
   init?: RequestInit,
 ): Promise<void> {
-  const response = await fetch(resolveRequestUrl(`/search/stream?${searchParamsOf(params)}`), {
+  const response = await fetch(resolveRequestUrl(`/search/torrents/stream?${searchParamsOf(params)}`), {
     ...init,
     headers: { Accept: "text/event-stream" },
   });

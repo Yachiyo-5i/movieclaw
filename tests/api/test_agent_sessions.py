@@ -132,8 +132,8 @@ def test_summarize_and_scan_all(tmp_path) -> None:
     assert [s.session_id for s in summaries] == [sid]
 
 
-def test_truncate_from_drops_turn_and_everything_after(tmp_path) -> None:
-    """改写重问：从第二轮提问处截断，文件只剩第一轮，后续追加接回新链尾。"""
+def test_discard_from_user_message_drops_message_and_everything_after(tmp_path) -> None:
+    """丢弃第二条用户消息后只剩首组问答，后续追加接回新链尾。"""
     store = AgentSessionStore(tmp_path)
     sid = store.create().session_id
     first = store.append(sid, ChatMessage(role="user", content="第一轮"))
@@ -141,13 +141,13 @@ def test_truncate_from_drops_turn_and_everything_after(tmp_path) -> None:
     second = store.append(sid, ChatMessage(role="user", content="第二轮"))
     store.append(sid, ChatMessage(role="assistant", content="第二轮答复"))
 
-    assert store.truncate_from(sid, second.uuid) == 2
+    assert store.discard_from_user_message(sid, second.uuid) == 2
 
     _, entries = store.read(sid)
     assert [e.uuid for e in entries] == [first.uuid, answer.uuid]
     # 上下文里不再有被丢弃的往返
     assert [m.text() for m in store.build_history(sid)] == ["第一轮", "第一轮答复"]
-    # 链尾回到截断点之前：新一轮的 parent 指向保留下来的最后一条
+    # 链尾回到目标消息之前：新消息的 parent 指向保留下来的最后一条
     rewritten = store.append(sid, ChatMessage(role="user", content="第二轮（改写后）"))
     assert rewritten.parent_uuid == answer.uuid
     summary = store.summarize(sid)
@@ -155,29 +155,29 @@ def test_truncate_from_drops_turn_and_everything_after(tmp_path) -> None:
     assert summary.last_prompt == "第二轮（改写后）"
 
 
-def test_truncate_from_rejects_non_user_anchor(tmp_path) -> None:
-    """只能从用户提问处切：从 assistant 中间切会留下没有回执的 tool_call。"""
+def test_discard_from_user_message_rejects_non_user_anchor(tmp_path) -> None:
+    """只能从 user message 丢弃：从 assistant 中间切会留下孤立工具轨迹。"""
     store = AgentSessionStore(tmp_path)
     sid = store.create().session_id
     store.append(sid, ChatMessage(role="user", content="执行任务"))
     assistant = store.append(sid, _assistant_with_tools())
 
     with pytest.raises(BadRequestException):
-        store.truncate_from(sid, assistant.uuid)
+        store.discard_from_user_message(sid, assistant.uuid)
     with pytest.raises(NotFoundException):
-        store.truncate_from(sid, "不存在的uuid")
+        store.discard_from_user_message(sid, "不存在的uuid")
     # 失败不改动文件
     assert len(store.read(sid)[1]) == 2
 
 
-def test_truncate_from_first_turn_empties_session(tmp_path) -> None:
-    """从首轮切 = 清空会话：只剩头行，链尾回到 None。"""
+def test_discard_from_first_message_empties_session(tmp_path) -> None:
+    """从首条消息开始丢弃会清空会话：只剩头行，链尾回到 None。"""
     store = AgentSessionStore(tmp_path)
     sid = store.create().session_id
     first = store.append(sid, ChatMessage(role="user", content="唯一一轮"))
     store.append(sid, ChatMessage(role="assistant", content="答复"))
 
-    assert store.truncate_from(sid, first.uuid) == 2
+    assert store.discard_from_user_message(sid, first.uuid) == 2
     header, entries = store.read(sid)
     assert header.session_id == sid
     assert entries == []
@@ -308,7 +308,7 @@ async def test_recorder_lifecycle_and_terminal_sealing(db) -> None:
 
     recorder = AgentSessionRecorder(store, sid, entry_count=0)
     await recorder.begin("run123")
-    await recorder.record_user_input("帮我找资源")
+    await recorder.record_user_message("帮我找资源")
     await recorder.on_message(
         _assistant_with_tools(),
         ChatResponse(model="kimi-k2", finish_reason="tool_calls"),
@@ -412,48 +412,52 @@ def client(tmp_path, monkeypatch):
 
     from movieclaw_api.api.deps import require_login
     from movieclaw_api.app import create_app
+    from movieclaw_api.services.auth import Principal
 
     app = create_app()
-    app.dependency_overrides[require_login] = lambda: "tester"
+    app.dependency_overrides[require_login] = lambda: Principal(kind="admin", name="tester")
     with TestClient(app) as c:
         yield c
     get_settings.cache_clear()
     reset_agent_session_store()
 
 
-def _run_turn(client, payload: dict) -> tuple[str, str]:
-    """发起一轮运行并等待终态，返回 (session_id, run_id)。"""
-    started = client.post("/api/v1/agent/start", json=payload)
+def _send_message_and_wait(client, payload: dict) -> tuple[str, str]:
+    """提交一条用户消息并等待终态，返回 (session_id, message_id)。"""
+    body = dict(payload)
+    started = client.post("/api/v1/sessions", json=body)
     assert started.status_code == 202
     data = started.json()["data"]
-    with client.stream("GET", f"/api/v1/agent/runs/{data['run_id']}/stream") as r:
+    with client.stream("GET", f"/api/v1/sessions/{data['session_id']}/events") as r:
         r.read()
-    return data["session_id"], data["run_id"]
+    return data["session_id"], data["message_id"]
 
 
 def _wait_not_running(client, session_id: str) -> dict:
     """等待终态收尾落库（on_terminal 与 SSE 收流并发，留一个短轮询窗）。"""
     for _ in range(50):
-        item = client.get(f"/api/v1/agent/sessions/{session_id}").json()["data"]["session"]
+        item = client.get(f"/api/v1/sessions/{session_id}").json()["data"]["session"]
         if not item["running"]:
             return item
         time.sleep(0.1)
     pytest.fail("会话运行状态未在期限内清空")
 
 
-def test_start_creates_session_and_persists_turn(client) -> None:
+def test_start_creates_session_and_persists_message(client) -> None:
     configure_provider(client)
-    session_id, _ = _run_turn(client, {"input": "找沙丘 4K"})
+    session_id, _ = _send_message_and_wait(client, {"content": "找沙丘 4K"})
 
     item = _wait_not_running(client, session_id)
     assert item["title"] == "找沙丘 4K"
     assert item["last_prompt"] == "找沙丘 4K"
     assert item["entry_count"] == 2  # user + 终答 assistant
-    assert item["active_run_id"] is None
+    assert "active_run_id" not in item
 
-    detail = client.get(f"/api/v1/agent/sessions/{session_id}").json()["data"]
+    detail = client.get(f"/api/v1/sessions/{session_id}").json()["data"]
     roles = [e["message"]["role"] for e in detail["entries"]]
     assert roles == ["user", "assistant"]
+    assert detail["entries"][0]["message_id"]
+    assert "id" not in detail["entries"][0]
     assistant = detail["entries"][1]
     # 定稿 assistant 带模型元数据；thinking 以内容块形式原样保留
     assert assistant["finish_reason"] == "stop"
@@ -461,12 +465,12 @@ def test_start_creates_session_and_persists_turn(client) -> None:
     parts = assistant["message"]["content"]
     assert [p["type"] for p in parts] == ["thinking", "text"]
 
-    listing = client.get("/api/v1/agent/sessions").json()["data"]
+    listing = client.get("/api/v1/sessions").json()["data"]
     assert [s["id"] for s in listing] == [session_id]
 
 
-def test_multi_turn_resume_builds_history_from_transcript(client, monkeypatch) -> None:
-    """续聊的上下文来自服务端转录，而非前端回传。"""
+def test_followup_message_builds_history_from_transcript(client, monkeypatch) -> None:
+    """后续消息的上下文来自服务端转录，而非前端回传。"""
     captured: dict = {}
 
     class _CaptureProtocol(_StreamProtocol):
@@ -488,21 +492,18 @@ def test_multi_turn_resume_builds_history_from_transcript(client, monkeypatch) -
         },
     )
 
-    session_id, _ = _run_turn(client, {"input": "第一轮"})
+    session_id, first_message_id = _send_message_and_wait(client, {"content": "第一轮"})
     _wait_not_running(client, session_id)
-    # 故意带上与服务端不符的 history：session_id 存在时应被忽略
-    second, _ = _run_turn(
+    second, _ = _send_message_and_wait(
         client,
         {
-            "input": "第二轮",
+            "content": "第二轮",
             "session_id": session_id,
-            "history": [{"role": "user", "content": "伪造历史"}],
         },
     )
     assert second == session_id
     assert captured["roles"] == ["system", "user", "assistant", "user"]
     assert captured["last"] == "第二轮"
-    assert "伪造历史" not in str(captured)
 
     item = _wait_not_running(client, session_id)
     assert item["entry_count"] == 4
@@ -510,153 +511,195 @@ def test_multi_turn_resume_builds_history_from_transcript(client, monkeypatch) -
     assert item["title"] == "第一轮"  # 标题保持首轮
 
 
-def test_start_on_unknown_session_returns_404(client) -> None:
+def test_send_message_to_unknown_session_returns_404(client) -> None:
     configure_provider(client)
-    r = client.post("/api/v1/agent/start", json={"input": "x", "session_id": "missing"})
+    r = client.post(
+        "/api/v1/sessions", json={"content": "x", "session_id": "missing"}
+    )
     assert r.status_code == 404
+
+
+def test_legacy_agent_and_turn_routes_are_removed(client) -> None:
+    """破坏式重构不保留旧 agent/run/turn/truncate 协议入口。"""
+    for path in (
+        "/api/v1/agent/start",
+        "/api/v1/sessions/missing/messages",
+        "/api/v1/sessions/missing/rewind",
+        "/api/v1/sessions/missing/turns",
+        "/api/v1/sessions/missing/truncate-from-turn",
+    ):
+        assert client.post(path, json={}).status_code == 404
 
 
 def test_rename_session_updates_index_title(client) -> None:
     configure_provider(client)
-    session_id, _ = _run_turn(client, {"input": "起个名字"})
+    session_id, _ = _send_message_and_wait(client, {"content": "起个名字"})
     _wait_not_running(client, session_id)
 
     r = client.patch(
-        f"/api/v1/agent/sessions/{session_id}", json={"title": "  我的追剧计划  "}
+        f"/api/v1/sessions/{session_id}", json={"title": "  我的追剧计划  "}
     )
     assert r.status_code == 200
     assert r.json()["data"]["title"] == "我的追剧计划"
     # 列表同步生效；转录文件不因改名而变化（标题只是索引元数据）
-    items = client.get("/api/v1/agent/sessions").json()["data"]
+    items = client.get("/api/v1/sessions").json()["data"]
     assert items[0]["title"] == "我的追剧计划"
 
     assert client.patch(
-        "/api/v1/agent/sessions/missing", json={"title": "x"}
+        "/api/v1/sessions/missing", json={"title": "x"}
     ).status_code == 404
     assert client.patch(
-        f"/api/v1/agent/sessions/{session_id}", json={"title": "   "}
+        f"/api/v1/sessions/{session_id}", json={"title": "   "}
     ).status_code == 422
 
 
-def _user_entry_uuids(client, session_id: str) -> list[str]:
-    """会话里各轮用户提问的 entry uuid（前端回放时拿到的就是它）。"""
-    detail = client.get(f"/api/v1/agent/sessions/{session_id}").json()["data"]
+def _user_message_ids(client, session_id: str) -> list[str]:
+    """会话里各条用户消息的公开 message_id。"""
+    detail = client.get(f"/api/v1/sessions/{session_id}").json()["data"]
     return [
-        e["uuid"]
+        e["message_id"]
         for e in detail["entries"]
         if e["type"] == "message" and e["message"]["role"] == "user"
     ]
 
 
-def test_truncate_drops_turn_and_later_context(client, monkeypatch) -> None:
-    """改写重问：截断后被丢弃的往返既不在回放里，也不再进入下一轮的模型上下文。"""
+def test_retry_replaces_user_message_and_later_context(client, monkeypatch) -> None:
+    """retry 一次完成问题替换，并为新消息生成稳定编号。"""
     captured: dict = {}
 
     class _CaptureProtocol(_StreamProtocol):
         async def chat_stream(self, request, model_id):
-            captured["texts"] = [m.text() for m in request.messages]
-            async for e in super().chat_stream(request, model_id):
-                yield e
+            captured["roles"] = [message.role for message in request.messages]
+            captured["texts"] = [message.text() for message in request.messages]
+            async for event in super().chat_stream(request, model_id):
+                yield event
 
     monkeypatch.setitem(PROTOCOLS, "openai_chat", _CaptureProtocol)
     client.put(
         "/api/v1/llm/provider",
-        json={"provider_type": "bailian", "api_key": "sk-truncate", "default_model": "qwen3.7-max"},
+        json={
+            "provider_type": "bailian",
+            "api_key": "sk-retry",
+            "default_model": "qwen3.7-max",
+        },
     )
 
-    session_id, _ = _run_turn(client, {"input": "第一轮"})
-    _wait_not_running(client, session_id)
-    _run_turn(client, {"input": "第二轮", "session_id": session_id})
-    _wait_not_running(client, session_id)
-
-    second_uuid = _user_entry_uuids(client, session_id)[1]
-    r = client.post(
-        f"/api/v1/agent/sessions/{session_id}/truncate", json={"entry_uuid": second_uuid}
+    session_id, first_message_id = _send_message_and_wait(
+        client, {"content": "第一轮"}
     )
-    assert r.status_code == 200
-    assert r.json()["data"] == {"removed_entries": 2, "entry_count": 2}
+    _wait_not_running(client, session_id)
+    _, old_message_id = _send_message_and_wait(
+        client, {"content": "第二轮", "session_id": session_id}
+    )
+    _wait_not_running(client, session_id)
 
-    # 索引与回放都回到第一轮结束处
-    item = client.get(f"/api/v1/agent/sessions/{session_id}").json()["data"]["session"]
-    assert item["entry_count"] == 2
-    assert item["last_prompt"] == "第一轮"
-    assert item["title"] == "第一轮"  # 首轮仍在，标题不动
-    detail = client.get(f"/api/v1/agent/sessions/{session_id}").json()["data"]
-    assert [e["message"]["role"] for e in detail["entries"]] == ["user", "assistant"]
+    retried = client.post(
+        f"/api/v1/sessions/{session_id}/retry",
+        json={"message_id": old_message_id, "content": "第二轮（改写后）"},
+    )
+    assert retried.status_code == 202
+    new_message_id = retried.json()["data"]["message_id"]
+    assert new_message_id != old_message_id
+    with client.stream("GET", f"/api/v1/sessions/{session_id}/events") as response:
+        response.read()
+    _wait_not_running(client, session_id)
 
-    # 改写后重发：上下文接在第一轮之后，被丢弃的「第二轮」不再出现
-    _run_turn(client, {"input": "第二轮（改写后）", "session_id": session_id})
+    detail = client.get(f"/api/v1/sessions/{session_id}").json()["data"]
+    user_entries = [
+        entry
+        for entry in detail["entries"]
+        if entry["type"] == "message" and entry["message"]["role"] == "user"
+    ]
+    assert [entry["message"]["content"] for entry in user_entries] == [
+        "第一轮",
+        "第二轮（改写后）",
+    ]
+    assert [entry["message_id"] for entry in user_entries] == [first_message_id, new_message_id]
+    assert old_message_id not in {entry["message_id"] for entry in detail["entries"]}
+    assert captured["roles"] == ["system", "user", "assistant", "user"]
     assert "第二轮" not in captured["texts"]
     assert captured["texts"][-1] == "第二轮（改写后）"
 
 
-def test_truncate_first_turn_clears_stale_title(client) -> None:
-    """从首轮切会把会话清空，标题一并清掉——留着就是个对不上号的名字。"""
+def test_retry_first_message_replaces_session_title(client) -> None:
+    """替换首条提问时，会话标题与最后提问同步更新。"""
     configure_provider(client)
-    session_id, _ = _run_turn(client, {"input": "写错了的第一句"})
-    _wait_not_running(client, session_id)
-
-    first_uuid = _user_entry_uuids(client, session_id)[0]
-    r = client.post(
-        f"/api/v1/agent/sessions/{session_id}/truncate", json={"entry_uuid": first_uuid}
+    session_id, first_message_id = _send_message_and_wait(
+        client, {"content": "写错了的第一句"}
     )
-    assert r.json()["data"]["entry_count"] == 0
-
-    item = client.get(f"/api/v1/agent/sessions/{session_id}").json()["data"]["session"]
-    assert item["title"] is None
-    assert item["last_prompt"] is None
-    # 下一条消息重新给会话命名
-    _run_turn(client, {"input": "改好的第一句", "session_id": session_id})
     _wait_not_running(client, session_id)
-    item = client.get(f"/api/v1/agent/sessions/{session_id}").json()["data"]["session"]
+
+    retried = client.post(
+        f"/api/v1/sessions/{session_id}/retry",
+        json={"message_id": first_message_id, "content": "改好的第一句"},
+    )
+    assert retried.status_code == 202
+    with client.stream("GET", f"/api/v1/sessions/{session_id}/events") as response:
+        response.read()
+    _wait_not_running(client, session_id)
+    item = client.get(f"/api/v1/sessions/{session_id}").json()["data"]["session"]
     assert item["title"] == "改好的第一句"
+    assert item["last_prompt"] == "改好的第一句"
 
 
-def test_truncate_rejects_unknown_target(client) -> None:
+def test_retry_without_content_resubmits_original_message(client) -> None:
     configure_provider(client)
-    session_id, _ = _run_turn(client, {"input": "只有一轮"})
+    session_id, old_message_id = _send_message_and_wait(client, {"content": "原问题"})
     _wait_not_running(client, session_id)
 
-    assert (
-        client.post("/api/v1/agent/sessions/missing/truncate", json={"entry_uuid": "x"}).status_code
-        == 404
+    retried = client.post(
+        f"/api/v1/sessions/{session_id}/retry",
+        json={"message_id": old_message_id},
     )
-    assert (
-        client.post(
-            f"/api/v1/agent/sessions/{session_id}/truncate", json={"entry_uuid": "不存在"}
-        ).status_code
-        == 404
-    )
-    # assistant 回答不是合法的截断锚点
-    detail = client.get(f"/api/v1/agent/sessions/{session_id}").json()["data"]
-    assistant_uuid = detail["entries"][1]["uuid"]
-    assert (
-        client.post(
-            f"/api/v1/agent/sessions/{session_id}/truncate", json={"entry_uuid": assistant_uuid}
-        ).status_code
-        == 400
-    )
+    assert retried.status_code == 202
+    assert retried.json()["data"]["message_id"] != old_message_id
+    with client.stream("GET", f"/api/v1/sessions/{session_id}/events") as response:
+        response.read()
+    _wait_not_running(client, session_id)
+    detail = client.get(f"/api/v1/sessions/{session_id}").json()["data"]
+    assert detail["entries"][0]["message"]["content"] == "原问题"
 
 
-def test_start_returns_entry_uuid_for_fresh_turn(client) -> None:
-    """新发起的一轮也要拿到锚点：它还没经过回放，前端只有这一个把手。"""
+def test_retry_rejects_unknown_or_non_user_target(client) -> None:
     configure_provider(client)
-    started = client.post("/api/v1/agent/start", json={"input": "刚发的这一轮"})
+    session_id, _ = _send_message_and_wait(client, {"content": "只有一轮"})
+    _wait_not_running(client, session_id)
+
+    assert client.post(
+        "/api/v1/sessions/missing/retry", json={"message_id": "x"}
+    ).status_code == 404
+    assert client.post(
+        f"/api/v1/sessions/{session_id}/retry",
+        json={"message_id": "不存在"},
+    ).status_code == 404
+    # assistant 回答不是合法的 retry 锚点
+    detail = client.get(f"/api/v1/sessions/{session_id}").json()["data"]
+    assistant_id = detail["entries"][1]["message_id"]
+    assert client.post(
+        f"/api/v1/sessions/{session_id}/retry",
+        json={"message_id": assistant_id},
+    ).status_code == 400
+
+
+def test_start_returns_message_id_for_fresh_message(client) -> None:
+    """新发出的 user message 立即返回稳定锚点，无需等待轨迹回放。"""
+    configure_provider(client)
+    started = client.post("/api/v1/sessions", json={"content": "刚发的消息"})
     data = started.json()["data"]
-    with client.stream("GET", f"/api/v1/agent/runs/{data['run_id']}/stream") as r:
+    with client.stream("GET", f"/api/v1/sessions/{data['session_id']}/events") as r:
         r.read()
     _wait_not_running(client, data["session_id"])
-    assert data["entry_uuid"] == _user_entry_uuids(client, data["session_id"])[0]
+    assert data["message_id"] == _user_message_ids(client, data["session_id"])[0]
 
 
 def test_delete_session_removes_file_and_index(client) -> None:
     from movieclaw_api.services.agent_sessions import get_agent_session_store
 
     configure_provider(client)
-    session_id, _ = _run_turn(client, {"input": "删掉我"})
+    session_id, _ = _send_message_and_wait(client, {"content": "删掉我"})
     _wait_not_running(client, session_id)
 
-    assert client.delete(f"/api/v1/agent/sessions/{session_id}").status_code == 200
-    assert client.get(f"/api/v1/agent/sessions/{session_id}").status_code == 404
+    assert client.delete(f"/api/v1/sessions/{session_id}").status_code == 200
+    assert client.get(f"/api/v1/sessions/{session_id}").status_code == 404
     assert not get_agent_session_store().path(session_id).exists()
-    assert client.get("/api/v1/agent/sessions").json()["data"] == []
+    assert client.get("/api/v1/sessions").json()["data"] == []

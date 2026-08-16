@@ -66,3 +66,9 @@ class TaskState(Generic[S]):
     def last(self, key: int) -> object | None:
         """最近一次完成的结论；从未完成过返回 None。"""
         return self._lasts.get(key)
+
+    def discard(self, key: int) -> None:
+        """丢弃一个已永久删除对象的残留状态与历史结论。"""
+        self._states.pop(key, None)
+        self._stops.discard(key)
+        self._lasts.pop(key, None)

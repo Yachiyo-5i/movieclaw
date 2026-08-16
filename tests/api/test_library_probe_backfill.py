@@ -35,6 +35,8 @@ _SPEC = MediaSpec(
     bit_depth=10,
     duration_seconds=5400,
     bit_rate=8_000_000,
+    frame_rate=23.976,
+    color_space="BT.709",
     audio_streams=[{"codec": "eac3", "channels": 6, "language": "chi", "default": True}],
     subtitle_streams=[{"codec": "subrip", "language": "chi"}],
 )
@@ -91,6 +93,7 @@ def _no_ffprobe(monkeypatch) -> None:
 
 def _with_ffprobe(monkeypatch, calls: list | None = None) -> None:
     """模拟"ffmpeg 已装"：探测返回固定规格。"""
+
     def _probe(path, *_a, **_k):
         if calls is not None:
             calls.append(str(path))
@@ -273,3 +276,139 @@ async def test_backfill_leaves_missing_and_ignored_rows_alone(db, tmp_path, monk
     assert after[rows[0].id].audio_streams is None
     assert after[rows[1].id].audio_streams is None
     assert after[rows[2].id].audio_streams is not None
+
+
+def _clpi_with_languages() -> bytes:
+    """一条中文音轨 + 一条中文字幕的最小 CLPI ProgramInfo。"""
+    streams = [
+        (0x1100, bytes([0x83, 0]) + b"eng"),
+        (0x1200, bytes([0x90]) + b"zho" + b"\0"),
+    ]
+    entries = bytearray()
+    for pid, coding_info in streams:
+        entries.extend(pid.to_bytes(2, "big"))
+        entries.append(len(coding_info))
+        entries.extend(coding_info)
+    body = bytearray(b"\0\1")
+    body.extend((0).to_bytes(4, "big"))
+    body.extend((0x100).to_bytes(2, "big"))
+    body.extend(bytes([len(streams), 0]))
+    body.extend(entries)
+    header = bytearray(32)
+    header[:8] = b"HDMV0200"
+    header[12:16] = (32).to_bytes(4, "big")
+    return bytes(header) + len(body).to_bytes(4, "big") + bytes(body)
+
+
+async def test_backfill_enriches_existing_bluray_once_by_pid(db, tmp_path, monkeypatch) -> None:
+    """已有流但 language=NULL 的 BDMV 也进入补探；版本写入后重扫不再读 m2ts。"""
+    root = tmp_path / "bluray-library"
+    disc = root / "1917 (2019)"
+    stream_dir = disc / "BDMV" / "STREAM"
+    clipinf_dir = disc / "BDMV" / "CLIPINF"
+    stream_dir.mkdir(parents=True)
+    clipinf_dir.mkdir(parents=True)
+    stream = stream_dir / "00294.m2ts"
+    stream.write_bytes(b"movie")
+    (clipinf_dir / "00294.clpi").write_bytes(_clpi_with_languages())
+
+    async with db.session() as session:
+        library = await LibraryRepository(session).create(
+            name="蓝光库", kind="movie", root_paths=[str(root)]
+        )
+        session.add(
+            LibraryFile(
+                library_id=library.id,
+                file_path=str(disc),
+                size_bytes=5,
+                container="bluray",
+                source="scanned",
+                audio_streams=[{"codec": "truehd", "language": None}],
+                subtitle_streams=[{"codec": "hdmv_pgs_subtitle", "language": None}],
+            )
+        )
+        await session.commit()
+
+    spec = MediaSpec(
+        resolution="1080p",
+        video_codec="h264",
+        hdr=None,
+        bit_depth=8,
+        duration_seconds=7200,
+        bit_rate=20_000_000,
+        frame_rate=24.0,
+        color_space="BT.709",
+        audio_streams=[{"codec": "truehd", "pid": 0x1100, "language": None}],
+        subtitle_streams=[{"codec": "hdmv_pgs_subtitle", "pid": 0x1200, "language": None}],
+    )
+    calls: list[str] = []
+
+    def fake_probe(path):
+        calls.append(str(path))
+        return spec
+
+    monkeypatch.setattr(probe_mod, "ffprobe_available", lambda: True)
+    monkeypatch.setattr(items_mod, "probe_media", fake_probe)
+
+    async with db.session() as session:
+        summary = ScanSummary(library_id=library.id)
+        state = scan_mod.ScanState(phase=scan_mod.ScanPhase.WALKING)
+        await scan_mod._probe_backfill(session, library.id, summary, state)
+        row = (await session.execute(select(LibraryFile))).scalars().one()
+        assert summary.probed == 1
+        assert row.audio_streams[0]["language"] == "eng"
+        assert row.subtitle_streams[0]["language"] == "zho"
+        assert row.subtitle_streams[0]["language_source"] == "clpi"
+
+    async with db.session() as session:
+        second = ScanSummary(library_id=library.id)
+        await scan_mod._probe_backfill(
+            session,
+            library.id,
+            second,
+            scan_mod.ScanState(phase=scan_mod.ScanPhase.WALKING),
+        )
+        assert second.probed == 0
+    assert calls == [str(stream)]
+
+
+async def test_backfill_missing_clpi_still_completes_candidate_progress(
+    db, tmp_path, monkeypatch
+) -> None:
+    """无 CLPI 时不重读 m2ts，但该候选已检查完，进度不能停在 0/N。"""
+    root = tmp_path / "bluray-library"
+    disc = root / "No CLPI (2020)"
+    stream_dir = disc / "BDMV" / "STREAM"
+    stream_dir.mkdir(parents=True)
+    (stream_dir / "00001.m2ts").write_bytes(b"movie")
+
+    async with db.session() as session:
+        library = await LibraryRepository(session).create(
+            name="蓝光库", kind="movie", root_paths=[str(root)]
+        )
+        session.add(
+            LibraryFile(
+                library_id=library.id,
+                file_path=str(disc),
+                size_bytes=5,
+                container="bluray",
+                source="scanned",
+                audio_streams=[{"codec": "truehd", "language": None}],
+                subtitle_streams=[{"codec": "hdmv_pgs_subtitle", "language": None}],
+            )
+        )
+        await session.commit()
+
+    monkeypatch.setattr(probe_mod, "ffprobe_available", lambda: True)
+
+    def unexpected_probe(_path):
+        raise AssertionError("没有 CLPI 时不应重读 m2ts")
+
+    monkeypatch.setattr(items_mod, "probe_media", unexpected_probe)
+    state = scan_mod.ScanState(phase=scan_mod.ScanPhase.WALKING)
+    async with db.session() as session:
+        summary = ScanSummary(library_id=library.id)
+        await scan_mod._probe_backfill(session, library.id, summary, state)
+
+    assert summary.probed == 0
+    assert state.processed == state.total == 1

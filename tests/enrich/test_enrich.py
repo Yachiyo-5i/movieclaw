@@ -211,7 +211,8 @@ class TestChinesePT:
             "Obsession.2025.2160p.UHD.BluRay.x265-UBits",
             f"痴迷 美版压制 {marker}",
         )
-        assert a.subtitle_languages == ["zh-Hans"]
+        # v15 起返回完整语言集合；这里的契约只要求明确包含简体中文字幕。
+        assert "zh-Hans" in a.subtitle_languages
 
     @pytest.mark.parametrize(
         "marker",
@@ -245,7 +246,9 @@ class TestChinesePT:
     )
     def test_ambiguous_or_traditional_subtitle_markers_are_not_simplified(self, marker):
         a = enrich("Obsession.2025.1080p.WEB-DL.x265-GROUP", f"痴迷 {marker}")
-        assert a.subtitle_languages == []
+        # 繁中、泛称中字、英文字幕在 v15 都会如实输出，不能再断言整个集合为空；
+        # 这组病例真正守护的是「不得误判成简体中文字幕」。
+        assert "zh-Hans" not in a.subtitle_languages
 
     def test_no_subtitle_in_description_overrides_title_marker(self):
         a = enrich("Obsession.2025.1080p.WEB-DL.CHS.x265-GROUP", "痴迷 无字幕")
@@ -387,3 +390,80 @@ class TestGluedTokens:
         from movieclaw_enrich import _pre_normalize
 
         assert _pre_normalize("Show Ep07 20260707 HDTV") == "Show Ep07 20260707 HDTV"
+
+
+class TestModelDeclChannel:
+    """模型通道（torrent-ner v2+）的装配路径与护栏否决——测试环境挂 R9 走不到
+    这些分支，用 monkeypatch 模拟模型输出补齐 CI 覆盖。"""
+
+    def _patch_model(self, monkeypatch, payload: dict):
+        import movieclaw_enrich as m
+
+        monkeypatch.setattr(m, "extract_with_model", lambda *_args, **_kw: dict(payload))
+
+    def test_model_decl_fields_flow_into_attrs(self, monkeypatch):
+        from movieclaw_enrich import enrich
+
+        self._patch_model(monkeypatch, {
+            "subtitle_decl_supported": True,
+            "subtitle_languages": ["zh-Hans", "en"],
+            "subtitle_carriers": ["embedded"],
+            "audio_languages": ["cmn"],
+        })
+        attrs = enrich("Some.Show.2026.1080p.WEB-DL", "示例 | 内封简英字幕 国语")
+        assert attrs.subtitle_languages == ["zh-Hans", "en"]
+        assert attrs.subtitle_carriers == ["embedded"]
+        assert attrs.audio_languages == ["cmn"]
+
+    def test_negation_guard_vetoes_model_output(self, monkeypatch, caplog):
+        from movieclaw_enrich import enrich
+
+        self._patch_model(monkeypatch, {
+            "subtitle_decl_supported": True,
+            "subtitle_languages": ["zh-Hans"],
+            "subtitle_carriers": ["embedded"],
+            "audio_languages": ["ja"],
+        })
+        # 合并文本命中否定正则：模型判有字幕 → 护栏否决字幕，音轨不受影响
+        attrs = enrich("Concert.2021.1080p.BluRay", "演唱会 | 无字幕")
+        assert attrs.subtitle_languages == []
+        assert attrs.subtitle_carriers == []
+        assert attrs.audio_languages == ["ja"]
+        assert any("字幕护栏否决" in r.message for r in caplog.records)
+
+    def test_legacy_fallback_without_capability(self, monkeypatch):
+        from movieclaw_enrich import enrich
+
+        # 旧模型：无能力位 → 回落正则通道（仅 zh-Hans）
+        self._patch_model(monkeypatch, {})
+        attrs = enrich("Some.Show.2026.1080p.WEB-DL", "示例 | 内封简中字幕")
+        assert attrs.subtitle_languages == ["zh-Hans"]
+        assert attrs.audio_languages == []
+
+
+class TestInferenceCache:
+    """模型通道的进程内 LRU 缓存：命中省推理、改写不污染。"""
+
+    def test_repeat_inference_hits_cache_without_pollution(self):
+        from movieclaw_enrich import inference
+
+        if inference._MODEL.get()[0] is None:
+            pytest.skip("NER 模型缺席，缓存路径不生效")
+
+        inference._extract_cached.cache_clear()
+        title = "Dune.Part.Two.2024.2160p.UHD.BluRay.REMUX.HEVC-CHD"
+        first = inference.extract_with_model(title, "沙丘2 | 国语中字")
+        assert inference._extract_cached.cache_info().misses == 1
+
+        # 调用方就地改写返回值（enrich 的护栏否决正是这么做的），不能污染缓存
+        first["year"] = 9999
+        for value in first.values():
+            if isinstance(value, list):
+                value.append("污染")
+
+        second = inference.extract_with_model(title, "沙丘2 | 国语中字")
+        assert inference._extract_cached.cache_info().hits == 1
+        assert second.get("year") == 2024
+        assert all(
+            "污染" not in value for value in second.values() if isinstance(value, list)
+        )

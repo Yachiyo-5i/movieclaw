@@ -35,12 +35,15 @@ import errno
 import logging
 import os
 import shutil
-from dataclasses import dataclass, field
+import uuid
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from sqlmodel import select
 
 from movieclaw_api.exceptions import BadRequestException, ConflictException
+from movieclaw_api.services import jobs
+from movieclaw_api.services.library.fsops import rename_no_replace
 from movieclaw_api.services.library.layout import entry_dir_of
 
 # 复用整理器的"只清理自己搬空的目录"实现（非空即停、绝不删文件）——同一
@@ -50,6 +53,7 @@ from movieclaw_api.services.task_state import TaskState
 from movieclaw_db.engine import get_database
 from movieclaw_db.models import Library, LibraryFile, MediaItem, Subscription, utcnow
 from movieclaw_db.repositories.library_file_repo import LibraryFileRepository
+from movieclaw_db.repositories.library_repo import LibraryRepository
 
 logger = logging.getLogger("movieclaw_api.library_transfer")
 
@@ -57,6 +61,10 @@ logger = logging.getLogger("movieclaw_api.library_transfer")
 # （foo.zh.srt / foo.nfo）。同名不同容器的视频是独立版本不是附属，排除。
 # 与 library_organize 同一套约定
 _SIDECAR_SKIP_EXTS = {".mkv", ".mp4", ".avi", ".ts", ".m2ts", ".iso", ".wmv", ".mov", ".flv"}
+
+# 跨盘复制按块落入隐藏临时路径。每块独立交还事件循环，使取消和应用更新
+# 最多只损失当前块；下次执行按临时文件现有长度续传，不重新复制几十 GB。
+_COPY_CHUNK_BYTES = 8 * 1024 * 1024
 
 
 @dataclass
@@ -425,12 +433,20 @@ async def _run(plan: TransferPlan, state: TransferState) -> None:
         )
         summary.errors.append("转移中断：发生未知错误（详见后端日志）")
     finally:
+        await _refresh_stats_after_transfer(plan, summary)
         finished = (utcnow(), summary)
         _transfer_tasks.finish(plan.source_library_id, result=finished)
         _transfer_tasks.finish(plan.target_library_id, result=finished)
 
 
-async def _transfer(plan: TransferPlan, state: TransferState, summary: TransferSummary) -> None:
+async def _transfer(
+    plan: TransferPlan,
+    state: TransferState,
+    summary: TransferSummary,
+    *,
+    context: jobs.JobContext | None = None,
+    checkpoint_id: str | None = None,
+) -> None:
     db = get_database()
     async with db.session() as session:
         target = await session.get(Library, plan.target_library_id)
@@ -442,20 +458,31 @@ async def _transfer(plan: TransferPlan, state: TransferState, summary: TransferS
         dirty_parents: set[Path] = set()
 
         for done, move in enumerate(plan.moves, start=1):
+            if context is not None:
+                await context.raise_if_cancelled()
             src, dst = Path(move.source_path), Path(move.target_path)
             try:
-                await asyncio.to_thread(_move, src, dst, plan.cross_device)
+                if context is not None and checkpoint_id is not None:
+                    await _move_resumable(context, src, dst, checkpoint_id)
+                else:
+                    await asyncio.to_thread(_move, src, dst, plan.cross_device)
             except _MoveError as exc:
                 summary.errors.append(str(exc))
                 state.processed = done
                 continue
-            summary.moved_paths.append(move.target_path)
+            if move.target_path not in summary.moved_paths:
+                summary.moved_paths.append(move.target_path)
             summary.bytes_moved += move.size_bytes
             dirty_parents.add(src.parent)
 
             for sidecar_src, sidecar_dst in move.sidecars:
                 try:
-                    await asyncio.to_thread(_move, Path(sidecar_src), Path(sidecar_dst), False)
+                    if context is not None and checkpoint_id is not None:
+                        await _move_resumable(
+                            context, Path(sidecar_src), Path(sidecar_dst), checkpoint_id
+                        )
+                    else:
+                        await asyncio.to_thread(_move, Path(sidecar_src), Path(sidecar_dst), False)
                 except _MoveError as exc:
                     summary.errors.append(f"附属文件搬运失败：{exc}")
 
@@ -464,20 +491,51 @@ async def _transfer(plan: TransferPlan, state: TransferState, summary: TransferS
                 row = await session.get(LibraryFile, file_id)
                 if row is None:
                     continue
-                new_path = (
-                    str(dst / Path(row.file_path).relative_to(src)) if move.is_dir else str(dst)
-                )
+                row_path = Path(row.file_path)
+                if (
+                    move.is_dir
+                    and row.library_id == plan.target_library_id
+                    and (row_path == dst or dst in row_path.parents)
+                ):
+                    new_path = row.file_path
+                else:
+                    new_path = str(dst / row_path.relative_to(src)) if move.is_dir else str(dst)
+                if row.library_id == plan.target_library_id and row.file_path == new_path:
+                    # 上次执行已提交该行；重启后不重复计数或改写。
+                    summary.files_relocated += 1
+                    continue
                 await repo.relocate_to_library(
                     file_id, library_id=plan.target_library_id, file_path=new_path
                 )
                 summary.files_relocated += 1
             state.processed = done
+            if context is not None:
+                await context.update_progress(
+                    mode="determinate",
+                    phase="transferring",
+                    message=f"已转移 {done} / {len(plan.moves)} 个路径",
+                    current=done,
+                    total=len(plan.moves),
+                    percent=(done / len(plan.moves) * 100) if plan.moves else 100.0,
+                    details={
+                        "media_item_id": plan.media_item_id,
+                        "source_library_id": plan.source_library_id,
+                        "target_library_id": plan.target_library_id,
+                        "bytes_moved": summary.bytes_moved,
+                        "errors": len(summary.errors),
+                    },
+                )
 
         # 缺失行没有磁盘实体，只改归属：留在旧库会变成"旧库里一个永远补不回来
         # 的缺失条目"，跟着条目走才对得上用户认知
         for file_id in plan.missing_file_ids:
+            if context is not None:
+                await context.raise_if_cancelled()
             row = await session.get(LibraryFile, file_id)
             if row is None:
+                continue
+            if row.library_id == plan.target_library_id:
+                summary.files_relocated += 1
                 continue
             await repo.relocate_to_library(
                 file_id,
@@ -506,7 +564,6 @@ async def _transfer(plan: TransferPlan, state: TransferState, summary: TransferS
                 subscription.updated_at = utcnow()
                 await session.commit()
                 summary.subscription_moved = True
-
     from movieclaw_api.services.media_server_notify import notify_media_server_refresh
 
     try:
@@ -528,8 +585,303 @@ async def _transfer(plan: TransferPlan, state: TransferState, summary: TransferS
     )
 
 
+async def _refresh_stats_after_transfer(plan: TransferPlan, summary: TransferSummary) -> None:
+    """转移收尾时一次刷新源/目标库；部分失败已提交的随迁行同样要纳入。"""
+    if not summary.files_relocated:
+        return
+    try:
+        db = get_database()
+        async with db.session() as session:
+            await LibraryRepository(session).refresh_stats(
+                [plan.source_library_id, plan.target_library_id]
+            )
+    except Exception:  # noqa: BLE001 -- 统计失败不回滚已完成的磁盘搬运
+        logger.exception(
+            "条目 #%s 转移后的媒体库统计刷新失败", plan.media_item_id
+        )
+        summary.errors.append("媒体库统计刷新失败，将在下次扫描时重试")
+
+
+async def enqueue_transfer_job(
+    session,
+    plan: TransferPlan,
+    *,
+    target_library_name: str,
+    actor_kind: str | None = None,
+    actor_name: str | None = None,
+    actor_id: str | None = None,
+    origin: str = "web",
+) -> jobs.CreateJobResult:
+    """保存确认后的转移计划；checkpoint_id 在人工重试时保持不变以复用副本。"""
+    checkpoint_id = uuid.uuid4().hex
+    return await jobs.create_job(
+        session,
+        job_type="library.transfer",
+        subject=f"{plan.title} → {target_library_name}",
+        input_data={
+            "plan": asdict(plan),
+            "target_library_name": target_library_name,
+            "checkpoint_id": checkpoint_id,
+        },
+        resources=[
+            jobs.ResourceRef("library", plan.source_library_id),
+            jobs.ResourceRef("library", plan.target_library_id),
+            jobs.ResourceRef("media_item", plan.media_item_id),
+        ],
+        dedupe_key=f"library.transfer:{plan.media_item_id}",
+        conflict_policy="return_existing",
+        handler_revision="library.transfer.v1",
+        max_attempts=3,
+        actor_kind=actor_kind,
+        actor_name=actor_name,
+        actor_id=actor_id,
+        origin=origin,
+        progress={
+            **jobs.default_progress("等待转移媒体文件"),
+            "total": len(plan.moves),
+            "details": {
+                "source_library_id": plan.source_library_id,
+                "target_library_id": plan.target_library_id,
+                "media_item_id": plan.media_item_id,
+                "cross_device": plan.cross_device,
+                "total_bytes": plan.total_bytes,
+            },
+        },
+    )
+
+
+def _plan_from_job(value: object) -> TransferPlan:
+    """恢复持久化转移计划；不在重启后重新猜测已经变化的源/目标路径。"""
+    if not isinstance(value, dict):
+        raise jobs.JobFailed("转移任务定义损坏，请重新预览后发起", code="JOB_INPUT_INVALID")
+    return TransferPlan(
+        source_library_id=int(value["source_library_id"]),
+        target_library_id=int(value["target_library_id"]),
+        media_item_id=int(value["media_item_id"]),
+        title=str(value.get("title") or "未知条目"),
+        moves=[TransferMove(**item) for item in value.get("moves", [])],
+        skips=[TransferSkip(**item) for item in value.get("skips", [])],
+        missing_file_ids=[int(item) for item in value.get("missing_file_ids", [])],
+        total_bytes=int(value.get("total_bytes") or 0),
+        cross_device=bool(value.get("cross_device")),
+        blocked=[str(item) for item in value.get("blocked", [])],
+    )
+
+
+@jobs.register_job_handler("library.transfer")
+async def _run_transfer_job(
+    context: jobs.JobContext, input_data: dict[str, object]
+) -> dict[str, object]:
+    """条目转移处理器：路径发布、台账迁移和订阅改挂均可跨进程恢复。"""
+    plan = _plan_from_job(input_data.get("plan"))
+    checkpoint_id = str(input_data.get("checkpoint_id") or context.job_id)
+    state = TransferState(
+        source_library_id=plan.source_library_id,
+        target_library_id=plan.target_library_id,
+        media_item_id=plan.media_item_id,
+        title=plan.title,
+        total=len(plan.moves),
+    )
+    if not _transfer_tasks.try_start(plan.source_library_id, state):
+        raise jobs.JobRetry("源媒体库仍有转移任务在收尾", delay_seconds=5)
+    if not _transfer_tasks.try_start(plan.target_library_id, state):
+        _transfer_tasks.finish(plan.source_library_id)
+        raise jobs.JobRetry("目标媒体库仍有转移任务在收尾", delay_seconds=5)
+
+    summary = TransferSummary(
+        source_library_id=plan.source_library_id,
+        target_library_id=plan.target_library_id,
+        media_item_id=plan.media_item_id,
+        title=plan.title,
+        target_library_name=str(input_data.get("target_library_name") or ""),
+    )
+    try:
+        await context.update_progress(
+            mode="determinate",
+            phase="transferring",
+            message="正在核对上次保存的转移进度",
+            current=0,
+            total=len(plan.moves),
+            percent=0.0 if plan.moves else 100.0,
+            details={
+                "source_library_id": plan.source_library_id,
+                "target_library_id": plan.target_library_id,
+                "media_item_id": plan.media_item_id,
+                "cross_device": plan.cross_device,
+                "total_bytes": plan.total_bytes,
+            },
+        )
+        await _transfer(
+            plan,
+            state,
+            summary,
+            context=context,
+            checkpoint_id=checkpoint_id,
+        )
+        message = f"已把「{plan.title}」转移到「{summary.target_library_name}」"
+        if summary.errors:
+            message += f"，{len(summary.errors)} 个问题已跳过"
+        return {"message": message, **asdict(summary)}
+    finally:
+        await _refresh_stats_after_transfer(plan, summary)
+        finished = (utcnow(), summary)
+        _transfer_tasks.finish(plan.source_library_id, result=finished)
+        _transfer_tasks.finish(plan.target_library_id, result=finished)
+
+
 class _MoveError(Exception):
     """单个单元搬运失败。message 是完整中文句子，直接进 errors。"""
+
+
+def _checkpoint_paths(dst: Path, checkpoint_id: str) -> tuple[Path, Path]:
+    """返回跨盘续传临时路径与发布标记；二者都与最终目标同目录。"""
+    safe = "".join(ch for ch in checkpoint_id if ch.isalnum())[:40]
+    return (
+        dst.with_name(f".{dst.name}.movieclaw-{safe}.partial"),
+        dst.with_name(f".{dst.name}.movieclaw-{safe}.transfer"),
+    )
+
+
+async def _move_resumable(
+    context: jobs.JobContext,
+    src: Path,
+    dst: Path,
+    checkpoint_id: str,
+) -> None:
+    """可跨重启恢复的搬运原语。
+
+    同盘仍是一次原子 rename。跨盘先复制到目标旁的隐藏路径，文件按现有
+    长度续传；全部复制完成才原子发布为最终路径。发布标记写在发布前，若
+    更新恰好发生在“目标已发布、源尚未删完”之间，下次可确认归属并继续
+    删除源，而不会把目标误判为外部冲突。
+    """
+    partial, marker = _checkpoint_paths(dst, checkpoint_id)
+    dst_exists = os.path.lexists(dst)
+    src_exists = os.path.lexists(src)
+    if dst_exists:
+        if marker.exists():
+            if src_exists:
+                await asyncio.to_thread(_remove_source, src)
+            marker.unlink(missing_ok=True)
+            return
+        if not src_exists:
+            # 同盘 rename 或跨盘发布完成后，进程停在台账提交之前。
+            return
+        raise _MoveError(f"源与目标同时存在且没有本任务续传标记，跳过以免覆盖：{dst}")
+    if not src_exists:
+        raise _MoveError(f"源路径已不在原位，且没有可恢复的目标：{src}")
+
+    try:
+        await asyncio.to_thread(_rename_no_replace_with_parent, src, dst)
+        return
+    except OSError as exc:
+        if exc.errno != errno.EXDEV:
+            if isinstance(exc, FileExistsError):
+                raise _MoveError(f"目标路径已被占用，跳过以免覆盖：{dst}") from exc
+            raise _MoveError(f"搬运失败（{exc.strerror}）：{src} → {dst}") from exc
+
+    try:
+        await _copy_path_resumable(context, src, partial)
+        await context.raise_if_cancelled()
+        await asyncio.to_thread(_write_transfer_marker, marker)
+        try:
+            await asyncio.to_thread(rename_no_replace, partial, dst)
+        except FileExistsError as exc:
+            raise _MoveError(f"目标路径在发布前被占用，已保留续传副本：{dst}") from exc
+        await asyncio.to_thread(_remove_source, src)
+        marker.unlink(missing_ok=True)
+    except jobs.JobCancelled:
+        raise
+    except asyncio.CancelledError:
+        raise
+    except _MoveError:
+        raise
+    except (OSError, shutil.Error) as exc:
+        # 临时副本刻意保留：网络盘瞬断或应用更新后，下次从已有字节继续。
+        raise _MoveError(f"跨盘复制暂未完成（{exc}）：{src} → {dst}") from exc
+
+
+def _rename_no_replace_with_parent(src: Path, dst: Path) -> None:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    rename_no_replace(src, dst)
+
+
+def _write_transfer_marker(marker: Path) -> None:
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.touch(exist_ok=True)
+
+
+def _remove_source(path: Path) -> None:
+    if not os.path.lexists(path):
+        return
+    if path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path)
+    else:
+        path.unlink(missing_ok=True)
+
+
+async def _copy_path_resumable(context: jobs.JobContext, source: Path, partial: Path) -> None:
+    """把文件或目录复制到隐藏路径；每个文件按字节偏移续传。"""
+    if source.is_symlink():
+        await asyncio.to_thread(_copy_symlink_once, source, partial)
+        return
+    if source.is_file():
+        await _copy_file_resumable(context, source, partial)
+        return
+    if not source.is_dir():
+        raise OSError(f"不支持的源路径类型：{source}")
+
+    partial.mkdir(parents=True, exist_ok=True)
+    entries = await asyncio.to_thread(lambda: sorted(source.rglob("*")))
+    for entry in entries:
+        await context.raise_if_cancelled()
+        target = partial / entry.relative_to(source)
+        if entry.is_symlink():
+            await asyncio.to_thread(_copy_symlink_once, entry, target)
+        elif entry.is_dir():
+            target.mkdir(parents=True, exist_ok=True)
+        elif entry.is_file():
+            await _copy_file_resumable(context, entry, target)
+    await asyncio.to_thread(shutil.copystat, source, partial, follow_symlinks=False)
+
+
+def _copy_symlink_once(source: Path, target: Path) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if os.path.lexists(target):
+        if target.is_symlink() and os.readlink(target) == os.readlink(source):
+            return
+        raise FileExistsError(f"续传路径已存在不同内容：{target}")
+    target.symlink_to(os.readlink(source), target_is_directory=source.is_dir())
+
+
+async def _copy_file_resumable(context: jobs.JobContext, source: Path, partial: Path) -> None:
+    partial.parent.mkdir(parents=True, exist_ok=True)
+    while True:
+        await context.raise_if_cancelled()
+        copied, total = await asyncio.to_thread(_copy_file_chunk, source, partial)
+        if copied >= total:
+            await asyncio.to_thread(shutil.copystat, source, partial, follow_symlinks=False)
+            return
+
+
+def _copy_file_chunk(source: Path, partial: Path) -> tuple[int, int]:
+    """复制至多一个块并关闭文件句柄；返回（已落盘字节，总字节）。"""
+    total = source.stat().st_size
+    copied = partial.stat().st_size if partial.exists() else 0
+    if copied > total:
+        partial.unlink()
+        copied = 0
+    if copied == total:
+        partial.touch(exist_ok=True)
+        return copied, total
+    with source.open("rb") as source_file:
+        source_file.seek(copied)
+        chunk = source_file.read(_COPY_CHUNK_BYTES)
+    mode = "ab" if copied else "wb"
+    with partial.open(mode) as target_file:
+        target_file.write(chunk)
+        target_file.flush()
+    return copied + len(chunk), total
 
 
 def _move(src: Path, dst: Path, cross_device: bool) -> None:

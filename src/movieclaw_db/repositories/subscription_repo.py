@@ -6,8 +6,8 @@ from sqlmodel import select
 
 from movieclaw_db.models.base import utcnow
 from movieclaw_db.models.rule_set import RuleSet
-from movieclaw_db.models.subscription import Subscription, WantedItem
-from movieclaw_db.models.subscription_activity import SubscriptionActivity
+from movieclaw_db.models.subscription import Subscription, SubscriptionFollower, WantedItem
+from movieclaw_db.models.subscription_activity import ActivityType, SubscriptionActivity
 
 
 class RuleSetRepository:
@@ -102,7 +102,12 @@ class SubscriptionRepository:
         return result.scalar_one_or_none()
 
     async def list_all(self, *, kind: str | None = None) -> list[Subscription]:
-        query = select(Subscription).order_by(Subscription.created_at.desc())  # type: ignore[attr-defined]
+        # 最近活动时间由数据库触发器在写活动流水时维护；读取路径只走固定字段
+        # 与覆盖索引，不扫描工单或聚合活动表。id 兜底保证同一时间戳下顺序稳定。
+        query = select(Subscription).order_by(  # type: ignore[attr-defined]
+            Subscription.last_activity_at.desc(),
+            Subscription.id.desc(),
+        )
         if kind is not None:
             query = query.where(Subscription.kind == kind)
         result = await self._session.execute(query)
@@ -121,14 +126,92 @@ class SubscriptionRepository:
         await self._session.commit()
 
     # ------------------------------------------------------------------
+    # 关注（docs/design/member-management.md §3.5：订阅全局唯一，
+    # 第二个成员再订同一部转为关注；取消互不影响）
+    # ------------------------------------------------------------------
+
+    async def add_follower(self, subscription_id: int, member_id: int) -> bool:
+        """成员关注订阅（幂等）。返回是否新增了关注行。"""
+        existing = await self._get_follower(subscription_id, member_id)
+        if existing is not None:
+            return False
+        self._session.add(
+            SubscriptionFollower(subscription_id=subscription_id, member_id=member_id)
+        )
+        await self._session.commit()
+        return True
+
+    async def remove_follower(self, subscription_id: int, member_id: int) -> bool:
+        """取消关注。返回是否真的删了一行（本就没关注返回 False）。"""
+        row = await self._get_follower(subscription_id, member_id)
+        if row is None:
+            return False
+        await self._session.delete(row)
+        await self._session.commit()
+        return True
+
+    async def _get_follower(
+        self, subscription_id: int, member_id: int
+    ) -> SubscriptionFollower | None:
+        result = await self._session.execute(
+            select(SubscriptionFollower).where(
+                SubscriptionFollower.subscription_id == subscription_id,
+                SubscriptionFollower.member_id == member_id,
+            )
+        )
+        return result.scalar_one_or_none()
+
+    async def follower_member_ids(self, subscription_id: int) -> list[int]:
+        """订阅的关注成员 id，按关注先后（发起人转移时取最早的一个）。"""
+        result = await self._session.execute(
+            select(SubscriptionFollower.member_id)
+            .where(SubscriptionFollower.subscription_id == subscription_id)
+            .order_by(SubscriptionFollower.id)
+        )
+        return list(result.scalars().all())
+
+    async def followed_subscription_ids(self, member_id: int) -> set[int]:
+        """成员关注中的订阅 id 集合（"我的订阅"列表的第二个来源）。"""
+        result = await self._session.execute(
+            select(SubscriptionFollower.subscription_id).where(
+                SubscriptionFollower.member_id == member_id
+            )
+        )
+        return set(result.scalars().all())
+
+    # ------------------------------------------------------------------
     # 工单
     # ------------------------------------------------------------------
 
-    async def list_wanted(self, subscription_id: int) -> list[WantedItem]:
+    async def list_wanted(
+        self, subscription_id: int, *, in_scope_only: bool = False
+    ) -> list[WantedItem]:
+        """列出工单；默认含退出范围的历史行，面向当前业务视图时显式过滤。"""
+        query = select(WantedItem).where(WantedItem.subscription_id == subscription_id)
+        if in_scope_only:
+            query = query.where(WantedItem.in_scope.is_(True))  # type: ignore[attr-defined]
         result = await self._session.execute(
-            select(WantedItem)
-            .where(WantedItem.subscription_id == subscription_id)
-            .order_by(WantedItem.season_number, WantedItem.episode_number)
+            query.order_by(WantedItem.season_number, WantedItem.episode_number)
+        )
+        return list(result.scalars().all())
+
+    async def list_wanted_many(
+        self, subscription_ids: list[int], *, in_scope_only: bool = False
+    ) -> list[WantedItem]:
+        """批量读取多条订阅的工单，供首页聚合视图使用，避免逐订阅查询。"""
+        if not subscription_ids:
+            return []
+        query = select(WantedItem).where(
+            WantedItem.subscription_id.in_(subscription_ids)  # type: ignore[union-attr]
+        )
+        if in_scope_only:
+            query = query.where(WantedItem.in_scope.is_(True))  # type: ignore[attr-defined]
+        result = await self._session.execute(
+            query.order_by(
+                WantedItem.subscription_id,
+                WantedItem.season_number,
+                WantedItem.episode_number,
+            )
         )
         return list(result.scalars().all())
 
@@ -148,7 +231,7 @@ class SubscriptionRepository:
     # ------------------------------------------------------------------
 
     async def add_activity(self, row: SubscriptionActivity) -> None:
-        """落一条活动。活动是历史事实，只增不改。"""
+        """落一条活动。活动是历史事实，只增不改；数据库同步推进海报墙排序键。"""
         self._session.add(row)
         await self._session.commit()
 
@@ -164,6 +247,24 @@ class SubscriptionRepository:
         )
         return list(result.scalars().all())
 
+    async def list_grabbed_activities(
+        self, subscription_id: int
+    ) -> list[SubscriptionActivity]:
+        """返回全部成功投递活动（最新在前），供每集资源耗时回放。
+
+        不能复用时间线默认的 100 条上限：长篇剧的早期集也需要一直显示当时
+        从资源发布到被系统拉取的耗时。
+        """
+        result = await self._session.execute(
+            select(SubscriptionActivity)
+            .where(
+                SubscriptionActivity.subscription_id == subscription_id,
+                SubscriptionActivity.type == ActivityType.GRABBED,
+            )
+            .order_by(SubscriptionActivity.id.desc())  # type: ignore[attr-defined]
+        )
+        return list(result.scalars().all())
+
     async def count_wanted_by_status(
         self, subscription_ids: list[int]
     ) -> dict[int, dict[str, int]]:
@@ -172,7 +273,10 @@ class SubscriptionRepository:
             return {}
         result = await self._session.execute(
             select(WantedItem.subscription_id, WantedItem.status, func.count())
-            .where(WantedItem.subscription_id.in_(subscription_ids))  # type: ignore[attr-defined]
+            .where(
+                WantedItem.subscription_id.in_(subscription_ids),  # type: ignore[attr-defined]
+                WantedItem.in_scope.is_(True),  # type: ignore[attr-defined]
+            )
             .group_by(WantedItem.subscription_id, WantedItem.status)
         )
         counts: dict[int, dict[str, int]] = {}

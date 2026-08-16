@@ -21,6 +21,7 @@ import movieclaw_api.services.library.items as items_mod
 import movieclaw_api.services.library.scan as scan_mod
 import movieclaw_api.services.media_discover as discover_mod
 from movieclaw_api.api.routes.libraries import (
+    _file_view,
     delete_library_file,
     delete_library_item,
     get_item_artwork,
@@ -29,6 +30,7 @@ from movieclaw_api.api.routes.libraries import (
 )
 from movieclaw_api.core.config import get_settings
 from movieclaw_api.exceptions import NotFoundException
+from movieclaw_api.services.auth import Principal
 from movieclaw_api.services.library.nfo import read_entry_metadata, read_tmdb_id
 from movieclaw_api.services.library.resolve import ResolveOutcome
 from movieclaw_api.services.library.scan import scan_library
@@ -40,6 +42,10 @@ from movieclaw_db.models.library_file import IdentitySource
 from movieclaw_db.repositories.library_repo import LibraryRepository
 
 _KEY = "0123456789abcdef0123456789abcdef"
+
+# 直调路由函数时替代 require_login 依赖注入的超管主体（成员管理引入
+# principal 参数后，直调必须显式传，否则 session 会错位进 principal）
+_ADMIN = Principal(kind="admin", name="tester")
 
 _ROUTES = {
     "/3/tv/200": {
@@ -92,7 +98,15 @@ _ROUTES = {
                 {"id": 9101, "name": "线上演员甲", "character": "主角", "profile_path": "/a1.jpg"},
                 {"id": 9102, "name": "线上演员乙", "character": "", "profile_path": None},
             ],
-            "crew": [{"name": "线上导演", "job": "Director"}],
+            "crew": [
+                {
+                    "id": 9001,
+                    "name": "线上导演",
+                    "original_name": "Online Director",
+                    "job": "Director",
+                    "profile_path": "/d1.jpg",
+                }
+            ],
         },
         # 选图策略的候选（无文字背景 / 中文海报各一张，都会被选中）
         "images": {
@@ -172,6 +186,27 @@ async def db(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+def test_file_view_parses_generated_subtitle_names() -> None:
+    """详情页应把产物类型与语言拆开，不能把整段文件名误当字幕标题。"""
+    row = LibraryFile(
+        id=88,
+        library_id=1,
+        media_item_id=1,
+        file_path="/media/Movie.mkv",
+        source="scanned",
+        subtitle_streams=[],
+    )
+
+    view = _file_view(
+        row,
+        ["Movie.ai-bilingual-chs-eng.chi.srt", "Movie.pgs-ocr.eng.srt"],
+    )
+
+    bilingual, ocr = view.subtitle_streams
+    assert bilingual.language == "chi" and bilingual.title == "ai-bilingual-chs-eng"
+    assert ocr.language == "eng" and ocr.title == "pgs-ocr"
+
+
 def test_parse_probe_extracts_audio_and_subtitle_streams() -> None:
     payload = {
         "format": {"duration": "7200.5", "bit_rate": "12000000"},
@@ -182,6 +217,8 @@ def test_parse_probe_extracts_audio_and_subtitle_streams() -> None:
                 "width": 3840,
                 "height": 1600,
                 "color_transfer": "smpte2084",
+                "color_primaries": "bt2020",
+                "avg_frame_rate": "24000/1001",
                 "pix_fmt": "yuv420p10le",
             },
             {
@@ -211,6 +248,7 @@ def test_parse_probe_extracts_audio_and_subtitle_streams() -> None:
     }
     spec = _parse_probe(payload)
     assert spec.resolution == "2160p" and spec.hdr == "HDR10" and spec.bit_depth == 10
+    assert spec.frame_rate == 23.976 and spec.color_space == "BT.2020"
     assert [a["codec"] for a in spec.audio_streams] == ["dts", "ac3"]
     assert spec.audio_streams[0]["profile"] == "DTS-HD MA"
     assert spec.audio_streams[0]["channels"] == 8 and spec.audio_streams[0]["default"] is True
@@ -224,6 +262,29 @@ def test_parse_probe_extracts_audio_and_subtitle_streams() -> None:
             "default": False,
         }
     ]
+
+
+def test_parse_probe_prefers_dynamic_hdr_formats_over_pq_fallback() -> None:
+    """动态 HDR side data 必须压过 PQ 的普通 HDR10 兜底标签。"""
+    cases = [
+        ("DOVI configuration record", "Dolby Vision"),
+        ("HDR Dynamic Metadata SMPTE2094-40", "HDR10+"),
+    ]
+    for side_data_type, expected in cases:
+        spec = _parse_probe(
+            {
+                "format": {},
+                "streams": [
+                    {
+                        "codec_type": "video",
+                        "codec_name": "hevc",
+                        "color_transfer": "smpte2084",
+                        "side_data_list": [{"side_data_type": side_data_type}],
+                    }
+                ],
+            }
+        )
+        assert spec.hdr == expected
 
 
 def test_parse_probe_no_extra_streams_gives_empty_lists() -> None:
@@ -344,6 +405,8 @@ _FAKE_SPEC = MediaSpec(
     bit_depth=10,
     duration_seconds=7260,
     bit_rate=8_000_000,
+    frame_rate=23.976,
+    color_space="BT.2020",
     audio_streams=[
         {
             "codec": "eac3",
@@ -393,10 +456,14 @@ async def test_item_detail_assembles_local_scrape(db, tmp_path, monkeypatch) -> 
             .scalars()
             .one()
         )
-        resp = await get_library_item(library.id, item.id, session)
+        item.douban_id = "1292052"
+        session.add(item)
+        await session.commit()
+        resp = await get_library_item(library.id, item.id, _ADMIN, session)
         view = resp.data
 
     assert view.title == "某电影" and view.kind == "movie" and view.tmdb_id == 300
+    assert view.douban_id == "1292052"
     # 本地美术图优先：走 artwork 接口相对路径而非 TMDB 图床
     # URL 带 ?v=<mtime> 版本戳：换图是原地覆盖同一路径，不带版本浏览器
     # 会一直显示缓存里的旧图（实测踩过）
@@ -405,10 +472,12 @@ async def test_item_detail_assembles_local_scrape(db, tmp_path, monkeypatch) -> 
     assert view.backdrop_url.startswith(f"{art_base}?kind=fanart&v=")
     assert int(view.poster_url.rsplit("v=", 1)[1]) > 0
     assert view.entry_dirs == [str(entry)]
-    # NFO 元数据
+    # NFO 元数据——2026-08-04 对齐语义：扫描收尾的资产镜像已把第三方 NFO
+    # 重写为与库内档案一致（rating 8.2/121 的旧值被 TMDB 档案 7.2/118 取代），
+    # 详情读到的 NFO 层与 media_metadata 同源（docs/design/metadata.md 6.2）
     assert view.local_meta is not None
-    assert view.local_meta.rating == 8.2 and view.local_meta.runtime_minutes == 121
-    assert [a.name for a in view.local_meta.actors] == ["演员甲", "演员乙"]
+    assert view.local_meta.rating == 7.2 and view.local_meta.runtime_minutes == 118
+    assert [a.name for a in view.local_meta.actors] == ["线上演员甲", "线上演员乙"]
     # 详情页不再触发补探：音轨保持"尚未探测"（前端据此提示重新扫描），
     # 浏览不碰媒体文件本体（云盘挂载上读文件就是流量与延迟）
     file = view.files[0]
@@ -427,10 +496,11 @@ async def test_item_detail_assembles_local_scrape(db, tmp_path, monkeypatch) -> 
         row = (await session.execute(select(LibraryFile))).scalars().one()
         assert row.audio_streams and row.audio_streams[0]["codec"] == "eac3"
         assert row.subtitle_streams and row.subtitle_streams[0]["codec"] == "subrip"
-        resp2 = await get_library_item(library.id, item.id, session)
+        resp2 = await get_library_item(library.id, item.id, _ADMIN, session)
         file2 = resp2.data.files[0]
         assert file2.audio_streams is not None and file2.audio_streams[0].codec == "eac3"
         assert file2.audio_streams[0].channels == 6
+        assert file2.frame_rate == 23.976 and file2.color_space == "BT.2020"
         embedded2 = [s for s in file2.subtitle_streams if not s.external]
         assert embedded2[0].codec == "subrip" and embedded2[0].language == "chi"
 
@@ -485,7 +555,7 @@ async def test_strm_rows_never_count_as_probe_pending(db, tmp_path) -> None:
         assert [v.probe_pending_count for v in wall] == [0]
         item_id = (await session.execute(select(MediaItem))).scalars().one().id
         # 详情页可正常打开（不再有任何补探副作用）
-        await get_library_item(library.id, item_id, session)
+        await get_library_item(library.id, item_id, _ADMIN, session)
 
 
 async def test_item_detail_selfsufficient_after_scan(db, tmp_path) -> None:
@@ -512,7 +582,7 @@ async def test_item_detail_selfsufficient_after_scan(db, tmp_path) -> None:
             .scalars()
             .one()
         )
-        resp = await get_library_item(library.id, item.id, session)
+        resp = await get_library_item(library.id, item.id, _ADMIN, session)
         view = resp.data
 
     # NFO 身份高置信（identity_source=nfo）→ 最小 NFO 被升级为完整版并回读
@@ -520,6 +590,11 @@ async def test_item_detail_selfsufficient_after_scan(db, tmp_path) -> None:
     assert view.local_meta.plot == "一段来自 TMDB 的简介。"
     assert view.local_meta.rating == 7.2 and view.local_meta.runtime_minutes == 118
     assert view.local_meta.directors == ["线上导演"]
+    assert [d.name for d in view.local_meta.director_credits] == ["线上导演"]
+    assert view.local_meta.director_credits[0].tmdb_person_id == 9001
+    assert view.local_meta.director_credits[0].thumb_url and view.local_meta.director_credits[
+        0
+    ].thumb_url.endswith("/w300/d1.jpg")
     assert [(a.name, a.role) for a in view.local_meta.actors] == [
         ("线上演员甲", "主角"),
         ("线上演员乙", None),
@@ -536,7 +611,7 @@ async def test_item_detail_selfsufficient_after_scan(db, tmp_path) -> None:
             .scalars()
             .one()
         )
-        resp = await get_library_item(library.id, item.id, session)
+        resp = await get_library_item(library.id, item.id, _ADMIN, session)
         view = resp.data
 
     assert view.local_meta is not None and view.local_meta.source == "db"
@@ -579,7 +654,7 @@ async def test_item_detail_fills_missing_actor_thumbs_from_archive(db, tmp_path)
             .scalars()
             .one()
         )
-        resp = await get_library_item(library.id, item.id, session)
+        resp = await get_library_item(library.id, item.id, _ADMIN, session)
         view = resp.data
 
     assert view.local_meta is not None and view.local_meta.source == "nfo"
@@ -622,7 +697,7 @@ async def test_item_detail_fills_person_ids_even_when_thumbs_complete(db, tmp_pa
             .scalars()
             .one()
         )
-        resp = await get_library_item(library.id, item.id, session)
+        resp = await get_library_item(library.id, item.id, _ADMIN, session)
         view = resp.data
 
     assert view.local_meta is not None and view.local_meta.source == "nfo"
@@ -700,9 +775,9 @@ async def test_library_refresh_is_full_and_reports_progress(db, tmp_path, monkey
         return await real_scrape(
             media_item_id,
             force=force,
-            on_phase=lambda phase: (seen_phases.append(phase), on_phase(phase))[1]
-            if on_phase
-            else None,
+            on_phase=lambda phase: (
+                (seen_phases.append(phase), on_phase(phase))[1] if on_phase else None
+            ),
         )
 
     monkeypatch.setattr(media_scrape, "scrape_media_item", _spy)
@@ -778,7 +853,7 @@ async def test_item_detail_reports_scraping_state(db, tmp_path) -> None:
             .scalars()
             .one()
         ).id
-        resp = await get_library_item(library.id, item_id, session)
+        resp = await get_library_item(library.id, item_id, _ADMIN, session)
         assert resp.data.scraping is False
         assert resp.data.scraping_phase is None
 
@@ -786,7 +861,7 @@ async def test_item_detail_reports_scraping_state(db, tmp_path) -> None:
         # 阶段文案与整库刷新同一套，两处状态语言因此一致
         media_scrape._scraping[item_id] = "下载图片"
         try:
-            resp = await get_library_item(library.id, item_id, session)
+            resp = await get_library_item(library.id, item_id, _ADMIN, session)
             assert resp.data.scraping is True
             assert resp.data.scraping_phase == "下载图片"
         finally:
@@ -887,7 +962,7 @@ async def test_delete_item_removes_whole_entry_dir(db, tmp_path) -> None:
         assert (await session.execute(select(LibraryFile))).scalars().all() == []
         resp404 = None
         try:
-            await get_library_item(library.id, item.id, session)
+            await get_library_item(library.id, item.id, _ADMIN, session)
         except NotFoundException as exc:
             resp404 = exc
         assert resp404 is not None
@@ -969,11 +1044,7 @@ async def test_delete_single_file_keeps_other_version(db, tmp_path) -> None:
             .one()
         )
         target = (
-            (
-                await session.execute(
-                    select(LibraryFile).where(LibraryFile.file_path == str(video))
-                )
-            )
+            (await session.execute(select(LibraryFile).where(LibraryFile.file_path == str(video))))
             .scalars()
             .one()
         )
@@ -986,7 +1057,7 @@ async def test_delete_single_file_keeps_other_version(db, tmp_path) -> None:
     assert other.exists() and entry.exists()  # 另一版本与条目目录不动
     assert (entry / "movie.nfo").exists() and (entry / "poster.jpg").exists()
     async with db.session() as session:
-        detail = (await get_library_item(library.id, item.id, session)).data
+        detail = (await get_library_item(library.id, item.id, _ADMIN, session)).data
         assert detail.file_count == 1
         assert detail.files[0].file_path == str(other)
 
@@ -1167,7 +1238,7 @@ async def test_tv_episodes_merge_local_and_tmdb(db, tmp_path) -> None:
             .scalars()
             .one()
         )
-        detail = (await get_library_item(library.id, item.id, session)).data
+        detail = (await get_library_item(library.id, item.id, _ADMIN, session)).data
         assert detail.seasons == [1]
 
         resp = await list_item_episodes(library.id, item.id, 1, session)
@@ -1183,7 +1254,7 @@ async def test_tv_episodes_merge_local_and_tmdb(db, tmp_path) -> None:
 
     # 本地缩略图接口按台账行回吐文件
     async with db.session() as session:
-        thumb_resp = await get_file_thumb(ep1.file_ids[0], session)
+        thumb_resp = await get_file_thumb(ep1.file_ids[0], _ADMIN, session)
         assert str(thumb_resp.path).endswith("-thumb.jpg")
 
 
@@ -1394,7 +1465,9 @@ async def test_reidentify_preview_then_claim_applies_and_clears_orphan(db, tmp_p
     async with db.session() as session:
         row = (await session.execute(select(LibraryFile))).scalars().one()
         resp = await claim_files_batch(
-            ClaimBatchPayload(file_ids=[row.id], tmdb_id=300), BackgroundTasks(), session
+            ClaimBatchPayload(file_ids=[row.id], title_ref="tmdb:movie:300"),
+            BackgroundTasks(),
+            session,
         )
     assert resp.data["claimed"] == 1
 
@@ -1407,8 +1480,14 @@ async def test_reidentify_preview_then_claim_applies_and_clears_orphan(db, tmp_p
         assert row.identity_source == IdentitySource.MANUAL
         # 旧条目已被腾空，孤儿清理的名单里应当有它（后台任务，这里只验语义前提）
         remaining = (
-            await session.execute(select(LibraryFile).where(LibraryFile.media_item_id == wrong_id))
-        ).scalars().all()
+            (
+                await session.execute(
+                    select(LibraryFile).where(LibraryFile.media_item_id == wrong_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
         assert not remaining
 
 
@@ -1465,7 +1544,7 @@ async def test_actor_thumb_missing_only_when_tmdb_has_no_profile(db, tmp_path) -
                 .scalars()
                 .one()
             )
-            resp = await get_library_item(library.id, item.id, session)
+            resp = await get_library_item(library.id, item.id, _ADMIN, session)
         return resp.data.local_meta
 
     # 1) NFO 路径（我们自己写出的完整 NFO：有图的写 <thumb>，没图的不写）

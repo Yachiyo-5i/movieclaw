@@ -1,0 +1,139 @@
+"""图片派生缓存：把原图按受控预设压成可复用的小图。
+
+原图仍是事实源（远程图由 ``ImageCache`` 缓存，本地刮削图在 metadata 目录）；
+本模块只生成可随时删除重建的 WebP 派生物。派生结果继续写进同一个图片缓存，
+因此与原图共用 singleflight、LRU 容量上限和 ``data/`` 持久化约定。
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+from dataclasses import dataclass
+from enum import StrEnum
+from io import BytesIO
+from pathlib import Path
+
+from PIL import Image, ImageOps, UnidentifiedImageError
+
+from movieclaw_api.exceptions import UpstreamServiceException
+from movieclaw_api.services.image_cache import CachedImage, ImageCache, get_image_cache
+
+logger = logging.getLogger("movieclaw_api.image_variants")
+
+# 改编码参数时 bump：旧派生图留给 LRU 淘汰，新请求自动生成新版本。
+_ENCODER_VERSION = "v1"
+
+
+class ImageVariant(StrEnum):
+    """允许从 HTTP 暴露的固定预设；拒绝任意宽高，避免制造无限缓存键。"""
+
+    LANDSCAPE_CARD = "landscape-card"
+    POSTER_CARD = "poster-card"
+
+
+@dataclass(frozen=True)
+class VariantPreset:
+    width: int
+    height: int
+    quality: int
+
+
+_PRESETS = {
+    # 最近观看/分集横卡最大 240 CSS px，480px 足够覆盖常见 2x 屏。
+    ImageVariant.LANDSCAPE_CARD: VariantPreset(width=480, height=270, quality=78),
+    # 竖海报最大 164 CSS px，328px 覆盖 2x 屏；也供横卡缺背景时的海报兜底复用。
+    ImageVariant.POSTER_CARD: VariantPreset(width=328, height=492, quality=80),
+}
+
+
+def local_source_version(path: Path) -> str:
+    """本地事实源的轻量版本指纹；不读整文件即可让原地换图自动失效。"""
+    stat = path.stat()
+    return f"{stat.st_mtime_ns}:{stat.st_size}"
+
+
+class ImageVariantService:
+    """按固定预设惰性生成 WebP；同一原图/版本/预设只编码一次。"""
+
+    def __init__(self, cache: ImageCache, *, max_parallel: int = 2) -> None:
+        self._cache = cache
+        # 首页首次出现多张原图时限制 Pillow 并发，避免 NAS 瞬间吃满 CPU。
+        self._slots = asyncio.Semaphore(max_parallel)
+
+    async def get_or_create(
+        self,
+        source_path: Path,
+        *,
+        source_key: str,
+        source_version: str,
+        variant: ImageVariant,
+    ) -> CachedImage:
+        preset = _PRESETS[variant]
+        cache_key = (
+            f"image-variant:{_ENCODER_VERSION}:{variant.value}:"
+            f"{source_key}:{source_version}"
+        )
+
+        async def produce() -> tuple[bytes, str]:
+            async with self._slots:
+                try:
+                    data = await asyncio.to_thread(_render_webp, source_path, preset)
+                except (OSError, ValueError, UnidentifiedImageError) as exc:
+                    logger.warning("图片派生失败：%s（%s）", source_path, exc)
+                    raise UpstreamServiceException("图片缩略图生成失败") from exc
+                return data, "image/webp"
+
+        return await self._cache.get_or_create(
+            cache_key,
+            produce,
+            metadata={
+                "source_key": source_key,
+                "source_version": source_version,
+                "variant": variant.value,
+            },
+        )
+
+
+def _render_webp(source_path: Path, preset: VariantPreset) -> bytes:
+    """同步解码、按比例居中裁切并编码；小于目标的原图绝不放大。"""
+    with Image.open(source_path) as opened:
+        opened.seek(0)  # 动图只取首帧；卡片缩略图不承诺播放动画。
+        image = ImageOps.exif_transpose(opened)
+        if image.mode not in ("RGB", "RGBA"):
+            image = image.convert("RGB")
+
+        scale = min(
+            1.0,
+            image.width / preset.width,
+            image.height / preset.height,
+        )
+        output_size = (
+            max(1, round(preset.width * scale)),
+            max(1, round(preset.height * scale)),
+        )
+        rendered = ImageOps.fit(
+            image,
+            output_size,
+            method=Image.Resampling.LANCZOS,
+            centering=(0.5, 0.5),
+        )
+        output = BytesIO()
+        rendered.save(output, "WEBP", quality=preset.quality, method=4)
+        return output.getvalue()
+
+
+_service: ImageVariantService | None = None
+
+
+def get_image_variant_service() -> ImageVariantService:
+    global _service
+    if _service is None:
+        _service = ImageVariantService(get_image_cache())
+    return _service
+
+
+def reset_image_variant_service() -> None:
+    """仅供测试：图片缓存实例重建后同步丢弃持有旧缓存的服务单例。"""
+    global _service
+    _service = None

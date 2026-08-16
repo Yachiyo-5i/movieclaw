@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "movieclaw"
-version = "0.8.0"
+version = "0.13.0"
 description = "Best-practice Python HTTP service template powered by FastAPI."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -73,6 +73,11 @@ dependencies = [
   # 中文标题的拼音首字母（媒体库海报墙的排序与 A-Z 快速定位）：纯 Python、
   # 无二进制依赖，自带姓氏/多音字词库，比自维护一张码点表准。
   "pypinyin>=0.53.0,<1.0.0",
+  # 字幕服务（movieclaw_playback.subtitles，docs/design/jellyfin-subtitle.md §5）：
+  # pysubs2 做格式解析与 srt↔vtt 转换（SubtitleEdit 的 Python 对应物）；
+  # charset-normalizer 探测 GBK/BIG5 等中文编码后统一转 UTF-8 输出。
+  "pysubs2>=1.7.0,<2.0.0",
+  "charset-normalizer>=3.4.0,<4.0.0",
 ]
 
 [project.optional-dependencies]
@@ -105,6 +110,7 @@ addopts = "-q"
 asyncio_mode = "auto"
 markers = [
   "integration: 依赖真实网络或 cookie 的集成测试，CI 中可用 -m 'not integration' 跳过",
+  "real_password_hash: 使用生产 Argon2 参数的专项测试，不启用低成本测试 hasher",
 ]
 
 [tool.ruff]

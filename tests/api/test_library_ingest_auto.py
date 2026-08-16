@@ -43,6 +43,8 @@ _FAKE_SPEC = SimpleNamespace(
     bit_depth=10,
     duration_seconds=3600,
     bit_rate=None,
+    frame_rate=23.976,
+    color_space="BT.709",
     audio_streams=[],
     subtitle_streams=[],
 )
@@ -105,7 +107,7 @@ def _auto_rule(watch, kind="tv") -> ImportWatch:
 
 async def _sweep_auto_twice(db, watch, kind="tv") -> None:
     for _ in range(2):
-        await ingest_mod._sweep_dir(_auto_rule(watch, kind), None)
+        await ingest_mod._sweep_dir(_auto_rule(watch, kind), None, execute_inline=True)
 
 
 @pytest.mark.asyncio
@@ -206,7 +208,9 @@ async def test_auto_claimed_entry_uses_pinned_library(db, tmp_path, monkeypatch)
     entry.mkdir()
     (entry / "ep1.mkv").write_bytes(b"video")
 
-    await ingest_mod._sweep_dir(_auto_rule(watch), None)  # 权威完成信号，单轮处理
+    await ingest_mod._sweep_dir(
+        _auto_rule(watch), None, execute_inline=True
+    )  # 权威完成信号，单轮处理
 
     # 落在订阅定格的剧集库，而不是收藏范围指向的动漫库
     assert (tv_root / "某动画 (2023)" / "Season 01" / "某动画 (2023) - S01E01.mkv").exists()

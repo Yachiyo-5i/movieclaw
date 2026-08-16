@@ -16,8 +16,10 @@
 完成检测（本功能的核心难点——下载开始时目录结构就已建立）：
 0. **下载器权威信号优先**：条目名能匹配到已配置下载器中的种子
    （比对种子名与落盘根名——**按名称匹配免疫容器路径映射**，save_path
-   两侧视角不同不可靠）时，以下载器报告的完成状态为准：未完成就等，
-   完成即处理、无需静默窗口——这是暂停种子误判的根治手段；
+   两侧视角不同不可靠）时，以下载器报告的完成状态为准：整种完成即处理；
+   整种未完成时按单文件完成字节数构造安全白名单，已完成且没有其他种子仍在
+   写同一路径的文件先入库，其余继续等待——这是暂停种子误判与同目录长尾
+   阻塞的共同解法；
    匹配不到（网盘/浏览器等非种子来源）或下载器不可达时退回启发式：
 1. **进行中标记排除**：条目树内存在下载器的未完成标记文件
    （qBittorrent ``.!qB`` / aria2 ``.aria2`` / 浏览器 ``.crdownload`` 等）
@@ -38,6 +40,9 @@
 - **环境故障 = 失败（failed）**：探测失败/搬运出错/TMDB 不可达，时间
   驱动的重试有意义，小时级退避 + 告警；告警按**源目录聚合**成一条
   （"某目录 N 个条目失败"），逐条目刷红灯在存量场景是灾难；
+- **部分入库不冒充完成**：季包只要还有文件因季集解析失败而跳过，就保留
+  pending；只要还有探测/搬运故障，就保留 failed。升级后的首轮补扫会自动
+  重试旧版误标成 imported 的同类记录，正常完成记录仍按指纹短路；
 - 识别顺序：订阅工单认领（info_hash）→ NFO 身份声明（第三方整理过的
   内容常自带 tmdbid，与扫描器同一解析器）→ 名称解析 + TMDB 收敛。
 
@@ -57,9 +62,9 @@
   自检/兜底回来看），按最近到期时间挂一次性自检，全部落定即归零；
 - 下载器状态轮询：被权威信号判为「未完成」的条目记入挂起表——完成的
   一瞬 fs 事件已停、下载器 API 又慢半拍（最后分片校验完 progress 才翻 1，
-  概览另有短缓存），事件路径必然错过这次翻转。自检对挂起条目先做纯 API
-  核对（不碰磁盘，暂停的种子可无限期挂着不扰磁盘休眠），翻转成完成才
-  巡检入库；
+  概览另有短缓存），事件路径必然错过这次翻转。自检先用 API 核对；只有
+  下载器给出新的单文件完成证据时才 stat 这些候选文件并触发分批入库，暂停
+  的种子仍可无限期挂着而不反复扫描目录；
 - 唯一的主动扫：目录**初次纳入监听**时补扫该目录一次——监听建立之前
   完成的下载（停机期间/目录刚就绪/刚加进配置）不会再产生事件，只有
   这一次能接住；之后该目录全靠事件驱动；
@@ -78,27 +83,33 @@
   跳过不覆盖；
 - 台账逐条目收口：源文件留在监听目录，没有台账每轮都会重复处理。
 
-与扫描/整理的并发：本模块只**新建**规范命名文件（与订阅入库管线同性质），
-写入触发的库根 watchdog 扫描对已落账路径秒过；与整理的目标冲突由双方的
-防覆盖改名兜底——均无需加锁（评估结论同 library_organize 模块头）。
+与扫描/整理的并发：巡检只创建持久化 ``library.ingest`` 作业，不在监听协程
+里直接搬运。指定库在入队时声明库资源，自动路由在识别出目标后动态补充同一
+资源并取得租约锁，因此扫描、整理、迁移与监听入库共享一套库级互斥。复制使用
+隐藏续传文件与源版本边车，服务更新后从已确认字节继续，最终仍以原子 rename
+发布；硬链接保持一次性原子发布。
 """
 
 from __future__ import annotations
 
 import asyncio
 import errno
+import hashlib
+import json
 import logging
 import os
 import shutil
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import NamedTuple
 from uuid import uuid4
 
 from sqlalchemy import update
 from sqlmodel import select
 
+from movieclaw_api.services import jobs
 from movieclaw_api.services.import_watch_config import rule_target_label
 from movieclaw_api.services.library.config import derive_entry_dir, derive_save_path
 from movieclaw_api.services.library.fsops import rename_no_replace
@@ -116,18 +127,22 @@ from movieclaw_api.services.media_library import MediaLibraryService
 from movieclaw_api.services.media_probe import ffprobe_available, probe_media
 from movieclaw_db.engine import get_database
 from movieclaw_db.models import (
+    ACTIVE_JOB_STATUSES,
     FileSource,
     ImportWatch,
     IngestEntry,
     IngestStatus,
+    JobStatus,
     Library,
     LibraryFile,
+    ManualDownloadIntent,
     MediaItem,
     NoticeSeverity,
     utcnow,
 )
 from movieclaw_db.models.scheduled_task import TriggerType
 from movieclaw_db.repositories.library_file_repo import LibraryFileRepository
+from movieclaw_db.repositories.library_repo import LibraryRepository
 from movieclaw_enrich import enrich
 from movieclaw_media.models import MediaKind
 from movieclaw_scheduler.registry import register_task
@@ -139,12 +154,25 @@ logger = logging.getLogger("movieclaw_api.library_ingest")
 FALLBACK_SWEEP_SECONDS = 3600
 # 静默窗口：指纹连续稳定 5 分钟才认为下载落定（写入中 mtime 持续变化）
 QUIET_SECONDS = 300
-# 挂起条目（下载器报未完成）的状态轮询节奏：纯 API 核对，不产生磁盘 IO
+# 挂起条目（下载器报未完成）的状态轮询节奏：优先 API 核对，只有出现新的
+# 单文件完成候选时才 stat 对应文件，不扫描整棵目录
 DEFERRED_POLL_SECONDS = 300
 # 失败条目的重试退避：指纹没变化时每小时才重试一次（避免反复打 TMDB）
 FAILED_RETRY_SECONDS = 3600
 # 下载器种子概览的缓存：一轮事件风暴中的多个目录巡检共享一次 API 调用
 _BRIEFS_TTL_SECONDS = 15.0
+# Job 复制每个安全停止点最多写 64 MiB。块太小会让 SQLite 进度事件膨胀，
+# 太大又会让取消/更新等待过久；NAS 上 64 MiB 通常在数秒内完成。
+_INGEST_COPY_CHUNK_BYTES = 64 * 1024 * 1024
+
+# Job 处理逻辑修订号不仅用于审计，也作为“升级后是否值得自动重试”的边界。
+# 修改季集解析/部分入库收口逻辑时必须递增；同一修订内的待处理条目不反复重跑。
+_INGEST_HANDLER_REVISION = "library.ingest.v3"
+
+# v0.10.0 以前，季包只要成功搬运一个文件就会被记成 imported，即使 message
+# 已明确写着其余文件因季集号解析失败而未入库。保留稳定中文片段用于识别这类
+# 历史脏状态；两种原因都不是作品身份歧义，解析能力升级后应自动补偿。
+_PARSER_GAP_MARKERS = ("解析不出集号，未入库", "解析不出季号，未入库")
 
 # 文件名含这些标记的视频不入库（与入库管线同口径）
 _IGNORE_MARKERS = ("sample",)
@@ -173,14 +201,40 @@ class IngestError(Exception):
     """单个文件搬运失败。message 是完整中文句子，直接进台账 message。"""
 
 
+class IngestSourceChanged(Exception):
+    """复制期间源文件继续变化；保留作业意图，等下载稳定后重新执行。"""
+
+
+def _has_parser_gap(record: IngestEntry | None) -> bool:
+    """台账是否仍有因季集解析失败而未入库的文件。"""
+    return bool(record and any(marker in (record.message or "") for marker in _PARSER_GAP_MARKERS))
+
+
 @dataclass
 class _EntrySnapshot:
     """条目的一次快照：指纹 + 完成检测所需的观察结果。"""
 
-    fingerprint: str  # 总大小:文件数:最大mtime
+    fingerprint: str  # 整树为大小/数量/mtime；文件批次为相对路径版本哈希
     has_marker: bool  # 树内存在下载中标记文件
     has_disc: bool  # 树内存在原盘结构（BDMV/VIDEO_TS）
     videos: list[Path] = field(default_factory=list)  # 可入库的视频文件
+
+
+@dataclass(frozen=True)
+class _ReadyDownloadFile:
+    """下载器确认可安全入库的单个视频及其来源证据。"""
+
+    relative_path: str
+    size_bytes: int
+    info_hashes: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class _DownloadFileBatch:
+    """同目录仍在下载时可先行处理的一批文件。"""
+
+    files: tuple[_ReadyDownloadFile, ...]
+    consumable_hashes: tuple[str, ...]
 
 
 def _snapshot(entry: Path) -> _EntrySnapshot:
@@ -230,6 +284,166 @@ def _snapshot(entry: Path) -> _EntrySnapshot:
         has_marker=has_marker,
         has_disc=has_disc,
         videos=sorted(videos),
+    )
+
+
+def _entry_file(entry: Path, relative_path: str) -> Path | None:
+    """把持久化相对路径安全还原到监听条目内，拒绝绝对路径与 ``..``。"""
+    if relative_path == ".":
+        return entry if entry.is_file() else None
+    relative = PurePosixPath(relative_path.replace("\\", "/"))
+    if relative.is_absolute() or not relative.parts or ".." in relative.parts:
+        return None
+    return entry.joinpath(*relative.parts)
+
+
+def _relative_entry_file(entry: Path, file: Path) -> str | None:
+    """把下载器映射后的文件路径收敛成条目内相对路径。"""
+    entry_path = Path(os.path.normpath(str(entry)))
+    file_path = Path(os.path.normpath(str(file)))
+    if entry.is_file():
+        return "." if file_path == entry_path else None
+    try:
+        relative = file_path.relative_to(entry_path)
+    except ValueError:
+        return None
+    return relative.as_posix() if relative.parts else None
+
+
+def _snapshot_ready_files(
+    entry: Path, ready_files: list[_ReadyDownloadFile]
+) -> _EntrySnapshot:
+    """只对下载器放行的文件取快照，目录内其他写入不再阻塞本批作业。"""
+    fingerprint_parts: list[str] = []
+    videos: list[Path] = []
+    for ready in ready_files:
+        file = _entry_file(entry, ready.relative_path)
+        if file is None or not file.is_file():
+            raise IngestSourceChanged(f"已完成文件已不存在：{ready.relative_path}")
+        try:
+            stat = file.stat()
+        except OSError as exc:
+            raise IngestSourceChanged(f"无法读取已完成文件：{file.name}") from exc
+        if stat.st_size != ready.size_bytes:
+            raise IngestSourceChanged(f"已完成文件大小发生变化：{file.name}")
+        lower = file.name.lower()
+        if any(lower.endswith(marker) for marker in IN_PROGRESS_MARKERS):
+            raise IngestSourceChanged(f"文件仍带下载中标记：{file.name}")
+        if file.suffix.lower() not in VIDEO_EXTS or any(
+            marker in lower for marker in _IGNORE_MARKERS
+        ):
+            continue
+        fingerprint_parts.append(
+            f"{ready.relative_path}\0{stat.st_size}\0{stat.st_mtime_ns}"
+        )
+        videos.append(file)
+    fingerprint = hashlib.sha256("\n".join(fingerprint_parts).encode()).hexdigest()
+    return _EntrySnapshot(
+        fingerprint=f"ready:{fingerprint}",
+        has_marker=False,
+        has_disc=False,
+        videos=sorted(videos),
+    )
+
+
+def _ingest_path_id(entry_path: str) -> str:
+    """把绝对路径收敛成稳定、无敏感目录信息的资源 id。"""
+    return hashlib.sha256(entry_path.encode("utf-8")).hexdigest()
+
+
+def _ingest_dedupe_key(entry_path: str) -> str:
+    return f"library.ingest:{_ingest_path_id(entry_path)}"
+
+
+async def _latest_ingest_job(session, entry_path: str):
+    """返回同一监听条目的最近 Job，供巡检处理去重与终态意图。"""
+    from movieclaw_db.models import Job
+
+    return (
+        (
+            await session.execute(
+                select(Job)
+                .where(Job.dedupe_key == _ingest_dedupe_key(entry_path))
+                .order_by(Job.created_at.desc())
+            )
+        )
+        .scalars()
+        .first()
+    )
+
+
+async def enqueue_ingest_job(
+    session,
+    rule: ImportWatch,
+    entry: Path,
+    snap: _EntrySnapshot,
+    *,
+    matched_hashes: list[str] | None,
+    ready_files: tuple[_ReadyDownloadFile, ...] | None = None,
+    consumable_hashes: tuple[str, ...] | None = None,
+    keep_deferred: bool = False,
+    record: IngestEntry | None = None,
+    origin: str = "system",
+) -> jobs.CreateJobResult:
+    """把一个已通过完成检测的监听条目固化为可恢复 Job。
+
+    路径只作为处理器输入，任务中心用条目名展示；资源索引保存路径哈希，
+    避免把 NAS 挂载结构暴露给无关视图。下载 infohash 作为来源资源关联，
+    让下载卡片能投影后续入库阶段，但不参与执行锁。
+    """
+    if rule.id is None:
+        raise RuntimeError("监听导入规则尚未落库，不能创建后台作业")
+    hashes = sorted({value.lower() for value in matched_hashes or [] if value})
+    resources = [
+        jobs.ResourceRef("import_watch", rule.id),
+        jobs.ResourceRef("ingest_path", _ingest_path_id(str(entry))),
+    ]
+    if rule.library_id is not None:
+        resources.append(jobs.ResourceRef("library", rule.library_id))
+    if record is not None and record.id is not None:
+        resources.append(jobs.ResourceRef("ingest_entry", record.id, relation="context"))
+    resources.extend(jobs.ResourceRef("download", value, relation="source") for value in hashes)
+    total_bytes = sum(path.stat().st_size for path in snap.videos if path.exists())
+    input_data: dict[str, object] = {
+        "rule_id": rule.id,
+        "entry_path": str(entry),
+        "detected_fingerprint": snap.fingerprint,
+        "info_hashes": hashes,
+    }
+    if ready_files is not None:
+        input_data["ready_files"] = [
+            {
+                "path": ready.relative_path,
+                "size_bytes": ready.size_bytes,
+                "info_hashes": list(ready.info_hashes),
+            }
+            for ready in ready_files
+        ]
+        input_data["consume_info_hashes"] = list(consumable_hashes or ())
+        input_data["keep_deferred"] = keep_deferred
+    return await jobs.create_job(
+        session,
+        job_type="library.ingest",
+        subject=entry.name,
+        input_data=input_data,
+        resources=resources,
+        dedupe_key=_ingest_dedupe_key(str(entry)),
+        conflict_policy="return_existing",
+        handler_revision=_INGEST_HANDLER_REVISION,
+        # 下载落地后的环境故障按小时退避；给足一天自动自愈窗口，超过后
+        # 明确失败等待用户处理，不能无限占住活跃任务。
+        max_attempts=24,
+        origin=origin,
+        correlation_id=hashes[0] if hashes else None,
+        progress={
+            **jobs.default_progress("等待自动整理入库"),
+            "total": total_bytes or None,
+            "details": {
+                "rule_id": rule.id,
+                "entry_name": entry.name,
+                "info_hashes": hashes,
+            },
+        },
     )
 
 
@@ -292,16 +506,22 @@ def _has_pending(source_path: str) -> bool:
     """
     prefix = source_path.rstrip("/") + "/"
     return any(
-        any(p.startswith(prefix) for p in table)
-        for table in (_stability, _deferred, _failed_retry)
+        any(p.startswith(prefix) for p in table) for table in (_stability, _deferred, _failed_retry)
     )
 
 
-async def _sweep_dir(rule: ImportWatch, library: Library | None) -> None:
+async def _sweep_dir(
+    rule: ImportWatch,
+    library: Library | None,
+    *,
+    execute_inline: bool = False,
+) -> None:
     """巡检一个监听目录：顶层每个文件/目录是一个条目（一次下载的产物）。
 
     ``library`` 为 None 即自动路由规则——目标库在识别出作品后按收藏范围
-    决定（_ingest_entry 内），kind 先验取自规则本身。
+    决定（_ingest_entry 内），kind 先验取自规则本身。生产路径只负责创建
+    ``library.ingest`` Job；``execute_inline`` 仅供领域单测与离线维护脚本复用
+    同一套处理原语，Web、监听器和调度器都不得开启。
     """
     root = Path(rule.source_path)
     if not root.is_dir():
@@ -321,7 +541,14 @@ async def _sweep_dir(rule: ImportWatch, library: Library | None) -> None:
         seen = {str(e) for e in entries}
         for entry in entries:
             try:
-                await _process_entry(rule, library, root, entry, briefs)
+                await _process_entry(
+                    rule,
+                    library,
+                    root,
+                    entry,
+                    briefs,
+                    execute_inline=execute_inline,
+                )
             except Exception:  # noqa: BLE001 -- 单条目失败不断整轮
                 logger.exception("处理监听条目失败：%s", entry)
         # 条目从监听目录消失（用户删源）后清掉它的静默观察与挂起记录，
@@ -404,9 +631,7 @@ async def _baseline_existing(
     )
 
 
-async def refresh_source_notice(
-    session, source_path: str, present: set[str] | None = None
-) -> None:
+async def refresh_source_notice(session, source_path: str, present: set[str] | None = None) -> None:
     """按源目录聚合失败告警：N 个条目失败 → 一条全局通知，清零即熄灭。
 
     逐条目告警在存量场景会瞬间刷出上百条红灯，聚合成"这个目录有 N 个
@@ -507,12 +732,132 @@ def _torrent_verdict(matches: list) -> str | None:
     return "complete" if all(b.completed for b in matches) else "downloading"
 
 
+async def _matched_torrent_statuses(matches: list) -> list[tuple[object, object]] | None:
+    """补查同名种子的文件状态；任一详情缺失时返回 None，调用方保守等待。"""
+    from movieclaw_api.services.download_progress import _query_torrent, _usable_downloaders
+
+    if any(not brief.info_hash for brief in matches):
+        return None  # 没有 hash 的轻量记录无法形成可复核的文件证据
+    hashes = sorted({str(brief.info_hash).lower() for brief in matches if brief.info_hash})
+    if len(hashes) != len(matches):
+        return None  # 重复 hash 的概览不应产生互相矛盾的文件写入证据
+    db = get_database()
+    async with db.session() as session:
+        downloaders = await _usable_downloaders(session)
+    if not downloaders:
+        return None
+    details: list[tuple[object, object]] = []
+    for info_hash in hashes:
+        found = await _query_torrent(info_hash, downloaders)
+        if found is None:
+            return None
+        details.append(found)
+    return details
+
+
+def _torrent_file_source(downloader, status, torrent_file) -> Path | None:  # noqa: ANN001
+    """把下载器文件路径翻译到 MovieClaw 视角；异常相对路径直接拒绝。"""
+    from movieclaw_api.services.torrent_submit import translate_to_local
+
+    local_dir = translate_to_local(status.save_path, downloader.path_mappings)
+    if not local_dir:
+        return None
+    relative = PurePosixPath(str(torrent_file.path).replace("\\", "/"))
+    if relative.is_absolute() or not relative.parts or ".." in relative.parts:
+        return None
+    return Path(local_dir).joinpath(*relative.parts)
+
+
+def _torrent_file_completed(status, torrent_file) -> bool:  # noqa: ANN001
+    """只认下载器完成字节；旧适配器缺字段时仅整种完成可兜底。"""
+    if status.completed:
+        return True
+    completed_bytes = torrent_file.completed_bytes
+    return completed_bytes is not None and completed_bytes >= torrent_file.size_bytes
+
+
+async def _completed_file_batch(entry: Path, matches: list) -> _DownloadFileBatch:
+    """计算同目录下载中的安全文件交集。
+
+    一个路径可能被多个同名种子引用；只有所有仍会写它的任务都确认该文件
+    完成，并且磁盘大小与每份下载器证据一致，才进入本批。详情读取失败时
+    返回空批，继续沿用原来的整目录等待语义。
+    """
+    details = await _matched_torrent_statuses(matches)
+    if not details:
+        return _DownloadFileBatch(files=(), consumable_hashes=())
+
+    writers: dict[str, list[tuple[object, object]]] = {}
+    video_paths_by_hash: dict[str, set[str]] = {}
+    status_by_hash: dict[str, object] = {}
+    for downloader, status in details:
+        info_hash = str(status.info_hash).lower()
+        status_by_hash[info_hash] = status
+        mapped_selected = 0
+        for torrent_file in status.files:
+            if not torrent_file.selected:
+                continue
+            source = _torrent_file_source(downloader, status, torrent_file)
+            if source is None:
+                continue
+            relative = _relative_entry_file(entry, source)
+            if relative is None:
+                continue
+            mapped_selected += 1
+            lower = source.name.lower()
+            if source.suffix.lower() not in VIDEO_EXTS or any(
+                marker in lower for marker in _IGNORE_MARKERS
+            ):
+                continue
+            writers.setdefault(relative, []).append((status, torrent_file))
+            video_paths_by_hash.setdefault(info_hash, set()).add(relative)
+        # 同名未完成种子存在、却无法还原它在本条目内写哪些文件时，不能证明
+        # 任何路径与它不重叠，整批保守等待。
+        if not status.completed and mapped_selected == 0:
+            return _DownloadFileBatch(files=(), consumable_hashes=())
+
+    ready: list[_ReadyDownloadFile] = []
+    for relative, references in sorted(writers.items()):
+        source = _entry_file(entry, relative)
+        if source is None or not source.is_file():
+            continue
+        try:
+            actual_size = source.stat().st_size
+        except OSError:
+            continue
+        expected_sizes = {int(file.size_bytes) for _status, file in references}
+        if len(expected_sizes) != 1 or actual_size not in expected_sizes:
+            continue
+        if not all(_torrent_file_completed(status, file) for status, file in references):
+            continue
+        ready.append(
+            _ReadyDownloadFile(
+                relative_path=relative,
+                size_bytes=actual_size,
+                info_hashes=tuple(
+                    sorted({str(status.info_hash).lower() for status, _file in references})
+                ),
+            )
+        )
+
+    ready_paths = {file.relative_path for file in ready}
+    consumable = tuple(
+        sorted(
+            info_hash
+            for info_hash, paths in video_paths_by_hash.items()
+            if status_by_hash[info_hash].completed and paths and paths <= ready_paths
+        )
+    )
+    return _DownloadFileBatch(files=tuple(ready), consumable_hashes=consumable)
+
+
 async def _deferred_flipped(prefix: str) -> bool:
-    """挂起条目（下载器报未完成）是否值得重新巡检。纯 API 核对，零磁盘 IO。
+    """挂起条目是否出现整种完成或新的单文件安全批次。
 
     任一条目的种子翻转成完成、或从下载器消失（用户删了任务 → 退回启发式
     检测）、或下载器整体不可达（权威信号缺席 → 同样退回启发式）都算翻转
-    ——巡检自会走完整判定链得出结论，这里只回答"要不要去巡检"。
+    ——巡检自会走完整判定链得出结论。仍在下载时只补查下载器文件状态并
+    stat 已被确认完成的少量文件；与台账指纹不同才唤醒完整巡检。
     """
     paths = [p for p in _deferred if p.startswith(prefix)]
     if not paths:
@@ -520,23 +865,51 @@ async def _deferred_flipped(prefix: str) -> bool:
     briefs = await _downloader_briefs()
     if briefs is None:
         return True
-    return any(
-        _torrent_verdict(_match_briefs(Path(p).name, briefs)) != "downloading" for p in paths
-    )
+    db = get_database()
+    for path in paths:
+        entry = Path(path)
+        matches = _match_briefs(entry.name, briefs)
+        if _torrent_verdict(matches) != "downloading":
+            return True
+        batch = await _completed_file_batch(entry, matches)
+        if not batch.files:
+            continue
+        try:
+            snap = await asyncio.to_thread(_snapshot_ready_files, entry, list(batch.files))
+        except IngestSourceChanged:
+            continue
+        async with db.session() as session:
+            record = (
+                await session.execute(
+                    select(IngestEntry).where(IngestEntry.entry_path == path)
+                )
+            ).scalar_one_or_none()
+        if record is None or record.fingerprint != snap.fingerprint:
+            return True
+    return False
 
 
 async def _process_entry(
-    rule: ImportWatch, library: Library | None, watch_root: Path, entry: Path, briefs: list | None
+    rule: ImportWatch,
+    library: Library | None,
+    watch_root: Path,
+    entry: Path,
+    briefs: list | None,
+    *,
+    execute_inline: bool,
 ) -> None:
     path_str = str(entry)
     # 权威信号优先：能匹配到下载器种子时以下载器状态为准。报未完成的条目
-    # 记入挂起表后返回（不做磁盘快照，状态轮询期间零磁盘 IO）——绝不能
+    # 先尝试按文件完成证据拆出安全批次；没有可放行文件时只记入挂起表，
+    # 状态轮询期间不做目录全树快照——绝不能
     # 一忘了之：下载完成的一瞬 fs 事件已经停了，下载器 API 又常慢半拍
     # （最后分片校验完 progress 才翻 1，概览另有短缓存），此处若不留痕，
     # 事件/自检/兜底三条触发路径会同时失灵，条目无限期卡住且无告警
     # （线上实证 bug）。挂起表由状态轮询自检 + 兜底巡检共同照看
     matches = _match_briefs(entry.name, briefs)
     verdict = _torrent_verdict(matches)
+    partial_batch: _DownloadFileBatch | None = None
+    snap: _EntrySnapshot | None = None
     if verdict == "downloading":
         _stability.pop(path_str, None)
         if path_str not in _deferred:
@@ -546,8 +919,24 @@ async def _process_entry(
                 entry.name,
                 DEFERRED_POLL_SECONDS,
             )
-        return
-    _deferred.pop(path_str, None)
+        partial_batch = await _completed_file_batch(entry, matches)
+        if not partial_batch.files:
+            return
+        try:
+            snap = await asyncio.to_thread(
+                _snapshot_ready_files, entry, list(partial_batch.files)
+            )
+        except IngestSourceChanged:
+            return
+        if not snap.videos:
+            return
+        logger.info(
+            "「%s」仍有下载写入，先处理 %d 个已完成且路径无冲突的文件",
+            entry.name,
+            len(snap.videos),
+        )
+    else:
+        _deferred.pop(path_str, None)
 
     db = get_database()
     async with db.session() as session:
@@ -560,8 +949,49 @@ async def _process_entry(
         if record is not None and record.status == IngestStatus.IGNORED:
             _failed_retry.pop(path_str, None)  # 失败后被人工忽略：不再退避重试
             return  # 用户拍板（或存量基线）永久忽略：指纹变化也不复活，恢复走接口
+        latest_job = None if execute_inline else await _latest_ingest_job(session, path_str)
+        parser_retry = _has_parser_gap(record)
+        if latest_job is not None and latest_job.status in ACTIVE_JOB_STATUSES:
+            if (
+                parser_retry
+                and latest_job.status == JobStatus.BLOCKED
+                and latest_job.handler_revision != _INGEST_HANDLER_REVISION
+            ):
+                # 旧处理器因季集解析能力不足而 blocked：新版本只自动唤醒一次。
+                # 同修订号不重跑，避免每轮巡检/每次重启反复消耗 NAS IO。
+                latest_job.handler_revision = _INGEST_HANDLER_REVISION
+                await jobs.retry_job(
+                    session,
+                    latest_job,
+                    actor_kind="system",
+                    actor_name="MovieClaw 升级补偿",
+                    origin="system",
+                )
+                logger.info("升级后重新尝试部分入库条目：%s（job=%s）", entry.name, latest_job.id)
+            # Job 已接管后不再反复遍历条目树；运行、等待重试与待人工认领
+            # 都以统一状态机为事实源，巡检只负责发现新的内容变化。
+            _stability.pop(path_str, None)
+            if partial_batch is None:
+                _deferred.pop(path_str, None)
+            _failed_retry.pop(path_str, None)
+            return
 
-        snap = await asyncio.to_thread(_snapshot, entry)
+        if snap is None:
+            snap = await asyncio.to_thread(_snapshot, entry)
+        if latest_job is not None and latest_job.status in {
+            JobStatus.CANCELLED,
+            JobStatus.FAILED,
+        }:
+            # 用户取消或重试耗尽后，同一磁盘版本不能被启动补扫悄悄复活。
+            # 已取消代表用户明确停止，只能显式重试；失败任务可由人工“恢复”
+            # 清空台账指纹，或在源内容真的变化后由监听器建立一条新作业。
+            terminal_fingerprint = (
+                record.fingerprint
+                if record is not None
+                else str(latest_job.input_data.get("detected_fingerprint") or "")
+            )
+            if latest_job.status == JobStatus.CANCELLED or terminal_fingerprint == snap.fingerprint:
+                return
         # 标记文件与权威信号矛盾（说完成却还有 .!qB 等）说明匹配可疑，从严按
         # 下载中处理。必须在静默观察表留痕：CIFS/NFS 等不产生 fs 事件的挂载
         # 上，标记消失不会有事件叫醒我们，一忘了之条目就永远卡死；留痕后
@@ -572,17 +1002,19 @@ async def _process_entry(
             return
 
         if record is not None and record.fingerprint == snap.fingerprint:
-            if record.status != IngestStatus.FAILED:
+            if record.status != IngestStatus.FAILED and not parser_retry:
                 return  # 已处理且没变化（pending 等的是人工拍板，不是时间）
+            if parser_retry:
+                logger.info("升级后重新检查旧版部分入库记录：%s", entry.name)
             elapsed = (utcnow() - record.attempted_at).total_seconds()
-            if elapsed < FAILED_RETRY_SECONDS:
+            if record.status == IngestStatus.FAILED and elapsed < FAILED_RETRY_SECONDS:
                 # 环境故障退避中。进程重启会丢失失败重试表——在此按已过的
                 # 退避时间补记，保证退避到点仍有第三唤醒源接得住
                 _failed_retry.setdefault(path_str, time.monotonic() - elapsed)
                 return
 
-        if verdict == "complete":
-            # 下载器确认完成：跳过静默窗口，立即处理
+        if verdict == "complete" or partial_batch is not None:
+            # 下载器确认完成：整种或单文件证据都跳过静默窗口，立即处理。
             _stability.pop(path_str, None)
         else:
             # 启发式兜底（非种子来源/下载器不可用）：
@@ -595,8 +1027,56 @@ async def _process_entry(
             if now - previous[1] < QUIET_SECONDS:
                 return
 
-        matched_hashes = [b.info_hash for b in matches if b.info_hash]
-        await _ingest_entry(session, rule, library, watch_root, entry, snap, record, matched_hashes)
+        matched_hashes = (
+            sorted(
+                {
+                    info_hash
+                    for ready in partial_batch.files
+                    for info_hash in ready.info_hashes
+                }
+            )
+            if partial_batch is not None
+            else [b.info_hash for b in matches if b.info_hash]
+        )
+        consumable_hashes = (
+            list(partial_batch.consumable_hashes) if partial_batch is not None else None
+        )
+        if execute_inline:
+            await _ingest_entry(
+                session,
+                rule,
+                library,
+                watch_root,
+                entry,
+                snap,
+                record,
+                matched_hashes,
+                consumable_hashes,
+            )
+            if partial_batch is not None:
+                _deferred[path_str] = time.monotonic()
+            return
+        created = await enqueue_ingest_job(
+            session,
+            rule,
+            entry,
+            snap,
+            matched_hashes=matched_hashes,
+            ready_files=partial_batch.files if partial_batch is not None else None,
+            consumable_hashes=(
+                partial_batch.consumable_hashes if partial_batch is not None else None
+            ),
+            keep_deferred=partial_batch is not None,
+            record=record,
+        )
+        _stability.pop(path_str, None)
+        if partial_batch is None:
+            _deferred.pop(path_str, None)
+        else:
+            _deferred[path_str] = time.monotonic()
+        _failed_retry.pop(path_str, None)
+        if created.created:
+            logger.info("监听条目已进入后台作业：%s（job=%s）", entry.name, created.job.id)
 
 
 # ---------------------------------------------------------------------------
@@ -613,8 +1093,10 @@ async def _ingest_entry(
     snap: _EntrySnapshot,
     record: IngestEntry | None,
     matched_hashes: list[str] | None = None,
+    consumable_hashes: list[str] | None = None,
     forced_item: MediaItem | None = None,
-) -> None:
+    job_context: jobs.JobContext | None = None,
+) -> IngestEntry:
     strategy = rule.strategy
     # 目标库：指定库规则即入参；auto 规则在识别出作品后才决定（见下），
     # conclude 闭包读的是当下的 dest_library——选定目标前失败的条目落账无归属库。
@@ -625,9 +1107,39 @@ async def _ingest_entry(
     # 与 dest_library 同理：conclude 读的是当下的 item——定出身份前失败/跳过的
     # 条目落账无作品归属，摘要行的作品去重自然不会把它算进任何一部
     item: MediaItem | None = None
+    # 手动下载的 hash 锚只服务于这次在途导入：一旦文件已成功整理，和台账
+    # 一起提交删除。删除依据是本次条目匹配到的全部 hash + 最终媒体身份，
+    # 不能只删“身份识别实际选中的那一行”：同一 hash 若先被订阅工单认领，
+    # 手动锚虽然没有参与识别，也已经随同一批文件完成了使命。
+    manual_intent: ManualDownloadIntent | None = None
+    # 只保存本次作业实际新增的条目内相对文件名，供任务中心展示本轮成果；
+    # 已在库而跳过的旧文件不计入，也不暴露监听目录或媒体库的绝对路径。
+    imported_files: list[str] = []
+    # 同一个监听条目本轮成功搬入的文件属于一个用户可理解的入库批次；增量
+    # 季包下一轮再补进来的集会拿新批次号，首页因此只摘要最后一次变化。
+    added_batch_id = uuid4().hex
 
-    async def conclude(status: IngestStatus, message: str, imported: int = 0) -> None:
-        await _save_record(
+    async def conclude(status: IngestStatus, message: str, imported: int = 0) -> IngestEntry:
+        if status is IngestStatus.IMPORTED and item is not None and item.id is not None:
+            source_hashes = matched_hashes if consumable_hashes is None else consumable_hashes
+            hashes = sorted({value.lower() for value in source_hashes or [] if value})
+            if hashes:
+                intents = list(
+                    (
+                        await session.execute(
+                            select(ManualDownloadIntent).where(
+                                ManualDownloadIntent.info_hash.in_(hashes),  # type: ignore[union-attr]
+                                ManualDownloadIntent.media_item_id == item.id,
+                            )
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+                for intent in intents:
+                    await session.delete(intent)
+                    logger.info("手动下载身份锚已随成功入库消费：hash=%s", intent.info_hash)
+        saved = await _save_record(
             session,
             dest_library,
             str(entry),
@@ -637,33 +1149,70 @@ async def _ingest_entry(
             message,
             imported,
             item,
+            schedule_retry=job_context is None,
         )
+        if (
+            status is IngestStatus.IMPORTED
+            and job_context is not None
+            and imported_files
+        ):
+            await job_context.update_progress(
+                mode="determinate",
+                phase="finalizing",
+                message=message,
+                percent=100.0,
+                phase_index=4,
+                phase_count=4,
+                details={
+                    "entry_name": entry.name,
+                    "rule_id": rule.id,
+                    "media_item_id": item.id if item is not None else None,
+                    "library_id": dest_library.id if dest_library is not None else None,
+                    "imported_files": list(dict.fromkeys(imported_files)),
+                },
+            )
+        return saved
 
     if snap.has_disc:
-        await conclude(
+        return await conclude(
             IngestStatus.SKIPPED, "原盘目录（BDMV/VIDEO_TS）暂不支持自动入库，请手动整理"
         )
-        return
     if not snap.videos:
-        await conclude(IngestStatus.SKIPPED, "条目中没有视频文件，已跳过")
-        return
+        return await conclude(IngestStatus.SKIPPED, "条目中没有视频文件，已跳过")
 
     # kind 先验：指定库取库类型；auto 规则取规则声明（识别链按 movie/tv 分叉）
     kind = MediaKind(library.kind if library is not None else rule.kind)
     main = max(snap.videos, key=lambda f: f.stat().st_size)
+    if job_context is not None:
+        await job_context.update_progress(
+            mode="indeterminate",
+            phase="probing",
+            message=f"正在检查「{main.name}」是否完整",
+            phase_index=1,
+            phase_count=4,
+            details={"entry_name": entry.name, "rule_id": rule.id},
+        )
     spec = await asyncio.to_thread(probe_media, main)
     if spec is None and ffprobe_available():
-        await conclude(
+        return await conclude(
             IngestStatus.FAILED,
             f"主视频「{main.name}」探测失败——可能尚未下载完成或已损坏，文件变化后自动重试",
         )
-        return
 
     # 身份优先级：人工认领（forced_item，用户拍板最高权威）→ 订阅工单认领
     # （info_hash 命中在途投递 → 继承投递时锚定的精确身份，零猜测）→
     # NFO/名称解析识别链（第三方下载的兜底）。自定义目录规则同样认领——
     # 身份与落点分离：认领只取身份（免重新识别、命名更准），落点始终由
     # 规则声明决定（docs/design/strm-workflow.md 2.3）
+    if job_context is not None:
+        await job_context.update_progress(
+            mode="indeterminate",
+            phase="identifying",
+            message=f"正在识别「{entry.name}」",
+            phase_index=2,
+            phase_count=4,
+            details={"entry_name": entry.name, "rule_id": rule.id},
+        )
     if forced_item is None and record is not None and record.claimed_tmdb_id is not None:
         # 台账里钉过认领身份：认领当轮环境故障（探测/搬运/TMDB 网络）失败
         # 后，自动重试凭这颗钉子还原用户拍板的身份，绝不回退重新识别——
@@ -674,38 +1223,45 @@ async def _ingest_entry(
                 claimed_kind, record.claimed_tmdb_id
             )
         except Exception as exc:  # noqa: BLE001 -- TMDB 不可达等环境故障，退避重试
-            await conclude(IngestStatus.FAILED, f"按认领身份重建条目失败（{exc}）；将自动重试")
-            return
+            return await conclude(
+                IngestStatus.FAILED, f"按认领身份重建条目失败（{exc}）；将自动重试"
+            )
     if forced_item is not None:
         item, pinned_library_id = forced_item, None
-        claimed = False
+        identity_source: str | None = None
     else:
         item, pinned_library_id = await _wanted_identity(session, matched_hashes or [])
-        claimed = item is not None
+        identity_source = "subscription" if item is not None else None
+        if item is None:
+            item, pinned_library_id, manual_intent = await _manual_download_identity(
+                session, matched_hashes or []
+            )
+            identity_source = "manual" if item is not None else None
         if item is None:
             try:
                 item = await _identify(session, kind, watch_root, main, spec)
             except IdentifyUnavailable as exc:
                 # 环境故障：网络恢复后重试就能过，不该钉进待处理清单
-                await conclude(IngestStatus.FAILED, f"识别中断：{exc}；将自动重试")
-                return
+                return await conclude(IngestStatus.FAILED, f"识别中断：{exc}；将自动重试")
     if item is None:
-        await conclude(
+        return await conclude(
             IngestStatus.PENDING,
             f"无法自动识别「{entry.name}」对应的影视条目；"
             "可在监听导入清单中搜索认领，或把条目改名为「标题 (年份)」形式自动重试",
         )
-        return
 
     # auto 规则：识别后决定目标库（docs/design/library-routing.md 2.3）。
-    # 订阅认领的内容沿用创建时定格的库——粘性 + 尊重用户在订阅上的手选，
-    # 不重新路由；识别链身份才走收藏范围路由（route 内含默认库兜底）
+    # 订阅/手动下载的已确认身份均沿用提交时定格的库——粘性 + 不让规则
+    # 后续变化改写已在下载任务的归属；名称识别的身份才重新走收藏范围路由。
     route_note: str | None = None
     if staging is None and dest_library is None:
-        if claimed and pinned_library_id is not None:
+        if identity_source is not None and pinned_library_id is not None:
             dest_library = await session.get(Library, pinned_library_id)
             if dest_library is not None:
-                route_note = f"入库到订阅指定的「{dest_library.name}」"
+                if identity_source == "subscription":
+                    route_note = f"入库到订阅指定的「{dest_library.name}」"
+                else:
+                    route_note = f"入库到手动下载时确认的「{dest_library.name}」"
         if dest_library is None:
             from movieclaw_api.services.library.routing import route_for_item
 
@@ -713,12 +1269,29 @@ async def _ingest_entry(
             dest_library = decision.library
             route_note = decision.reason
         if dest_library is None:
-            await conclude(
+            return await conclude(
                 IngestStatus.FAILED,
                 f"没有可用的{'电影' if kind is MediaKind.MOVIE else '剧集'}媒体库，"
                 "无法自动路由入库；请先到「媒体库」创建",
             )
-            return
+
+    if job_context is not None and dest_library is not None:
+        assert dest_library.id is not None
+        while not await job_context.acquire_target_resource("library", dest_library.id):
+            await job_context.raise_if_cancelled()
+            await job_context.update_progress(
+                mode="waiting",
+                phase="waiting_library",
+                message=f"媒体库「{dest_library.name}」正在执行其他作业，等待安全入库",
+                phase_index=3,
+                phase_count=4,
+                details={
+                    "entry_name": entry.name,
+                    "rule_id": rule.id,
+                    "library_id": dest_library.id,
+                },
+            )
+            await asyncio.sleep(2)
 
     if staging is not None:
         # 自定义目录与库入库共用同一命名规范——回流文件名天然规范，
@@ -728,10 +1301,9 @@ async def _ingest_entry(
         assert dest_library is not None
         dest_dir = derive_save_path(dest_library, title=item.title, year=item.year)
         if dest_dir is None:
-            await conclude(
+            return await conclude(
                 IngestStatus.FAILED, f"媒体库「{dest_library.name}」没有配置根路径，无法入库"
             )
-            return
 
     # 发布信息以条目名为准（比单集文件名完整），与入库管线的种子名口径一致
     release_attrs = enrich(entry.name if entry.is_dir() else entry.stem)
@@ -745,6 +1317,7 @@ async def _ingest_entry(
     # 逐文件的失败按性质分档：环境故障（探测失败/搬运出错）→ failed 退避
     # 重试；解析不出季集 → pending 等人（重试改变不了解析结果，改名才行）
     env_error = False
+    parser_gap = False
     if kind is MediaKind.MOVIE and len(snap.videos) > 1:
         notes.append(f"已取最大文件为正片，忽略其余 {len(snap.videos) - 1} 个视频")
 
@@ -755,19 +1328,28 @@ async def _ingest_entry(
 
     imported = 0
     skipped_owned = 0
+    total_bytes = sum(file.stat().st_size for file in files)
+    completed_bytes = 0
     for file in files:
+        if job_context is not None:
+            await job_context.raise_if_cancelled()
         if kind is MediaKind.MOVIE:
             season, episode = 0, 0
         else:
             season, episode = _unit(file, entry)
             if not episode:
                 notes.append(f"「{file.name}」解析不出集号，未入库")
+                parser_gap = True
+                completed_bytes += file.stat().st_size
                 continue
             if season is None:
                 notes.append(f"「{file.name}」解析不出季号，未入库")
+                parser_gap = True
+                completed_bytes += file.stat().st_size
                 continue
         if staging is not None and (season, episode) in owned_units:
             skipped_owned += 1
+            completed_bytes += file.stat().st_size
             continue
         ext = file.suffix.lower()
         if kind is MediaKind.MOVIE:
@@ -787,13 +1369,56 @@ async def _ingest_entry(
             continue
         label = (file_spec.resolution if file_spec else None) or release_attrs.media_source or "V2"
         try:
-            final = await asyncio.to_thread(_transfer, file, target, strategy, label)
+            if job_context is None:
+                final = await asyncio.to_thread(_transfer, file, target, strategy, label)
+            else:
+
+                async def report_copy(
+                    copied: int,
+                    _total: int,
+                    *,
+                    _file=file,
+                    _completed=completed_bytes,
+                    _total_bytes=total_bytes,
+                ) -> None:
+                    current = min(_completed + copied, _total_bytes)
+                    percent = current / _total_bytes * 100 if _total_bytes else 100.0
+                    await job_context.update_progress(
+                        mode="determinate",
+                        phase="transferring",
+                        message=(
+                            f"正在{'复制' if strategy == 'copy' else '硬链接'}「{_file.name}」"
+                        ),
+                        current=current,
+                        total=_total_bytes,
+                        percent=round(percent, 1),
+                        phase_index=3,
+                        phase_count=4,
+                        details={
+                            "entry_name": entry.name,
+                            "file_name": _file.name,
+                            "library_id": dest_library.id if dest_library else None,
+                            "bytes_copied": current,
+                        },
+                    )
+
+                final = await _transfer_for_job(
+                    file,
+                    target,
+                    strategy,
+                    label,
+                    job_context,
+                    report_copy,
+                )
         except IngestError as exc:
             notes.append(str(exc))
             env_error = True
             continue
+        completed_bytes += file.stat().st_size
         if final is None:
             continue  # 同一内容已在目标（重复处理/增量重扫），静默幂等
+        relative_name = _relative_entry_file(entry, file)
+        imported_files.append(file.name if relative_name in {None, "."} else relative_name)
         if staging is not None:
             # 自定义目录：文件是"过客"，搬到位即完成，不写库台账
             imported += 1
@@ -817,16 +1442,23 @@ async def _ingest_entry(
                 bit_depth=file_spec.bit_depth if file_spec else None,
                 duration_seconds=file_spec.duration_seconds if file_spec else None,
                 bit_rate=file_spec.bit_rate if file_spec else None,
+                frame_rate=file_spec.frame_rate if file_spec else None,
+                color_space=file_spec.color_space if file_spec else None,
                 audio_streams=list(file_spec.audio_streams) if file_spec else None,
                 subtitle_streams=list(file_spec.subtitle_streams) if file_spec else None,
                 media_source=release_attrs.media_source,
                 release_group=release_attrs.release_group,
                 source=FileSource.IMPORTED,
+                added_batch_id=added_batch_id,
             )
         )
         imported += 1
 
     if imported and staging is None:
+        assert dest_library is not None and dest_library.id is not None
+        # 监听入库不经过存量扫描；条目文件全部落账后在同一写路径刷新一次
+        # 快照，避免首页要等下一轮定时扫描才看到新库存。
+        await LibraryRepository(session).refresh_stats([dest_library.id])
         # NFO 身份档案：Emby 零歧义、自家重扫免收敛（已存在不覆盖，失败不阻断）
         from movieclaw_api.services.library.nfo import write_entry_nfo
 
@@ -842,7 +1474,22 @@ async def _ingest_entry(
         from movieclaw_api.services.media_scrape import ensure_assets
 
         assert item.id is not None
-        asyncio.get_running_loop().create_task(ensure_assets(item.id))
+        if job_context is None:
+            asyncio.get_running_loop().create_task(ensure_assets(item.id))
+        else:
+            await job_context.update_progress(
+                mode="indeterminate",
+                phase="finalizing",
+                message=f"正在补齐《{item.title}》的图片与媒体目录资产",
+                phase_index=4,
+                phase_count=4,
+                details={
+                    "entry_name": entry.name,
+                    "media_item_id": item.id,
+                    "library_id": dest_library.id if dest_library else None,
+                },
+            )
+            await ensure_assets(item.id)
 
     verb = "硬链接" if strategy == "hardlink" else "复制"
     if imported:
@@ -856,20 +1503,29 @@ async def _ingest_entry(
             message += f"；{skipped_owned} 个文件的内容已在媒体库，跳过"
         if notes:
             message += "；" + "；".join(notes)
-        await conclude(IngestStatus.IMPORTED, message, imported)
+        status = (
+            IngestStatus.FAILED
+            if env_error
+            else IngestStatus.PENDING
+            if parser_gap
+            else IngestStatus.IMPORTED
+        )
+        return await conclude(status, message, imported)
     elif notes:
         # 一个文件都没进：环境故障退避重试；纯解析问题进待处理等人拍板/改名
-        await conclude(
+        return await conclude(
             IngestStatus.FAILED if env_error else IngestStatus.PENDING, "；".join(notes)
         )
     elif skipped_owned:
         # 自定义目录条目的全部单元都已回流入库：链路闭环完成，不再搬运
-        await conclude(IngestStatus.IMPORTED, f"《{item.title}》的内容已在媒体库，无需整理")
+        return await conclude(IngestStatus.IMPORTED, f"《{item.title}》的内容已在媒体库，无需整理")
     elif staging is not None:
-        await conclude(IngestStatus.IMPORTED, f"《{item.title}》的内容已全部在目标目录，无需搬运")
+        return await conclude(
+            IngestStatus.IMPORTED, f"《{item.title}》的内容已全部在目标目录，无需搬运"
+        )
     else:
         # 全部文件都已在库（此前处理过/多下载器重复下载）：结论记 imported
-        await conclude(IngestStatus.IMPORTED, f"《{item.title}》的内容已全部在库，无需搬运")
+        return await conclude(IngestStatus.IMPORTED, f"《{item.title}》的内容已全部在库，无需搬运")
 
 
 async def _wanted_identity(session, info_hashes: list[str]) -> tuple[MediaItem | None, int | None]:
@@ -880,7 +1536,7 @@ async def _wanted_identity(session, info_hashes: list[str]) -> tuple[MediaItem |
     """
     if not info_hashes:
         return None, None
-    from movieclaw_db.models import Subscription, WantedItem
+    from movieclaw_db.models import Subscription, SubscriptionDownloadAttempt, WantedItem
 
     result = await session.execute(
         select(MediaItem, Subscription.library_id)
@@ -890,10 +1546,50 @@ async def _wanted_identity(session, info_hashes: list[str]) -> tuple[MediaItem |
     )
     row = result.first()
     if row is None:
+        # 自动换源后 wanted 只指向新主源；旧源可能因 H&R/用户所有权被保留，
+        # 它之后若自行完成仍应继承原订阅身份，而不是退回模糊的文件名识别。
+        result = await session.execute(
+            select(MediaItem, Subscription.library_id)
+            .join(Subscription, MediaItem.id == Subscription.media_item_id)  # type: ignore[arg-type]
+            .join(
+                SubscriptionDownloadAttempt,
+                SubscriptionDownloadAttempt.subscription_id == Subscription.id,  # type: ignore[arg-type]
+            )
+            .where(SubscriptionDownloadAttempt.info_hash.in_(info_hashes))  # type: ignore[union-attr]
+        )
+        row = result.first()
+    if row is None:
         return None, None
     item, library_id = row
     logger.info("条目按 info_hash 认领了订阅身份：《%s》", item.title)
     return item, library_id
+
+
+async def _manual_download_identity(
+    session, info_hashes: list[str]
+) -> tuple[MediaItem | None, int | None, ManualDownloadIntent | None]:
+    """按 info_hash 反查手动下载在提交时确认的身份与目标库。
+
+    监听目录常被多个库复用，文件名不足以重新识别时，这颗锚把「搜索结果
+    已确认的 TMDB 身份 → 收藏范围选库 → 实际投递目录」完整接到完成后的
+    整理流程。订阅工单优先级更高，调用方只会在它未命中时走这里。
+    """
+    if not info_hashes:
+        return None, None, None
+    result = await session.execute(
+        select(MediaItem, ManualDownloadIntent)
+        .join(
+            ManualDownloadIntent,
+            MediaItem.id == ManualDownloadIntent.media_item_id,  # type: ignore[arg-type]
+        )
+        .where(ManualDownloadIntent.info_hash.in_(info_hashes))  # type: ignore[union-attr]
+    )
+    row = result.first()
+    if row is None:
+        return None, None, None
+    item, intent = row
+    logger.info("条目按 info_hash 认领了手动下载身份：《%s》", item.title)
+    return item, intent.library_id, intent
 
 
 class IdentifyUnavailable(Exception):
@@ -994,15 +1690,8 @@ def _same_payload(a: Path, b: Path) -> bool:
         return False
 
 
-def _transfer(src: Path, dst: Path, strategy: str, version_label: str) -> Path | None:
-    """把源文件按策略搬到目标；返回最终落位路径，None = 同内容已在库。
-
-    目标已存在且内容不同时按多版本约定退让到 ``… - 版本标签.ext``；
-    落位一律「先在目标目录写 .part 临时名（复制=copyfile、硬链=os.link），
-    再 rename_no_replace 发布到最终名」——rename 保证极空间等 FUSE 存储的
-    索引能看到新文件（见 fsops 模块头），NOREPLACE 保证不静默覆盖；
-    库根的 watchdog/扫描不认 .part 后缀，不会看到半成品。
-    """
+def _resolve_transfer_target(src: Path, dst: Path, version_label: str) -> Path | None:
+    """按既有多版本规则选择最终路径；None 表示内容已经落位。"""
     final = dst
     if final.exists():
         if _same_payload(src, final):
@@ -1016,6 +1705,21 @@ def _transfer(src: Path, dst: Path, strategy: str, version_label: str) -> Path |
         final.parent.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
         raise IngestError(f"创建目标目录失败（{exc.strerror}）：{final.parent}") from exc
+    return final
+
+
+def _transfer(src: Path, dst: Path, strategy: str, version_label: str) -> Path | None:
+    """把源文件按策略搬到目标；返回最终落位路径，None = 同内容已在库。
+
+    目标已存在且内容不同时按多版本约定退让到 ``… - 版本标签.ext``；
+    落位一律「先在目标目录写 .part 临时名（复制=copyfile、硬链=os.link），
+    再 rename_no_replace 发布到最终名」——rename 保证极空间等 FUSE 存储的
+    索引能看到新文件（见 fsops 模块头），NOREPLACE 保证不静默覆盖；
+    库根的 watchdog/扫描不认 .part 后缀，不会看到半成品。
+    """
+    final = _resolve_transfer_target(src, dst, version_label)
+    if final is None:
+        return None
 
     if strategy == "copy":
         part = final.with_name(final.name + ".part")
@@ -1050,6 +1754,135 @@ def _transfer(src: Path, dst: Path, strategy: str, version_label: str) -> Path |
     return final
 
 
+def _ingest_copy_paths(final: Path) -> tuple[Path, Path]:
+    """返回 Job 复制的隐藏续传文件与源版本边车。"""
+    partial = final.with_name(f".{final.name}.movieclaw-ingest.part")
+    return partial, partial.with_name(partial.name + ".json")
+
+
+def _prepare_ingest_copy(source: Path, partial: Path, state_path: Path) -> tuple[int, int, int]:
+    """校验/初始化续传点，返回（源大小、源 mtime_ns、已复制字节）。"""
+    stat = source.stat()
+    expected = {
+        "source": str(source),
+        "size": stat.st_size,
+        "mtime_ns": stat.st_mtime_ns,
+    }
+    valid = False
+    if partial.exists() and state_path.is_file():
+        try:
+            valid = json.loads(state_path.read_text(encoding="utf-8")) == expected
+        except (OSError, json.JSONDecodeError):
+            valid = False
+    if not valid:
+        partial.unlink(missing_ok=True)
+        state_path.unlink(missing_ok=True)
+    partial.parent.mkdir(parents=True, exist_ok=True)
+    if not state_path.exists():
+        temp = state_path.with_name(state_path.name + ".tmp")
+        temp.write_text(json.dumps(expected, ensure_ascii=False), encoding="utf-8")
+        os.replace(temp, state_path)
+    copied = partial.stat().st_size if partial.exists() else 0
+    if copied > stat.st_size:
+        partial.unlink(missing_ok=True)
+        copied = 0
+    return stat.st_size, stat.st_mtime_ns, copied
+
+
+def _copy_ingest_chunk(
+    source: Path,
+    partial: Path,
+    *,
+    expected_size: int,
+    expected_mtime_ns: int,
+) -> int:
+    """从现有长度续写一个块，源文件变化时拒绝发布混合内容。"""
+    before = source.stat()
+    if before.st_size != expected_size or before.st_mtime_ns != expected_mtime_ns:
+        raise IngestSourceChanged(f"源文件仍在变化：{source.name}")
+    copied = partial.stat().st_size if partial.exists() else 0
+    if copied >= expected_size:
+        partial.touch(exist_ok=True)
+        return copied
+    with source.open("rb") as source_file:
+        source_file.seek(copied)
+        chunk = source_file.read(_INGEST_COPY_CHUNK_BYTES)
+    with partial.open("ab" if copied else "wb") as target_file:
+        target_file.write(chunk)
+        target_file.flush()
+    after = source.stat()
+    if after.st_size != expected_size or after.st_mtime_ns != expected_mtime_ns:
+        raise IngestSourceChanged(f"源文件仍在变化：{source.name}")
+    return copied + len(chunk)
+
+
+async def _transfer_for_job(
+    source: Path,
+    target: Path,
+    strategy: str,
+    version_label: str,
+    context: jobs.JobContext,
+    on_copy_progress: Callable[[int, int], Awaitable[None]],
+) -> Path | None:
+    """Job 专用搬运：硬链接保持原子语义，复制按隐藏文件断点续传。"""
+    final = await asyncio.to_thread(_resolve_transfer_target, source, target, version_label)
+    if final is None:
+        # 上次执行可能已发布最终文件、却在清理边车前被强制终止。恢复时既要
+        # 以最终文件为幂等事实，也要清掉不再可能使用的隐藏续传状态。
+        candidates = [target, target.with_name(f"{target.stem} - {version_label}{target.suffix}")]
+        for candidate in candidates:
+            if candidate.exists() and _same_payload(source, candidate):
+                partial, state_path = _ingest_copy_paths(candidate)
+                partial.unlink(missing_ok=True)
+                state_path.unlink(missing_ok=True)
+        return None
+    if strategy != "copy":
+        return await asyncio.to_thread(_transfer, source, target, strategy, version_label)
+
+    partial, state_path = _ingest_copy_paths(final)
+    try:
+        total, mtime_ns, copied = await asyncio.to_thread(
+            _prepare_ingest_copy, source, partial, state_path
+        )
+        await on_copy_progress(copied, total)
+        while copied < total:
+            await context.raise_if_cancelled()
+            copied = await asyncio.to_thread(
+                _copy_ingest_chunk,
+                source,
+                partial,
+                expected_size=total,
+                expected_mtime_ns=mtime_ns,
+            )
+            await on_copy_progress(copied, total)
+        await context.raise_if_cancelled()
+        try:
+            await asyncio.to_thread(rename_no_replace, partial, final)
+        except FileExistsError as exc:
+            if _same_payload(source, final):
+                partial.unlink(missing_ok=True)
+                state_path.unlink(missing_ok=True)
+                return None
+            raise IngestError(f"目标已存在同名文件，跳过以免覆盖：{final.name}") from exc
+        state_path.unlink(missing_ok=True)
+        return final
+    except IngestSourceChanged:
+        # 续传副本属于旧源版本，继续使用会把两个版本拼在一起；删除后短延迟
+        # 重试，重新走下载完成检测。用户的 Job 意图本身继续保留。
+        partial.unlink(missing_ok=True)
+        state_path.unlink(missing_ok=True)
+        raise
+    except jobs.JobCancelled:
+        raise
+    except asyncio.CancelledError:
+        raise
+    except IngestError:
+        raise
+    except OSError as exc:
+        # 网络盘瞬断时刻意保留校验过的隐藏副本，下次从实际长度继续。
+        raise IngestError(f"复制暂未完成（{exc}）：{source.name} → {final}") from exc
+
+
 # ---------------------------------------------------------------------------
 # 台账
 # ---------------------------------------------------------------------------
@@ -1065,7 +1898,9 @@ async def _save_record(
     message: str,
     imported: int,
     item: MediaItem | None = None,
-) -> None:
+    *,
+    schedule_retry: bool = True,
+) -> IngestEntry:
     now = utcnow()
     if record is None:
         record = IngestEntry(
@@ -1098,7 +1933,7 @@ async def _save_record(
     # 弹出该条目，下载早已结束不会再有 fs 事件，若不留痕，_arm_recheck 挂
     # 不上自检、兜底巡检的 _has_pending 也看不见它——「自动退避重试」就
     # 成了一句空话（回归：FAILED 条目落账后被彻底遗忘，永不重试）
-    if status is IngestStatus.FAILED:
+    if status is IngestStatus.FAILED and schedule_retry:
         _failed_retry[entry_path] = time.monotonic()
     else:
         _failed_retry.pop(entry_path, None)
@@ -1109,6 +1944,309 @@ async def _save_record(
         logger.warning("监听导入未完成（%s）：%s", entry_path, message)
     else:
         logger.info("监听导入（%s）：%s", entry_path, message)
+    return record
+
+
+async def _attach_ingest_entry_resource(context: jobs.JobContext, record: IngestEntry) -> None:
+    """处理结论落账后把 Job 关联到清单行，供认领/忽略动作精确接管。"""
+    if record.id is None:
+        return
+    await context.attach_resource("ingest_entry", record.id)
+
+
+async def _ensure_job_snapshot_stable(
+    context: jobs.JobContext,
+    snap: _EntrySnapshot,
+    detected_fingerprint: str,
+    *,
+    rule_id: int,
+    entry_name: str,
+) -> None:
+    """入队后磁盘版本变化时重新建立静默窗口，避免恢复后复制在途文件。"""
+    if not detected_fingerprint or snap.fingerprint == detected_fingerprint or QUIET_SECONDS <= 0:
+        return
+    progress = await context.current_progress()
+    details = dict(progress.get("details") or {})
+    observed_fingerprint = str(details.get("stability_fingerprint") or "")
+    try:
+        observed_at = float(details.get("stability_observed_at") or 0)
+    except (TypeError, ValueError):
+        observed_at = 0
+    now = time.time()
+    elapsed = now - observed_at if observed_fingerprint == snap.fingerprint else 0
+    if observed_fingerprint == snap.fingerprint and elapsed >= QUIET_SECONDS:
+        return
+    if observed_fingerprint != snap.fingerprint:
+        observed_at = now
+        elapsed = 0
+    details.update(
+        {
+            "rule_id": rule_id,
+            "entry_name": entry_name,
+            "stability_fingerprint": snap.fingerprint,
+            "stability_observed_at": observed_at,
+        }
+    )
+    remaining = max(1, int(QUIET_SECONDS - elapsed))
+    await context.update_progress(
+        mode="waiting",
+        phase="waiting_stable",
+        message=f"「{entry_name}」在排队期间发生变化，等待下载完全停止",
+        phase_index=1,
+        phase_count=4,
+        details=details,
+    )
+    raise jobs.JobRetry(
+        "源条目仍在变化，静默后继续入库",
+        delay_seconds=remaining,
+    )
+
+
+def _ready_files_from_input(value: object) -> list[_ReadyDownloadFile]:
+    """解析持久化文件白名单；坏路径交后续安全还原拒绝，不静默扩权。"""
+    if not isinstance(value, list):
+        return []
+    ready: list[_ReadyDownloadFile] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        path = item.get("path")
+        size = item.get("size_bytes")
+        if not isinstance(path, str) or not isinstance(size, int) or size < 0:
+            continue
+        hashes = item.get("info_hashes")
+        ready.append(
+            _ReadyDownloadFile(
+                relative_path=path,
+                size_bytes=size,
+                info_hashes=tuple(
+                    sorted(
+                        {
+                            str(info_hash).lower()
+                            for info_hash in hashes
+                            if isinstance(info_hash, str) and info_hash
+                        }
+                    )
+                )
+                if isinstance(hashes, list)
+                else (),
+            )
+        )
+    return ready
+
+
+async def _execute_ingest_job(
+    context: jobs.JobContext, input_data: dict[str, object]
+) -> dict[str, object]:
+    """监听入库 Job：重新核对磁盘现场后执行，领域台账作为幂等检查点。
+
+    Job 输入表达“处理这个监听条目”的稳定意图，而不是把一次目录快照当作
+    永久真相。更新期间下载目录发生变化时会重新快照；复制原语另用源大小与
+    mtime 边车保护续传，绝不把两个文件版本拼接在一起。
+    """
+    rule_id = int(input_data["rule_id"])
+    entry = Path(str(input_data["entry_path"]))
+    stored_hashes = [
+        str(value).lower()
+        for value in input_data.get("info_hashes", [])
+        if isinstance(value, str) and value
+    ]
+    file_scoped = "ready_files" in input_data
+    ready_files = _ready_files_from_input(input_data.get("ready_files"))
+    if file_scoped and not ready_files:
+        raise jobs.JobFailed(
+            "文件级入库白名单无效，已停止以避免扩大处理范围",
+            code="INGEST_READY_FILES_INVALID",
+        )
+    consume_hashes = [
+        str(value).lower()
+        for value in input_data.get("consume_info_hashes", [])
+        if isinstance(value, str) and value
+    ]
+    db = get_database()
+    async with db.session() as session:
+        pair = (
+            await session.execute(
+                select(ImportWatch, Library)
+                .outerjoin(Library, ImportWatch.library_id == Library.id)  # type: ignore[arg-type]
+                .where(ImportWatch.id == rule_id)
+            )
+        ).first()
+    if pair is None:
+        return {"message": "监听导入规则已删除，本次作业已停止", "rule_id": rule_id}
+    rule, library = pair
+    if not _is_entry_of(str(entry), rule.source_path):
+        raise jobs.JobFailed(
+            "监听条目已不属于原规则，已停止处理",
+            code="INGEST_ENTRY_OUTSIDE_RULE",
+            details={"rule_id": rule_id},
+        )
+    if not entry.exists():
+        return {
+            "message": "源条目已被移除，无需继续入库",
+            "rule_id": rule_id,
+            "entry_name": entry.name,
+        }
+
+    persisted_progress = await context.current_progress()
+    persisted_details = dict(persisted_progress.get("details") or {})
+    await context.update_progress(
+        mode="indeterminate",
+        phase="preparing",
+        message=f"正在核对「{entry.name}」的下载完成状态",
+        phase_index=1,
+        phase_count=4,
+        details={**persisted_details, "rule_id": rule_id, "entry_name": entry.name},
+    )
+    briefs = await _downloader_briefs()
+    matches = _match_briefs(entry.name, briefs)
+    verdict = _torrent_verdict(matches)
+    if file_scoped and verdict == "downloading":
+        current_batch = await _completed_file_batch(entry, matches)
+        current_ready = {
+            (ready.relative_path, ready.size_bytes) for ready in current_batch.files
+        }
+        if any(
+            (ready.relative_path, ready.size_bytes) not in current_ready for ready in ready_files
+        ):
+            raise jobs.JobRetry(
+                "已完成文件的下载器证据发生变化，稍后重新核对",
+                delay_seconds=DEFERRED_POLL_SECONDS,
+            )
+    elif verdict == "downloading":
+        raise jobs.JobRetry(
+            "下载器仍在写入该条目，稍后继续检查",
+            delay_seconds=DEFERRED_POLL_SECONDS,
+        )
+    try:
+        snap = (
+            await asyncio.to_thread(_snapshot_ready_files, entry, ready_files)
+            if file_scoped
+            else await asyncio.to_thread(_snapshot, entry)
+        )
+    except IngestSourceChanged as exc:
+        raise jobs.JobRetry(str(exc), delay_seconds=30) from exc
+    if not file_scoped and snap.has_marker:
+        raise jobs.JobRetry(
+            "条目仍有下载中标记，稍后继续检查",
+            delay_seconds=DEFERRED_POLL_SECONDS,
+        )
+    await _ensure_job_snapshot_stable(
+        context,
+        snap,
+        str(input_data.get("detected_fingerprint") or ""),
+        rule_id=rule_id,
+        entry_name=entry.name,
+    )
+    current_hashes = (
+        []
+        if file_scoped
+        else [brief.info_hash.lower() for brief in matches if brief.info_hash]
+    )
+    matched_hashes = sorted(set(stored_hashes) | set(current_hashes))
+
+    async with db.session() as session:
+        record = (
+            await session.execute(select(IngestEntry).where(IngestEntry.entry_path == str(entry)))
+        ).scalar_one_or_none()
+        if record is not None and record.status == IngestStatus.IGNORED:
+            await _attach_ingest_entry_resource(context, record)
+            return {
+                "message": "条目已被忽略，不再自动入库",
+                "entry_id": record.id,
+                "entry_name": entry.name,
+            }
+        if record is not None and record.fingerprint == snap.fingerprint:
+            await _attach_ingest_entry_resource(context, record)
+            parser_retry = _has_parser_gap(record)
+            if record.status in {IngestStatus.IMPORTED, IngestStatus.SKIPPED} and not parser_retry:
+                return {
+                    "message": record.message or "监听条目已处理",
+                    "entry_id": record.id,
+                    "status": record.status,
+                }
+            if (
+                record.status == IngestStatus.PENDING
+                and record.claimed_tmdb_id is None
+                and not parser_retry
+            ):
+                raise jobs.JobBlocked(
+                    record.message or "无法自动识别该条目，请到监听导入清单认领",
+                    code="INGEST_IDENTITY_REQUIRED",
+                    actions=[
+                        {
+                            "type": "open_settings",
+                            "label": "去监听导入认领",
+                            "target": "import-watch",
+                        }
+                    ],
+                    details={"entry_id": record.id, "rule_id": rule_id},
+                )
+        try:
+            record = await _ingest_entry(
+                session,
+                rule,
+                library,
+                Path(rule.source_path),
+                entry,
+                snap,
+                record,
+                matched_hashes,
+                consume_hashes if file_scoped else None,
+                job_context=context,
+            )
+        except IngestSourceChanged as exc:
+            raise jobs.JobRetry(str(exc), delay_seconds=30) from exc
+        await _attach_ingest_entry_resource(context, record)
+        await refresh_source_notice(session, rule.source_path)
+
+    if record.status == IngestStatus.PENDING:
+        parser_gap = _has_parser_gap(record)
+        raise jobs.JobBlocked(
+            record.message or "监听条目需要人工确认",
+            code="INGEST_EPISODE_PARSE_REQUIRED" if parser_gap else "INGEST_IDENTITY_REQUIRED",
+            actions=[
+                {
+                    "type": "open_settings",
+                    "label": "查看监听导入" if parser_gap else "去监听导入认领",
+                    "target": "import-watch",
+                }
+            ],
+            details={"entry_id": record.id, "rule_id": rule_id},
+        )
+    if record.status == IngestStatus.FAILED:
+        raise jobs.JobRetry(
+            record.message or "监听入库暂未完成",
+            delay_seconds=FAILED_RETRY_SECONDS,
+            actions=[
+                {
+                    "type": "open_settings",
+                    "label": "查看监听导入",
+                    "target": "import-watch",
+                }
+            ],
+        )
+    return {
+        "message": record.message or "监听条目已完成入库",
+        "entry_id": record.id,
+        "entry_name": entry.name,
+        "status": record.status,
+        "imported_count": record.imported_count,
+        "media_item_id": record.media_item_id,
+    }
+
+
+@jobs.register_job_handler("library.ingest")
+async def _run_ingest_job(
+    context: jobs.JobContext, input_data: dict[str, object]
+) -> dict[str, object]:
+    """执行持久化入库；分批作业结束后继续轮询同目录剩余下载。"""
+    entry = Path(str(input_data["entry_path"]))
+    try:
+        return await _execute_ingest_job(context, input_data)
+    finally:
+        if bool(input_data.get("keep_deferred")) and entry.exists():
+            _deferred[str(entry)] = time.monotonic()
 
 
 # ---------------------------------------------------------------------------
@@ -1178,9 +2316,7 @@ async def entry_stats(session, rules: list[ImportWatch]) -> dict[int, LedgerStat
     return stats
 
 
-async def list_entries(
-    session, rule: ImportWatch, status: str | None = None
-) -> list[IngestEntry]:
+async def list_entries(session, rule: ImportWatch, status: str | None = None) -> list[IngestEntry]:
     """一条规则的台账清单（可按状态过滤），最近处理的在前。"""
     prefix = rule.source_path.rstrip("/") + "/"
     rows = (
@@ -1213,6 +2349,9 @@ async def ignore_entry(session, entry_id: int) -> IngestEntry:
     record.message = "已手动忽略；如需处理可在清单中恢复"
     record.updated_at = utcnow()
     await session.commit()
+    active = await jobs.latest_job_for_resource(session, "ingest_entry", entry_id)
+    if active is not None and active.status in ACTIVE_JOB_STATUSES:
+        await jobs.request_cancel(session, active.id, requested_by="监听导入清单")
     await refresh_source_notice(session, str(Path(record.entry_path).parent))
     return record
 
@@ -1237,16 +2376,33 @@ async def restore_entry(session, entry_id: int) -> IngestEntry:
     await session.commit()
     source = str(Path(record.entry_path).parent)
     await refresh_source_notice(session, source)
-    request_sweep(source)
+    active = await jobs.latest_job_for_resource(session, "ingest_entry", entry_id)
+    if active is not None and active.status == JobStatus.BLOCKED:
+        await jobs.retry_job(
+            session,
+            active,
+            actor_kind="user",
+            actor_name="监听导入清单",
+            origin="web",
+        )
+    else:
+        request_sweep(source)
     return record
 
 
-async def claim_entry(session, entry_id: int, tmdb_id: int) -> IngestEntry:
-    """人工认领：把条目钉到指定 TMDB 身份并立即走完整入库流程。
+async def claim_entry(
+    session,
+    entry_id: int,
+    tmdb_id: int,
+    *,
+    execute_inline: bool = False,
+) -> IngestEntry:
+    """人工认领：把条目钉到指定 TMDB 身份并恢复同一个后台入库作业。
 
     用户拍板是最高权威——跳过工单认领与识别链；kind 先验仍取自规则
-    （指定库=库类型，自动路由/自定义目录=规则声明）。处理结论（成功/
-    失败原因）写回台账行，调用方按状态与 message 呈现。
+    （指定库=库类型，自动路由/自定义目录=规则声明）。生产路径只保存认领
+    事实并原地解除 blocked Job，稳定 job id、事件时间线与复制断点都不变；
+    ``execute_inline`` 仅供领域单测复用处理原语。
     """
     from movieclaw_api.exceptions import BadRequestException, NotFoundException
 
@@ -1270,7 +2426,9 @@ async def claim_entry(session, entry_id: int, tmdb_id: int) -> IngestEntry:
     if not entry.exists():
         raise BadRequestException("条目已不在源目录（可能已被删除），无法认领")
     snap = await asyncio.to_thread(_snapshot, entry)
-    if snap.has_marker:
+    briefs = await _downloader_briefs()
+    matches = _match_briefs(entry.name, briefs)
+    if snap.has_marker or _torrent_verdict(matches) == "downloading":
         raise BadRequestException("条目似乎还在下载中（存在未完成标记文件），请等下载完成再认领")
     kind = MediaKind(library.kind if library is not None else rule.kind)
     item = await MediaLibraryService(session, get_tmdb_client()).ensure_media_item(kind, tmdb_id)
@@ -1280,7 +2438,31 @@ async def claim_entry(session, entry_id: int, tmdb_id: int) -> IngestEntry:
     # pending、更不需要用户再认领一次
     record.claimed_tmdb_id = tmdb_id
     record.claimed_kind = kind.value
+    record.status = IngestStatus.PENDING
+    record.message = f"已认领为《{item.title}》，等待后台整理入库"
+    record.updated_at = utcnow()
     await session.commit()
+    if not execute_inline:
+        created = await enqueue_ingest_job(
+            session,
+            rule,
+            entry,
+            snap,
+            matched_hashes=[brief.info_hash for brief in matches if brief.info_hash],
+            record=record,
+            origin="web",
+        )
+        if created.job.status == JobStatus.BLOCKED:
+            await jobs.retry_job(
+                session,
+                created.job,
+                actor_kind="user",
+                actor_name="监听导入清单",
+                origin="web",
+            )
+        await session.refresh(record)
+        await refresh_source_notice(session, source)
+        return record
     async with _sweep_lock:
         await _ingest_entry(
             session,
@@ -1336,7 +2518,7 @@ class IngestWatcher:
     事件，事件停止即静默的开端；没有下载活动时零开销，NAS 磁盘可以休眠。
     静默窗口的"到点检查"没有事件会叫醒——每轮巡检后若仍有条目在等静默
     或在挂起表里等下载器完成，挂一个一次性自检任务（前者按最近到期时间，
-    后者按固定轮询节奏且醒来先纯 API 核对、不碰磁盘），全部落定后归零。
+    后者按固定轮询节奏且醒来先通过 API 核对文件进度），全部落定后归零。
     """
 
     def __init__(self) -> None:
@@ -1500,7 +2682,8 @@ class IngestWatcher:
         """仍有条目在等静默窗口、等下载器状态翻转或等失败退避时，挂一次性自检。
 
         三个唤醒源：静默窗口按最近到期时间挂；挂起条目按固定节奏轮询——
-        自检醒来先纯 API 核对状态（见 _recheck_later），不打扰磁盘休眠；
+        自检醒来先通过 API 核对状态（见 _recheck_later），仅在出现新的单文件
+        完成候选时 stat 对应文件，不扫描整棵目录；
         **失败条目按退避到期时间挂**——失败结论落账时静默表/挂起表都已弹出
         该条目、fs 事件也不会再来（下载早已结束），没有这第三个源就没人
         回来重试。取三者中最近的到期时间挂一次即可（自检收尾会重挂）。
@@ -1539,8 +2722,8 @@ class IngestWatcher:
             if path.startswith(prefix)
         )
         if not failed_due and not any(path.startswith(prefix) for path in _stability):
-            # 只剩挂起条目：先纯 API 核对（零磁盘 IO）。种子仍未完成就只
-            # 重挂下一轮——暂停的种子可以无限期挂着，NAS 磁盘照常休眠
+            # 只剩挂起条目：先通过 API 核对。没有新的单文件完成证据就只
+            # 重挂下一轮；有候选时也只 stat 候选，不扫描整棵目录
             try:
                 flipped = await _deferred_flipped(prefix)
             except Exception:  # noqa: BLE001 -- 核对失败就去巡检，交给巡检的降级链

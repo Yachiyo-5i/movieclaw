@@ -27,6 +27,7 @@ from movieclaw_downloader.base import BaseDownloader
 from movieclaw_downloader.exceptions import (
     DownloaderAuthError,
     DownloaderConnectError,
+    DownloaderDeleteError,
     DownloaderSubmitError,
 )
 from movieclaw_downloader.models import (
@@ -58,14 +59,16 @@ def _normalize_state(torrent, completed: bool) -> str:  # noqa: ANN001 -- transm
         # 有速度才算真在下，零速对齐 qBittorrent 的 stalled 语义
         return "downloading" if int(torrent.fields.get("rateDownload", 0)) > 0 else "stalled"
     if status == "3":
-        return "stalled"
+        return "queued"
     if status == "0":
         return "paused"
+    if status in ("1", "2"):
+        return "checking"
     return "unknown"
 
 
 @contextmanager
-def _translate_errors(url: str) -> Iterator[None]:
+def _translate_errors(url: str, *, operation: str = "submit") -> Iterator[None]:
     """把 transmission-rpc 的异常翻译成本模块的统一异常。"""
     try:
         yield
@@ -79,6 +82,11 @@ def _translate_errors(url: str) -> Iterator[None]:
             details={"url": url, "error": str(exc)},
         ) from exc
     except TransmissionError as exc:
+        if operation == "delete":
+            raise DownloaderDeleteError(
+                "删除 Transmission 任务失败，请检查下载器状态",
+                details={"url": url, "error": str(exc)},
+            ) from exc
         raise DownloaderSubmitError(
             "Transmission 拒绝了该请求（种子无效或下载器返回错误）",
             details={"url": url, "error": str(exc)},
@@ -169,23 +177,41 @@ class TransmissionDownloader(BaseDownloader):
         # 直接读原始字段：transmission-rpc 的 .eta 属性在无法估算时抛异常，
         # fields 里的原始值 -1（未知）/-2（不适用）直接判掉更稳
         eta = int(torrent.fields.get("eta", -1))
+        size_bytes = int(torrent.fields.get("sizeWhenDone", 0))
+        have_valid = torrent.fields.get("haveValid")
+        have_unchecked = torrent.fields.get("haveUnchecked")
+        if have_valid is None and have_unchecked is None:
+            completed_bytes = int(size_bytes * float(torrent.percent_done))
+        else:
+            completed_bytes = int(have_valid or 0) + int(have_unchecked or 0)
+        downloaded = torrent.fields.get("downloadedEver")
         return TorrentStatus(
             info_hash=info_hash,
             name=torrent.name,
             progress=float(torrent.percent_done),
+            completed_bytes=max(0, min(size_bytes, completed_bytes)) if size_bytes else None,
+            downloaded_bytes=max(0, int(downloaded)) if downloaded is not None else None,
             completed=completed,
             save_path=torrent.download_dir,
             files=(
                 [
                     # file.name 是种子内相对路径（含顶层目录）
-                    TorrentFile(path=file.name, size_bytes=int(file.size))
+                    TorrentFile(
+                        path=file.name,
+                        size_bytes=int(file.size),
+                        completed_bytes=max(
+                            0,
+                            min(int(file.size), int(file.completed)),
+                        ),
+                        selected=bool(file.selected),
+                    )
                     for file in torrent.get_files()
                 ]
                 # 进度快照类调用不需要文件清单，跳过逐文件的构造
                 if include_files
                 else []
             ),
-            size_bytes=int(torrent.fields.get("sizeWhenDone", 0)) or None,
+            size_bytes=size_bytes or None,
             dlspeed_bytes=int(torrent.fields.get("rateDownload", 0)),
             eta_seconds=eta if eta > 0 else None,
             state=_normalize_state(torrent, completed=completed),
@@ -199,15 +225,48 @@ class TransmissionDownloader(BaseDownloader):
         with _translate_errors(self.config.url):
             torrents = client.get_torrents()
         # Transmission 的任务名即落盘根目录/文件名，无独立的 content_path
-        return [
-            TorrentBrief(
-                name=torrent.name,
-                content_name=torrent.name,
-                completed=float(torrent.percent_done) >= 1.0,
-                info_hash=str(torrent.hash_string).lower(),
+        briefs: list[TorrentBrief] = []
+        for torrent in torrents:
+            progress = float(torrent.percent_done)
+            completed = progress >= 1.0
+            eta = int(torrent.fields.get("eta", -1))
+            briefs.append(
+                TorrentBrief(
+                    name=torrent.name,
+                    content_name=torrent.name,
+                    completed=completed,
+                    info_hash=str(torrent.hash_string).lower(),
+                    progress=progress,
+                    completed_bytes=max(
+                        0,
+                        min(
+                            int(torrent.fields.get("sizeWhenDone", 0)),
+                            int(torrent.fields.get("haveValid", 0) or 0)
+                            + int(torrent.fields.get("haveUnchecked", 0) or 0)
+                            or int(int(torrent.fields.get("sizeWhenDone", 0)) * progress),
+                        ),
+                    ),
+                    size_bytes=int(torrent.fields.get("sizeWhenDone", 0)) or None,
+                    dlspeed_bytes=int(torrent.fields.get("rateDownload", 0)),
+                    eta_seconds=eta if eta > 0 else None,
+                    state=_normalize_state(torrent, completed=completed),
+                )
             )
-            for torrent in torrents
-        ]
+        return briefs
+
+    async def delete_torrent(self, info_hash: str, *, delete_files: bool = False) -> None:
+        await asyncio.to_thread(self._delete_torrent_sync, info_hash, delete_files)
+
+    def _delete_torrent_sync(self, info_hash: str, delete_files: bool) -> None:
+        """按用户选择删除任务或连同数据文件。"""
+        client = self._client()
+        with _translate_errors(self.config.url, operation="delete"):
+            client.remove_torrent(info_hash.lower(), delete_data=delete_files)
+        logger.info(
+            "已从 Transmission 删除任务%s: hash=%s",
+            "并删除数据文件" if delete_files else "并保留数据文件",
+            info_hash,
+        )
 
     async def test_connection(self) -> DownloaderInfo:
         return await asyncio.to_thread(self._test_connection_sync)

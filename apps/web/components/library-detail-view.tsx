@@ -1,6 +1,6 @@
 "use client";
 
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
@@ -8,6 +8,7 @@ import type { Route } from "next";
 import Link from "next/link";
 
 import { useConfirm } from "@/components/feedback";
+import { refreshLibraryConfirm, scanLibraryConfirm } from "@/lib/library-confirm";
 import { MoreIcon, XIcon } from "@/components/icons";
 import { PAGE_NAV_BUTTON_CLASS, PageNav } from "@/components/page-nav";
 import { usePageTitle } from "@/lib/use-page-title";
@@ -26,24 +27,24 @@ import {
   type ReviewGroup,
   type MetadataRefreshProgress,
   type UnidentifiedGroup,
-  claimFilesBatch,
-  clearMissing,
-  clearUnidentified,
+  assignLibraryFilesToTitle,
+  clearMissingLibraryRecords,
   getMetadataRefreshProgress,
-  ignoreFile,
-  listIdentityReview,
-  listIgnored,
+  ignoreAllUnidentifiedLibraryFiles,
+  ignoreUnidentifiedLibraryFile,
+  listIgnoredLibraryFiles,
+  listLibraryIdentityReviewCases,
   listLibraries,
   listLibraryItemIds,
   listLibraryItemIndex,
   listLibraryItems,
   type LibraryIndexEntry,
   type LibraryItemSort,
-  listMissing,
-  listUnidentified,
+  listMissingLibraryFiles,
+  listUnidentifiedLibraryFiles,
   redownloadMissing,
-  restoreIgnored,
-  resolveIdentityReview,
+  resolveLibraryIdentityReview,
+  restoreIgnoredLibraryFiles,
   SCAN_PHASE_HINTS,
   SCAN_PHASE_LABELS,
   type ScanPhase,
@@ -61,10 +62,20 @@ import {
 } from "@/components/claim-panels";
 import { listSubscriptions, type Subscription } from "@/lib/api/subscriptions";
 import { formatBytes } from "@/lib/format";
+import { formatLibraryInventorySummary } from "@/lib/library-inventory-summary";
+import { activeWallInitialAtViewport, wallInitialAtOffset } from "@/lib/library-wall-index";
 import { formatRelativeTime } from "@/lib/time";
 import { cachedImageUrl, imageUrl } from "@/lib/image-proxy";
 import { keepIfEqual, reconcileList } from "@/lib/poll-reconcile";
+import { usePermissions } from "@/lib/permissions";
 import { useVisiblePolling } from "@/lib/use-visible-polling";
+import { useJobs } from "@/lib/jobs";
+import {
+  getLibraryDetailSnapshot,
+  setLibraryDetailSnapshot,
+  type LibraryDetailSnapshot,
+} from "@/lib/library-detail-snapshot";
+import { useScrollRestoration } from "@/lib/use-scroll-restoration";
 import {
   subscriptionProgressNote,
   subscriptionStatusMeta,
@@ -94,32 +105,62 @@ function busyText(progress: ScanProgress | null): string {
  */
 /** 海报墙每次向服务端要的格数（首屏一批，滚到底再追加一批）。 */
 const WALL_PAGE_SIZE = 60;
+/** 后端单次分页的硬上限；轮询已加载窗口时按此上限分块请求。 */
+const WALL_API_PAGE_SIZE = 200;
 
 export function LibraryDetailView({ libraryId }: { libraryId: number }) {
-  const [libraries, setLibraries] = useState<MediaLibrary[] | null>(null);
-  const [items, setItems] = useState<LibraryItem[]>([]);
+  const initialSnapshot = getLibraryDetailSnapshot(libraryId);
+  const restoredFromSnapshot = useRef(initialSnapshot !== undefined);
+  const { canManageLibraries } = usePermissions();
+  const { activeJobs } = useJobs();
+  const restoreScrollRef = useScrollRestoration(`library:${libraryId}`, {
+    anchorAttribute: "data-library-item-id",
+  });
+  const [scrollElement, setScrollElement] = useState<HTMLDivElement | null>(null);
+  // 滚动位置恢复与字母索引联动共用同一个真实滚动容器，合并 callback ref
+  // 避免两套监听器各自猜测 window/document。
+  const scrollRef = useCallback(
+    (node: HTMLDivElement | null) => {
+      restoreScrollRef(node);
+      setScrollElement(node);
+    },
+    [restoreScrollRef],
+  );
+  const confirm = useConfirm();
+  const [libraries, setLibraries] = useState<MediaLibrary[] | null>(initialSnapshot?.libraries ?? null);
+  const [items, setItems] = useState<LibraryItem[]>(initialSnapshot?.items ?? []);
   // 服务端还有没有下一页；滚动加载的哨兵据此决定是否继续观察
-  const [wallHasMore, setWallHasMore] = useState(false);
+  const [wallHasMore, setWallHasMore] = useState(initialSnapshot?.wallHasMore ?? false);
   // 本库全部条目 id：海报墙分页后这份名单仍要完整——「追踪中」要靠它把
   // 已入库的订阅剔掉，而已入库的那部可能在第 5 页上，光看当前页会误判
-  const [ownedIds, setOwnedIds] = useState<Set<number>>(() => new Set());
+  const [ownedIds, setOwnedIds] = useState<Set<number>>(
+    () => initialSnapshot?.ownedIds ?? new Set(),
+  );
   // A-Z 索引条的分档（按标题排序时才有意义）
-  const [wallIndex, setWallIndex] = useState<LibraryIndexEntry[]>([]);
+  const [wallIndex, setWallIndex] = useState<LibraryIndexEntry[]>(initialSnapshot?.wallIndex ?? []);
   // 当前窗口在整份排序里的起点：0 = 从头开始；点字母跳转后是该档的 offset。
   // 轮询要按这个起点重拉，否则每 3 秒把用户拽回墙首
-  const [wallStart, setWallStart] = useState(0);
-  const [unidentified, setUnidentified] = useState<UnidentifiedGroup[]>([]);
-  const [review, setReview] = useState<ReviewGroup[]>([]);
-  const [ignored, setIgnored] = useState<UnidentifiedGroup[]>([]);
-  const [missing, setMissing] = useState<MissingItem[]>([]);
-  const [subscriptions, setSubscriptions] = useState<Subscription[]>([]);
+  const [wallStart, setWallStart] = useState(initialSnapshot?.wallStart ?? 0);
+  // 与分页窗口起点分离：wallStart 只决定服务端从哪里取；活动字母要跟随
+  // 用户在已加载窗口里的真实滚动位置。
+  const [activeWallInitial, setActiveWallInitial] = useState<string | null>(null);
+  const [unidentified, setUnidentified] = useState<UnidentifiedGroup[]>(initialSnapshot?.unidentified ?? []);
+  const [review, setReview] = useState<ReviewGroup[]>(initialSnapshot?.review ?? []);
+  const [ignored, setIgnored] = useState<UnidentifiedGroup[]>(initialSnapshot?.ignored ?? []);
+  const [missing, setMissing] = useState<MissingItem[]>(initialSnapshot?.missing ?? []);
+  const [subscriptions, setSubscriptions] = useState<Subscription[]>(initialSnapshot?.subscriptions ?? []);
   const [failed, setFailed] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const [editing, setEditing] = useState<MediaLibrary | null>(null);
   // 整理文件名对话框的目标库；null = 关闭
   const [organizeTarget, setOrganizeTarget] = useState<MediaLibrary | null>(null);
   // 整库元数据刷新进度（进行中每 3 秒轮询，结束自动刷新库存）
-  const [metaRefresh, setMetaRefresh] = useState<MetadataRefreshProgress | null>(null);
+  const [metaRefresh, setMetaRefresh] = useState<MetadataRefreshProgress | null>(
+    initialSnapshot?.metaRefresh ?? null,
+  );
+  // 删除/转移等详情页操作会把旧窗口标记为过期。先保留它供滚动锚点落脚，
+  // 后台对账成功后再清除标记；请求失败时下次返回仍会重试。
+  const [snapshotStale, setSnapshotStale] = useState(initialSnapshot?.stale ?? false);
   // 工单抽屉：从哪个胶囊点进来就落在哪个 tab；null = 关闭
   const [issueTab, setIssueTab] = useState<IssueTab | null>(null);
 
@@ -128,33 +169,92 @@ export function LibraryDetailView({ libraryId }: { libraryId: number }) {
   const reloadSeq = useRef(0);
   // 海报墙已加载的格数：轮询按这个数重拉第一页，用户滚到第几屏就刷新到第几屏
   // ——否则每轮轮询都把墙缩回首屏，正在看的位置被抽走
-  const wallLoaded = useRef(WALL_PAGE_SIZE);
+  const wallLoaded = useRef(initialSnapshot?.wallLoaded ?? WALL_PAGE_SIZE);
   // 当前排序（扫描补探阶段切到「待补探优先」）。放 ref 而不进依赖：reload
   // 每轮都读最新值，不必为切排序重建回调链
-  const wallSort = useRef<LibraryItemSort>("title");
+  const wallSort = useRef<LibraryItemSort>(initialSnapshot?.wallSort ?? "title");
   // 当前窗口起点的 ref 版：reload 每轮读它，不进依赖（同 wallSort）
-  const wallOffset = useRef(0);
+  const wallOffset = useRef(initialSnapshot?.wallOffset ?? 0);
+  const snapshotRef = useRef<LibraryDetailSnapshot | null>(null);
+  snapshotRef.current = libraries
+    ? {
+        libraries,
+        items,
+        wallHasMore,
+        ownedIds,
+        wallIndex,
+        wallStart,
+        unidentified,
+        review,
+        ignored,
+        missing,
+        subscriptions,
+        metaRefresh,
+        wallLoaded: wallLoaded.current,
+        wallSort: wallSort.current,
+        wallOffset: wallOffset.current,
+        stale: snapshotStale,
+      }
+    : null;
+
+  // 布局提交后就更新快照，路由切换的下一棵树可以在首帧直接读取它；不能只在
+  // 卸载 cleanup 中写入，因为新路由的首次 render 可能早于被动 effect 的 cleanup。
+  useLayoutEffect(() => {
+    if (snapshotRef.current) setLibraryDetailSnapshot(libraryId, snapshotRef.current);
+  }, [
+    ignored,
+    items,
+    libraries,
+    libraryId,
+    metaRefresh,
+    missing,
+    ownedIds,
+    review,
+    subscriptions,
+    snapshotStale,
+    unidentified,
+    wallHasMore,
+    wallIndex,
+    wallStart,
+  ]);
+
   const reload = useCallback(() => {
     const seq = ++reloadSeq.current;
     const wanted = wallLoaded.current;
     const from = wallOffset.current;
+    const itemPages = Array.from(
+      { length: Math.ceil(wanted / WALL_API_PAGE_SIZE) },
+      (_, page) => {
+        const offset = from + page * WALL_API_PAGE_SIZE;
+        return listLibraryItems(libraryId, {
+          sort: wallSort.current,
+          limit: Math.min(WALL_API_PAGE_SIZE, wanted - page * WALL_API_PAGE_SIZE),
+          offset,
+        });
+      },
+    );
     Promise.all([
       listLibraries(),
-      listLibraryItems(libraryId, {
-        sort: wallSort.current,
-        limit: wanted,
-        offset: from,
-      }).catch(() => []),
+      Promise.all(itemPages).then((pages) => pages.flat()),
       listLibraryItemIds(libraryId).catch(() => []),
       listLibraryItemIndex(libraryId).catch(() => []),
-      listUnidentified(libraryId).catch(() => []),
-      listIdentityReview(libraryId).catch(() => []),
-      listIgnored(libraryId).catch(() => []),
-      listMissing(libraryId).catch(() => []),
+      canManageLibraries
+        ? listUnidentifiedLibraryFiles(libraryId).catch(() => [])
+        : Promise.resolve([]),
+      canManageLibraries
+        ? listLibraryIdentityReviewCases(libraryId).catch(() => [])
+        : Promise.resolve([]),
+      canManageLibraries
+        ? listIgnoredLibraryFiles(libraryId).catch(() => [])
+        : Promise.resolve([]),
+      canManageLibraries
+        ? listMissingLibraryFiles(libraryId).catch(() => [])
+        : Promise.resolve([]),
       listSubscriptions().catch(() => []),
     ])
       .then(([libs, libraryItems, ids, index, unknown, reviewGroups, ignoredGroups, missingItems, subs]) => {
         if (seq !== reloadSeq.current) return;
+        setSnapshotStale(false);
         setFailed(false);
         // 轮询快照内容没变时复用旧引用：库存墙逐条目复用（配合 InventoryCell
         // 的 memo，只有真正变化的格子重渲染），其余列表整体复用。否则扫描期间
@@ -185,11 +285,16 @@ export function LibraryDetailView({ libraryId }: { libraryId: number }) {
       .catch(() => {
         if (seq === reloadSeq.current) setFailed(true);
       });
-  }, [libraryId]);
+  }, [canManageLibraries, libraryId]);
 
   useEffect(() => {
-    reload();
-  }, [reload]);
+    // 从详情页返回时，已加载分页窗口就在会话快照中。立刻重拉会先把墙缩成
+    // 首批 60 条，深处的滚动目标又会失去高度；之后仍由可见页轮询负责对账。
+    if (!restoredFromSnapshot.current || snapshotStale) {
+      restoredFromSnapshot.current = true;
+      reload();
+    }
+  }, [reload, snapshotStale]);
 
   // 海报墙滚到底时向服务端追加一页。并发闸门用 ref：哨兵在快速滚动中会
   // 连续触发几次，不挡住就是同一页被拉好几遍
@@ -197,9 +302,13 @@ export function LibraryDetailView({ libraryId }: { libraryId: number }) {
   const loadMore = useCallback(() => {
     if (loadingMore.current) return;
     loadingMore.current = true;
+    // 分页请求开始后作废正在路上的轮询响应；否则旧轮询可能先/后返回，
+    // 用较短的窗口覆盖刚追加的页面，把用户滚动到的内容又截回首批。
+    const requestSeq = ++reloadSeq.current;
     const offset = wallOffset.current + wallLoaded.current;
     listLibraryItems(libraryId, { sort: wallSort.current, limit: WALL_PAGE_SIZE, offset })
       .then((next) => {
+        if (requestSeq !== reloadSeq.current) return;
         wallLoaded.current += next.length;
         // 追加与轮询可能交叠着回来，同一条目被拿到两次——按 id 去重再拼
         setItems((current) => {
@@ -208,7 +317,9 @@ export function LibraryDetailView({ libraryId }: { libraryId: number }) {
         });
         setWallHasMore(next.length >= WALL_PAGE_SIZE);
       })
-      .catch(() => setWallHasMore(false))
+      .catch(() => {
+        if (requestSeq === reloadSeq.current) setWallHasMore(false);
+      })
       .finally(() => {
         loadingMore.current = false;
       });
@@ -217,6 +328,7 @@ export function LibraryDetailView({ libraryId }: { libraryId: number }) {
   // 海报墙顶部的锚：跳字母后滚回墙首，否则用户停在原来的滚动位置上，
   // 看到的是新一批的中间，像是"点了没反应"
   const wallTop = useRef<HTMLDivElement>(null);
+  const wallGrid = useRef<HTMLDivElement>(null);
   /**
    * 跳到某个首字母档：换掉整个窗口（而不是继续往后追加），此后照常向下滚动加载。
    * offset=0 即回到墙首，索引条的「全部」走的也是这条路。
@@ -246,10 +358,14 @@ export function LibraryDetailView({ libraryId }: { libraryId: number }) {
 
   // 进入页面先探一次元数据刷新状态（可能是别的入口/上次会话发起的）
   useEffect(() => {
+    if (!canManageLibraries) {
+      setMetaRefresh(null);
+      return;
+    }
     getMetadataRefreshProgress(libraryId)
       .then(setMetaRefresh)
       .catch(() => {});
-  }, [libraryId]);
+  }, [canManageLibraries, libraryId]);
 
   // 刷新进行中每 2 秒轮询状态，结束自动重拉库存（海报/档案已更新）。
   // 2 秒是"阶段文字跟得上"与"别把接口打太密"的折中：单部片的一个阶段
@@ -268,7 +384,7 @@ export function LibraryDetailView({ libraryId }: { libraryId: number }) {
         // （曾是线上实况）。刷新真结束时成功响应会带 refreshing=false 收尾
         .catch(() => {});
     },
-    refreshingMeta ? 2000 : null,
+    canManageLibraries && refreshingMeta ? 2000 : null,
   );
 
   const library = libraries?.find((l) => l.id === libraryId) ?? null;
@@ -308,6 +424,30 @@ export function LibraryDetailView({ libraryId }: { libraryId: number }) {
     () => new Map((metaRefresh?.active ?? []).map((a) => [a.media_item_id, a.phase])),
     [metaRefresh],
   );
+  // 统一 Job 资源索引让 CLI / Agent 发起的任务也能直接点亮海报格，不依赖
+  // 详情组件是否已经挂载。一个任务关联剧集条目时只显示一枚聚合状态。
+  const jobPhaseById = useMemo(() => {
+    const mapped = new Map<number, string>();
+    for (const job of activeJobs) {
+      const resource = job.resources.find((item) => item.resource_type === "media_item");
+      if (!resource) continue;
+      const mediaId = Number(resource.resource_id);
+      if (!Number.isFinite(mediaId) || mapped.has(mediaId)) continue;
+      const prefix = job.status === "blocked" ? "需要处理" : "后台任务";
+      mapped.set(mediaId, `${prefix} · ${job.progress.message}`);
+    }
+    return mapped;
+  }, [activeJobs]);
+  const libraryJobs = useMemo(
+    () =>
+      activeJobs.filter((job) =>
+        job.resources.some(
+          (resource) =>
+            resource.resource_type === "library" && resource.resource_id === String(libraryId),
+        ),
+      ),
+    [activeJobs, libraryId],
+  );
 
   // 扫描的补探阶段：把「还有文件没读出规格」的条目排到墙前面并点亮——
   // 头部胶囊只有一个总数（22/25），用户看不出具体是哪几部还在处理。
@@ -315,6 +455,46 @@ export function LibraryDetailView({ libraryId }: { libraryId: number }) {
   const probing = Boolean(
     library?.scanning && library.scan_progress?.phase === "probing",
   );
+  const initialByOffset = useMemo(
+    () => new Map(wallIndex.map((entry) => [entry.offset, entry.initial])),
+    [wallIndex],
+  );
+
+  // 用户滚动时，用每个字母首部影片的 DOM 锚点更新活动字母。滚动事件用
+  // requestAnimationFrame 合帧；每帧最多读取 27 个锚点，与已加载影片数无关。
+  useEffect(() => {
+    const fallback = wallInitialAtOffset(wallIndex, wallStart);
+    setActiveWallInitial(fallback);
+    if (!scrollElement || probing) return;
+
+    let frame = 0;
+    const update = () => {
+      frame = 0;
+      const grid = wallGrid.current;
+      if (!grid) return;
+      const markers = Array.from(
+        grid.querySelectorAll<HTMLElement>("[data-wall-initial]"),
+        (marker) => ({
+          initial: marker.dataset.wallInitial ?? "",
+          top: marker.getBoundingClientRect().top,
+        }),
+      ).filter((marker) => marker.initial !== "");
+      const viewportTop = scrollElement.getBoundingClientRect().top + 1;
+      const next = activeWallInitialAtViewport(markers, viewportTop, fallback);
+      setActiveWallInitial((current) => (current === next ? current : next));
+    };
+    const schedule = () => {
+      if (!frame) frame = requestAnimationFrame(update);
+    };
+
+    scrollElement.addEventListener("scroll", schedule, { passive: true });
+    schedule();
+    return () => {
+      scrollElement.removeEventListener("scroll", schedule);
+      if (frame) cancelAnimationFrame(frame);
+    };
+  }, [items.length, probing, scrollElement, wallIndex, wallStart]);
+
   // 排序切换是**服务端**的事（墙是分页的，本地排只能排到已加载的那几屏）：
   // 阶段一变就换排序键重拉第一页，回到首屏看的就是正在处理的那几部
   useEffect(() => {
@@ -344,12 +524,12 @@ export function LibraryDetailView({ libraryId }: { libraryId: number }) {
   // 用户看到的就是"页面闪没了"
   // 兜底态（加载中/失败/不存在）也渲染 PageNav（库名未知，末项留空）：向外壳
   // 登记「本页自带顶栏」，否则移动端全局顶栏（☰ + logo）会先显示再消失、顶部闪一下。
-  const fallbackTrail = [{ label: "媒体库", href: "/library" }, { label: "" }];
+  const navFallback = { label: "媒体库", href: "/library" as Route };
 
   if (failed && libraries === null) {
     return (
       <div className="flex-1">
-        <PageNav items={fallbackTrail} />
+        <PageNav title="" fallback={navFallback} />
         <CenteredNote>
           <p className="text-ui text-[var(--text-muted)]">媒体库加载失败</p>
           <button
@@ -367,7 +547,7 @@ export function LibraryDetailView({ libraryId }: { libraryId: number }) {
   if (libraries === null) {
     return (
       <div className="flex-1">
-        <PageNav items={fallbackTrail} />
+        <PageNav title="" fallback={navFallback} />
         <CenteredNote>
           <span className="size-4 animate-spin rounded-full border-2 border-white/20 border-t-white/70" />
           <p className="text-ui text-[var(--text-muted)]">正在加载媒体库…</p>
@@ -379,10 +559,14 @@ export function LibraryDetailView({ libraryId }: { libraryId: number }) {
   if (library === null) {
     return (
       <div className="flex-1">
-        <PageNav items={fallbackTrail} />
+        <PageNav title="" fallback={navFallback} />
         <CenteredNote>
           <p className="text-ui text-[var(--text-muted)]">这个媒体库不存在（可能已被删除）</p>
-          <Link href={"/library" as Route} className="btn-glass px-4 py-2 text-ui font-medium">
+          <Link
+            href={"/library" as Route}
+            replace
+            className="btn-glass px-4 py-2 text-ui font-medium"
+          >
             返回媒体库
           </Link>
         </CenteredNote>
@@ -394,7 +578,7 @@ export function LibraryDetailView({ libraryId }: { libraryId: number }) {
   const { stats } = library;
 
   // 库操作全部收进 ⋯ 菜单，顶栏只留这一个入口；运行状态看头部下方的胶囊
-  const actionsMenu = (
+  const actionsMenu = canManageLibraries ? (
     <LibraryActionsMenu
       scanning={Boolean(library.scanning)}
       scanPhase={library.scan_progress?.phase ?? null}
@@ -410,9 +594,19 @@ export function LibraryDetailView({ libraryId }: { libraryId: number }) {
       }
       onToggleScan={() => {
         setNotice(null);
-        void (library.scanning ? stopLibraryScan(library.id) : startLibraryScan(library.id))
-          .then(() => reload())
-          .catch((e) => setNotice((e as Error).message));
+        if (library.scanning) {
+          void stopLibraryScan(library.id)
+            .then(() => reload())
+            .catch((e) => setNotice((e as Error).message));
+          return;
+        }
+        // 重操作先确认（停止不确认：停止本身就是在纠正）
+        void confirm(scanLibraryConfirm(library.name)).then((ok) => {
+          if (!ok) return;
+          void startLibraryScan(library.id)
+            .then(() => reload())
+            .catch((e) => setNotice((e as Error).message));
+        });
       }}
       organizing={Boolean(library.organizing)}
       organizePercent={
@@ -439,27 +633,32 @@ export function LibraryDetailView({ libraryId }: { libraryId: number }) {
       }}
       onToggleMetaRefresh={() => {
         setNotice(null);
-        void (
-          refreshingMeta
-            ? stopLibraryMetadataRefresh(libraryId)
-            : startLibraryMetadataRefresh(libraryId)
-        )
-          .then(() =>
-            getMetadataRefreshProgress(libraryId)
-              .then(setMetaRefresh)
-              .catch(() => {}),
-          )
-          .catch((e) => setNotice((e as Error).message));
+        const kick = (action: Promise<unknown>) =>
+          action
+            .then(() =>
+              getMetadataRefreshProgress(libraryId)
+                .then(setMetaRefresh)
+                .catch(() => {}),
+            )
+            .catch((e) => setNotice((e as Error).message));
+        if (refreshingMeta) {
+          void kick(stopLibraryMetadataRefresh(libraryId));
+          return;
+        }
+        void confirm(refreshLibraryConfirm(library.name)).then((ok) => {
+          if (ok) void kick(startLibraryMetadataRefresh(libraryId));
+        });
       }}
       onEdit={() => setEditing(library)}
     />
-  );
+  ) : null;
 
   return (
-    <div className="scroll-thin scroll-safe flex-1 overflow-y-auto pb-10">
+    <div ref={scrollRef} className="scroll-thin scroll-safe flex-1 overflow-y-auto pb-10">
       {/* 顶栏：返回媒体库 + 吸顶库名 + 库操作 ⋯（无 pt——顶边与侧栏卡片顶边齐平） */}
       <PageNav
-        items={[{ label: "媒体库", href: "/library" }, { label: library.name }]}
+        title={library.name}
+        fallback={navFallback}
         actions={actionsMenu}
       />
       {/* —— 库头部 —— */}
@@ -474,13 +673,9 @@ export function LibraryDetailView({ libraryId }: { libraryId: number }) {
             </span>
           )}
         </div>
-        <p
-          className="text-on-image mt-1.5 truncate text-ui text-[var(--text-muted)] max-md:text-sub"
-          title={library.root_paths.join("\n")}
-        >
+        <p className="text-on-image mt-1.5 truncate text-ui text-[var(--text-muted)] max-md:text-sub">
           {meta.label}库 · {stats.item_count} 部作品 · {stats.file_count} 个文件 ·{" "}
           {formatBytes(stats.total_size_bytes)}
-          {library.primary_root ? ` · ${library.primary_root}` : ""}
         </p>
         {library.last_scan && !busy && (
           <p className="mt-1 text-sub text-white/45">
@@ -506,10 +701,11 @@ export function LibraryDetailView({ libraryId }: { libraryId: number }) {
           </p>
         )}
         {/* —— 健康状态胶囊：工单收进抽屉，海报墙保持干净 —— */}
-        {(missing.length > 0 ||
+        {canManageLibraries && (missing.length > 0 ||
           unidentified.length > 0 ||
           review.length > 0 ||
           importing > 0 ||
+          libraryJobs.length > 0 ||
           refreshingMeta ||
           busy) && (
           <div className="mt-2.5 flex flex-wrap items-center gap-2">
@@ -527,6 +723,12 @@ export function LibraryDetailView({ libraryId }: { libraryId: number }) {
               <span className="flex items-center gap-1.5 rounded-full border border-[#7dd3fc]/35 bg-[#7dd3fc]/[0.12] px-3 py-1 text-sub font-semibold text-[#7dd3fc]">
                 <span className="size-1.5 animate-pulse rounded-full bg-[#7dd3fc]" />
                 已发现 {importing} 个新文件 · 写入完成后自动入库
+              </span>
+            )}
+            {libraryJobs.length > 0 && (
+              <span className="flex items-center gap-1.5 rounded-full border border-[#7dd3fc]/35 bg-[#7dd3fc]/[0.12] px-3 py-1 text-sub font-semibold text-[#7dd3fc]">
+                <span className="size-1.5 animate-pulse rounded-full bg-[#7dd3fc]" />
+                {libraryJobs.length} 个后台任务正在处理库内影片
               </span>
             )}
             {missing.length > 0 && (
@@ -563,7 +765,7 @@ export function LibraryDetailView({ libraryId }: { libraryId: number }) {
           </div>
         )}
         {/* —— 整库刷新进度：全量重刷每部都要重下图，慢，状态给全 —— */}
-        {refreshingMeta && metaRefresh && (
+        {canManageLibraries && refreshingMeta && metaRefresh && (
           <MetadataRefreshPanel
             state={metaRefresh}
             onStop={() => {
@@ -591,18 +793,20 @@ export function LibraryDetailView({ libraryId }: { libraryId: number }) {
       </div>
 
       {/* —— 工单抽屉：缺失 / 待识别 / 身份复核 / 已忽略，从头部胶囊进入 —— */}
-      <IssueDrawer
-        open={issueTab}
-        onClose={() => setIssueTab(null)}
-        onSwitchTab={setIssueTab}
-        libraryId={libraryId}
-        missing={missing}
-        unidentified={unidentified}
-        review={review}
-        ignored={ignored}
-        movie={library.kind === "movie"}
-        onChanged={reload}
-      />
+      {canManageLibraries && (
+        <IssueDrawer
+          open={issueTab}
+          onClose={() => setIssueTab(null)}
+          onSwitchTab={setIssueTab}
+          libraryId={libraryId}
+          missing={missing}
+          unidentified={unidentified}
+          review={review}
+          ignored={ignored}
+          movie={library.kind === "movie"}
+          onChanged={reload}
+        />
+      )}
 
       {/* —— 追踪中（订阅已指向本库、文件未落地）：自动化正在进行的部分，置顶优先 —— */}
       {pending.length > 0 && (
@@ -626,7 +830,9 @@ export function LibraryDetailView({ libraryId }: { libraryId: number }) {
         <p className="mt-16 text-center text-ui leading-7 text-[var(--text-muted)]">
           这个库还没有内容。
           <br />
-          点右上角 ⋯ 里的「扫描库」把根路径下已有的影片识别入库；订阅的内容下载完成后也会自动进来。
+          {canManageLibraries
+            ? "点右上角菜单里的「扫描库」把已有影片识别入库；订阅内容下载完成后也会自动进来。"
+            : "订阅内容下载并入库后会显示在这里。"}
         </p>
       ) : (
         <>
@@ -638,21 +844,28 @@ export function LibraryDetailView({ libraryId }: { libraryId: number }) {
           <div ref={wallTop} className={pending.length > 0 ? "mt-4" : "mt-6 max-md:mt-4"}>
             {/* 索引条与墙并排：条固定在视口右侧（sticky），墙照常滚 */}
             <div className="flex items-start gap-2 px-6 max-md:gap-1 max-md:px-4">
-              <div className="grid flex-1 gap-x-4 gap-y-7 [grid-template-columns:repeat(auto-fill,minmax(148px,1fr))] max-md:gap-x-3 max-md:gap-y-5 max-md:[grid-template-columns:repeat(auto-fill,minmax(140px,1fr))]">
-                {items.map((item) => (
+              <div
+                ref={wallGrid}
+                className="grid flex-1 gap-x-4 gap-y-7 [grid-template-columns:repeat(auto-fill,minmax(148px,1fr))] max-md:gap-x-3 max-md:gap-y-5 max-md:[grid-template-columns:repeat(auto-fill,minmax(140px,1fr))]"
+              >
+                {items.map((item, index) => (
                   <InventoryCell
                     key={item.media_item_id}
                     item={item}
                     libraryId={libraryId}
+                    wallInitial={initialByOffset.get(wallStart + index)}
                     workingLabel={
                       refreshPhaseById.get(item.media_item_id) ??
+                      jobPhaseById.get(item.media_item_id) ??
                       (probing && item.probe_pending_count > 0 ? "正在读取规格" : undefined)
                     }
                   />
                 ))}
               </div>
               {/* 补探阶段排序不是拼音序，字母跳转会跳错位置——那几分钟里收起来 */}
-              {!probing && <WallIndexBar index={wallIndex} start={wallStart} onJump={jumpTo} />}
+              {!probing && (
+                <WallIndexBar index={wallIndex} active={activeWallInitial} onJump={jumpTo} />
+              )}
             </div>
           </div>
           <WallLoadMore
@@ -665,20 +878,23 @@ export function LibraryDetailView({ libraryId }: { libraryId: number }) {
         </>
       )}
 
-      <LibraryFormDialog
-        state={editing}
-        onClose={() => setEditing(null)}
-        onSaved={() => {
-          setEditing(null);
-          reload();
-        }}
-      />
-
-      <LibraryOrganizeDialog
-        library={organizeTarget}
-        onClose={() => setOrganizeTarget(null)}
-        onChanged={reload}
-      />
+      {canManageLibraries && (
+        <>
+          <LibraryFormDialog
+            state={editing}
+            onClose={() => setEditing(null)}
+            onSaved={() => {
+              setEditing(null);
+              reload();
+            }}
+          />
+          <LibraryOrganizeDialog
+            library={organizeTarget}
+            onClose={() => setOrganizeTarget(null)}
+            onChanged={reload}
+          />
+        </>
+      )}
     </div>
   );
 }
@@ -859,13 +1075,20 @@ function MetadataRefreshPanel({
 const InventoryCell = memo(function InventoryCell({
   item,
   libraryId,
+  wallInitial,
   workingLabel,
 }: {
   item: LibraryItem;
   libraryId: number;
+  /** 该格是否为某个拼音首字母档的第一部影片；滚动联动只标记这些锚点。 */
+  wallInitial?: string;
   /** 这一格正被后台处理（整库刷新的阶段 / 扫描补探）时的文案；不在处理为 undefined */
   workingLabel?: string;
 }) {
+  const inventoryLabel =
+    item.kind === "tv" && item.inventory_summary
+      ? formatLibraryInventorySummary(item.inventory_summary)
+      : null;
   const visual: PosterVisualItem = {
     id: String(item.tmdb_id),
     source: "tmdb",
@@ -873,29 +1096,26 @@ const InventoryCell = memo(function InventoryCell({
     title: item.title,
     year: item.year ?? undefined,
     rating: 0,
+    overlayDetails: inventoryLabel ? { primary: inventoryLabel } : undefined,
     // 海报可能是本地刮削资产的相对路径（断网可用），也可能是 TMDB 图床地址
     posterUrl: imageUrl(item.poster_url),
   };
-  // 格下只说剧集规模与异常；单部的大小/清晰度规格对浏览海报墙没有决策
-  // 价值，不展示（点进条目详情能看到），总大小看库头部
-  const parts: string[] = [];
-  if (item.kind === "tv" && item.seasons.length > 0) {
-    parts.push(
-      item.seasons.length === 1
-        ? `第 ${item.seasons[0]} 季 · ${item.episode_count} 集`
-        : `${item.seasons.length} 季 · ${item.episode_count} 集`,
-    );
-  }
   // 文件全部缺失的"死条目"：海报置灰，一眼与在位内容区分
   const dead = item.file_count > 0 && item.missing_count >= item.file_count;
-  // 库存墙里的东西本来就都在库里，「已入库」不值一行；只有缺失这类异常才点灯
-  const abnormal = dead || item.missing_count > 0;
-  if (dead) parts.splice(0, parts.length, "文件已全部缺失");
-  else if (item.missing_count > 0) parts.push(`${item.missing_count} 个文件缺失`);
+  // 卡片下方只保留片名与年份；缺失是需要常显的异常，作为唯一例外单独点灯。
+  const abnormalLabel = dead
+    ? "文件已全部缺失"
+    : item.missing_count > 0
+      ? `${item.missing_count} 个文件缺失`
+      : null;
   return (
     // content-visibility：视口外的格子跳过布局与绘制，大库海报墙的滚动/更新
     // 成本只与可见格数相关；intrinsic-size 占住尺寸，滚动条不跳
-    <div className="[contain-intrinsic-size:auto_270px] [content-visibility:auto]">
+    <div
+      data-library-item-id={item.media_item_id}
+      data-wall-initial={wallInitial}
+      className="[contain-intrinsic-size:auto_270px] [content-visibility:auto]"
+    >
       {/* 后台正在处理的那一格自己点亮：进度面板/胶囊列的是总数或片名，
           海报墙上也要能一眼看到"正在弄这部"，否则用户得在两处之间对片名 */}
       <div className="relative">
@@ -904,6 +1124,7 @@ const InventoryCell = memo(function InventoryCell({
             item={visual}
             href={`/library/${libraryId}/item/${item.media_item_id}` as Route}
             action={libraryCardAction(item)}
+            revealInfoOnTouch
           />
         </div>
         {workingLabel && (
@@ -917,14 +1138,12 @@ const InventoryCell = memo(function InventoryCell({
           </>
         )}
       </div>
-      {parts.length > 0 && (
+      {abnormalLabel && (
         <p className="text-on-image mt-1.5 flex items-center gap-1.5 truncate text-caption text-[var(--text-muted)]">
-          {abnormal && (
-            <span
-              className={`size-1.5 shrink-0 rounded-full ${dead ? "bg-white/30" : "bg-[#f5c451]"}`}
-            />
-          )}
-          <span className="truncate">{parts.join(" · ")}</span>
+          <span
+            className={`size-1.5 shrink-0 rounded-full ${dead ? "bg-white/30" : "bg-[#f5c451]"}`}
+          />
+          <span className="truncate">{abnormalLabel}</span>
         </p>
       )}
     </div>
@@ -1005,20 +1224,15 @@ const WALL_INDEX_HEIGHT = `min(${WALL_INDEX_MAX_HEIGHT}px, 72dvh)`;
  */
 function WallIndexBar({
   index,
-  start,
+  active,
   onJump,
 }: {
   index: LibraryIndexEntry[];
-  /** 当前窗口起点，用来高亮"现在停在哪一档" */
-  start: number;
+  /** 当前视口所在档位；由海报墙滚动锚点实时更新。 */
+  active: string | null;
   onJump: (offset: number) => void;
 }) {
   const byInitial = useMemo(() => new Map(index.map((e) => [e.initial, e])), [index]);
-  // 当前档 = 起点落在哪一档的区间里
-  const active = useMemo(
-    () => index.findLast((e) => e.offset <= start)?.initial ?? null,
-    [index, start],
-  );
   const barRef = useRef<HTMLDivElement>(null);
   // 正在滑选的字母（气泡预览 + 高亮）；null = 没在按压
   const [preview, setPreview] = useState<string | null>(null);
@@ -1317,7 +1531,7 @@ function IssueDrawer({
                 )
                   return;
                 setBusy(true);
-                void clearMissing(libraryId)
+                void clearMissingLibraryRecords(libraryId)
                   .then(onChanged)
                   .catch(() => {})
                   .finally(() => setBusy(false));
@@ -1342,7 +1556,7 @@ function IssueDrawer({
                 )
                   return;
                 setBusy(true);
-                void clearUnidentified(libraryId)
+                void ignoreAllUnidentifiedLibraryFiles(libraryId)
                   .then(onChanged)
                   .catch(() => {})
                   .finally(() => setBusy(false));
@@ -1499,7 +1713,7 @@ function MissingRow({
                   tone: "danger",
                 });
                 if (!ok) return;
-                act(() => clearMissing(libraryId, item.media_item_id));
+                act(() => clearMissingLibraryRecords(libraryId, item.media_item_id));
               }}
               className="btn-glass px-3 py-1.5 text-sub font-medium disabled:opacity-50"
             >
@@ -1660,7 +1874,7 @@ function UnidentifiedGroupRow({
       }))
     )
       return;
-    act(() => Promise.all(fileIds.map((id) => ignoreFile(id))));
+    act(() => Promise.all(fileIds.map((id) => ignoreUnidentifiedLibraryFile(id))));
   };
 
   return (
@@ -1785,7 +1999,14 @@ function UnidentifiedGroupRow({
           movie={movie}
           fileCount={group.file_count}
           busy={busy}
-          onConfirm={() => act(() => claimFilesBatch(fileIds, panel.seed.tmdbId))}
+          onConfirm={() =>
+            act(() =>
+              assignLibraryFilesToTitle(
+                fileIds,
+                `tmdb:${movie ? "movie" : "tv"}:${panel.seed.tmdbId}`,
+              ),
+            )
+          }
           onCancel={() => setPanel(null)}
         />
       )}
@@ -1816,7 +2037,10 @@ function ReviewGroupRow({ group, onChanged }: { group: ReviewGroup; onChanged: (
   const act = (accept: boolean) => {
     setBusy(true);
     setError(null);
-    void resolveIdentityReview(group.file_ids, accept)
+    void resolveLibraryIdentityReview(
+      group.file_ids,
+      accept ? "accept_suggestion" : "keep_current",
+    )
       .then(onChanged)
       .catch((e) => setError((e as Error).message))
       .finally(() => setBusy(false));
@@ -1927,7 +2151,7 @@ function IgnoredGroupRow({
           onClick={() => {
             setBusy(true);
             setError(null);
-            void restoreIgnored(group.files.map((f) => f.id))
+            void restoreIgnoredLibraryFiles(group.files.map((f) => f.id))
               .then(onChanged)
               .catch((e) => setError((e as Error).message))
               .finally(() => setBusy(false));

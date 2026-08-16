@@ -31,6 +31,8 @@ class LoginSelectors:
     # 额外的固定登录表单参数（站点特殊字段）
     # 示例：ttg 需要 (("passan", ""), ("passid", "0"), ("lang", "0"))
     extra_form_data: tuple[tuple[str, str], ...] = ()
+    # select 字段的默认值。登录页表单中存在该字段时才会提交。
+    select_defaults: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -47,6 +49,8 @@ class NexusPHPSelectors:
     login_password_field: str = "password"
     login_error_css: str = "td.text"
     login_success_css: str = "a[href*='logout']"
+    login_extra_form_data: tuple[tuple[str, str], ...] = ()
+    login_select_defaults: tuple[tuple[str, str], ...] = ()
 
     # -- 种子列表 --
     torrent_list_path: str = "torrents.php"
@@ -69,7 +73,6 @@ class NexusPHPSelectors:
     torrent_time_fallback_css: str = "td:nth-child(4)"
     # strptime 格式
     torrent_time_fmt: str = "%Y-%m-%d %H:%M:%S"
-
     torrent_uploader_css: str = "td:nth-child(9) a"
 
     # -- 促销 --
@@ -157,6 +160,8 @@ class NexusPHPSelectors:
             password_field=self.login_password_field,
             success_css=self.login_success_css,
             error_css=self.login_error_css,
+            extra_form_data=self.login_extra_form_data,
+            select_defaults=self.login_select_defaults,
         )
 
     def replace(self, **kwargs: str) -> NexusPHPSelectors:

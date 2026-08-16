@@ -21,7 +21,7 @@ import { usePageChrome } from "@/lib/page-chrome";
 import { usePageTitle } from "@/lib/use-page-title";
 
 /**
- * Agent 会话页（/runs/[id]）—— 对齐 ChatGPT / Claude 的对话交互：
+ * Agent 会话页（/sessions/[id]）—— 对齐 ChatGPT / Claude 的对话交互：
  * 顶部标题条 + 可滚动消息列（用户右侧气泡 / Agent 左侧全宽正文）+ 底部固定
  * Composer。流式生成中支持停止；随时可追问下一轮（自动携带多轮历史）。
  *
@@ -34,7 +34,7 @@ import { usePageTitle } from "@/lib/use-page-title";
  *   一个持续推进的动画比一句会过期的文案更可信。
  */
 export function AgentConversationView({ conversationId }: { conversationId: string }) {
-  const { get, open, send, stop, truncate } = useAgentConversations();
+  const { get, open, send, stop, retry } = useAgentConversations();
   const conversation = get(conversationId);
   usePageTitle(conversation?.title);
   // 移动端全局顶栏：把会话标题挂上去顶替品牌字标（见 lib/page-chrome.tsx），
@@ -47,6 +47,13 @@ export function AgentConversationView({ conversationId }: { conversationId: stri
     return chrome.setTopBarTitle(title);
   }, [chrome, title]);
   const [input, setInput] = useState("");
+  const [retryTarget, setRetryTarget] = useState<{
+    conversationId: string;
+    messageId: string;
+  } | null>(null);
+  const [retrying, setRetrying] = useState(false);
+  const activeRetryTarget =
+    retryTarget?.conversationId === conversationId ? retryTarget : null;
   // 服务端详情加载失败的提示（404 = 会话不存在；其余为网络/服务错误）
   const [loadError, setLoadError] = useState<string | null>(null);
   const confirm = useConfirm();
@@ -87,31 +94,13 @@ export function AgentConversationView({ conversationId }: { conversationId: stri
     return () => vv.removeEventListener("resize", pin);
   }, []);
 
-  /**
-   * 改写重问：丢弃这一轮及其之后的全部记录，原提问填回输入框。
-   *
-   * 二次确认是硬要求——服务端删的是事实源转录，删完没有任何回退路径，
-   * 而入口就浮在气泡边上，误触代价太大。确认文案必须把「删到哪、不可恢复」
-   * 说清楚，光说「确定吗」等于没说。
-   */
+  /** 改写入口只进入本地编辑态，不提前触碰服务端历史。 */
   const handleEdit = useCallback(
-    async (entryUuid: string) => {
-      const agreed = await confirm({
-        title: "改写这条提问？",
-        description:
-          "这条提问、以及它之后的所有对话（含回答）会被永久删除，无法恢复。\n" +
-          "原文会填回输入框，你可以改完再发一次，Agent 将从这里继续。",
-        confirmLabel: "删除并改写",
-        tone: "danger",
-      });
-      if (!agreed) return;
-      try {
-        setInput(await truncate(conversationId, entryUuid));
-      } catch (error) {
-        toast.error((error as Error).message);
-      }
+    (messageId: string, original: string) => {
+      setRetryTarget({ conversationId, messageId });
+      setInput(original);
     },
-    [confirm, conversationId, toast, truncate],
+    [conversationId],
   );
 
   if (loadError) {
@@ -136,8 +125,31 @@ export function AgentConversationView({ conversationId }: { conversationId: stri
   const running = conversation.turns.some((t) => t.status === "running");
 
   function submit(text: string) {
-    setInput("");
-    send(conversationId, text);
+    if (!activeRetryTarget) {
+      setInput("");
+      send(conversationId, text);
+      return;
+    }
+    void (async () => {
+      const agreed = await confirm({
+        title: "重新提交这条提问？",
+        description:
+          "这条提问及其之后的对话会被新问题替换，原记录无法恢复。",
+        confirmLabel: "替换并重新提问",
+        tone: "danger",
+      });
+      if (!agreed) return;
+      setRetrying(true);
+      try {
+        await retry(conversationId, activeRetryTarget.messageId, text);
+        setInput("");
+        setRetryTarget(null);
+      } catch (error) {
+        toast.error((error as Error).message);
+      } finally {
+        setRetrying(false);
+      }
+    })();
   }
 
   return (
@@ -171,8 +183,12 @@ export function AgentConversationView({ conversationId }: { conversationId: stri
         >
           <div className="mx-auto max-w-3xl space-y-8">
             {conversation.turns.map((turn) => (
-              // 运行中不给改写入口：服务端会拒绝截断正在写转录的会话
-              <TurnView key={turn.id} turn={turn} onEdit={running ? undefined : handleEdit} />
+              // 运行中不给改写入口：服务端会拒绝替换正在写轨迹的会话
+              <TurnView
+                key={turn.id}
+                turn={turn}
+                onEdit={running || retrying ? undefined : handleEdit}
+              />
             ))}
           </div>
         </div>
@@ -197,6 +213,21 @@ export function AgentConversationView({ conversationId }: { conversationId: stri
           要自己把 Home 指示条的高度让出来，否则发送键会被指示条压住 */}
       <div className="shrink-0 px-4 pb-5 pt-2 max-md:px-3 max-md:pb-[calc(0.75rem+var(--safe-bottom))]">
         <div className="mx-auto max-w-3xl">
+          {activeRetryTarget && (
+            <div className="mb-2 flex items-center justify-between px-2 text-caption text-[var(--text-muted)]">
+              <span>正在改写较早的提问，发送后将替换其后的对话</span>
+              <button
+                type="button"
+                onClick={() => {
+                  setRetryTarget(null);
+                  setInput("");
+                }}
+                className="rounded-md px-2 py-1 text-[var(--text-faint)] transition-colors hover:text-[var(--text)]"
+              >
+                取消改写
+              </button>
+            </div>
+          )}
           <Composer
             flat
             value={input}
@@ -204,8 +235,14 @@ export function AgentConversationView({ conversationId }: { conversationId: stri
             onSubmit={submit}
             busy={running}
             onStop={() => stop(conversationId)}
-            disabled={locked}
-            placeholder={locked ? "请先接入 AI 模型，再继续对话" : undefined}
+            disabled={locked || (retrying && activeRetryTarget != null)}
+            placeholder={
+              locked
+                ? "请先接入 AI 模型，再继续对话"
+                : activeRetryTarget
+                  ? "修改问题后发送，将从这里重新生成回答"
+                  : undefined
+            }
           />
           {locked && <LlmSetupNotice />}
         </div>
@@ -225,15 +262,15 @@ const TurnView = memo(function TurnView({
 }: {
   turn: AgentTurn;
   /** 改写本轮重问；不给（运行中）则气泡上不出现该入口 */
-  onEdit?: (entryUuid: string) => void;
+  onEdit?: (messageId: string, input: string) => void;
 }) {
-  const entryUuid = turn.entryUuid;
+  const messageId = turn.messageId;
   return (
     <div className="group/turn space-y-3">
       {/* 用户消息：右侧玻璃气泡 */}
       <UserBubble
         text={turn.input}
-        onEdit={onEdit && entryUuid ? () => onEdit(entryUuid) : undefined}
+        onEdit={onEdit && messageId ? () => onEdit(messageId, turn.input) : undefined}
       />
 
       {/* Agent 回应：整栏正文，不挂头像、不套气泡（ChatGPT / Claude 同款版式） */}
@@ -301,7 +338,7 @@ function UserBubble({ text, onEdit }: { text: string; onEdit?: () => void }) {
         <button
           type="button"
           aria-label="改写这条提问"
-          title="改写这条提问（会删除其后的对话）"
+          title="改写这条提问"
           onClick={(event) => {
             // 不冒泡到气泡的 toggle：否则点完操作键，浮现态立刻被切回去
             event.stopPropagation();

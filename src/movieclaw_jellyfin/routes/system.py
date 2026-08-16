@@ -13,12 +13,18 @@ router = APIRouter()
 
 
 async def _local_address(request: Request) -> str:
-    """published_server_url 优先；否则回显本次请求的 scheme+Host（必然可达）。"""
+    """published_server_url 优先；否则回显客户端实际访问的 scheme+Host。
+
+    Next/reverse proxy 会把 Host 改成内部上游地址，因此优先读取标准转发头；
+    多级代理产生逗号列表时取最外层客户端首先访问的值。
+    """
     setting = await get_jellyfin_compat()
     if setting.published_server_url:
         return setting.published_server_url.rstrip("/")
-    host = request.headers.get("Host") or request.url.netloc
-    scheme = request.headers.get("X-Forwarded-Proto") or request.url.scheme or "http"
+    forwarded_host = request.headers.get("X-Forwarded-Host", "").split(",", 1)[0].strip()
+    forwarded_proto = request.headers.get("X-Forwarded-Proto", "").split(",", 1)[0].strip()
+    host = forwarded_host or request.headers.get("Host") or request.url.netloc
+    scheme = forwarded_proto or request.url.scheme or "http"
     return f"{scheme}://{host}"
 
 

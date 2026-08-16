@@ -19,7 +19,7 @@
 2. **令牌隔离（安全升级）**：MOVIECLAW_TOKEN 只注入 mclaw 工具的子进程，
    **不再进 bash 的环境**——bash 里 `env`/`echo $MOVIECLAW_TOKEN` 从此拿不到
    凭证，泄漏面从「整个 shell」收窄到「一个不透传环境的专用工具」。
-3. **硬闸位点**：递归禁令（不允许在工具里再调 `mclaw agent ...`）从提示词
+3. **硬闸位点**：递归禁令（不允许在工具里调用 `session start/retry/follow`）从提示词
    软约束升级为工具 handler 里的代码硬闸，模型绕不过去。
 
 ---
@@ -43,7 +43,7 @@ def make_mclaw_tool(
   "properties": {
     "args": {
       "type": "string",
-      "description": "mclaw 后面的完整参数串（不含 mclaw 本身），如 'sub list' 或 'search \"沙丘2\" --resolution 2160p'"
+      "description": "mclaw 后面的完整参数串（不含 mclaw 本身），如 'subscriptions list' 或 'search torrents \"沙丘2\" --resolution 2160p'"
     },
     "timeout": {
       "type": "number",
@@ -60,10 +60,9 @@ def make_mclaw_tool(
   ——没有管道/重定向/变量展开，注入面为零；需要组合处理输出时，模型把
   JSON 结果交给 bash/read 等其他工具，职责分明。
 - 子进程环境 = 进程环境 + extra_env（令牌仅此处注入）；cwd = 工作区。
-- **硬闸**：`args` 的首个 token 为 `agent` 时直接返回错误文本
-  「不能在工具里调用 mclaw agent——那是你自己的运行入口（禁止递归）。
-  请直接在当前会话完成任务」，不执行子进程。`login`/`logout` 同样拦截
-  （授权已配置，执行只会破坏凭证状态）。
+- **硬闸**：`session start/retry/follow` 不执行子进程，防止当前 Agent
+  递归创建或嵌套跟随会话；`login`/`logout` 同样拦截。任何 `--server` 参数
+  也被拒绝，避免把短时令牌发往其他服务器。
 - 输出组装（复用 bash 工具的截断实现）：
 
 ```
@@ -77,48 +76,99 @@ def make_mclaw_tool(
   中文解读（0 不标注；1 业务错误看 stderr；2 用法错误先 --help；3 授权失效
   应停止并报告用户；5 需要 --yes；6 等待超时任务仍在后台；7 歧义待选）。
   模型即使没读过任何文档，也能从工具结果本身学会正确的下一步。
+  唯一例外是 `session get-transcript`：它返回未经工具层截断的完整轨迹，
+  description 明确提醒长会话结果可能很大，由模型自行决定是否读取和如何使用。
 
-## 2. 工具 description 全文草案（评审点 ②：一级服务目录 + 使用协议）
+## 2. 工具 description（评审点 ②：产品能力地图 + 使用协议）
 
 description = 静态协议文本 + 动态服务目录（`service_map` 拼接）。全文如下：
 
 ```text
-movieclaw 的官方命令行工具。对本产品的一切操作——搜索资源、订阅、媒体库、
-下载、站点/下载器/规则等全部设置——都用本工具完成，不要用 bash 直接调 API。
-授权已自动配置，永远不需要 login。
+movieclaw 的官方命令行工具。用于从 TMDB 和豆瓣发现实时热点、最新、热映/在播、
+热门和高分电影/剧集，搜索并下载 PT 资源，持续订阅追更并自动整理入库，管理本地
+媒体库；也可查看任务进度，以及配置资源站点、下载器、规则、消息渠道、AI 模型、
+网络和应用更新。查询或变更 movieclaw 产品状态都用本工具完成（不要通过 bash
+调用，bash 环境没有授权）。授权已自动配置，永远不需要 login。
 
-可用服务（一级目录，参数细节用 --help 现查，如 args="sub --help"）：
-- search   站点资源搜索：search "关键词" 流式聚合出带行号的结果
-- download 下载：download <行号> 提交上次搜索的某行（或 --site-id + --url）
-- sub      订阅：sub create 一步完成消歧/预检/创建；list/show/update/pause/delete
-- lib      媒体库：库管理、scan 扫描、organize 整理、items 条目、
-           unidentified 待识别认领、missing 缺失重下、review 身份复核
-- site     PT 站点接入与验证 ｜ dl 下载器接入与默认设置
-- watch    监听导入规则 ｜ rules 订阅过滤规则组
-- discover 影视元数据与榜单 ｜ people 影人档案（本地库）
-- llm      AI 模型供应商 ｜ net 网络与代理 ｜ logs 系统日志
-- auth     账号/API 令牌 ｜ status 一眼看部署与登录状态
+可用服务（按用户意图选一级目录；参数细节用 --help 现查，如 args="sub --help"）：
+- app      应用设置与维护（设置外部访问地址、重启；检查/升级/回退应用，更新 NER
+  模型并查看进度/兼容性）
+- appearance 首页背景与图库（查看、上传、下载、切换和删除背景图）
+- auth     个人信息与 CLI 访问（查看身份，修改头像/昵称/密码，管理 API 令牌）
+- channels 消息推送与 AI 对话入口（微信、Telegram、Discord 配对/解绑，配置事件
+  推送并测试；绑定后可发消息搜片、订阅、查进度）
+- discover 发现电影/剧集（来自 TMDB、豆瓣的实时热点、热映/待上映/在播、热门、
+  高分、口碑及地区/类型片单；list-collections 列片单，browse-collection 浏览片单，
+  get-title-details 看资料/演职员/剧照/相关推荐）
+- dl       qBittorrent/Transmission 下载器与投递（接入/验证/启停/设默认实例，
+  配置保存路径与路径映射，预演落点并提交种子）
+- extension Chromium 浏览器插件 Cookie 同步（管理同步令牌/支持站点，把页面中的
+  httpOnly 站点 Cookie 安全同步到服务端）
+- health   API 存活检查（通常优先用顶级 status 查看更完整的部署状态）
+- jobs     后台作业（按来源/状态/类型查询，查看事件与执行器健康，等待/取消/重试；
+  订阅的在途下载进度看 sub downloads）
+- library  本地电影/剧集媒体库（建库与默认路由，扫描和规范命名入库；查看库存条目与
+  物理文件，处理待识别/错识别/缺失内容，并管理元数据、图片、字幕和跨库转移）
+- llm      AI 模型供应商（接入 OpenAI、阿里云百炼或任意 OpenAI 兼容服务，选择
+  模型并验证连通性，供 AI 对话等智能能力使用）
+- net      网络与代理（配置全局/指定服务代理及镜像地址，立即生效；按 TMDB/豆瓣/
+  GitHub/PT 站点等服务测试连通性）
+- notices  系统待处理事项（查看按严重程度排序的活跃问题，或忽略指定提示）
+- people   本地媒体库影人档案（按 TMDB 人物 ID 查看资料及已入库参演作品）
+- rules    订阅过滤规则组（管理分辨率、编码、HDR、字幕/音轨、免费/H&R、做种数、
+  体积和制作组等条件及默认规则组）
+- search   统一搜索（titles 搜 TMDB/豆瓣影视条目，torrents 跨 PT 站点搜种子并可把
+  结果行号交给 download，library-items 搜已入库内容；另可管理搜索预设和历史结果）
+- session  用户与智能体的会话管理（发起新对话或继续已有对话，按指定用户消息重新提问，
+  读取并分析完整 message/compaction 轨迹；也可重命名、压缩上下文、跟随或停止处理，
+  以及删除会话）
+- site     PT 资源站点（查看支持目录/鉴权要求，配置、验证、启停站点，查看本地种子
+  缓存统计；Cookie 可由 extension 同步）
+- sub      电影/剧集订阅与自动追更（持续追踪新资源，按规则自动搜索、下载并整理
+  入库；支持消歧/选季、缺口工单、立即搜索/手动选种、暂停恢复、活动/下载进度与链路体检）
+- ui       Web 界面质感与显示偏好（读取或整体保存各页面的布局、显示和样式设置）
+- watch    监听导入（监控已完成且稳定的下载，自动识别、标准命名并转移到目标媒体库；
+  查看并认领、忽略或恢复异常条目）
+- webhook  事件 Webhook（把播放、收藏等事件以 JSON 推送到外部端点；配置 HMAC
+  签名，测试投递、查记录并轮换密钥）
+- download 下载：把上次 search 的结果行号投递到下载器；默认先识别 TMDB 身份并
+  预演智能入库，唯一且路由可用才提交。退出码 7 时读取 stdout 候选并用
+  `--tmdb-id` 重试；也可显式指定 `--library`/`--save-path`，只有明确使用
+  `--downloader-default` 才落下载器默认目录。站点+链接形态不含媒体身份，不自动猜测
+- status   部署总览：服务健康、当前身份、客户端/服务端版本与命令目录同步状态
 
 使用协议：
+- 常用链路：search titles 找片/找剧 → subscriptions create 订阅；search torrents
+  搜 PT 种子 → download 投递；search library-items 查库存，discover 浏览榜单，
+  library 管理已入库内容；订阅会持续追踪，并在出现符合规则的新资源
+  后自动搜索、下载和整理入库。
 - 输出即数据：stdout 是 JSON（默认），stderr 是过程提示与错误原因。
-- 参数拿不准就先 --help（域级和命令级都有，含示例），不要凭记忆猜。
-- 列表默认有条数上限、长字段有截断；下结论前确认没有被截断（--limit 可调）。
-- 带 ⚠ 的命令需要 --yes 确认。其中 lib items delete 会删除磁盘上的媒体文件：
+- 参数拿不准就先 --help（域级与命令级都有，含示例），不要凭记忆猜参数或取值。
+- 列表默认有条数上限、长字段有截断；下结论前确认数据没有被截断（--limit 可调）。
+- 带 ⚠ 的命令需要 --yes 确认。其中 library items delete 会删除磁盘上的媒体文件：
   必须先用只读命令查清将删除的具体条目、向用户复述并取得本轮明确同意后才能
   执行；用户泛泛说「清理/整理」不构成删除文件的同意。其余 ⚠ 命令（删配置、
   清记录）在用户任务明确要求时可直接 --yes。
 - 扫描/整理/元数据刷新默认阻塞等待完成；预计超过 4 分钟的任务用 --no-wait
-  启动，再用对应查询命令轮询进度，或调大本工具的 timeout 参数。
+  启动后轮询进度，或调大本工具的 timeout 参数。
 ```
 
 设计取舍说明（供评审）：
 
-- **一级目录进 description，二级以下坚决不进**：目录 17 行 ≈ 300 token，让
-  模型「知道去哪个域找」；126 条命令的参数细节交给 --help 现查（L4），
-  否则 description 膨胀到数千 token 且必然漂移。
-- **目录不是手写的**：`service_map` 段由 API 层从 CLI 内置 spec +
-  `tree_builder.DOMAIN_HELP` 渲染（含每个域的一行说明与关键子能力），
-  同仓构建保证与真实命令面严格同版；上面草案即渲染目标格式。
+- **能力地图进 description，参数合同进 `--help`**：21 个开放域各用一行说明
+  用户能完成什么，并只点出有助于选路的代表性入口；181 个生成接口的完整参数
+  不平铺进提示词，避免膨胀和漂移。当前完整 description 约 2.4k 字符。
+- **前端用户心智是文案基线，CLI 域是执行边界**：能力名和结果承诺沿用页面文案
+  （如“持续追踪后自动下载入库”“消息渠道也是 AI 对话入口”），但一个页面聚合的
+  多项设置仍拆回准确域：资源站点对应 `site/search/extension`，订阅对应
+  `sub/rules`，外观对应 `appearance/ui`。这样既让模型理解产品，也不会选错命令。
+- **域集合自动、语义人工**：开放域集合来自 CLI 内置 spec，保证不会静默漏域；
+  每域的用户语义由 `_DOMAIN_LINES` 人工维护，测试强制每个开放域都经过润色。
+  新域在运行期仍可回落 `DOMAIN_HELP` 保证可用，但提交代码时会被守卫测试拦下，
+  必须补齐功能介绍并显式评审快照。
+- **明确相邻域分工**：工具协议直接说明 discover=浏览榜单、search=搜索影视/种子/
+  库存，并给出「搜影视 → 订阅」「搜种 → 投递」「查库存 → 管理」三条常用链路，
+  降低模型仅凭技术名词误选命令的概率。
 - **危险规约放 description 而非系统提示词**：这是 mclaw 的领域语义，按
   现有架构归工具承载；且模型每次调用工具时 description 都在注意力窗口里，
   比相隔很远的系统提示词更「贴现场」。
@@ -144,22 +194,23 @@ def get_agent_tools(cli_env: dict[str, str]) -> list[AgentTool]:
 ```
 
 `render_service_map()` 放 `movieclaw_api/services/mclaw_tool.py`：数据源为
-`movieclaw_cli.gen.spec_loader.load_baseline()` + `tree_builder`（域 →
-DOMAIN_HELP 简介 + 关键子命令），进程内缓存一次。
+`movieclaw_cli.gen.spec_loader.load_baseline()`（自动发现开放域）+
+`_DOMAIN_LINES`（人工维护用户语义与关键入口），进程内缓存一次；`DOMAIN_HELP`
+同时承载 `mclaw --help` 的域级短简介，并作为新域运行期的安全回落。
 
 ## 4. 安全设计（双硬闸 + 令牌收窄）
 
 | 防线 | 位置 | 拦什么 |
 |---|---|---|
-| 工具 handler 硬闸 | `make_mclaw_tool` | `agent` 子命令（递归）、`login/logout`（破坏凭证） |
-| 服务端硬闸 | `agent.start` 路由 | 持 `agent:` 身份令牌的再发起（防绕过工具直接 curl） |
+| 工具 handler 硬闸 | `make_mclaw_tool` | `session start/retry/follow`（递归）、`login/logout`、`--server` |
+| 服务端硬闸 | `session.start/retry/stop` 路由 | 持 `agent:` 身份令牌开始、继续或重试会话，以及停止自身会话 |
 | 令牌收窄 | 只注入 mclaw 工具子进程 | bash 里 `env` 再也看不到 MOVIECLAW_TOKEN |
 
 服务端硬闸实现（同前版设计）：
 
 ```python
-async def start_agent(payload, identity: str = Depends(require_login), ...):
-    if identity.startswith("agent:"):
+async def start_session(payload, identity: Principal = Depends(require_login), ...):
+    if identity.kind == "agent":
         raise BadRequestException("Agent 工作区内不能再发起新的 Agent 运行（禁止递归）")
 ```
 
@@ -177,8 +228,8 @@ async def start_agent(payload, identity: str = Depends(require_login), ...):
 1. **description 快照测试**：完整工具描述（含渲染目录）全文快照——描述是
    模型行为的一部分，改动必须显式过评审；
 2. **目录同步守护**：service_map 覆盖的域集合 == spec 非 hidden 域集合；
-3. **硬闸测试**：`args="agent run xx"` / `args="login"` 返回拒绝文本且未起
-   子进程；服务端 agent 令牌调 start → 400；
+3. **硬闸测试**：`session start/retry/follow`、`login` 与 `--server` 返回拒绝
+   文本且未起子进程；服务端 agent 令牌开始会话/发送消息或停止自身会话 → 400；
 4. **令牌隔离测试**：bash 子进程 `echo $MOVIECLAW_TOKEN` 为空，mclaw 工具
    子进程能成功调用（e2e：真实 uvicorn + 真实 mclaw）；
 5. **退出码标注测试**：构造 5/7 退出码场景，断言工具结果含对应中文解读；

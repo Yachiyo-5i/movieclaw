@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import type { Route } from "next";
@@ -14,20 +14,32 @@ import {
   StarIcon,
 } from "@/components/icons";
 import { MediaRow } from "@/components/media-row";
+import { DiscoveryFilterControl } from "@/components/discovery-filter-dialog";
+import { FilteredDiscoveryView } from "@/components/filtered-discovery-view";
 import { PosterImage } from "@/components/poster-image";
 import { useSubscribeEntry } from "@/components/subscribe-entry";
 import {
-  fetchDiscoverHero,
-  fetchDiscoverLayout,
-  fetchDiscoverRow,
+  browseDiscoveryCollection,
+  collectionHref,
+  collectionToRow,
+  fetchDiscoveryPage,
+  type DiscoveryPageData,
+  type DiscoveryPageSection,
 } from "@/lib/api/discover";
 import { HttpError } from "@/lib/http";
+import {
+  discoveryFilterCount,
+  discoveryFiltersKey,
+  discoveryFiltersQuery,
+  EMPTY_DISCOVERY_FILTERS,
+  type DiscoveryFilters,
+} from "@/lib/discovery-filters";
 import { useMediaDetail } from "@/lib/media-detail";
 import { usePageChrome } from "@/lib/page-chrome";
+import { useScrollRestoration } from "@/lib/use-scroll-restoration";
 import { useIsMobile } from "@/lib/use-media-query";
 import { useTapGuard } from "@/lib/use-tap-guard";
 import type {
-  DiscoverLayoutData,
   MediaItem,
   MediaRowData,
   MediaSource,
@@ -39,23 +51,14 @@ import type {
  *
  * 页面纵向结构：
  *   1. HeroBanner —— 精选影片轮播大横幅（宽幅剧照 + 渐变蒙版 + 标题区 + 操作按钮）
- *   2. 若干 MediaRow —— 「今日热榜 Top 10（排名变体）/ 热门 / 高分 / …」横滚海报行
+ *   2. 若干 MediaRow —— 「今日热榜（排名变体）/ 热门 / 高分 / …」横滚海报行
  *
- * 渐进加载：先拉毫秒级的布局接口拿到行清单，立刻按真实行名撑起整页骨架，
- * 再按行序逐行请求数据、先就绪的行先淡入。这对豆瓣视角尤其关键——后端对
- * 豆瓣限速每秒 1 个请求，冷缓存整页聚合要十几秒，逐行加载让首行 1~2 秒可见。
- * 布局/Hero/单行分别做模块级内存缓存，「发现电影 ↔ 发现剧集」来回切换即时
- * 呈现，刷新页面才会重新拉取。
+ * 渐进加载：先读取 Web 展示清单，再把每个 collectionRef 原样交给领域接口。
+ * 页面只知道一个片单应画成 Hero、排名行还是普通行，不再拼装 provider 专属
+ * 端点。展示清单与片单预览都做模块级内存缓存，视角切换后可以即时恢复。
  */
-const layoutCache = new Map<string, DiscoverLayoutData>();
-const heroCache = new Map<string, MediaItem[]>();
-const rowCache = new Map<string, MediaRowData>();
-
-/** 有「看全部」落地页的榜单行：横滚只露前 10 条，入口跳完整榜单网格页。 */
-const ROW_MORE_LINKS: Record<string, Route> = {
-  "douban-movie_top250": "/discover/movie/top250?source=douban" as Route,
-  "douban-movie_high_score": "/discover/movie/high-score?source=douban" as Route,
-};
+const pageCache = new Map<string, DiscoveryPageData>();
+const collectionCache = new Map<string, MediaRowData>();
 
 /** 加载失败信息：除文案外带上后端错误码与引导提示，驱动引导式错误态。 */
 interface DiscoverErrorInfo {
@@ -84,106 +87,121 @@ function toErrorInfo(err: unknown): DiscoverErrorInfo {
 export function DiscoverView({
   mediaType,
   source,
+  filters,
+  currentYear,
 }: {
   mediaType: MediaType;
   source: MediaSource;
+  filters: DiscoveryFilters;
+  /** 服务端确定年份，避免跨年瞬间 SSR 与浏览器水合生成不同选项。 */
+  currentYear: number;
 }) {
   const router = useRouter();
   const cacheKey = `${mediaType}:${source}`;
-  const [layout, setLayout] = useState<DiscoverLayoutData | null>(
-    () => layoutCache.get(cacheKey) ?? null,
-  );
+  const filterKey = discoveryFiltersKey(filters);
+  const filtering = source === "tmdb" && discoveryFilterCount(filters) > 0;
+  const scrollRef = useScrollRestoration(`discover:${cacheKey}:${filterKey}`);
+  const [page, setPage] = useState<DiscoveryPageData | null>(() => pageCache.get(cacheKey) ?? null);
   // Hero 三态：undefined=加载中（出骨架）、[]=无或失败（收起）、有值=轮播
-  const [hero, setHero] = useState<MediaItem[] | undefined>(
-    () => heroCache.get(cacheKey),
-  );
+  const [hero, setHero] = useState<MediaItem[] | undefined>();
   // 每行三态：undefined=加载中（出骨架）、"error"=失败（收起）、有值=渲染
-  const [rowsById, setRowsById] = useState<Record<string, MediaRowData | "error">>({});
+  const [rowsByRef, setRowsByRef] = useState<Record<string, MediaRowData | "error">>({});
   const [error, setError] = useState<DiscoverErrorInfo | null>(null);
   // 重试计数器：点「重试」时 +1，触发 effect 重新拉取
   const [reloadKey, setReloadKey] = useState(0);
 
   useEffect(() => {
-    let cancelled = false;
+    if (filtering) return;
+    const controller = new AbortController();
     setError(null);
-    setHero(heroCache.get(cacheKey));
+    setHero(undefined);
 
-    // 已缓存的行直接进入初始状态，未缓存的保持 undefined（骨架）等待逐行到达
-    const seedRows = (rows: DiscoverLayoutData["rows"]) => {
+    const cacheKeyFor = (section: DiscoveryPageSection) =>
+      `${section.collectionRef}:${section.previewLimit}`;
+
+    // 已缓存的片单直接进入初始状态，未缓存的保持 undefined（骨架）等待逐项到达。
+    const seedRows = (sections: DiscoveryPageSection[]) => {
       const seeded: Record<string, MediaRowData | "error"> = {};
-      for (const stub of rows) {
-        const cached = rowCache.get(`${cacheKey}:${stub.id}`);
-        if (cached) seeded[stub.id] = cached;
+      for (const section of sections) {
+        const cached = collectionCache.get(cacheKeyFor(section));
+        if (cached) seeded[section.collectionRef] = cached;
       }
-      setRowsById(seeded);
+      setRowsByRef(seeded);
       return seeded;
     };
 
-    // 布局就绪后逐行拉数据：请求按行序发起，豆瓣限速器先到先得，
-    // 数据自上而下依次填充，与用户视线顺序一致。全部行都失败时才
-    // 整页转为错误态（通常是网络不通），部分失败只收起对应行。
-    const loadPage = (pageLayout: DiscoverLayoutData) => {
-      const seeded = seedRows(pageLayout.rows);
-      if (pageLayout.hasHero) {
-        if (!heroCache.has(cacheKey)) {
-          fetchDiscoverHero(mediaType, source)
-            .then((items) => {
-              heroCache.set(cacheKey, items);
-              if (!cancelled) setHero(items);
+    // 展示清单就绪后逐个读取片单：先到先渲染；Hero 失败只收起自身，普通
+    // 分区全部失败且没有缓存时，整页进入带网络引导的错误态。
+    const loadPage = (pageData: DiscoveryPageData) => {
+      const heroSection = pageData.sections.find((section) => section.presentation === "hero");
+      const rowSections = pageData.sections.filter((section) => section.presentation !== "hero");
+      const seeded = seedRows(rowSections);
+
+      if (heroSection) {
+        const cached = collectionCache.get(cacheKeyFor(heroSection));
+        if (cached) {
+          setHero(cached.items);
+        } else {
+          browseDiscoveryCollection(heroSection.collectionRef, heroSection.previewLimit, {
+            signal: controller.signal,
+          })
+            .then((collection) => {
+              const row = collectionToRow(collection);
+              collectionCache.set(cacheKeyFor(heroSection), row);
+              if (!controller.signal.aborted) setHero(row.items);
             })
             .catch(() => {
-              // Hero 失败只收起大横幅，不影响行数据
-              if (!cancelled) setHero([]);
+              if (!controller.signal.aborted) setHero([]);
             });
         }
       } else {
         setHero([]);
       }
 
-      const pending = pageLayout.rows.filter((stub) => !seeded[stub.id]);
+      const pending = rowSections.filter((section) => !seeded[section.collectionRef]);
       let failed = 0;
       let firstError: DiscoverErrorInfo | null = null;
-      for (const stub of pending) {
-        fetchDiscoverRow(mediaType, stub.id, source)
-          .then((row) => {
-            rowCache.set(`${cacheKey}:${stub.id}`, row);
-            if (!cancelled) setRowsById((prev) => ({ ...prev, [stub.id]: row }));
+      for (const section of pending) {
+        browseDiscoveryCollection(section.collectionRef, section.previewLimit, {
+          signal: controller.signal,
+        })
+          .then((collection) => {
+            const row = collectionToRow(collection);
+            collectionCache.set(cacheKeyFor(section), row);
+            if (!controller.signal.aborted) {
+              setRowsByRef((prev) => ({ ...prev, [section.collectionRef]: row }));
+            }
           })
           .catch((err: unknown) => {
+            if (controller.signal.aborted) return;
             firstError ??= toErrorInfo(err);
             failed += 1;
-            if (cancelled) return;
-            setRowsById((prev) => ({ ...prev, [stub.id]: "error" }));
-            // 没有任何一行成功（含缓存）且全部请求都失败：整页转错误态
-            if (failed === pending.length && pending.length === pageLayout.rows.length) {
+            setRowsByRef((prev) => ({ ...prev, [section.collectionRef]: "error" }));
+            if (failed === pending.length && pending.length === rowSections.length) {
               setError(firstError);
             }
           });
       }
     };
 
-    const cachedLayout = layoutCache.get(cacheKey);
-    setLayout(cachedLayout ?? null);
-    if (cachedLayout) {
-      loadPage(cachedLayout);
-      return () => {
-        cancelled = true;
-      };
+    const cachedPage = pageCache.get(cacheKey);
+    setPage(cachedPage ?? null);
+    if (cachedPage) {
+      loadPage(cachedPage);
+    } else {
+      fetchDiscoveryPage(mediaType, source, { signal: controller.signal })
+        .then((data) => {
+          pageCache.set(cacheKey, data);
+          if (controller.signal.aborted) return;
+          setPage(data);
+          loadPage(data);
+        })
+        .catch((err: unknown) => {
+          if (!controller.signal.aborted) setError(toErrorInfo(err));
+        });
     }
-    fetchDiscoverLayout(mediaType, source)
-      .then((data) => {
-        layoutCache.set(cacheKey, data);
-        if (cancelled) return;
-        setLayout(data);
-        loadPage(data);
-      })
-      .catch((err: unknown) => {
-        if (!cancelled) setError(toErrorInfo(err));
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [cacheKey, mediaType, reloadKey, source]);
+    return () => controller.abort();
+  }, [cacheKey, filtering, mediaType, reloadKey, source]);
 
   const switchSource = useCallback(
     (nextSource: MediaSource) => {
@@ -191,6 +209,31 @@ export function DiscoverView({
       router.push(`/discover/${mediaType}?source=${nextSource}` as Route);
     },
     [mediaType, router, source],
+  );
+
+  const applyFilters = useCallback(
+    (nextFilters: DiscoveryFilters) => {
+      const query = discoveryFiltersQuery(nextFilters);
+      router.push(`/discover/${mediaType}${query ? `?${query}` : ""}` as Route);
+    },
+    [mediaType, router],
+  );
+
+  const controls = useMemo(
+    () => (
+      <div className="flex items-center gap-2">
+        {source === "tmdb" && (
+          <DiscoveryFilterControl
+            mediaType={mediaType}
+            filters={filters}
+            currentYear={currentYear}
+            onApply={applyFilters}
+          />
+        )}
+        <SourceSwitcher value={source} onChange={switchSource} />
+      </div>
+    ),
+    [applyFilters, currentYear, filters, mediaType, source, switchSource],
   );
 
   // 发现页是侧栏一级入口，没有 PageNav，数据源切换若自己吸一条顶栏，窄屏上
@@ -201,36 +244,57 @@ export function DiscoverView({
   const setTopBarActions = chrome?.setTopBarActions;
   useEffect(() => {
     if (!isMobile || !setTopBarActions) return;
-    return setTopBarActions(<SourceSwitcher value={source} onChange={switchSource} />);
-  }, [isMobile, setTopBarActions, source, switchSource]);
+    return setTopBarActions(controls);
+  }, [controls, isMobile, setTopBarActions]);
 
   const toolbar = isMobile ? null : (
-    <div className="sticky top-0 z-20 flex items-center justify-end px-6 py-3">
-      <SourceSwitcher value={source} onChange={switchSource} />
+    <div className="sticky top-0 z-20 flex items-center justify-end px-6 pb-3 pt-7">
+      {controls}
     </div>
   );
 
+  if (filtering) {
+    return (
+      <div
+        ref={scrollRef}
+        data-scroll-root
+        className="scroll-thin scroll-safe flex-1 overflow-y-auto pb-10 max-md:pt-4"
+      >
+        {toolbar}
+        <FilteredDiscoveryView
+          key={filterKey}
+          mediaType={mediaType}
+          filters={filters}
+          onClear={() => applyFilters(EMPTY_DISCOVERY_FILTERS)}
+        />
+      </div>
+    );
+  }
+
   if (error) {
     return (
-      <div className="flex flex-1 flex-col">
+      <div className="flex flex-1 flex-col max-md:pt-4">
         {toolbar}
         <DiscoverError error={error} onRetry={() => setReloadKey((k) => k + 1)} />
       </div>
     );
   }
-  if (!layout) {
+  if (!page) {
     return (
-      <div className="flex flex-1 flex-col">
+      <div className="flex flex-1 flex-col max-md:pt-4">
         {toolbar}
         <DiscoverSkeleton />
       </div>
     );
   }
   return (
-    <div className="scroll-thin scroll-safe flex-1 overflow-y-auto pb-10">
+    <div
+      ref={scrollRef}
+      className="scroll-thin scroll-safe flex-1 overflow-y-auto pb-10 max-md:pt-4"
+    >
       {toolbar}
-      {/* Hero 区：布局声明有 Hero 时先占位，数据到达后换成轮播；失败/无则收起 */}
-      {layout.hasHero && hero === undefined && (
+      {/* Hero 区：展示清单声明 Hero 时先占位，数据到达后换成轮播。 */}
+      {page.sections.some((section) => section.presentation === "hero") && hero === undefined && (
         <div className="px-6 max-md:px-4">
           <HeroSkeleton />
         </div>
@@ -241,13 +305,16 @@ export function DiscoverView({
         </div>
       )}
       <div className="mt-8 space-y-8">
-        {layout.rows.map((stub) => {
-          const row = rowsById[stub.id];
+        {page.sections.filter((section) => section.presentation !== "hero").map((section) => {
+          const row = rowsByRef[section.collectionRef];
           // 失败或条目太少（空 items）的行整行收起
           if (row === "error") return null;
           if (row && row.items.length === 0) return null;
-          if (!row) return <RowSkeleton key={stub.id} stub={stub} />;
-          const moreHref = ROW_MORE_LINKS[row.id];
+          if (!row) return <RowSkeleton key={section.collectionRef} stub={section} />;
+          const href = section.supportsFullListing
+            ? collectionHref(section.collectionRef)
+            : undefined;
+          const moreHref = href as Route | undefined;
           return (
             <MediaRow
               key={row.id}
@@ -503,7 +570,7 @@ function HeroSlide({
   preload: boolean;
 }) {
   const { open } = useMediaDetail();
-  const { open: openSubscribe, subscriptionOf } = useSubscribeEntry();
+  const { canSubscribe, open: openSubscribe, subscriptionOf } = useSubscribeEntry();
   // 该影片是否已有订阅（数据来自 SubscribeEntryProvider 的全站订阅列表，Hero 自身不发请求）
   const existingSub = subscriptionOf(item);
   // 「粘性」装载：轮到过一次就永久保留 src（浏览器已缓存，重复挂载无成本）
@@ -600,7 +667,7 @@ function HeroSlide({
             它嵌在「整块进详情」的点击区里，所以点击必须 stopPropagation，
             否则订阅弹层弹出的同时详情页也会被打开。 */}
         <div className="mt-5 flex flex-wrap items-center gap-3 max-md:mt-3.5 max-md:gap-2">
-          <button
+          {canSubscribe && <button
             type="button"
             aria-label={existingSub ? `管理《${item.title}》的订阅` : `订阅影片《${item.title}》`}
             onPointerDown={subscribeTapGuard.onPointerDown}
@@ -627,7 +694,7 @@ function HeroSlide({
                 订阅影片
               </>
             )}
-          </button>
+          </button>}
         </div>
       </div>
     </div>

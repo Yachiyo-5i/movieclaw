@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+from collections.abc import Collection
+
+from sqlalchemy import and_, case, func
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
 from movieclaw_db.models.base import utcnow
 from movieclaw_db.models.library import Library
+from movieclaw_db.models.library_file import LibraryFile
 
 
 class LibraryRepository:
@@ -52,6 +56,135 @@ class LibraryRepository:
         """库总数（首启种子判空用）。"""
         result = await self._session.execute(select(Library.id))
         return len(result.scalars().all())
+
+    async def refresh_stats(self, library_ids: Collection[int]) -> None:
+        """重算指定媒体库的库存统计快照。
+
+        聚合只在台账发生变化的写路径收尾时执行，媒体库列表/详情的高频读
+        路径直接读取 ``library.stats_*``，查询成本不再随库存文件数增长。
+        一批库只发固定两条聚合查询：条目数按库内在位文件的
+        ``media_item_id`` 去重，分集数按（条目、季、集）去重；文件数与
+        容量同样排除 missing 历史记录。这两条查询只在写路径的批次
+        收尾执行，不会放大 Jellyfin 和管理端的高频读请求。
+        """
+        ids = sorted(set(library_ids))
+        if not ids:
+            return
+
+        present = LibraryFile.missing_since.is_(None)  # type: ignore[union-attr]
+        identified_item = case(
+            (
+                and_(
+                    present,
+                    LibraryFile.media_item_id.is_not(None),  # type: ignore[union-attr]
+                ),
+                LibraryFile.media_item_id,
+            ),
+            else_=None,
+        )
+        aggregate_rows = (
+            await self._session.execute(
+                select(
+                    LibraryFile.library_id,
+                    func.count(func.distinct(identified_item)).label("item_count"),
+                    func.sum(case((present, 1), else_=0)).label("file_count"),
+                    func.sum(case((present, LibraryFile.size_bytes), else_=0)).label(
+                        "total_size_bytes"
+                    ),
+                    func.sum(
+                        case(
+                            (
+                                and_(
+                                    present,
+                                    LibraryFile.media_item_id.is_(None),  # type: ignore[union-attr]
+                                    LibraryFile.ignored_at.is_(None),  # type: ignore[union-attr]
+                                ),
+                                1,
+                            ),
+                            else_=0,
+                        )
+                    ).label("unidentified_count"),
+                    func.sum(
+                        case(
+                            (LibraryFile.missing_since.is_not(None), 1),  # type: ignore[union-attr]
+                            else_=0,
+                        )
+                    ).label("missing_count"),
+                    func.sum(
+                        case(
+                            (
+                                and_(
+                                    present,
+                                    LibraryFile.media_item_id.is_(None),  # type: ignore[union-attr]
+                                    LibraryFile.ignored_at.is_not(None),  # type: ignore[union-attr]
+                                ),
+                                1,
+                            ),
+                            else_=0,
+                        )
+                    ).label("ignored_count"),
+                )
+                .where(LibraryFile.library_id.in_(ids))  # type: ignore[attr-defined]
+                .group_by(LibraryFile.library_id)
+            )
+        ).mappings()
+        aggregates = {int(values["library_id"]): values for values in aggregate_rows}
+
+        # SQLite 不支持 COUNT(DISTINCT col1, col2, col3)，先用子查询
+        # 对分集单元去重，再按库计数。全程在数据库内聚合，不把
+        # 大量台账行拉回 Python。
+        distinct_units = (
+            select(
+                LibraryFile.library_id.label("library_id"),
+                LibraryFile.media_item_id.label("media_item_id"),
+                LibraryFile.season_number.label("season_number"),
+                LibraryFile.episode_number.label("episode_number"),
+            )
+            .join(Library, Library.id == LibraryFile.library_id)
+            .where(
+                LibraryFile.library_id.in_(ids),  # type: ignore[attr-defined]
+                Library.kind == "tv",
+                present,
+                LibraryFile.media_item_id.is_not(None),  # type: ignore[union-attr]
+            )
+            .distinct()
+            .subquery()
+        )
+        episode_rows = (
+            await self._session.execute(
+                select(
+                    distinct_units.c.library_id,
+                    func.count().label("episode_count"),
+                ).group_by(distinct_units.c.library_id)
+            )
+        ).mappings()
+        episode_counts = {
+            int(values["library_id"]): int(values["episode_count"] or 0)
+            for values in episode_rows
+        }
+        libraries = list(
+            (
+                await self._session.execute(select(Library).where(Library.id.in_(ids)))  # type: ignore[attr-defined]
+            )
+            .scalars()
+            .all()
+        )
+        refreshed_at = utcnow()
+        for library in libraries:
+            values = aggregates.get(library.id or -1)
+            library.stats_item_count = int(values["item_count"] or 0) if values else 0
+            library.stats_episode_count = episode_counts.get(library.id or -1, 0)
+            library.stats_file_count = int(values["file_count"] or 0) if values else 0
+            library.stats_total_size_bytes = (
+                int(values["total_size_bytes"] or 0) if values else 0
+            )
+            library.stats_unidentified_count = (
+                int(values["unidentified_count"] or 0) if values else 0
+            )
+            library.stats_missing_count = int(values["missing_count"] or 0) if values else 0
+            library.stats_ignored_count = int(values["ignored_count"] or 0) if values else 0
+            library.stats_refreshed_at = refreshed_at
+        await self._session.commit()
 
     # -- 写入 --------------------------------------------------------------
 

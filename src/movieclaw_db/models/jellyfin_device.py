@@ -22,6 +22,11 @@ class JellyfinDevice(TimestampMixin, table=True):
 
     id: int | None = Field(default=None, primary_key=True)
 
+    # 归属身份（docs/design/member-management.md §3.7）：0 = 超管（哨兵，
+    # 与 playback_state.member_id 同约定，非外键）。协议侧没有 token_version
+    # 机制，停用/删除成员时由服务层直接删除其全部设备行。
+    member_id: int = Field(default=0, index=True, description="登录身份；0=超管")
+
     token: str = Field(unique=True, index=True, description="AccessToken（32 位 hex）")
     device_id: str = Field(
         unique=True, index=True, description="客户端上报的设备标识（重登录覆盖键）"

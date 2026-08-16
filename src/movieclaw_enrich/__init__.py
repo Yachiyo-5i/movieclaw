@@ -25,7 +25,11 @@ from __future__ import annotations
 import logging
 import re
 
-from movieclaw_enrich.extractors import EXTRACTORS, extract_subtitle_languages
+from movieclaw_enrich.extractors import (
+    _NO_SUBTITLE_RE,
+    EXTRACTORS,
+    extract_subtitle_languages,
+)
 from movieclaw_enrich.inference import extract_with_model
 from movieclaw_enrich.models import TorrentAttrs
 
@@ -58,7 +62,16 @@ logger = logging.getLogger("movieclaw_enrich")
 # v13: 字幕识别修误报/漏报：音轨守卫覆盖「简中」且不再吞掉「字幕语言：简体」；
 #      「无字幕组」不再当「无字幕」；配对/分隔桥接不跨句读与配音词；
 #      新增简日/简韩配对与 & 分隔符、「字幕：无」否定
-ENRICH_VERSION = 13
+# v14：全集标记正则补 Fin（大小写敏感，动漫 BDRip "01-12 Fin" 写法；FIN 芬兰
+#     国家代码与 fin 词内片段均不误伤）——配合标注规范 v13"英文完结词归正则
+#     通道"的裁决，见 docs/design/subtitle-audio-ner.md
+# v15：字幕/音轨识别切换模型通道（torrent-ner v2+ 的 SUBTITLE/AUDIO span +
+#     lang_decl 微解析器）：subtitle_languages 值域扩展为完整 BCP 47（含泛称
+#     "中字"→zh，选种规则按前缀匹配），新增 subtitle_carriers 与
+#     audio_languages；旧模型部署自动回落 v13 正则行为（仅 zh-Hans）；
+#     老否定正则转为护栏（模型判有+正则判无 → 否决并告警，供 guard_audit）。
+#     随 torrent-ner-v2 镜像基线一起发布，发布日志需提醒镜像升级
+ENRICH_VERSION = 15
 
 # 场景命名的两类粘连（站点生成器丢空格所致），喂模型前拆开：
 # ① 季号紧贴分辨率："S021080p" → "S02 1080p"
@@ -108,20 +121,54 @@ def enrich(title: str, subtitle: str = "", category: str | None = None) -> Torre
             if not _has_value(fields.get(key)):
                 fields[key] = value
 
-    # 字幕的明确否定需要跨主标题/副标题生效，例如标题带 CHS、描述却写「无字幕」。
-    # 其它技术字段仍保持逐段提取、主标题优先；字幕字段只对合并文本提取这一次
-    # （不在 EXTRACTORS 注册表里），失败与其它提取器同一铁律：只跳过自己。
-    try:
-        fields.update(extract_subtitle_languages("\n".join(filter(None, (title, subtitle)))))
-    except Exception:  # noqa: BLE001
-        logger.warning("字幕语言提取失败，已跳过：%.80r", title)
-
-    # 模型通道：片名/年份/季集/题材，双段联合推理一次产出。
+    # 模型通道：片名/年份/季集/题材，双段联合推理一次产出；v2+ 模型同时产出
+    # 字幕/音轨声明两轴（subtitle_decl_supported 能力位）。
     # 模型缺席/失败返回空字典，相关字段保持空值——绝不拖垮整条数据。
+    model_fields: dict = {}
     try:
-        fields.update(extract_with_model(title, subtitle) if title else {})
+        model_fields = extract_with_model(title, subtitle) if title else {}
     except Exception:  # noqa: BLE001
         logger.warning("模型提取失败，已跳过：%.80r", title)
+    model_decl = model_fields.pop("subtitle_decl_supported", False)
+    fields.update(model_fields)
+
+    merged_text = "\n".join(filter(None, (title, subtitle)))
+    if model_decl:
+        # 模型通道产出字幕/音轨字段。老正则的**否定判定**保留为确定性护栏跑一个
+        # 版本周期：模型给出语言但正则认定"无字幕"时否决并告警——冲突样本是
+        # guard_audit 四象限的素材，护栏存废由审计裁决（guard_killed_correct=0 后退役）
+        if fields.get("subtitle_languages") and _NO_SUBTITLE_RE.search(merged_text):
+            logger.warning(
+                "字幕护栏否决：模型判有字幕 %s 但否定正则命中：%.80r",
+                fields["subtitle_languages"], merged_text,
+            )
+            fields["subtitle_languages"] = []
+            fields["subtitle_carriers"] = []
+
+        # v2 把字幕语言扩展为完整集合，但简体中文这一维已有一套经过线上病例
+        # 打磨的高精度规则。模型在极短拉丁标签（CHS / ZHS / zh-Hans）上会
+        # 偶发漏圈，也可能把「简体中文配音」误圈到字幕轴。发布切换期用旧规则
+        # 对 zh-Hans 做双向校准：其它语言仍完全采用模型结果，不会退回 v13 的
+        # 单一语言能力；待下一轮模型吃回这些错例后再审计是否移除。
+        legacy_simplified = extract_subtitle_languages(merged_text).get(
+            "subtitle_languages", []
+        )
+        languages = list(fields.get("subtitle_languages", []))
+        legacy_has_simplified = "zh-Hans" in legacy_simplified
+        model_has_simplified = "zh-Hans" in languages
+        if legacy_has_simplified and not model_has_simplified:
+            languages.append("zh-Hans")
+        elif model_has_simplified and not legacy_has_simplified:
+            languages.remove("zh-Hans")
+        fields["subtitle_languages"] = languages
+    else:
+        # 旧模型（无 SUBTITLE/AUDIO 标签）回落正则通道：行为与 v13 一致，仅 zh-Hans。
+        # 字幕的明确否定需要跨主标题/副标题生效（标题带 CHS、描述写「无字幕」），
+        # 故只对合并文本提取一次；失败与其它提取器同一铁律：只跳过自己。
+        try:
+            fields.update(extract_subtitle_languages(merged_text))
+        except Exception:  # noqa: BLE001
+            logger.warning("字幕语言提取失败，已跳过：%.80r", title)
 
     attrs = TorrentAttrs(**fields)  # type: ignore[arg-type]
     # 影视类型仲裁：站点分类明确标注 movie/tv 时信站点（极少标错），

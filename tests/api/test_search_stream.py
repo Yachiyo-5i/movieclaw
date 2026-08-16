@@ -1,4 +1,4 @@
-"""SSE 流式搜索端点（GET /search/stream）的端到端测试。
+"""SSE 流式搜索端点（GET /search/torrents/stream）的端到端测试。
 
 覆盖：事件序列完整性（start → site_start × N → site_result/site_error × N → done）、
 快站先于慢站出结果（流式的核心价值）、单站失败被隔离成 site_error、
@@ -92,9 +92,10 @@ def client(tmp_path, monkeypatch):
 
     from movieclaw_api.api.deps import require_login
     from movieclaw_api.app import create_app
+    from movieclaw_api.services.auth import Principal
 
     app = create_app()
-    app.dependency_overrides[require_login] = lambda: "tester"
+    app.dependency_overrides[require_login] = lambda: Principal(kind="admin", name="tester")
     with TestClient(app) as c:
         yield c
     get_settings.cache_clear()
@@ -110,7 +111,7 @@ def test_stream_event_sequence(client: TestClient, monkeypatch) -> None:
         },
     )
 
-    resp = client.get("/api/v1/search/stream", params={"keyword": "沙丘"})
+    resp = client.get("/api/v1/search/torrents/stream", params={"keyword": "沙丘"})
     assert resp.status_code == 200
     assert resp.headers["content-type"].startswith("text/event-stream")
 
@@ -149,7 +150,7 @@ def test_stream_fast_site_arrives_before_slow(client: TestClient, monkeypatch) -
     )
 
     events = _parse_sse(
-        client.get("/api/v1/search/stream", params={"keyword": "沙丘"}).text
+        client.get("/api/v1/search/torrents/stream", params={"keyword": "沙丘"}).text
     )
     result_order = [d["site_id"] for e, d in events if e == "site_result"]
     assert result_order == ["fast", "slow"]
@@ -169,7 +170,7 @@ def test_stream_isolates_single_site_failure(client: TestClient, monkeypatch) ->
     )
 
     events = _parse_sse(
-        client.get("/api/v1/search/stream", params={"keyword": "奥本海默"}).text
+        client.get("/api/v1/search/torrents/stream", params={"keyword": "奥本海默"}).text
     )
     names = [e for e, _ in events]
     assert names.count("site_result") == 1
@@ -192,7 +193,7 @@ def test_stream_no_active_sites_yields_empty_done(client: TestClient, monkeypatc
     _wire(monkeypatch, {})
 
     events = _parse_sse(
-        client.get("/api/v1/search/stream", params={"keyword": "沙丘"}).text
+        client.get("/api/v1/search/torrents/stream", params={"keyword": "沙丘"}).text
     )
     assert [e for e, _ in events] == ["start", "done"]
     assert events[0][1]["sites"] == []
@@ -203,8 +204,11 @@ def test_stream_records_search_history(client: TestClient, monkeypatch) -> None:
     """流式搜索与阻塞版同口径落搜索历史（仅第 1 页）。"""
     _wire(monkeypatch, {"mteam": _FakeSite(items=[_item("m1", "沙丘")])})
 
-    client.get("/api/v1/search/stream", params={"keyword": "沙丘", "label": "电影"})
-    client.get("/api/v1/search/stream", params={"keyword": "沙丘", "label": "电影", "page": 2})
+    client.get("/api/v1/search/torrents/stream", params={"keyword": "沙丘", "label": "电影"})
+    client.get(
+        "/api/v1/search/torrents/stream",
+        params={"keyword": "沙丘", "label": "电影", "page": 2},
+    )
 
     history = client.get("/api/v1/search/history").json()["data"]
     assert len(history) == 1
@@ -217,7 +221,7 @@ def test_stream_no_history_skips_recording(client: TestClient, monkeypatch) -> N
     _wire(monkeypatch, {"mteam": _FakeSite(items=[_item("m1", "沙丘")])})
 
     resp = client.get(
-        "/api/v1/search/stream",
+        "/api/v1/search/torrents/stream",
         params={"keyword": "沙丘", "label": "隐私分类", "no_history": "true"},
     )
     events = _parse_sse(resp.text)

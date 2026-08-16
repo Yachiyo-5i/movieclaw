@@ -326,7 +326,7 @@ class WeixinChannelService:
         session_id = await self._ensure_agent_session(msg)
         history = store.build_history(session_id)
         recorder = AgentSessionRecorder(store, session_id, entry_count=len(history))
-        await recorder.record_user_input(msg.text)
+        await recorder.record_user_message(msg.text)
 
         runner = AgentRunner(
             llm_router,

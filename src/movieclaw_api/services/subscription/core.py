@@ -4,8 +4,8 @@
 
 - **初始化**：``_expected_units`` 按订阅参数展开期望单元，``_schedule_for`` 给每个
   单元写死调度语义（补旧=now / 追新=air_date+宽限 / 未定档=NULL）；
-- **diff 重算**：修改订阅时新增缺的、删掉出域且未完成的，**已 grabbed 的永不回收**
-  （不变量③：现实不可逆）。
+- **diff 重算**：修改订阅时新增缺的、切换既有工单的 ``in_scope``；状态与投递
+  历史不回退，退出范围的单元停止搜索、观察与救援。
 
 订阅状态是派生值（不变量④）：``_recompute_status`` 随时可从工单集合重算，
 paused 是用户显式操作、重算不碰它。
@@ -15,21 +15,37 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
+from statistics import median
 from types import EllipsisType
 
+from sqlalchemy import and_, or_
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlmodel import select
 
-from movieclaw_api.exceptions import BadRequestException, NotFoundException
+from movieclaw_api.exceptions import (
+    BadRequestException,
+    ForbiddenException,
+    NotFoundException,
+)
 from movieclaw_api.services.media_library import MediaLibraryService
 from movieclaw_api.services.rule_sets import RuleSetService
+from movieclaw_api.services.subscription.matching import publish_calendar_date
+from movieclaw_api.services.subscription.release_forecast import (
+    next_forecast_probe_times_by_wanted,
+    refresh_release_forecasts,
+)
+from movieclaw_api.services.system_notice import resolve_notices
 from movieclaw_db.models import (
     ActivityType,
+    DownloadAttemptStatus,
     MediaEpisode,
     MediaItem,
     MediaSeason,
+    SiteTorrent,
     Subscription,
     SubscriptionActivity,
+    SubscriptionDownloadAttempt,
     SubscriptionStatus,
     WantedItem,
     WantedStatus,
@@ -49,8 +65,26 @@ logger = logging.getLogger("movieclaw_api.subscription")
 # 被动匹配通常在到点前满足工单；真到点仍缺的，worker 捞起即漏抓兜底。
 FUTURE_GRACE = timedelta(hours=48)
 
+# 首页“预计入库”在缺少本剧历史样本时使用的冷启动值。出现真实入库记录后，
+# 会自动切换成该订阅自己的中位耗时，不把这个展示层兜底写进预测快照。
+_DEFAULT_RELEASE_TO_IMPORT_MINUTES = 60
+_DEFAULT_DOWNLOAD_TO_IMPORT_MINUTES = 10
+
 # 剧集完结类 status：期望集合不再生长的判定输入之一
 _ENDED_STATUSES = frozenset({"Ended", "Canceled"})
+
+
+def _payload_time(value: object) -> datetime | None:
+    """解析活动 payload 中冻结的 UTC 时间；老活动或坏数据安全返回 None。"""
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed
+    return parsed.astimezone(UTC).replace(tzinfo=None)
 
 
 @dataclass(frozen=True)
@@ -60,6 +94,46 @@ class ExpectedUnit:
     season_number: int
     episode_number: int
     air_date: date | None
+
+
+@dataclass(frozen=True)
+class TodayArrivalCandidate:
+    """订阅首页的一行待入库剧集，以及由本剧历史得出的耗时基线。"""
+
+    subscription: Subscription
+    media: MediaItem
+    wanted: WantedItem
+    next_probe_at: datetime | None
+    release_to_import_minutes: int
+    download_to_import_minutes: int
+
+
+def _median_pipeline_minutes(
+    rows: list[WantedItem],
+    *,
+    start_field: str,
+    end_field: str,
+    fallback: int,
+    maximum: timedelta,
+) -> int:
+    """从已完成工单取中位耗时；异常长链路不参与首页的日内时间估算。"""
+    durations: list[float] = []
+    for row in rows:
+        start = getattr(row, start_field)
+        end = getattr(row, end_field)
+        if not isinstance(start, datetime) or not isinstance(end, datetime):
+            continue
+        elapsed = end - start
+        if timedelta(0) < elapsed <= maximum:
+            durations.append(elapsed.total_seconds() / 60)
+    return max(1, round(median(durations))) if durations else fallback
+
+
+def _forecast_predicted_at(wanted: WantedItem) -> datetime | None:
+    forecast = wanted.release_forecast
+    if not isinstance(forecast, dict):
+        return None
+    return _payload_time(forecast.get("predicted_at"))
 
 
 def expected_units(
@@ -74,7 +148,7 @@ def expected_units(
 
     集数据来自 ``media_episode`` 表（集数据唯一事实源，metadata.md 第 1 节）。
     追新的锚定取**评估时刻**而非订阅创建时刻：创建时二者等价；后来才打开
-    追新开关时，不回补开关关闭期间播出的集（用户此刻的意图是"从现在起追"）。
+    自动续订开关时，不回补开关关闭期间播出的集（用户此刻的意图是"从现在起追"）。
     更早的历史集通过勾选季表达。特别季 0 仅显式勾选才纳入。
     """
     if kind is MediaKind.MOVIE:
@@ -130,7 +204,7 @@ async def recompute_subscription_status(
         return
     assert subscription.id is not None
     repo = SubscriptionRepository(session)
-    wanted = await repo.list_wanted(subscription.id)
+    wanted = await repo.list_wanted(subscription.id, in_scope_only=True)
 
     def _is_open(w: WantedItem) -> bool:
         if w.status == WantedStatus.WANTED:
@@ -207,10 +281,26 @@ class SubscriptionService:
         rule_set_id: int | None = None,
         library_id: int | None = None,
         douban_id: str | None = None,
+        member_id: int | None = None,
     ) -> Subscription:
-        """创建订阅并生成初始工单。同一条目已有订阅时幂等返回已有（不改参数）。"""
+        """创建订阅并生成初始工单。同一条目已有订阅时幂等返回已有（不改参数）。
+
+        ``member_id``：发起成员（None=超管）。已有订阅时成员的"再订"转为
+        **关注**（docs/design/member-management.md §3.5）——订阅出现在他的
+        列表里，期望集合 E 不变，一份下载全家共享。
+        """
         item, seasons, existing = await self.prepare(kind, tmdb_id, douban_id=douban_id)
         if existing is not None:
+            assert existing.id is not None
+            is_new_follower = (
+                member_id is not None
+                and existing.created_by_member_id != member_id
+                and await self._repo.add_follower(existing.id, member_id)
+            )
+            if is_new_follower:
+                await self._log(
+                    existing, ActivityType.CREATED, "有成员关注了本订阅（共享同一份下载）"
+                )
             logger.info("条目《%s》已有订阅 #%s，幂等返回", item.title, existing.id)
             return existing
         assert item.id is not None
@@ -247,6 +337,7 @@ class SubscriptionService:
                 rule_set_id=rule_set_id,
                 library_id=library_id,
                 status=SubscriptionStatus.ACTIVE,
+                created_by_member_id=member_id,
             )
         )
         assert subscription.id is not None
@@ -277,8 +368,9 @@ class SubscriptionService:
             },
         )
         await self._recompute_status(subscription, item)
+        await refresh_release_forecasts(self._session, media_item_ids={item.id})
         logger.info(
-            "已订阅《%s》(%s)：勾选季 %s，追新 %s，生成工单 %d 个",
+            "已订阅《%s》(%s)：勾选季 %s，自动续订 %s，生成工单 %d 个",
             item.title,
             kind.value,
             selected or "无",
@@ -301,17 +393,16 @@ class SubscriptionService:
         rule_set_id: int | None = None,
         library_id: int | None | EllipsisType = ...,
     ) -> Subscription:
-        """修改 E 的定义（季选择/追新/规则组/入库目标库），diff 重算工单。
+        """修改 E 的定义（季选择/自动续订/规则组/入库目标库），diff 重算工单。
 
         ``library_id`` 用 ``...``（Ellipsis）作「未传=不变」的哨兵：显式传 None
         表示清除指定库、改回按默认库路由——旧订阅（library_id 为空）需要这条
         双向通道。
 
         diff 规则（不变量③）：
-        - 新入域的单元 → 补工单（调度语义按当下重新判定）；
-        - 出域且 status=wanted 的 → 删除；
-        - **已 grabbed/downloaded 的一律保留**——现实不可逆，重新入域时也
-          因此不会重复下载。
+        - 新入域且从未见过的单元 → 补工单；
+        - 已存在的单元只切换 ``in_scope``，不回退状态、不删除投递历史；
+        - 尝试没有任何入域目标时同步取消观察与换源，但不删除下载器任务。
         """
         subscription = await self._get_or_404(subscription_id)
         item = await self._media_repo_get(subscription.media_item_id)
@@ -363,46 +454,202 @@ class SubscriptionService:
                 and (w.air_date is None or w.air_date > created_date)
             )
 
-        to_remove = [
-            w
-            for w in existing
-            if w.status == WantedStatus.WANTED
-            and (w.season_number, w.episode_number) not in expected_keys
-            and w.season_number not in selected_set
-            and not _protected_by_follow(w)
-        ]
+        def _should_be_in_scope(w: WantedItem) -> bool:
+            return (
+                (w.season_number, w.episode_number) in expected_keys
+                or w.season_number in selected_set
+                or _protected_by_follow(w)
+            )
 
-        await self._repo.save(subscription)
-        if to_add:
-            await self._repo.add_wanted(to_add)
-        if to_remove:
-            await self._repo.delete_wanted(to_remove)
+        reactivated = 0
+        deactivated = 0
+        now = utcnow()
+        for row in existing:
+            target_scope = _should_be_in_scope(row)
+            if row.in_scope == target_scope:
+                continue
+            row.in_scope = target_scope
+            if target_scope:
+                reactivated += 1
+                # 退出范围期间不应消耗搜索机会；重新纳入的已播缺口立即可搜。
+                if (
+                    row.status == WantedStatus.WANTED
+                    and row.air_date is not None
+                    and row.air_date <= now.date()
+                ):
+                    row.search_attempts = 0
+                    row.next_search_at = now
+            else:
+                deactivated += 1
+            self._session.add(row)
+
+        subscription.updated_at = now
+        self._session.add(subscription)
+        for row in to_add:
+            self._session.add(row)
+        await self._session.flush()
+        cancelled_attempts, resumed_attempts, cancelled_hashes = (
+            await self._reconcile_attempt_scope(
+                subscription_id, [*existing, *to_add], now=now
+            )
+        )
+        await self._session.commit()
+        await self._session.refresh(subscription)
+        for info_hash in cancelled_hashes:
+            await resolve_notices(
+                self._session,
+                dedupe_key=f"subscription.landing:{subscription_id}:{info_hash}",
+            )
         season_text = self._season_text(list(subscription.selected_seasons))
         rule_note = f"，规则组改为「{new_rule_set.name}」" if new_rule_set is not None else ""
         await self._log(
             subscription,
             ActivityType.ADJUSTED,
-            f"调整订阅：勾选{season_text}，持续追新{'开' if subscription.follow_future else '关'}"
-            f"{rule_note}；补 {len(to_add)} 个工单，移除 {len(to_remove)} 个未完成工单"
-            "（已提交下载的保留，不会重复下载）",
+            f"调整订阅：勾选{season_text}，自动续订{'开' if subscription.follow_future else '关'}"
+            f"{rule_note}；新增 {len(to_add)} 个单元，重新纳入 {reactivated} 个，"
+            f"退出范围 {deactivated} 个"
+            "（下载器任务不会自动删除；退出范围后停止搜索与换源）",
             payload={
                 "selected_seasons": list(subscription.selected_seasons),
                 "follow_future": subscription.follow_future,
                 "rule_set_id": subscription.rule_set_id,
                 "added": len(to_add),
-                "removed": len(to_remove),
+                "reactivated": reactivated,
+                "deactivated": deactivated,
+                "cancelled_attempts": cancelled_attempts,
+                "resumed_attempts": resumed_attempts,
             },
         )
         await self._recompute_status(subscription, item)
+        await refresh_release_forecasts(
+            self._session, media_item_ids={subscription.media_item_id}
+        )
         logger.info(
-            "订阅 #%s 已调整：补工单 %d 个，移除未完成工单 %d 个",
+            "订阅 #%s 已调整：新增 %d 个，重新纳入 %d 个，退出范围 %d 个，取消尝试 %d 个",
             subscription_id,
             len(to_add),
-            len(to_remove),
+            reactivated,
+            deactivated,
+            cancelled_attempts,
         )
-        if to_add:
+        if to_add or reactivated:
             self._kick_search()  # diff 可能补了新的补旧工单，同样立即发车
         return subscription
+
+    async def set_follow_future(self, subscription_id: int, enabled: bool) -> Subscription:
+        """独立开启/关闭剧集自动续订；重复设置同一状态保持幂等。"""
+        subscription = await self._get_or_404(subscription_id)
+        if MediaKind(subscription.kind) is not MediaKind.TV:
+            raise BadRequestException("只有剧集订阅可以设置自动续订")
+        if subscription.follow_future == enabled:
+            return subscription
+        return await self.update(subscription_id, follow_future=enabled)
+
+    async def _reconcile_attempt_scope(
+        self,
+        subscription_id: int,
+        wanted_rows: list[WantedItem],
+        *,
+        now: datetime,
+    ) -> tuple[int, int, set[str]]:
+        """让下载尝试与当前范围同步，但绝不替用户删除下载器里的任务。
+
+        一个季包可能覆盖多个单元，因此只在尝试已没有任何入域在途目标时取消；
+        重新勾选季则恢复原主尝试，继续使用既有 infohash，避免重复投递。试用源
+        是一次性救援过程，退出范围后不自动恢复，后续由主源重新触发救援。
+        """
+        result = await self._session.execute(
+            select(SubscriptionDownloadAttempt).where(
+                SubscriptionDownloadAttempt.subscription_id == subscription_id
+            )
+        )
+        attempts = list(result.scalars().all())
+        by_id = {row.id: row for row in attempts if row.id is not None}
+        children_by_parent: dict[int, list[SubscriptionDownloadAttempt]] = {}
+        for row in attempts:
+            if row.replaces_attempt_id is not None:
+                children_by_parent.setdefault(row.replaces_attempt_id, []).append(row)
+        active_statuses = {
+            DownloadAttemptStatus.ACTIVE,
+            DownloadAttemptStatus.REPLACEMENT_PENDING,
+            DownloadAttemptStatus.TRIAL,
+            DownloadAttemptStatus.CLEANUP_PENDING,
+            DownloadAttemptStatus.COMPLETED,
+        }
+
+        def _units(row: SubscriptionDownloadAttempt) -> set[tuple[int, int]]:
+            units: set[tuple[int, int]] = set()
+            for unit in row.units:
+                if isinstance(unit, (list, tuple)) and len(unit) == 2:
+                    try:
+                        units.add((int(unit[0]), int(unit[1])))
+                    except (TypeError, ValueError):
+                        continue
+            return units
+
+        def _targets(row: SubscriptionDownloadAttempt) -> list[WantedItem]:
+            source_hashes = {row.info_hash.lower()}
+            if (
+                row.status == DownloadAttemptStatus.TRIAL
+                and row.replaces_attempt_id is not None
+            ):
+                parent = by_id.get(row.replaces_attempt_id)
+                if parent is not None:
+                    # 试用阶段工单仍指向旧源；只有晋升成功后才改成试用源 hash。
+                    source_hashes = {parent.info_hash.lower()}
+            elif row.status == DownloadAttemptStatus.CLEANUP_PENDING and row.id is not None:
+                # 已晋升时旧源不再直接持有工单，但仍由活动子尝试接管。普通订阅
+                # 更新不能把这段谱系误判成“无目标”，否则会打断幂等清理。
+                source_hashes.update(
+                    child.info_hash.lower()
+                    for child in children_by_parent.get(row.id, [])
+                    if child.status
+                    in (DownloadAttemptStatus.ACTIVE, DownloadAttemptStatus.COMPLETED)
+                )
+            scoped_units = _units(row)
+            return [
+                wanted
+                for wanted in wanted_rows
+                if wanted.in_scope
+                and wanted.status in (WantedStatus.GRABBED, WantedStatus.DOWNLOADED)
+                and (wanted.info_hash or "").lower() in source_hashes
+                and (
+                    not scoped_units
+                    or (wanted.season_number, wanted.episode_number) in scoped_units
+                )
+            ]
+
+        cancelled = 0
+        resumed = 0
+        cancelled_hashes: set[str] = set()
+        for attempt in attempts:
+            targets = _targets(attempt)
+            if not targets and attempt.status in active_statuses:
+                attempt.status = DownloadAttemptStatus.CANCELLED
+                attempt.next_search_at = None
+                attempt.cleanup_note = "关联单元已退出当前订阅范围；保留下载器任务，不再观察或换源"
+                self._session.add(attempt)
+                cancelled += 1
+                cancelled_hashes.add(attempt.info_hash.lower())
+                continue
+            if (
+                targets
+                and attempt.status == DownloadAttemptStatus.CANCELLED
+            ):
+                # 未晋升的试用源在 CANCELLED 状态下按自身 hash 找不到目标，不会
+                # 复活；已经晋升并成为当前主源的子尝试则应随重新勾选立即恢复。
+                attempt.status = (
+                    DownloadAttemptStatus.COMPLETED
+                    if all(row.status == WantedStatus.DOWNLOADED for row in targets)
+                    else DownloadAttemptStatus.ACTIVE
+                )
+                attempt.last_progress_at = now
+                attempt.missing_observations = 0
+                attempt.next_search_at = None
+                attempt.cleanup_note = None
+                self._session.add(attempt)
+                resumed += 1
+        return cancelled, resumed, cancelled_hashes
 
     # ------------------------------------------------------------------
     # 状态操作与查询
@@ -492,7 +739,7 @@ class SubscriptionService:
             raise BadRequestException("订阅已暂停，请先恢复追踪再触发搜索")
         now = utcnow()
         today = now.date()
-        wanted = await self._repo.list_wanted(subscription_id)
+        wanted = await self._repo.list_wanted(subscription_id, in_scope_only=True)
         reset = 0
         for w in wanted:
             if w.status != WantedStatus.WANTED or w.next_search_at is None:
@@ -530,20 +777,89 @@ class SubscriptionService:
         await self._log(subscription, ActivityType.RESUMED, "已恢复追踪")
         item = await self._media_repo_get(subscription.media_item_id)
         await self._recompute_status(subscription, item)
+        await refresh_release_forecasts(
+            self._session, media_item_ids={subscription.media_item_id}
+        )
         self._kick_search()  # 暂停期间积压的到期工单立即处理
         return subscription
 
-    async def delete(self, subscription_id: int) -> None:
-        """删除订阅（工单级联删除；不动已下载内容与下载器任务）。"""
+    async def assert_can_manage(self, subscription_id: int, member_id: int | None) -> None:
+        """归属校验：修改/暂停订阅只有发起人与超管可以（§3.5）。
+
+        ``member_id`` 为 None（超管/PAT/Agent）直通；成员不是发起人时给
+        可读中文错误——他能做的是取消关注，而不是改别人的订阅参数。
+        """
+        if member_id is None:
+            return
+        subscription = await self._get_or_404(subscription_id)
+        if subscription.created_by_member_id != member_id:
+            raise ForbiddenException(
+                "只有订阅的发起人（或管理员）可以调整它；如不想再追，可在列表里取消关注"
+            )
+
+    async def unsubscribe(self, subscription_id: int, *, member_id: int) -> str:
+        """让成员停止关注订阅，返回可直接展示的结果描述。
+
+        这里表达的是成员的“退出”意图，不是管理员删除资源：
+        - 非发起人 → 只删自己的关注行，订阅不受影响；
+        - 发起人且仍有关注者 → 发起人转移给最早的关注者，订阅继续活着——
+          成员的取消永远不影响别人正在追的内容；
+        - 发起人且无关注者 → 真删。
+        """
+        subscription = await self._get_or_404(subscription_id)
+        if subscription.created_by_member_id != member_id:
+            if await self._repo.remove_follower(subscription_id, member_id):
+                logger.info("成员 #%d 已取消关注订阅 #%d", member_id, subscription_id)
+                return "已取消关注；订阅本身不受影响"
+            raise ForbiddenException(
+                "只有订阅的发起人（或管理员）可以删除它；你当前也没有关注本订阅"
+            )
+        followers = await self._repo.follower_member_ids(subscription_id)
+        if followers:
+            heir = followers[0]
+            subscription.created_by_member_id = heir
+            await self._repo.save(subscription)
+            await self._repo.remove_follower(subscription_id, heir)
+            await self._log(
+                subscription, ActivityType.CREATED, "发起人退出，订阅转由最早的关注者接管"
+            )
+            logger.info(
+                "订阅 #%d 发起人 #%d 退出，转移给成员 #%d", subscription_id, member_id, heir
+            )
+            return "你已退出；订阅转由其他关注的家人继续追更"
+        await self._repo.delete(subscription)
+        logger.info("成员 #%d 退出并删除无人关注的订阅 #%d", member_id, subscription_id)
+        return "已取消订阅"
+
+    async def delete_permanently(self, subscription_id: int) -> str:
+        """管理员永久删除订阅记录与工单，不影响已下载文件或下载器任务。"""
         subscription = await self._get_or_404(subscription_id)
         await self._repo.delete(subscription)
-        logger.info("订阅 #%s 已删除", subscription_id)
+        logger.info("管理员已永久删除订阅 #%d", subscription_id)
+        return "订阅已永久删除；已下载内容不受影响"
+
+    async def delete(self, subscription_id: int, *, member_id: int | None = None) -> str:
+        """兼容旧调用；新代码应明确选择 ``unsubscribe`` 或 ``delete_permanently``。"""
+        if member_id is None:
+            return await self.delete_permanently(subscription_id)
+        return await self.unsubscribe(subscription_id, member_id=member_id)
 
     async def list_with_progress(
-        self, *, kind: str | None = None
+        self, *, kind: str | None = None, member_id: int | None = None
     ) -> list[tuple[Subscription, MediaItem, dict[str, int]]]:
-        """列表页数据：订阅 + 条目 + 工单状态分布（一次分组统计，不逐条查）。"""
+        """列表页数据：订阅 + 条目 + 工单状态分布（一次分组统计，不逐条查）。
+
+        ``member_id``：成员视角只看"自己发起的 + 自己关注的"；None=全部
+        （超管视角）。
+        """
         subscriptions = await self._repo.list_all(kind=kind)
+        if member_id is not None:
+            followed = await self._repo.followed_subscription_ids(member_id)
+            subscriptions = [
+                s
+                for s in subscriptions
+                if s.created_by_member_id == member_id or s.id in followed
+            ]
         counts = await self._repo.count_wanted_by_status(
             [s.id for s in subscriptions if s.id is not None]
         )
@@ -553,13 +869,175 @@ class SubscriptionService:
             rows.append((sub, item, counts.get(sub.id or -1, {})))
         return rows
 
+    async def today_arrivals(self, *, member_id: int | None = None) -> list[TodayArrivalCandidate]:
+        """聚合今天待播或仍在下载/整理中的可见剧集，不查询外部下载器。
+
+        资源预测只负责给出“何时可能出种”。首页把本订阅过往的
+        ``投递→入库`` 中位耗时叠加上去，得到面向用户的预计入库时间；
+        下载中的实时 ETA 由 Web 已有的全局下载快照进一步覆盖。
+        """
+        visible = await self.list_with_progress(kind=MediaKind.TV.value, member_id=member_id)
+        subscriptions = {
+            sub.id: (sub, media) for sub, media, _counts in visible if sub.id is not None
+        }
+        wanted_rows = await self._repo.list_wanted_many(list(subscriptions), in_scope_only=True)
+        next_probe_by_wanted = await next_forecast_probe_times_by_wanted(
+            self._session,
+            wanted_items=[row for row in wanted_rows if row.status == WantedStatus.WANTED],
+        )
+        by_subscription: dict[int, list[WantedItem]] = {}
+        for wanted in wanted_rows:
+            by_subscription.setdefault(wanted.subscription_id, []).append(wanted)
+
+        today = publish_calendar_date(utcnow())
+        candidates: list[TodayArrivalCandidate] = []
+        for subscription_id, (subscription, media) in subscriptions.items():
+            rows = by_subscription.get(subscription_id, [])
+            release_to_import = _median_pipeline_minutes(
+                rows,
+                start_field="grabbed_at",
+                end_field="imported_at",
+                fallback=_DEFAULT_RELEASE_TO_IMPORT_MINUTES,
+                maximum=timedelta(days=7),
+            )
+            download_to_import = _median_pipeline_minutes(
+                rows,
+                start_field="downloaded_at",
+                end_field="imported_at",
+                fallback=_DEFAULT_DOWNLOAD_TO_IMPORT_MINUTES,
+                maximum=timedelta(days=1),
+            )
+            for wanted in rows:
+                in_pipeline = wanted.status in (
+                    WantedStatus.GRABBED,
+                    WantedStatus.DOWNLOADED,
+                )
+                if in_pipeline:
+                    # 模拟投递没有后续下载/入库链路，不应伪装成首页的“下载中”。
+                    if wanted.info_hash is None:
+                        continue
+                elif wanted.status == WantedStatus.WANTED:
+                    if subscription.status != SubscriptionStatus.ACTIVE:
+                        continue
+                    predicted = _forecast_predicted_at(wanted)
+                    predicted_import_day = (
+                        publish_calendar_date(predicted + timedelta(minutes=release_to_import))
+                        if predicted is not None
+                        else None
+                    )
+                    if wanted.air_date != today and predicted_import_day != today:
+                        continue
+                else:
+                    continue
+
+                candidates.append(
+                    TodayArrivalCandidate(
+                        subscription=subscription,
+                        media=media,
+                        wanted=wanted,
+                        next_probe_at=next_probe_by_wanted.get(wanted.id or -1),
+                        release_to_import_minutes=release_to_import,
+                        download_to_import_minutes=download_to_import,
+                    )
+                )
+
+        status_order = {
+            WantedStatus.DOWNLOADED: 0,
+            WantedStatus.GRABBED: 1,
+            WantedStatus.WANTED: 2,
+        }
+        candidates.sort(
+            key=lambda row: (
+                status_order.get(row.wanted.status, 9),
+                _forecast_predicted_at(row.wanted) or datetime.max,
+                row.media.title,
+                row.wanted.season_number,
+                row.wanted.episode_number,
+            )
+        )
+        return candidates
+
     async def detail(
         self, subscription_id: int
     ) -> tuple[Subscription, MediaItem, list[WantedItem]]:
         subscription = await self._get_or_404(subscription_id)
         item = await self._media_repo_get(subscription.media_item_id)
-        wanted = await self._repo.list_wanted(subscription_id)
+        wanted = await self._repo.list_wanted(subscription_id, in_scope_only=True)
         return subscription, item, wanted
+
+    async def resource_timings(
+        self, subscription_id: int
+    ) -> dict[tuple[int, int], dict[str, object]]:
+        """按季集返回最近一次成功投递的资源时间链。
+
+        新活动直接读取冻结快照；上线前的老活动没有这些键时，再用其
+        ``site_id/torrent_id`` 从现存 ``site_torrent`` 回补发布时间和首次索引
+        时间。站点索引已经被删除的老记录自然降级，不伪造耗时。
+        """
+        activities = await self._repo.list_grabbed_activities(subscription_id)
+        if not activities:
+            return {}
+
+        legacy_refs: dict[str, set[str]] = {}
+        for activity in activities:
+            payload = activity.payload
+            site_id = payload.get("site_id")
+            torrent_id = payload.get("torrent_id")
+            if not isinstance(site_id, str) or not isinstance(torrent_id, str):
+                continue
+            if not payload.get("resource_publish_time") or not payload.get(
+                "resource_first_seen_at"
+            ):
+                legacy_refs.setdefault(site_id, set()).add(torrent_id)
+
+        indexed: dict[tuple[str, str], SiteTorrent] = {}
+        if legacy_refs:
+            conditions = [
+                and_(
+                    SiteTorrent.site_id == site_id,
+                    SiteTorrent.torrent_id.in_(torrent_ids),  # type: ignore[union-attr]
+                )
+                for site_id, torrent_ids in legacy_refs.items()
+            ]
+            rows = await self._session.execute(select(SiteTorrent).where(or_(*conditions)))
+            indexed = {(row.site_id, row.torrent_id): row for row in rows.scalars().all()}
+
+        result: dict[tuple[int, int], dict[str, object]] = {}
+        for activity in activities:
+            payload = activity.payload
+            site_id = payload.get("site_id")
+            torrent_id = payload.get("torrent_id")
+            if not isinstance(site_id, str) or not isinstance(torrent_id, str):
+                continue
+            torrent = indexed.get((site_id, torrent_id))
+            publish_time = _payload_time(payload.get("resource_publish_time"))
+            first_seen_at = _payload_time(payload.get("resource_first_seen_at"))
+            submitted_at = _payload_time(payload.get("submitted_at")) or activity.created_at
+            if publish_time is None and torrent is not None:
+                publish_time = torrent.publish_time
+            if first_seen_at is None and torrent is not None:
+                first_seen_at = torrent.created_at
+
+            units = payload.get("units")
+            if not isinstance(units, list):
+                continue
+            timing: dict[str, object] = {
+                "site_id": site_id,
+                "torrent_id": torrent_id,
+                "publish_time": publish_time,
+                "first_seen_at": first_seen_at,
+                "submitted_at": submitted_at,
+                "dry_run": payload.get("dry_run") is True,
+            }
+            for unit in units:
+                if (
+                    isinstance(unit, list)
+                    and len(unit) == 2
+                    and all(isinstance(number, int) for number in unit)
+                ):
+                    # 活动按最新在前；重新下载过的单元只展示最近一次拉取耗时。
+                    result.setdefault((unit[0], unit[1]), timing)
+        return result
 
     # ------------------------------------------------------------------
     # 工单构造与派生状态（核心逻辑在模块级函数，服务只做委托）
@@ -638,7 +1116,7 @@ class SubscriptionService:
         detail = "；".join(parts) if parts else "暂无待办集"
         return (
             f"创建订阅《{item.title}》：勾选{self._season_text(selected)}，"
-            f"持续追新{'开' if follow_future else '关'}；"
+            f"自动续订{'开' if follow_future else '关'}；"
             f"共生成 {len(rows)} 个追踪项——{detail}"
         )
 
@@ -708,5 +1186,3 @@ class SubscriptionService:
         if item is None:  # 外键保证下理论不可达
             raise NotFoundException("订阅关联的媒体条目不存在")
         return item
-
-

@@ -93,6 +93,18 @@ class RuleSetSpec(BaseModel):
     hr_unknown_policy: HrUnknownPolicy = Field(
         default=HrUnknownPolicy.LENIENT, description="H&R 未知时的策略"
     )
+    # 字幕/音轨语言要求（BCP 47，前缀匹配：要求 "zh" 命中 zh/zh-Hans/zh-Hant，
+    # 要求 "zh-Hans" 只命中简体）。声明式匹配：任一命中即过；规则非空而资源
+    # **未声明**该轴时按不合格处理——与 resolution/codec 的未知语义一致，
+    # 自动选种精确率优先。识别来源见 movieclaw_enrich.lang_decl（torrent-ner v2）
+    subtitle_languages_require: list[str] = Field(
+        default_factory=list,
+        description="要求的字幕语言（任一命中即过，如 [\"zh\"]=要中文字幕）；空=不限",
+    )
+    audio_languages_require: list[str] = Field(
+        default_factory=list,
+        description="要求的音轨语言（任一命中即过，如 [\"cmn\"]=要国语）；空=不限",
+    )
 
     # -- 预留（本期不消费，字段先占位保证 spec 向前兼容）--------------------
     sites: list[str] = Field(

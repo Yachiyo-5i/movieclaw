@@ -1,8 +1,8 @@
 """「订阅止于投递」两半的测试：库存对账关闭工单 + 投递救援巡检。
 
 订阅不再亲自跟踪完成与搬运：工单完成状态由 library_file 库存对账推导
-（任何入库路径都能关闭工单）；订阅只照看投递结果的死活（种子被删/卡死
-→ 退回重新找资源）。
+（任何入库路径都能关闭工单）；订阅只照看投递结果的死活，并在完成字节
+连续 15/30 分钟不增长时提醒/自动试用同品质替代源。
 """
 
 from __future__ import annotations
@@ -19,12 +19,16 @@ from movieclaw_api.services.subscription.wanted_fulfillment import close_fulfill
 from movieclaw_db.engine import dispose_db, get_database, init_db
 from movieclaw_db.migrations import run_migrations
 from movieclaw_db.models import (
+    DownloadAttemptStatus,
     FileSource,
     LibraryFile,
     MediaItem,
     RuleSet,
+    SiteTorrent,
     Subscription,
     SubscriptionActivity,
+    SubscriptionDownloadAttempt,
+    TorrentSource,
     WantedItem,
     WantedStatus,
     utcnow,
@@ -168,61 +172,192 @@ async def test_inventory_ignores_unrelated_units(db):
 
 
 @pytest.mark.asyncio
-async def test_rescue_requeues_missing_torrent(db, monkeypatch):
-    """救援巡检：种子在下载器中消失 → 工单退回 wanted 并记活动。"""
+async def test_rescue_does_not_treat_unreachable_downloader_as_missing(db, monkeypatch):
+    """所有下载器不可达只表示未知，不能清空工单或累计缺失次数。"""
     _library_id, _item_id, sub_id, wanted_id = await _seed(db)
 
-    async def query_none(info_hash, downloaders):
-        return None
+    async def lookup_unknown(*args, **kwargs):
+        return progress_mod._TorrentLookup(match=None, reachable_count=0)
 
-    monkeypatch.setattr(progress_mod, "_query_torrent", query_none)
+    monkeypatch.setattr(progress_mod, "_lookup_torrent", lookup_unknown)
     await progress_mod._rescue_group(sub_id, "abc123", downloaders=[])
 
     async with db.session() as session:
         wanted = await session.get(WantedItem, wanted_id)
-        assert wanted.status == WantedStatus.WANTED
-        assert wanted.info_hash is None
-        assert wanted.next_search_at is not None
+        assert wanted.status == WantedStatus.GRABBED
+        assert wanted.info_hash == "abc123"
+        attempt = (
+            await session.execute(
+                select(SubscriptionDownloadAttempt).where(
+                    SubscriptionDownloadAttempt.subscription_id == sub_id
+                )
+            )
+        ).scalar_one()
+        assert attempt.last_downloader_state == "unknown"
+        assert attempt.missing_observations == 0
+
+
+@pytest.mark.asyncio
+async def test_reachable_missing_requires_three_observations_before_warning(db, monkeypatch):
+    """下载器可达但查无任务要连续确认三次，且仍保留旧 infohash。"""
+    stale = utcnow() - timedelta(minutes=20)
+    _library_id, _item_id, sub_id, wanted_id = await _seed(db, grabbed_at=stale)
+
+    async def lookup_missing(*args, **kwargs):
+        return progress_mod._TorrentLookup(match=None, reachable_count=1)
+
+    monkeypatch.setattr(progress_mod, "_lookup_torrent", lookup_missing)
+    for _ in range(3):
+        await progress_mod._rescue_group(sub_id, "abc123", downloaders=[])
+
+    async with db.session() as session:
+        wanted = await session.get(WantedItem, wanted_id)
+        assert wanted.status == WantedStatus.GRABBED
+        assert wanted.info_hash == "abc123"
+        attempt = (
+            await session.execute(
+                select(SubscriptionDownloadAttempt).where(
+                    SubscriptionDownloadAttempt.subscription_id == sub_id
+                )
+            )
+        ).scalar_one()
+        assert attempt.missing_observations == 3
+        assert attempt.stalled_notified_at is not None
         activities = list(
             (
                 await session.execute(
                     select(SubscriptionActivity).where(
-                        SubscriptionActivity.subscription_id == sub_id
+                        SubscriptionActivity.subscription_id == sub_id,
+                        SubscriptionActivity.type == "download_stalled",
                     )
                 )
-            )
-            .scalars()
-            .all()
+            ).scalars()
         )
-        assert any("不在下载器" in a.message for a in activities)
+        assert len(activities) == 1
 
 
 @pytest.mark.asyncio
-async def test_rescue_requeues_stalled_torrent(db, monkeypatch):
-    """救援巡检：投递超时仍未完成 → 视为卡死退回；未超时/已完成不动。"""
+async def test_completed_task_missing_before_import_reenters_rescue(db, monkeypatch):
+    """下载完成但尚未入库时任务被删，不能藏在 completed 永久失去救援。"""
+    stale = utcnow() - timedelta(minutes=20)
+    _library_id, _item_id, sub_id, _wanted_id = await _seed(db, grabbed_at=stale)
+    async with db.session() as session:
+        wanted = (
+            await session.execute(
+                select(WantedItem).where(WantedItem.subscription_id == sub_id)
+            )
+        ).scalar_one()
+        await progress_mod._ensure_attempts(session, {(sub_id, "abc123"): [wanted]})
+        attempt = (
+            await session.execute(
+                select(SubscriptionDownloadAttempt).where(
+                    SubscriptionDownloadAttempt.subscription_id == sub_id
+                )
+            )
+        ).scalar_one()
+        attempt.status = DownloadAttemptStatus.COMPLETED
+        attempt.last_progress_at = stale
+        await session.commit()
+
+    async def lookup_missing(*args, **kwargs):
+        return progress_mod._TorrentLookup(match=None, reachable_count=1)
+
+    monkeypatch.setattr(progress_mod, "_lookup_torrent", lookup_missing)
+    for _ in range(3):
+        await progress_mod._rescue_group(sub_id, "abc123", downloaders=[])
+
+    async with db.session() as session:
+        attempt = (
+            await session.execute(
+                select(SubscriptionDownloadAttempt).where(
+                    SubscriptionDownloadAttempt.subscription_id == sub_id
+                )
+            )
+        ).scalar_one()
+        assert attempt.status == DownloadAttemptStatus.ACTIVE
+        assert attempt.stalled_notified_at is not None
+
+
+@pytest.mark.asyncio
+async def test_rescue_warns_at_15_minutes_and_replaces_at_30(db, monkeypatch):
+    """完成字节不增长：15 分钟提醒，30 分钟保留工单并进入换源。"""
     from types import SimpleNamespace
 
-    stale = utcnow() - timedelta(days=progress_mod.STALLED_REQUEUE_DAYS + 1)
-    _library_id, _item_id, sub_id, wanted_id = await _seed(db, grabbed_at=stale)
+    _library_id, _item_id, sub_id, wanted_id = await _seed(db)
 
-    status = SimpleNamespace(name="Slow.Torrent", completed=False, progress=0.5)
+    status = SimpleNamespace(
+        name="Slow.Torrent",
+        completed=False,
+        completed_bytes=500,
+        progress=0.5,
+        state="stalled",
+    )
 
-    fake_downloader = SimpleNamespace(name="测试下载器", path_mappings=None)
+    fake_downloader = SimpleNamespace(id=None, name="测试下载器", path_mappings=None)
 
-    async def query_status(info_hash, downloaders):
-        return fake_downloader, status
+    async def lookup_status(*args, **kwargs):
+        return progress_mod._TorrentLookup(
+            match=(fake_downloader, status), reachable_count=1
+        )
 
-    monkeypatch.setattr(progress_mod, "_query_torrent", query_status)
+    monkeypatch.setattr(progress_mod, "_lookup_torrent", lookup_status)
+    # 首次采样只建立完成字节基线。
     await progress_mod._rescue_group(sub_id, "abc123", downloaders=[])
 
     async with db.session() as session:
+        attempt = (
+            await session.execute(
+                select(SubscriptionDownloadAttempt).where(
+                    SubscriptionDownloadAttempt.subscription_id == sub_id
+                )
+            )
+        ).scalar_one()
+        attempt.last_progress_at = utcnow() - timedelta(minutes=16)
+        await session.commit()
+    await progress_mod._rescue_group(sub_id, "abc123", downloaders=[])
+    async with db.session() as session:
+        attempt = (
+            await session.execute(
+                select(SubscriptionDownloadAttempt).where(
+                    SubscriptionDownloadAttempt.subscription_id == sub_id
+                )
+            )
+        ).scalar_one()
+        assert attempt.status == DownloadAttemptStatus.ACTIVE
+        assert attempt.stalled_notified_at is not None
+        attempt.last_progress_at = utcnow() - timedelta(minutes=31)
+        await session.commit()
+
+    searched = []
+
+    async def fake_search(attempt_id, *, force=False):
+        searched.append(attempt_id)
+        return False
+
+    import movieclaw_api.services.subscription as subscription_services
+
+    monkeypatch.setattr(subscription_services, "run_replacement_search", fake_search)
+    await progress_mod._rescue_group(sub_id, "abc123", downloaders=[])
+    async with db.session() as session:
         wanted = await session.get(WantedItem, wanted_id)
-        assert wanted.status == WantedStatus.WANTED  # 卡死退回
+        assert wanted.status == WantedStatus.GRABBED
+        assert wanted.info_hash == "abc123"
+        attempt = (
+            await session.execute(
+                select(SubscriptionDownloadAttempt).where(
+                    SubscriptionDownloadAttempt.subscription_id == sub_id
+                )
+            )
+        ).scalar_one()
+        assert attempt.status == DownloadAttemptStatus.REPLACEMENT_PENDING
+        assert searched == [attempt.id]
 
     # 已完成待入库（宽限期内）：救援不做任何事（搬运归监听导入/扫描，
     # 工单归库存对账，落点核验也等宽限期过后才判）
     _library_id2, _item_id2, sub_id2, wanted_id2 = await _seed_second(db)
     status.completed = True
+    status.completed_bytes = 1000
+    status.state = "completed"
     await progress_mod._rescue_group(sub_id2, "def456", downloaders=[])
     async with db.session() as session:
         wanted = await session.get(WantedItem, wanted_id2)
@@ -240,21 +375,26 @@ async def test_rescue_alerts_unreachable_landing(db, monkeypatch, tmp_path):
 
     # 下载器视角 /downloads ↔ movieclaw 视角 tmp_path/downloads（内容不存在）
     fake_downloader = SimpleNamespace(
+        id=None,
         name="qb",
         path_mappings=[{"local": str(tmp_path / "downloads"), "remote": "/downloads"}],
     )
     status = SimpleNamespace(
         name="Some.Show.S01",
         completed=True,
+        completed_bytes=1,
         progress=1.0,
+        state="completed",
         save_path="/downloads",
         files=[SimpleNamespace(path="Some.Show.S01/e1.mkv", size_bytes=1)],
     )
 
-    async def query_status(info_hash, downloaders):
-        return fake_downloader, status
+    async def lookup_status(*args, **kwargs):
+        return progress_mod._TorrentLookup(
+            match=(fake_downloader, status), reachable_count=1
+        )
 
-    monkeypatch.setattr(progress_mod, "_query_torrent", query_status)
+    monkeypatch.setattr(progress_mod, "_lookup_torrent", lookup_status)
     await progress_mod._rescue_group(sub_id, "abc123", downloaders=[])
     await progress_mod._rescue_group(sub_id, "abc123", downloaders=[])  # 二跑验证去重
 
@@ -302,6 +442,105 @@ async def test_rescue_alerts_unreachable_landing(db, monkeypatch, tmp_path):
             .all()
         )
         assert activities == []
+
+
+@pytest.mark.asyncio
+async def test_completed_attempt_rechecks_landing_after_grace(db, monkeypatch, tmp_path):
+    """首次完成仍在宽限期时，过期后必须继续核验，而不是永久退出观察。"""
+    _library_id, _item_id, sub_id, wanted_id = await _seed(db)
+    fake_downloader = type(
+        "Downloader",
+        (),
+        {
+            "id": None,
+            "name": "qb",
+            "path_mappings": [
+                {"local": str(tmp_path / "downloads"), "remote": "/downloads"}
+            ],
+        },
+    )()
+    status = type(
+        "Status",
+        (),
+        {
+            "name": "Grace.Show.S01",
+            "completed": True,
+            "completed_bytes": 1,
+            "downloaded_bytes": 1,
+            "progress": 1.0,
+            "state": "completed",
+            "save_path": "/downloads",
+            "files": [type("File", (), {"path": "Grace.Show.S01/e1.mkv"})()],
+        },
+    )()
+
+    async def lookup_status(*args, **kwargs):
+        return progress_mod._TorrentLookup(match=(fake_downloader, status), reachable_count=1)
+
+    monkeypatch.setattr(progress_mod, "_lookup_torrent", lookup_status)
+    await progress_mod._rescue_group(sub_id, "abc123", downloaders=[])
+
+    async with db.session() as session:
+        wanted = await session.get(WantedItem, wanted_id)
+        stale = utcnow() - timedelta(minutes=progress_mod._LANDING_GRACE_MINUTES + 1)
+        wanted.grabbed_at = stale
+        wanted.updated_at = stale
+        await session.commit()
+
+    await progress_mod._rescue_group(sub_id, "abc123", downloaders=[])
+    async with db.session() as session:
+        activities = list(
+            (
+                await session.execute(
+                    select(SubscriptionActivity).where(
+                        SubscriptionActivity.subscription_id == sub_id,
+                        SubscriptionActivity.type == "import_failed",
+                    )
+                )
+            ).scalars()
+        )
+        assert len(activities) == 1
+
+
+@pytest.mark.asyncio
+async def test_legacy_attempt_does_not_guess_quality_without_exact_info_hash(db) -> None:
+    """旧活动没有 infohash 时，即使单元重叠也不能猜成当前种子的品质。"""
+    _library_id, _item_id, sub_id, wanted_id = await _seed(db)
+    async with db.session() as session:
+        session.add(
+            SiteTorrent(
+                site_id="legacy",
+                torrent_id="wrong-source",
+                title="Wrong.Source.720p",
+                attrs={"resolution": "720p", "media_source": "WEB-Rip"},
+                enrich_version=1,
+                source=TorrentSource.SEARCH,
+            )
+        )
+        session.add(
+            SubscriptionActivity(
+                subscription_id=sub_id,
+                wanted_item_id=wanted_id,
+                type="grabbed",
+                message="旧版投递活动",
+                payload={
+                    "site_id": "legacy",
+                    "torrent_id": "wrong-source",
+                    "units": [[1, 1]],
+                },
+            )
+        )
+        await session.commit()
+        wanted = await session.get(WantedItem, wanted_id)
+        await progress_mod._ensure_attempts(session, {(sub_id, "abc123"): [wanted]})
+        attempt = (
+            await session.execute(
+                select(SubscriptionDownloadAttempt).where(
+                    SubscriptionDownloadAttempt.subscription_id == sub_id
+                )
+            )
+        ).scalar_one()
+        assert attempt.quality == {}
 
 
 async def _seed_second(db):

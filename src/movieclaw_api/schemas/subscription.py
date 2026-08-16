@@ -7,10 +7,12 @@
 from __future__ import annotations
 
 from datetime import UTC, date, datetime
+from enum import StrEnum
 from typing import Literal
 
-from pydantic import BaseModel, Field, field_serializer
+from pydantic import Field, field_serializer
 
+from movieclaw_api.schemas.base import BaseModel
 from movieclaw_db.models import (
     MediaItem,
     MediaSeason,
@@ -31,27 +33,18 @@ def _iso_utc(value: datetime | None) -> str | None:
     return value.isoformat()
 
 
-# ---------------------------------------------------------------------------
-# prepare
-# ---------------------------------------------------------------------------
+class SubscriptionTargetPreviewPayload(BaseModel):
+    """订阅表单打开前的内部预览请求。
 
-
-class PreparePayload(BaseModel):
-    """订阅弹层打开时的预检请求。
-
-    - source=tmdb：带 kind + tmdb_id（发现页/详情页入口）；
-    - source=douban：带 kind + title（豆瓣入口，year/douban_id 尽量带上，
-      收敛精度更高）。
+    ``title_ref`` 必须直接来自 Discover；服务端负责识别来源、解析豆瓣候选并
+    建立 TMDB 锚点，Web 不再拼装 ``source/kind/external_id`` 组合。
     """
 
-    source: Literal["tmdb", "douban"] = Field(
-        default="tmdb", description="入口来源：tmdb（带 tmdb_id）/ douban（带 title，可配 year）"
+    title_ref: str = Field(
+        min_length=1,
+        max_length=160,
+        description="Discover 返回的影视条目稳定引用",
     )
-    kind: MediaKind
-    tmdb_id: int | None = Field(default=None, description="source=tmdb 时必填的 TMDB 条目 id")
-    title: str | None = Field(default=None, description="豆瓣入口：豆瓣标题")
-    year: int | None = Field(default=None, description="豆瓣入口：年份（可缺）")
-    douban_id: str | None = Field(default=None, description="豆瓣入口：豆瓣条目 ID")
 
 
 class MediaBrief(BaseModel):
@@ -124,13 +117,14 @@ class ResolveCandidateView(BaseModel):
     """豆瓣收敛歧义时的确认候选。"""
 
     tmdb_id: int
+    title_ref: str = Field(description="选定候选后用于订阅的稳定引用")
     title: str
     original_title: str
     year: int | None
     poster_url: str | None
 
     @classmethod
-    def from_model(cls, c: ResolveCandidate) -> ResolveCandidateView:
+    def from_model(cls, c: ResolveCandidate, *, kind: MediaKind) -> ResolveCandidateView:
         from movieclaw_api.core.config import get_settings
 
         poster_url = None
@@ -139,6 +133,7 @@ class ResolveCandidateView(BaseModel):
             poster_url = f"{base}/w342{c.poster_path}"
         return cls(
             tmdb_id=c.tmdb_id,
+            title_ref=f"tmdb:{kind.value}:{c.tmdb_id}",
             title=c.title,
             original_title=c.original_title,
             year=c.year,
@@ -200,15 +195,32 @@ class DispatchPreviewView(BaseModel):
 
 
 class SubscriptionCreatePayload(BaseModel):
-    kind: MediaKind
-    tmdb_id: int = Field(description="TMDB 条目 id（movie 用电影 id，tv 用剧集 id）")
+    """从 Discover 条目创建订阅的公开请求。
+
+    调用方只传递上游返回的稳定引用；来源识别、豆瓣到 TMDB 的锚定、媒体
+    建档和初始工单生成均由服务端完成。豆瓣发生歧义时，错误详情会返回可重试
+    的 TMDB ``title_ref`` 候选。
+    """
+
+    title_ref: str = Field(
+        min_length=1,
+        max_length=160,
+        description="Discover 搜索、片单或详情返回的影视条目稳定引用",
+    )
+    source_title_ref: str | None = Field(
+        default=None,
+        max_length=160,
+        description=(
+            "可选的原始来源引用；从豆瓣歧义候选改选 TMDB 条目时原样回传，"
+            "用于保留豆瓣身份"
+        ),
+    )
     selected_seasons: list[int] = Field(
         default_factory=list, description="剧集要订阅的季号数组，如 [1,2]；空=全部缺失季"
     )
-    follow_future: bool = Field(default=False, description="持续追新：未来新季自动纳入订阅")
+    follow_future: bool = Field(default=False, description="自动续订：未来新集与新季自动纳入订阅")
     rule_set_id: int | None = Field(default=None, description="缺省用默认规则组")
     library_id: int | None = Field(default=None, description="入库目标库；缺省用该类型默认库")
-    douban_id: str | None = Field(default=None, description="豆瓣入口时带上，留存来源身份")
 
 
 class SubscriptionUpdatePayload(BaseModel):
@@ -218,7 +230,7 @@ class SubscriptionUpdatePayload(BaseModel):
         default=None, description="新的季选择，如 [1,2]；不传=不变"
     )
     follow_future: bool | None = Field(
-        default=None, description="是否持续追新（新季自动纳入）；不传=不变"
+        default=None, description="是否自动续订（未来新集与新季自动纳入）；不传=不变"
     )
     rule_set_id: int | None = Field(default=None, description="换绑规则组 id；不传=不变")
     library_id: int | None = Field(
@@ -227,8 +239,23 @@ class SubscriptionUpdatePayload(BaseModel):
     )
 
 
-class SubscriptionPausePayload(BaseModel):
-    paused: bool = Field(description="true=暂停（停止抓种与投递）；false=恢复追踪")
+class SubscriptionTrackingState(StrEnum):
+    """用户可显式设置的追踪状态；完成态仍由工单自动派生。"""
+
+    ACTIVE = "active"
+    PAUSED = "paused"
+
+
+class SubscriptionTrackingStatePayload(BaseModel):
+    state: SubscriptionTrackingState = Field(
+        description="目标追踪状态：active 恢复追踪，paused 暂停搜索与投递"
+    )
+
+
+class SubscriptionFollowFuturePayload(BaseModel):
+    """自动续订是详情页上的独立动作，不与选季等批量调整耦合。"""
+
+    enabled: bool = Field(description="是否持续追踪之后播出的新集与新一季")
 
 
 class DownloadUnitView(BaseModel):
@@ -239,13 +266,13 @@ class DownloadUnitView(BaseModel):
 
 
 class SearchNowView(BaseModel):
-    """立即搜索（sub.search-now）的结果。"""
+    """立即搜索缺失资源的结果。"""
 
     reset_count: int = Field(description="跳过冷却、重新排队的缺口工单数")
 
 
 class GrabPayload(BaseModel):
-    """手动选种（sub.grab）：把搜索结果里的一条种子直接投给本订阅。
+    """人工选择种子下载：把搜索结果里的一条种子直接投给本订阅。
 
     字段即搜索结果行（TorrentHit）原样回传——交互式搜索现算现返、不落
     种子索引，只能由前端带回。attrs 同样回传（它本就是搜索链路里服务端
@@ -295,6 +322,10 @@ class SubscriptionView(BaseModel):
     rule_set_id: int
     library_id: int | None = Field(description="入库目标库；null=该类型默认库")
     progress: ProgressView
+    season_collection: list[SeasonOverview] = Field(
+        default_factory=list,
+        description="剧集按季收录统计；电影或无需展示时为空",
+    )
     created_at: datetime
     updated_at: datetime
 
@@ -304,7 +335,11 @@ class SubscriptionView(BaseModel):
 
     @classmethod
     def from_model(
-        cls, sub: Subscription, item: MediaItem, counts: dict[str, int]
+        cls,
+        sub: Subscription,
+        item: MediaItem,
+        counts: dict[str, int],
+        season_collection: list[SeasonOverview] | None = None,
     ) -> SubscriptionView:
         wanted = counts.get("wanted", 0)
         grabbed = counts.get("grabbed", 0)
@@ -325,8 +360,117 @@ class SubscriptionView(BaseModel):
                 downloaded=downloaded,
                 imported=imported,
             ),
+            season_collection=season_collection or [],
             created_at=sub.created_at,
             updated_at=sub.updated_at,
+        )
+
+
+class TodayArrivalView(BaseModel):
+    """订阅首页的单集待入库摘要；不携带海报和下载进度等重复信息。"""
+
+    subscription_id: int
+    wanted_id: int
+    media_title: str
+    season_number: int
+    episode_number: int
+    status: Literal["wanted", "grabbed", "downloaded"]
+    air_date: date | None
+    release_forecast: dict | None
+    next_probe_at: datetime | None = Field(
+        description="按站点游标与礼貌间隔换算后的下一次有效预测探测时间"
+    )
+    info_hash: str | None
+    grabbed_at: datetime | None
+    downloaded_at: datetime | None
+    estimated_release_to_import_minutes: int = Field(
+        description="预计出种后到入库的分钟数；优先使用本订阅历史中位数"
+    )
+    estimated_download_to_import_minutes: int = Field(
+        description="下载完成后到入库的分钟数；优先使用本订阅历史中位数"
+    )
+
+    @field_serializer("next_probe_at", "grabbed_at", "downloaded_at")
+    def _serialize_utc(self, value: datetime | None) -> str | None:
+        return _iso_utc(value)
+
+    @classmethod
+    def from_models(
+        cls,
+        sub: Subscription,
+        item: MediaItem,
+        wanted: WantedItem,
+        *,
+        next_probe_at: datetime | None,
+        release_to_import_minutes: int,
+        download_to_import_minutes: int,
+    ) -> TodayArrivalView:
+        return cls(
+            subscription_id=sub.id,  # type: ignore[arg-type]
+            wanted_id=wanted.id,  # type: ignore[arg-type]
+            media_title=item.title,
+            season_number=wanted.season_number,
+            episode_number=wanted.episode_number,
+            status=wanted.status,  # type: ignore[arg-type]
+            air_date=wanted.air_date,
+            release_forecast=wanted.release_forecast,
+            next_probe_at=next_probe_at,
+            info_hash=wanted.info_hash,
+            grabbed_at=wanted.grabbed_at,
+            downloaded_at=wanted.downloaded_at,
+            estimated_release_to_import_minutes=release_to_import_minutes,
+            estimated_download_to_import_minutes=download_to_import_minutes,
+        )
+
+
+def _elapsed_seconds(start: datetime | None, end: datetime | None) -> int | None:
+    """计算非负整秒耗时；站点时间异常时不向用户展示误导性的负数。"""
+    if start is None or end is None or end < start:
+        return None
+    return round((end - start).total_seconds())
+
+
+class ResourceTimingView(BaseModel):
+    """一集最近一次成功投递所使用资源的发布→发现→提交时间链。"""
+
+    site_id: str
+    torrent_id: str
+    publish_time: datetime | None
+    first_seen_at: datetime | None
+    submitted_at: datetime
+    publish_to_seen_seconds: int | None
+    seen_to_submit_seconds: int | None
+    publish_to_submit_seconds: int | None
+    dry_run: bool = False
+
+    @field_serializer("publish_time", "first_seen_at", "submitted_at")
+    def _serialize_utc(self, value: datetime | None) -> str | None:
+        return _iso_utc(value)
+
+    @classmethod
+    def from_snapshot(cls, snapshot: dict[str, object]) -> ResourceTimingView | None:
+        publish_time = snapshot.get("publish_time")
+        first_seen_at = snapshot.get("first_seen_at")
+        submitted_at = snapshot.get("submitted_at")
+        if not isinstance(publish_time, datetime):
+            publish_time = None
+        if not isinstance(first_seen_at, datetime):
+            first_seen_at = None
+        if not isinstance(submitted_at, datetime):
+            return None
+        # 既没有发布时间也没有首次发现时间时无法回答“隔了多久”，不返回空壳。
+        if publish_time is None and first_seen_at is None:
+            return None
+        return cls(
+            site_id=str(snapshot["site_id"]),
+            torrent_id=str(snapshot["torrent_id"]),
+            publish_time=publish_time,
+            first_seen_at=first_seen_at,
+            submitted_at=submitted_at,
+            publish_to_seen_seconds=_elapsed_seconds(publish_time, first_seen_at),
+            seen_to_submit_seconds=_elapsed_seconds(first_seen_at, submitted_at),
+            publish_to_submit_seconds=_elapsed_seconds(publish_time, submitted_at),
+            dry_run=snapshot.get("dry_run") is True,
         )
 
 
@@ -337,11 +481,15 @@ class WantedView(BaseModel):
     status: str
     air_date: date | None
     priority: int
-    # 在途工单锚定的种子 hash；前端据此把工单行与 sub.downloads 的进度组对上
+    # 在途工单锚定的种子 hash；前端据此把工单行与实时下载进度组对上
     info_hash: str | None
     next_search_at: datetime | None
     search_attempts: int
     last_search_at: datetime | None
+    # 由历史种子发布时间推导的可解释调度快照；NULL=样本不足/不适用。
+    release_forecast: dict | None
+    # 实际拉取时间链；老记录或站点未提供发布时间时可为空。
+    resource_timing: ResourceTimingView | None
     grabbed_at: datetime | None
     downloaded_at: datetime | None
     imported_at: datetime | None
@@ -353,7 +501,9 @@ class WantedView(BaseModel):
         return _iso_utc(value)
 
     @classmethod
-    def from_model(cls, w: WantedItem) -> WantedView:
+    def from_model(
+        cls, w: WantedItem, resource_timing: dict[str, object] | None = None
+    ) -> WantedView:
         return cls(
             id=w.id,  # type: ignore[arg-type]
             season_number=w.season_number,
@@ -365,6 +515,12 @@ class WantedView(BaseModel):
             next_search_at=w.next_search_at,
             search_attempts=w.search_attempts,
             last_search_at=w.last_search_at,
+            release_forecast=w.release_forecast,
+            resource_timing=(
+                ResourceTimingView.from_snapshot(resource_timing)
+                if resource_timing is not None
+                else None
+            ),
             grabbed_at=w.grabbed_at,
             downloaded_at=w.downloaded_at,
             imported_at=w.imported_at,
@@ -380,6 +536,7 @@ class SubscriptionDetailView(SubscriptionView):
         sub: Subscription,
         item: MediaItem,
         wanted_rows: list[WantedItem],
+        resource_timings: dict[tuple[int, int], dict[str, object]] | None = None,
     ) -> SubscriptionDetailView:
         counts: dict[str, int] = {}
         for w in wanted_rows:
@@ -387,12 +544,28 @@ class SubscriptionDetailView(SubscriptionView):
         base = SubscriptionView.from_model(sub, item, counts)
         return cls(
             **base.model_dump(),
-            wanted=[WantedView.from_model(w) for w in wanted_rows],
+            wanted=[
+                WantedView.from_model(
+                    w,
+                    (resource_timings or {}).get((w.season_number, w.episode_number)),
+                )
+                for w in wanted_rows
+            ],
         )
 
 
+class SubscriptionCreateView(BaseModel):
+    """完整创建工作流结果：订阅本身以及管理员可见的下载路由预检。"""
+
+    subscription: SubscriptionDetailView
+    download_routing: DispatchPreviewView | None = Field(
+        default=None,
+        description="管理员可见的下载与入库路由预检；成员调用时为空",
+    )
+
+
 class SubscriptionDownloadView(BaseModel):
-    """订阅在途种子的实时下载快照（sub.downloads，详情页轮询展示）。
+    """订阅在途种子的实时下载快照（详情页轮询展示）。
 
     state 词表与 TorrentStatus.state 一致，另加 missing——种子已不在任何
     可用下载器中（可能被手动删除，救援巡检稍后会退回工单重新找资源）。
@@ -452,8 +625,11 @@ class RuleSetPayload(BaseModel):
             "dv 策略（any/require/forbid，单独判断杜比视界，与 hdr 正交，"
             "如必须 HDR 但排除 DV = hdr:require + dv:forbid）、free_only 只要免费种、"
             "min_seeders 做种数下限、size_min_mb/size_max_mb 体积区间（整季包按每集均摊）、"
-            "exclude_hr 排除 H&R。"
-            '例：{"resolutions":["2160p"],"free_only":true}'
+            "exclude_hr 排除 H&R、hr_unknown_policy 决定 H&R 状态未知时宽松/严格处理、"
+            "未填写的条件均不限制。\n\n"
+            "subtitle_languages_require：要求的字幕语言（BCP 47，任一命中即通过）。\n\n"
+            "audio_languages_require：要求的音轨语言（BCP 47，任一命中即通过）。\n\n"
+            '示例：{"resolutions":["2160p"],"free_only":true}'
         ),
     )
 

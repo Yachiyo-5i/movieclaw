@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from typing import Literal
 
-from pydantic import BaseModel, Field, field_serializer, field_validator
+from pydantic import Field, field_serializer, field_validator, model_validator
 
+from movieclaw_api.schemas.base import BaseModel
 from movieclaw_db.models.downloader_client import ClientType, DownloaderClient
 from movieclaw_db.models.site_credential import ConfigStatus
 
@@ -38,8 +40,9 @@ class DownloaderView(BaseModel):
     username: str | None = None
     save_path: str | None = Field(default=None, description="提交下载时的默认保存目录")
     path_mappings: list[PathMapping] | None = Field(
-        default=None, description="路径映射 JSON 数组（movieclaw 路径 → 下载器路径），"
-        '形如 [{"local":"/volume1/downloads","remote":"/downloads"}]'
+        default=None,
+        description="路径映射 JSON 数组（movieclaw 路径 → 下载器路径），"
+        '形如 [{"local":"/volume1/downloads","remote":"/downloads"}]',
     )
     enabled: bool
     is_default: bool = Field(description="是否为默认下载器（一键下载不选目标时投给它）")
@@ -81,6 +84,104 @@ class DownloaderView(BaseModel):
             created_at=row.created_at,
             updated_at=row.updated_at,
         )
+
+
+class DownloadTaskUnitView(BaseModel):
+    """订阅下载覆盖的一个追踪单元；电影沿用 0/0 哨兵。"""
+
+    season_number: int
+    episode_number: int
+
+
+class DownloadTaskSubscriptionView(BaseModel):
+    """下载器任务关联的订阅摘要，供任务中心回到业务上下文。"""
+
+    id: int
+    media_item_id: int
+    media_title: str
+    media_kind: str
+    poster_url: str | None = None
+    units: list[DownloadTaskUnitView] = Field(default_factory=list)
+
+
+class DownloadTaskView(BaseModel):
+    """任务中心使用的下载器实时快照。
+
+    下载器仍是下载状态的事实源；这里只在请求时汇总快照，并通过 infohash
+    关联订阅工单、换源心跳或手动下载意图，不把实时下载进度复制进本地数据库。
+    """
+
+    id: str = Field(description="稳定前端键：下载器 ID + infohash；缺失任务用 missing 前缀")
+    info_hash: str
+    name: str | None
+    downloader_id: int | None
+    downloader_name: str | None
+    downloader_type: ClientType | None
+    progress: float | None = Field(default=None, ge=0, le=1)
+    size_bytes: int | None = None
+    dlspeed_bytes: int | None = None
+    eta_seconds: int | None = None
+    state: Literal[
+        "downloading",
+        "stalled",
+        "queued",
+        "paused",
+        "checking",
+        "completed",
+        "error",
+        "missing",
+        "unknown",
+    ]
+    source: Literal["subscription", "manual", "external"]
+    media_item_id: int | None = None
+    media_title: str | None = None
+    media_kind: str | None = None
+    poster_url: str | None = None
+    subscriptions: list[DownloadTaskSubscriptionView] = Field(default_factory=list)
+    rescue_state: Literal[
+        "active",
+        "replacement_pending",
+        "trial",
+        "cleanup_pending",
+        "retained",
+        "completed",
+    ] | None = None
+    no_progress_seconds: int | None = Field(default=None, ge=0)
+    can_replace: bool = False
+    replacement_due_at: datetime | None = None
+    rescue_message: str | None = None
+
+
+class DownloadTaskSourceView(BaseModel):
+    """一台下载器在本次快照中的可观测状态；单台故障不拖垮整页。"""
+
+    id: int
+    name: str
+    client_type: ClientType
+    status: Literal["active", "disabled", "unavailable", "error"]
+    message: str | None = None
+    task_count: int = 0
+
+
+class DownloadTaskListView(BaseModel):
+    items: list[DownloadTaskView]
+    sources: list[DownloadTaskSourceView]
+
+
+class DownloadTaskDeleteView(BaseModel):
+    """删除下载器任务的结果。"""
+
+    downloader_id: int
+    info_hash: str
+    delete_files: bool
+
+
+class DownloadTaskReplaceView(BaseModel):
+    """用户立即换种请求的受理结果。"""
+
+    downloader_id: int
+    info_hash: str
+    attempt_id: int
 
 
 class DownloaderPayload(BaseModel):
@@ -167,6 +268,13 @@ class DownloadSubmitPayload(BaseModel):
     save_path: str | None = Field(default=None, description="手选保存目录（覆盖库推导）")
     # 指定投递到哪台下载器（配了多台按需分流）；缺省走默认下载器
     downloader_id: int | None = Field(default=None, description="指定下载器；缺省用默认下载器")
+    # 智能入库由服务端重新按 TMDB 身份路由，不能信任前端预检返回的 library_id。
+    # 成功提交后会按 infohash 锚定身份，供共享监听目录完成后直接认领。
+    auto_route: bool = Field(default=False, description="按确认的 TMDB 身份自动匹配媒体库并投递")
+    media_kind: Literal["movie", "tv"] | None = Field(
+        default=None, description="智能入库的媒体类型"
+    )
+    tmdb_id: int | None = Field(default=None, description="智能入库已确认的 TMDB 条目 ID")
 
     @field_validator("save_path")
     @classmethod
@@ -177,6 +285,62 @@ class DownloadSubmitPayload(BaseModel):
         if not value.startswith("/"):
             raise ValueError("保存目录必须是以 / 开头的绝对路径")
         return value
+
+    @model_validator(mode="after")
+    def _validate_auto_route(self) -> DownloadSubmitPayload:
+        """智能入库必须是一组完整、不可被手选目录覆盖的身份锚。"""
+        if not self.auto_route:
+            return self
+        if self.media_kind is None or self.tmdb_id is None or not self.title:
+            raise ValueError("智能入库必须提供媒体类型、TMDB ID 和标题")
+        if self.library_id is not None or self.save_path is not None:
+            raise ValueError("智能入库不能同时指定媒体库或保存目录")
+        return self
+
+
+class ManualDownloadTargetPayload(BaseModel):
+    """手动下载的识别预检输入：只接受搜索结果已解析出的最小身份线索。"""
+
+    kind: Literal["movie", "tv"] = Field(description="搜索结果识别出的媒体类型")
+    title: str = Field(min_length=1, description="搜索结果识别出的主标题")
+    year: int = Field(ge=1888, le=2100, description="搜索结果识别出的发行/首播年份")
+    subtitle: str | None = Field(default=None, description="种子副标题（中文别名等识别补强）")
+    # 缺省按默认下载器预检，与 dl submit 的既有语义一致；前端显式切换
+    # 下载器时带上它，确保路径映射的预检结论与真实提交是同一台机器。
+    downloader_id: int | None = Field(
+        default=None, ge=1, description="预检指定下载器；缺省用默认下载器"
+    )
+    # 歧义时只能从本次返回的候选中确认一个 ID，服务端会再次校验，不能把
+    # 任意 TMDB ID 当成已识别结果直接放行。
+    selected_tmdb_id: int | None = Field(
+        default=None, ge=1, description="用户从本次识别候选中确认的 TMDB 条目 ID"
+    )
+
+
+class ManualDownloadCandidateView(BaseModel):
+    """预检未收敛时留给用户确认的 TMDB 候选。"""
+
+    tmdb_id: int
+    title: str
+    year: int | None = None
+    episode_count: int | None = None
+
+
+class ManualDownloadTargetView(BaseModel):
+    """手动下载的「识别 → 路由 → 投递目录」预检结论。"""
+
+    status: Literal["ready", "ambiguous", "not_found"]
+    tmdb_id: int | None = None
+    candidates: list[ManualDownloadCandidateView] = Field(default_factory=list)
+    library_id: int | None = None
+    library_name: str | None = None
+    mode: Literal["watch", "inplace", "downloader_default"] | None = None
+    path: str | None = Field(default=None, description="movieclaw 视角的实际投递目录")
+    staging_path: str | None = Field(default=None, description="自定义目录规则的整理落点")
+    route_matched: bool | None = Field(default=None, description="是否命中媒体库收藏范围")
+    route_reason: str | None = Field(default=None, description="媒体库路由理由")
+    ok: bool = Field(default=False, description="当前选择的下载器和投递配置能否自动入库")
+    warning: str | None = Field(default=None, description="不可自动入库时的中文指引")
 
 
 class DownloadSubmitView(BaseModel):

@@ -37,6 +37,9 @@ NAMESPACE_PREFIXES = {
     "playingitems",
     "branding",
     "quickconnect",
+    "plugins",
+    "library",
+    "displaypreferences",
     "emby",
 }
 
@@ -76,6 +79,11 @@ _KNOWN_QUERY_KEYS = [
     "static",
     "container",
     "mediaSourceId",
+    # 字幕接口的 route 段同名覆盖参数（jellyfin-subtitle.md §4.4；
+    # mediaSourceId/format 已在列）——漏登记 PascalCase 客户端就取不到
+    "itemId",
+    "index",
+    "startPositionTicks",
     "ApiKey",
     "api_key",
     "playSessionId",
@@ -85,6 +93,8 @@ _KNOWN_QUERY_KEYS = [
     "positionTicks",
     "userId",
     "format",
+    # DisplayPreferences 的客户端标识参数（issue #124）
+    "client",
 ]
 
 # 注册顺序即匹配顺序：字面路径的模块在参数路径之前

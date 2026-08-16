@@ -16,7 +16,7 @@ async def test_movie_playback_event_hides_sentinel(seeded_db):
     async with get_database().session() as session:
         unit = (seeded_db["movie"], 0, 0)
         row, newly_played = await playback_state.record_playback_progress(
-            session, unit, position_ms=3_000_000, runtime_ms=3_100_000
+            session, unit, member_id=0, position_ms=3_000_000, runtime_ms=3_100_000
         )
         await session.commit()
         assert newly_played is True
@@ -43,7 +43,7 @@ async def test_episode_playback_event_and_no_flip(seeded_db):
     async with get_database().session() as session:
         unit = (seeded_db["show"], 2, 4)
         row, newly_played = await playback_state.record_playback_progress(
-            session, unit, position_ms=60_000, runtime_ms=2_800_000
+            session, unit, member_id=0, position_ms=60_000, runtime_ms=2_800_000
         )
         await session.commit()
         assert newly_played is False  # 2% 进度不足以标记已看
@@ -57,9 +57,9 @@ async def test_episode_playback_event_and_no_flip(seeded_db):
 async def test_marked_events_share_batch_id(seeded_db):
     units = [(seeded_db["show"], 1, 1), (seeded_db["show"], 1, 2)]
     async with get_database().session() as session:
-        await playback_state.mark_played(session, units, date_played=None)
+        await playback_state.mark_played(session, units, member_id=0, date_played=None)
         await session.commit()
-        events = await build_marked_events(session, "playback.marked_played", units)
+        events = await build_marked_events(session, "playback.marked_played", units, member_id=0)
     assert len(events) == 2
     assert events[0].batch_id is not None
     assert events[0].batch_id == events[1].batch_id
@@ -69,9 +69,9 @@ async def test_marked_events_share_batch_id(seeded_db):
 async def test_marked_single_unit_no_batch(seeded_db):
     units = [(seeded_db["movie"], 0, 0)]
     async with get_database().session() as session:
-        await playback_state.mark_played(session, units, date_played=None)
+        await playback_state.mark_played(session, units, member_id=0, date_played=None)
         await session.commit()
-        events = await build_marked_events(session, "playback.marked_played", units)
+        events = await build_marked_events(session, "playback.marked_played", units, member_id=0)
     assert len(events) == 1
     assert events[0].batch_id is None
 
@@ -86,7 +86,7 @@ async def test_favorite_levels(seeded_db):
     ]
     async with get_database().session() as session:
         for unit, level, season, episode in cases:
-            await playback_state.set_favorite(session, unit, favorite=True)
+            await playback_state.set_favorite(session, unit, member_id=0, favorite=True)
             await session.commit()
             event = await build_favorite_event(session, unit, favorite=True)
             media = event.data["media"]
@@ -114,5 +114,7 @@ async def test_missing_item_returns_none(seeded_db):
             await build_favorite_event(session, (99999, 0, 0), favorite=True)
         ) is None
         assert (
-            await build_marked_events(session, "playback.marked_played", [(99999, 0, 0)])
+            await build_marked_events(
+                session, "playback.marked_played", [(99999, 0, 0)], member_id=0
+            )
         ) == []

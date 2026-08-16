@@ -23,10 +23,11 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import logging
 import os
 import shutil
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -36,7 +37,17 @@ from sqlalchemy import and_, func, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
-from movieclaw_api.schemas.library import LibraryItemView, derive_air_status
+from movieclaw_api.schemas.library import (
+    LibraryInventorySummaryView,
+    LibraryItemView,
+    LibraryRecentAdditionView,
+    derive_air_status,
+)
+from movieclaw_api.services.library.bluray import (
+    enrich_spec_with_clpi,
+    read_clpi_languages,
+    streams_have_clpi_metadata,
+)
 from movieclaw_api.services.library.layout import STRM_EXT, entry_dir_of
 from movieclaw_api.services.library.nfo import (
     EntryMetadata,
@@ -47,7 +58,8 @@ from movieclaw_api.services.library.nfo import (
 from movieclaw_api.services.library.sort_key import title_initial, title_sort_key
 from movieclaw_api.services.media_probe import probe_media
 from movieclaw_api.services.media_scrape import asset_version, file_version
-from movieclaw_db.models import Library, LibraryFile, MediaItem, utcnow
+from movieclaw_db.models import Library, LibraryFile, MediaItem, MediaSeason, utcnow
+from movieclaw_db.repositories.library_repo import LibraryRepository
 from movieclaw_media.models import MediaKind
 
 logger = logging.getLogger("movieclaw_api.library_items")
@@ -138,7 +150,7 @@ def _external_subtitles(video: Path) -> list[str]:
 
 
 class _FileFacts(NamedTuple):
-    """海报墙聚合用到的七个台账字段（顺序与查询列一致）。
+    """海报墙聚合用到的八个台账字段（顺序与查询列一致）。
 
     代码读起来与整行取时一模一样，只是不再拖着四十列（含三列 JSON）走。"""
 
@@ -148,8 +160,67 @@ class _FileFacts(NamedTuple):
     resolution: str | None
     missing_since: datetime | None
     created_at: datetime
+    added_batch_id: str | None
     # 尚未探出介质规格（audio_streams IS NULL 在 SQL 里算好，不取 JSON 本体）
     unprobed: bool
+
+
+def _build_inventory_summary(
+    units: set[tuple[int, int]],
+    season_episode_counts: dict[int, int | None],
+) -> LibraryInventorySummaryView | None:
+    """按本库在位单元与 TMDB 季结构计算 hover 完整度，不把“连续”猜成“全”。
+
+    正季与特别篇不混算：只要有正季，摘要就聚焦正季；只有 S00 时才展示
+    “特别篇”。季度完整表示已覆盖 TMDB 已知的所有正季，集数完整则要求
+    当前摘要覆盖的每一季都精确拥有 E01..EN。任何官方集数未知时都不写“全”。
+    """
+    regular_by_season: dict[int, set[int]] = {}
+    specials: set[int] = set()
+    for season_number, episode_number in units:
+        if episode_number <= 0:
+            continue
+        if season_number > 0:
+            regular_by_season.setdefault(season_number, set()).add(episode_number)
+        elif season_number == 0:
+            specials.add(episode_number)
+
+    if regular_by_season:
+        by_season = regular_by_season
+        season_count = len(by_season)
+        known_regular_seasons = {
+            season_number for season_number in season_episode_counts if season_number > 0
+        }
+        all_seasons_owned = bool(known_regular_seasons) and (
+            set(by_season) == known_regular_seasons
+        )
+    elif specials:
+        by_season = {0: specials}
+        season_count = 0
+        all_seasons_owned = False
+    else:
+        return None
+
+    total_episode_count: int | None = 0
+    all_episodes_owned = True
+    for season_number, episodes in by_season.items():
+        expected = season_episode_counts.get(season_number)
+        if expected is None or expected <= 0:
+            total_episode_count = None
+            all_episodes_owned = False
+            break
+        total_episode_count += expected
+        if episodes != set(range(1, expected + 1)):
+            all_episodes_owned = False
+
+    return LibraryInventorySummaryView(
+        season_count=season_count,
+        episode_count=sum(len(episodes) for episodes in by_season.values()),
+        season_number=next(iter(by_season)) if len(by_season) == 1 else None,
+        total_episode_count=total_episode_count,
+        all_seasons_owned=all_seasons_owned,
+        all_episodes_owned=all_episodes_owned,
+    )
 
 
 WallSort = Literal["title", "added_at", "probing"]
@@ -321,6 +392,7 @@ async def _aggregate_wall_views(
                 LibraryFile.resolution,
                 LibraryFile.missing_since,
                 LibraryFile.created_at,
+                LibraryFile.added_batch_id,
                 # strm 占位文件永远探不出规格，不算「待补探」
                 and_(
                     LibraryFile.audio_streams.is_(None),  # type: ignore[union-attr]
@@ -354,6 +426,21 @@ async def _aggregate_wall_views(
     tv_item_ids = [i for i, (item, _) in grouped.items() if item.kind == "tv"]
     aired_by_item = await MediaItemRepository(session).aired_units_many(tv_item_ids)
     owned_by_item = await LibraryFileRepository(session).owned_units_many(tv_item_ids)
+    # 季集完整度判定只取季号与官方集数：本地恰好覆盖 E01..EN 才能写「全 N 集」，
+    # 不能因为文件看起来连续就猜一季已经完整（在播季后面可能还有集）。保留
+    # episode_count=NULL 的季行：季度覆盖仍然可判断，但集数未知时不能声称“全”。
+    season_episode_counts_by_item: dict[int, dict[int, int | None]] = {}
+    season_rows = (
+        await session.execute(
+            select(
+                MediaSeason.media_item_id,
+                MediaSeason.season_number,
+                MediaSeason.episode_count,
+            ).where(MediaSeason.media_item_id.in_(tv_item_ids))  # type: ignore[attr-defined]
+        )
+    ).all()
+    for item_id, season_number, episode_count in season_rows:
+        season_episode_counts_by_item.setdefault(item_id, {})[season_number] = episode_count
 
     base = get_settings().tmdb_image_base_url.rstrip("/")
     # 海报优先本地刮削资产（断网可用），没有资产的回落 TMDB 图床
@@ -370,7 +457,50 @@ async def _aggregate_wall_views(
     }
     by_id: dict[int, LibraryItemView] = {}
     for item, files in grouped.values():
+        season_episode_counts = season_episode_counts_by_item.get(item.id, {})  # type: ignore[arg-type]
         units = {(f.season_number, f.episode_number) for f in files}
+        available_units = {
+            (f.season_number, f.episode_number) for f in files if f.missing_since is None
+        }
+        latest_file = max(files, key=lambda file: file.created_at)
+        recent_addition: LibraryRecentAdditionView | None = None
+        if item.kind == "tv" and latest_file.added_batch_id is not None:
+            recent_units = sorted(
+                {
+                    (file.season_number, file.episode_number)
+                    for file in files
+                    if file.added_batch_id == latest_file.added_batch_id
+                }
+            )
+            recent_by_season: dict[int, list[int]] = {}
+            for season_number, episode_number in recent_units:
+                recent_by_season.setdefault(season_number, []).append(episode_number)
+            single_season = (
+                next(iter(recent_by_season.items())) if len(recent_by_season) == 1 else None
+            )
+            if single_season is None:
+                season_number = first_episode = last_episode = None
+                complete_season = False
+            else:
+                season_number, episodes = single_season
+                first_episode, last_episode = episodes[0], episodes[-1]
+                consecutive = episodes == list(range(first_episode, last_episode + 1))
+                if not consecutive:
+                    first_episode = last_episode = None
+                expected = season_episode_counts.get(season_number)
+                complete_season = (
+                    expected is not None
+                    and expected > 0
+                    and episodes == list(range(1, expected + 1))
+                )
+            recent_addition = LibraryRecentAdditionView(
+                season_count=len(recent_by_season),
+                episode_count=len(recent_units),
+                season_number=season_number,
+                first_episode_number=first_episode,
+                last_episode_number=last_episode,
+                complete_season=complete_season,
+            )
         if item.kind == "tv":
             missing_episodes = len(
                 aired_by_item.get(item.id, set()) - owned_by_item.get(item.id, set())  # type: ignore[arg-type]
@@ -398,7 +528,13 @@ async def _aggregate_wall_views(
             missing_count=sum(1 for f in files if f.missing_since is not None),
             air_status=derive_air_status(item.status) if item.kind == "tv" else None,
             missing_episode_count=missing_episodes,
-            added_at=max(f.created_at for f in files),
+            added_at=latest_file.created_at,
+            recent_addition=recent_addition,
+            inventory_summary=(
+                _build_inventory_summary(available_units, season_episode_counts)
+                if item.kind == "tv"
+                else None
+            ),
             # 缺失文件不算「待补探」：文件都不在了，探不是「还没轮到」而是「探不了」
             probe_pending_count=sum(1 for f in files if f.unprobed and f.missing_since is None),
         )
@@ -459,6 +595,61 @@ class ItemDetailBundle:
     external_subtitles: dict[int, list[str]]  # file_id -> 外挂字幕文件名
 
 
+def resolve_entry_dirs(roots: list[Path], files: list[LibraryFile]) -> list[Path]:
+    """条目目录集合：多根/多版本可能给出多个，去重保序（第一个用于 NFO 与美术图）。"""
+    entry_dirs: list[Path] = []
+    for row in files:
+        entry = entry_dir_of(roots, Path(row.file_path))
+        # 原盘条目 file_path 本身就是目录（BDMV/VIDEO_TS），直接在根下时以它为条目目录
+        if entry is None and row.container in ("bluray", "dvd"):
+            entry = Path(row.file_path)
+        if entry is not None and entry not in entry_dirs:
+            entry_dirs.append(entry)
+    return entry_dirs
+
+
+async def layered_item_meta(
+    session: AsyncSession,
+    item: MediaItem,
+    entry_dirs: list[Path],
+    files: list[LibraryFile],
+    kind: MediaKind,
+) -> EntryMetadata | None:
+    """条目展示元数据的**唯一读口径**（docs/design/metadata.md 第 5 节），
+    Web 详情页与 Jellyfin 兼容层共用——分层策略只在这里维护一份：
+    本地 NFO 最优先（尊重既有刮削成果）→ 库内刮削档案（media_metadata，
+    绝大多数条目的日常路径，断网可用）→ TMDB 实时兜底（条目还没刮过，
+    顺带触发后台刮削自愈）。
+    """
+    local_meta = await asyncio.to_thread(_read_meta, entry_dirs, files, kind)
+    if local_meta is not None:
+        await _fill_actor_thumbs(session, item, local_meta)
+    if local_meta is None:
+        local_meta = await _db_meta(session, item)
+    if local_meta is None:
+        local_meta = await _tmdb_fallback_meta(item)
+        if item.id is not None:
+            from movieclaw_api.services.media_scrape import scrape_media_item
+
+            asyncio.get_running_loop().create_task(scrape_media_item(item.id))
+    return local_meta
+
+
+def local_item_artwork(roots: list[Path], files: list[LibraryFile], kind: str) -> Path | None:
+    """条目目录里的本地美术图（逐个条目目录找，第一张命中即用）。
+
+    Web 的 artwork 接口与 Jellyfin 图片接口共用；找不到时两端各自退回
+    刮削资产 / TMDB 图床。同步磁盘 IO——调用方自行决定是否进线程池。
+    """
+    for entry in resolve_entry_dirs(roots, files):
+        if not entry.is_dir():
+            continue
+        art = find_local_artwork(entry, kind)
+        if art is not None:
+            return art
+    return None
+
+
 async def build_item_detail(
     session: AsyncSession, library: Library, item: MediaItem, files: list[LibraryFile]
 ) -> ItemDetailBundle:
@@ -470,30 +661,8 @@ async def build_item_detail(
     roots = [Path(p) for p in library.root_paths]
     kind = MediaKind(library.kind)
 
-    # 条目目录：多根/多版本可能给出多个，去重保序（第一个用于 NFO 与美术图）
-    entry_dirs: list[Path] = []
-    for row in files:
-        entry = entry_dir_of(roots, Path(row.file_path))
-        # 原盘条目 file_path 本身就是目录（BDMV/VIDEO_TS），直接在根下时以它为条目目录
-        if entry is None and row.container in ("bluray", "dvd"):
-            entry = Path(row.file_path)
-        if entry is not None and entry not in entry_dirs:
-            entry_dirs.append(entry)
-
-    local_meta = await asyncio.to_thread(_read_meta, entry_dirs, files, kind)
-    # 读路径分层（docs/design/metadata.md 第 5 节）：本地 NFO 最优先（尊重
-    # 既有刮削成果）→ 库内刮削档案（media_metadata，绝大多数条目的日常
-    # 路径，断网可用）→ TMDB 实时兜底（条目还没刮过，顺带触发后台刮削自愈）
-    if local_meta is not None:
-        await _fill_actor_thumbs(session, item, local_meta)
-    if local_meta is None:
-        local_meta = await _db_meta(session, item)
-    if local_meta is None:
-        local_meta = await _tmdb_fallback_meta(item)
-        if item.id is not None:
-            from movieclaw_api.services.media_scrape import scrape_media_item
-
-            asyncio.get_running_loop().create_task(scrape_media_item(item.id))
+    entry_dirs = resolve_entry_dirs(roots, files)
+    local_meta = await layered_item_meta(session, item, entry_dirs, files, kind)
 
     primary_dir = next((d for d in entry_dirs if d.is_dir()), None)
     poster_art = fanart_art = None
@@ -847,62 +1016,114 @@ async def backfill_streams(
     files: list[LibraryFile],
     *,
     limit: int | None = None,
-    on_probed: Callable[[], bool] | None = None,
+    on_processed: Callable[[], bool | Awaitable[bool]] | None = None,
+    on_checkpoint: Callable[[], None | Awaitable[None]] | None = None,
 ) -> int:
-    """给没探测过音轨/字幕轨的在位台账行按需补探并回填，返回实际探了几个。
+    """补齐未探测的介质详情，并为存量 BDMV 回填 CLPI 语言；返回 ffprobe 数。
 
-    这是「ffprobe 后装」的唯一救赎路径——扫描对已识别且在位的行整体秒过，
-    不会回头重探。**只由扫描的补探阶段调用**（有进度与停止按钮的后台任务，
-    慢没关系，半途而废才是问题），用 ``on_probed`` 汇报进度——回调返回
-    False 即收尾（用户点了停止）。详情页曾经也会限量触发补探，已移除：
-    浏览不碰媒体文件本体（云盘挂载上 ffprobe 读文件就是流量与延迟），
-    未探测的行由前端提示用户重新扫描补齐。
+    这是「ffprobe 后装」和「旧 BDMV 尚未读取 CLPI」的统一补救路径——扫描对
+    已识别且在位的行整体秒过，不会在主循环回头重探。**只由扫描的补探阶段
+    调用**（有进度与停止按钮的后台任务，慢没关系，半途而废才是问题），用
+    ``on_processed`` 汇报进度——无论最终是否需要 ffprobe，每检查完一个
+    候选都回调一次，返回 False 即收尾（用户点了停止）。详情页曾经也会
+    限量触发补探，已移除：浏览不碰媒体文件本体（云盘挂载上 ffprobe 读文件
+    就是流量与延迟），未探测的行由前端提示用户重新扫描补齐。
 
-    探测失败的行保持 NULL、下次再试：失败常常是暂时的（挂载还没就绪）。
-    代价是永远探不出的坏文件每轮都会被重试一次，坏文件多的库要留意。
+    探测失败的行保持原值、下次再试：失败常常是暂时的（挂载还没就绪）。
+    BDMV 已有流但缺 CLPI 版本戳时先读对应 CLPI；只有 CLPI 有效才重探 m2ts，
+    随后用 PID 合并，避免缺失元数据导致无意义的大文件读取。
     """
     from movieclaw_api.services.library.scan import disc_main_stream
 
     probed = 0
-    since_commit = 0
+    since_checkpoint = 0
+
+    async def keep_going() -> bool:
+        nonlocal since_checkpoint
+        since_checkpoint += 1
+        # 先提交领域数据再让进度回调写 Job：SQLite 同一时刻只允许一个写
+        # 事务，顺序反过来会让两个会话互等。即使本批全是无需探测的候选，
+        # 也结束读事务后再保存观察进度。
+        if since_checkpoint >= _PROBE_COMMIT_EVERY:
+            await session.commit()
+            since_checkpoint = 0
+            if on_checkpoint is not None:
+                checkpoint_result = on_checkpoint()
+                if inspect.isawaitable(checkpoint_result):
+                    await checkpoint_result
+        if on_processed is None:
+            return True
+        result = on_processed()
+        return bool(await result) if inspect.isawaitable(result) else result
+
     for row in files:
         if limit is not None and probed >= limit:
             break
-        if row.audio_streams is not None or row.missing_since is not None:
+        needs_clpi = row.container == "bluray" and not streams_have_clpi_metadata(
+            row.audio_streams, row.subtitle_streams
+        )
+        # 新增帧率/色彩空间后，历史行两列同时为空时允许整库扫描补探一次。
+        # 正常视频至少能取得其中一项，避免个别元数据缺失的文件每轮重复 ffprobe。
+        needs_visual_details = row.frame_rate is None and row.color_space is None
+        if (
+            row.audio_streams is not None
+            and not needs_clpi
+            and not needs_visual_details
+        ) or row.missing_since is not None:
+            if not await keep_going():
+                break
             continue
         if row.file_path.lower().endswith(STRM_EXT):
+            if not await keep_going():
+                break
             continue  # strm 占位文件没有媒体流，探了必失败，别每轮白试
         path = Path(row.file_path)
         target = disc_main_stream(path) if row.container in ("bluray", "dvd") else path
         if target is None or not await asyncio.to_thread(target.exists):
+            if not await keep_going():
+                break
             continue
+        languages = None
+        if row.container == "bluray":
+            languages = await asyncio.to_thread(read_clpi_languages, target)
+            # 已有 ffprobe 流的存量行只缺 CLPI 回填；CLPI 不存在/损坏时不值得
+            # 再读一遍大 m2ts。audio_streams=NULL 的行仍按原逻辑补普通规格。
+            if row.audio_streams is not None and languages is None:
+                if not await keep_going():
+                    break
+                continue
         probed += 1
         spec = await asyncio.to_thread(probe_media, target)
         if spec is not None:
+            if languages is not None:
+                spec = enrich_spec_with_clpi(spec, languages)
             row.audio_streams = list(spec.audio_streams)
             row.subtitle_streams = list(spec.subtitle_streams)
             # 顺手回填缺失的视频规格（同一次探测的免费产出，不覆盖已有值）
             row.resolution = row.resolution or spec.resolution
             row.video_codec = row.video_codec or spec.video_codec
-            row.hdr = row.hdr or spec.hdr
+            # 新探测能把历史上笼统的 HDR10 细化成 Dolby Vision/HDR10+。
+            row.hdr = spec.hdr or row.hdr
             row.bit_depth = row.bit_depth or spec.bit_depth
             row.duration_seconds = row.duration_seconds or spec.duration_seconds
             row.bit_rate = row.bit_rate or spec.bit_rate
+            row.frame_rate = row.frame_rate or spec.frame_rate
+            row.color_space = row.color_space or spec.color_space
             if row.file_mtime_ns is None:
                 # 播放 ETag 用的 mtime 顺手回填（文件刚探测过，stat 是热的）
                 with contextlib.suppress(OSError):
                     row.file_mtime_ns = Path(row.file_path).stat().st_mtime_ns
             row.updated_at = utcnow()
-            since_commit += 1
-        # 分批提交而不是攒到最后：整库补探可能要几个小时，中途断电/重启
-        # 时已经探完的那部分不该白探
-        if since_commit >= _PROBE_COMMIT_EVERY:
-            await session.commit()
-            since_commit = 0
-        if on_probed is not None and not on_probed():
+        if not await keep_going():
             break
-    if since_commit:
-        await session.commit()
+    # 分批提交而不是攒到最后：整库补探可能要几个小时，中途断电/重启
+    # 时已经探完的那部分不该白探。这里无论有无写入都 commit，确保随后
+    # 的 Job 进度回调不与本会话的读事务交叠。
+    await session.commit()
+    if on_checkpoint is not None and since_checkpoint:
+        checkpoint_result = on_checkpoint()
+        if inspect.isawaitable(checkpoint_result):
+            await checkpoint_result
     return probed
 
 
@@ -999,6 +1220,8 @@ async def delete_item_files(
             await session.delete(row)
     result.rows_deleted = len(deleted_row_ids)
     await session.commit()
+    if result.rows_deleted and library.id is not None:
+        await LibraryRepository(session).refresh_stats([library.id])
 
     if result.removed_paths:
         logger.info(
@@ -1041,6 +1264,8 @@ async def delete_single_file(
         await session.delete(row)
         result.rows_deleted = 1
         await session.commit()
+        if library.id is not None:
+            await LibraryRepository(session).refresh_stats([library.id])
         return result
 
     path = Path(row.file_path)
@@ -1055,6 +1280,8 @@ async def delete_single_file(
         result.freed_bytes = row.size_bytes
         await session.delete(row)
         await session.commit()
+        if library.id is not None:
+            await LibraryRepository(session).refresh_stats([library.id])
         logger.info(
             "已从磁盘删除条目 #%s 的单个文件（库「%s」，释放约 %.1f GB）：%s",
             row.media_item_id,

@@ -18,7 +18,7 @@ class MoviePayload(BaseModel):
     title: str
 
 
-@pytest.fixture
+@pytest.fixture(scope="module")
 def test_app():
     app = create_app()
 

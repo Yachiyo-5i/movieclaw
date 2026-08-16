@@ -17,13 +17,19 @@ class PlaybackState(TimestampMixin, table=True):
 
     键沿用全局约定的 (media_item_id, season_number, episode_number) 数字对
     （电影 (0,0) 哨兵，与 wanted_item / library_file 同源），不锚 media_episode
-    行 id（集行随元数据刷新可增删重建）。单管理员形态不带 user 维度，
-    将来真要多用户时加列即可向前兼容。
+    行 id（集行随元数据刷新可增删重建）。
+
+    成员维度（docs/design/member-management.md §3.4）：``member_id`` 进唯一
+    约束，每人各一行——进度、已看、收藏全部按人隔离。**哨兵值 0 = 超管**，
+    刻意不用 NULL：SQLite 的 UNIQUE 视 NULL 互不相等，可空列进唯一约束会
+    让同一单元插出无限行。也因此本列不是外键——删除成员时由服务层显式
+    清理其状态行。存量数据迁移后 member_id=0（历史进度归超管，语义正确）。
     """
 
     __tablename__ = "playback_state"
     __table_args__ = (
         UniqueConstraint(
+            "member_id",
             "media_item_id",
             "season_number",
             "episode_number",
@@ -32,6 +38,7 @@ class PlaybackState(TimestampMixin, table=True):
     )
 
     id: int | None = Field(default=None, primary_key=True)
+    member_id: int = Field(default=0, index=True, description="归属成员；0=超管（哨兵）")
 
     media_item_id: int = Field(
         sa_column=Column(
@@ -46,6 +53,14 @@ class PlaybackState(TimestampMixin, table=True):
     episode_number: int = Field(default=0, description="集号；电影=0（哨兵）")
 
     position_ms: int = Field(default=0, description="续播位置（毫秒）；0=无续播点")
+    # 轨选择记忆（docs/design/jellyfin-subtitle.md §3.3）：存协议无关的
+    # 中性轨引用（"embedded:<k>" / "external:<文件名>" / 字幕特有 "off"），
+    # 不存 Jellyfin 的合成流序号——序号随补探回填漂移，中性引用天然免疫。
+    # NULL=从未上报过轨选择。
+    audio_track: str | None = Field(default=None, description="记忆的音轨（中性引用）")
+    subtitle_track: str | None = Field(
+        default=None, description="记忆的字幕轨（中性引用；off=明确关闭）"
+    )
     played: bool = Field(default=False, index=True, description="是否已看完")
     play_count: int = Field(default=0, description="播放次数（开始播放时 +1）")
     is_favorite: bool = Field(default=False, description="是否收藏")

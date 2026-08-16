@@ -4,18 +4,31 @@
  * 约定：所有需要展示时间的地方都走这里，不要在组件里散落 `new Date().toLocaleString()`
  * 之类的裸写法。好处：
  *   1. 解析口径统一 —— 后端时间统一为**带时区标记**的 ISO 串（naive UTC 序列化时补 +00:00，
- *      见 movieclaw_api/schemas/site.py 的 _serialize_utc），dayjs 会正确按 UTC 解析后转成
+ *      见 movieclaw_api/schemas/base.py），dayjs 会正确按 UTC 解析后转成
  *      浏览器本地时区展示，避免"刚验证完却显示 8 小时前"这类时区错位。
  *   2. 中文文案统一 —— relativeTime 插件配 zh-cn locale，产出"几秒前 / 几分钟前 / 几天前"。
  *
  * dayjs 选型：~2KB，仅按需加载 relativeTime 插件与 zh-cn 语言包，不引入完整 moment。
  */
 import dayjs from "dayjs";
-import relativeTime from "dayjs/plugin/relativeTime";
-import "dayjs/locale/zh-cn";
+import relativeTime from "dayjs/plugin/relativeTime.js";
+import "dayjs/locale/zh-cn.js";
 
 dayjs.extend(relativeTime);
-dayjs.locale("zh-cn");
+
+/** 时间展示的唯一地区化配置；未来切换语言或格式只改这里。 */
+const TIME_DISPLAY_CONFIG = {
+  locale: "zh-cn",
+  dateTimeFormat: "YYYY/MM/DD HH:mm",
+  clockTimeFormat: "HH:mm",
+  timelineDateFormat: "MM/DD",
+  historyDayFormat: "M月D日",
+  historyDayFullFormat: "YYYY年M月D日",
+  neverLabel: "从未",
+  emptyLabel: "—",
+} as const;
+
+dayjs.locale(TIME_DISPLAY_CONFIG.locale);
 
 /**
  * ISO 时间 → 中文相对时间，如「刚刚 / 3 分钟前 / 2 天前」。
@@ -23,7 +36,7 @@ dayjs.locale("zh-cn");
  * 传入 null/空 表示从未发生，返回「从未」。
  */
 export function formatRelativeTime(iso: string | null | undefined): string {
-  if (!iso) return "从未";
+  if (!iso) return TIME_DISPLAY_CONFIG.neverLabel;
   return dayjs(iso).fromNow();
 }
 
@@ -32,6 +45,49 @@ export function formatRelativeTime(iso: string | null | undefined): string {
  * 用于"令牌生成于""创建于"这类关注"具体是哪一刻"的场景。
  */
 export function formatDateTime(iso: string | null | undefined): string {
-  if (!iso) return "—";
-  return dayjs(iso).format("YYYY/MM/DD HH:mm");
+  if (!iso) return TIME_DISPLAY_CONFIG.emptyLabel;
+  return dayjs(iso).format(TIME_DISPLAY_CONFIG.dateTimeFormat);
+}
+
+/** 时间线的紧凑本地时间；完整日期仍通过卡片提示中的 formatDateTime 提供。 */
+export function formatClockTime(iso: string | null | undefined): string {
+  if (!iso) return TIME_DISPLAY_CONFIG.emptyLabel;
+  return dayjs(iso).format(TIME_DISPLAY_CONFIG.clockTimeFormat);
+}
+
+/**
+ * Feed 时间轴的紧凑时间：当天记录显示时分，跨天记录显示月日。调用方仍可在
+ * 卡片悬停信息里提供完整绝对时间，避免长历史把不同日期误看成同一天。
+ */
+export function formatTimelineTime(
+  iso: string | null | undefined,
+  referenceIso?: string,
+): string {
+  if (!iso) return TIME_DISPLAY_CONFIG.emptyLabel;
+  const value = dayjs(iso);
+  return value.isSame(referenceIso ? dayjs(referenceIso) : dayjs(), "day")
+    ? value.format(TIME_DISPLAY_CONFIG.clockTimeFormat)
+    : value.format(TIME_DISPLAY_CONFIG.timelineDateFormat);
+}
+
+/** Feed 历史分组键使用浏览器本地日期，避免 UTC 日期把午夜附近的记录分错组。 */
+export function timelineDayKey(iso: string): string {
+  return dayjs(iso).format("YYYY-MM-DD");
+}
+
+/** 历史分组标题：今天、昨天优先使用自然语言，更早记录才显示具体日期。 */
+export function formatTimelineDayLabel(iso: string, referenceIso?: string): string {
+  const value = dayjs(iso);
+  const reference = referenceIso ? dayjs(referenceIso) : dayjs();
+  if (value.isSame(reference, "day")) return "今天早些时候";
+  if (value.isSame(reference.subtract(1, "day"), "day")) return "昨天";
+  return value.isSame(reference, "year")
+    ? value.format(TIME_DISPLAY_CONFIG.historyDayFormat)
+    : value.format(TIME_DISPLAY_CONFIG.historyDayFullFormat);
+}
+
+/** Unix 秒时间戳 → 本地绝对时间，避免组件绕开统一地区化配置。 */
+export function formatUnixDateTime(seconds: number | null | undefined): string {
+  if (seconds == null) return TIME_DISPLAY_CONFIG.emptyLabel;
+  return dayjs.unix(seconds).format(TIME_DISPLAY_CONFIG.dateTimeFormat);
 }

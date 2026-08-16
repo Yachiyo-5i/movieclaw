@@ -5,12 +5,10 @@ import type { Route } from "next";
 
 import { PosterCardVisual, type PosterVisualItem } from "@/components/poster-card";
 import { libraryCardAction } from "@/components/library-view";
-import {
-  searchLibraryItems,
-  type LibraryItem,
-  type LibrarySearchGroup,
-} from "@/lib/api/libraries";
+import type { LibraryItem, LibrarySearchGroup } from "@/lib/api/libraries";
+import { searchLibraryItems } from "@/lib/api/search";
 import { imageUrl } from "@/lib/image-proxy";
+import { useScrollRestoration } from "@/lib/use-scroll-restoration";
 
 /**
  * 搜索结果页「媒体库」垂直：跨全部媒体库搜索已入库条目，按库分区展示。
@@ -28,8 +26,9 @@ export function LibrarySearchResults({
 }: {
   keyword: string;
   /** 切到「影视」垂直（空态时的出口：库里没有 → 去找来） */
-  onSwitchToMedia: () => void;
+  onSwitchToMedia?: () => void;
 }) {
+  const scrollRef = useScrollRestoration(`search:library:${keyword}`);
   // null = 加载中；[] = 无结果；error 非空 = 请求失败
   const [groups, setGroups] = useState<LibrarySearchGroup[] | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -61,7 +60,10 @@ export function LibrarySearchResults({
         </h1>
       </header>
 
-      <div className="scroll-thin scroll-safe relative min-h-0 flex-1 overflow-y-auto px-6 pb-6 max-md:px-4">
+      <div
+        ref={scrollRef}
+        className="scroll-thin scroll-safe relative min-h-0 flex-1 overflow-y-auto px-6 pb-6 max-md:px-4"
+      >
         {groups === null && !error && <LibrarySearchSkeleton />}
         {(error || empty) && (
           <div className="flex flex-col items-center pt-24 text-center">
@@ -71,13 +73,15 @@ export function LibrarySearchResults({
             <p className="text-on-image mt-1.5 text-sub text-[rgba(243,245,249,0.7)]">
               {error ?? "已入库条目按标题和原名匹配；库里还没有的片子，去影视条目里找。"}
             </p>
-            <button
-              type="button"
-              onClick={onSwitchToMedia}
-              className="btn-accent mt-5 rounded-full px-4 py-1.5 text-sub font-semibold"
-            >
-              搜索影视条目
-            </button>
+            {onSwitchToMedia && (
+              <button
+                type="button"
+                onClick={onSwitchToMedia}
+                className="btn-accent mt-5 rounded-full px-4 py-1.5 text-sub font-semibold"
+              >
+                搜索影视条目
+              </button>
+            )}
           </div>
         )}
         {groups !== null && groups.length > 0 && (

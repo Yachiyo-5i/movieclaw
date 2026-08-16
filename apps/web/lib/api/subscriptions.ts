@@ -47,6 +47,8 @@ export interface SeasonOverview {
 /** 豆瓣收敛歧义时的确认候选 */
 export interface ResolveCandidate {
   tmdb_id: number;
+  /** 选定该候选后用于创建订阅的稳定引用 */
+  title_ref: string;
   title: string;
   original_title: string;
   year: number | null;
@@ -84,8 +86,76 @@ export interface Subscription {
   /** 入库目标库；null = 该类型的默认库 */
   library_id: number | null;
   progress: SubscriptionProgress;
+  /** 剧集按季收录统计；电影为空数组 */
+  season_collection: SeasonOverview[];
   created_at: string;
   updated_at: string;
+}
+
+/** 订阅首页的一行“今日可能入库”单集摘要。 */
+export interface TodaySubscriptionArrival {
+  subscription_id: number;
+  wanted_id: number;
+  media_title: string;
+  season_number: number;
+  episode_number: number;
+  status: Extract<WantedStatus, "wanted" | "grabbed" | "downloaded">;
+  air_date: string | null;
+  release_forecast: ReleaseForecast | null;
+  /** 后端按站点游标和礼貌间隔计算的下一次有效预测探测时间。 */
+  next_probe_at: string | null;
+  info_hash: string | null;
+  grabbed_at: string | null;
+  downloaded_at: string | null;
+  estimated_release_to_import_minutes: number;
+  estimated_download_to_import_minutes: number;
+}
+
+export interface ReleaseForecastSite {
+  site_id: string;
+  predicted_at: string;
+  window_start: string;
+  window_end: string;
+  lag_minutes: number;
+  coverage_count: number;
+  probe_times: string[];
+}
+
+/** 单集资源发布时间预测快照；它是可重算的调度结论，不是新的观测事实源。 */
+export interface ReleaseForecast {
+  version: number;
+  generated_at: string;
+  target_air_date: string;
+  predicted_at: string;
+  window_start: string;
+  window_end: string;
+  confidence: "bootstrap" | "growing" | "stable" | "volatile";
+  sample_count: number;
+  cadence_days: number;
+  basis_units: [number, number][];
+  basis_torrent_row_ids: number[];
+  sites: ReleaseForecastSite[];
+  first: {
+    generated_at: string;
+    predicted_at: string;
+    window_start: string;
+    window_end: string;
+    confidence: string;
+    sample_count: number;
+  };
+}
+
+/** 一集最近一次成功投递所用资源的发布→索引→提交时间链。 */
+export interface ResourceTiming {
+  site_id: string;
+  torrent_id: string;
+  publish_time: string | null;
+  first_seen_at: string | null;
+  submitted_at: string;
+  publish_to_seen_seconds: number | null;
+  seen_to_submit_seconds: number | null;
+  publish_to_submit_seconds: number | null;
+  dry_run: boolean;
 }
 
 export interface WantedItem {
@@ -98,10 +168,12 @@ export interface WantedItem {
   next_search_at: string | null;
   search_attempts: number;
   last_search_at: string | null;
+  release_forecast: ReleaseForecast | null;
+  resource_timing: ResourceTiming | null;
   grabbed_at: string | null;
   downloaded_at: string | null;
   imported_at: string | null;
-  /** 在途工单锚定的种子 hash；据此与 listSubscriptionDownloads 的进度组对上 */
+  /** 在途工单锚定的种子 hash；据此与 listActiveSubscriptionDownloads 的进度组对上 */
   info_hash: string | null;
 }
 
@@ -127,6 +199,10 @@ export interface RuleSetSpec {
   size_max_mb?: number | null;
   exclude_hr?: boolean;
   hr_unknown_policy?: "lenient" | "strict";
+  /** 要求的字幕语言（BCP 47，任一命中即过；"zh" 含简/繁/未标简繁）；空=不限 */
+  subtitle_languages_require?: string[];
+  /** 要求的音轨语言（cmn=国语、yue=粤语…）；空=不限 */
+  audio_languages_require?: string[];
 }
 
 export interface RuleSet {
@@ -138,25 +214,27 @@ export interface RuleSet {
   reference_count: number;
 }
 
-export interface PreparePayload {
-  source: "tmdb" | "douban";
-  kind: MediaType;
-  tmdb_id?: number;
-  /** 豆瓣入口：豆瓣标题 */
-  title?: string;
-  year?: number;
-  douban_id?: string;
+export interface SubscriptionTargetPreviewPayload {
+  /** Discover 返回的影视条目稳定引用 */
+  title_ref: string;
 }
 
 export interface CreateSubscriptionPayload {
-  kind: MediaType;
-  tmdb_id: number;
+  /** Discover 返回或歧义候选确认后的稳定引用 */
+  title_ref: string;
+  /** 从豆瓣候选改选 TMDB 条目时保留原始豆瓣身份 */
+  source_title_ref?: string | null;
   selected_seasons?: number[];
   follow_future?: boolean;
   rule_set_id?: number | null;
   /** 入库目标库；缺省用该类型的默认库 */
   library_id?: number | null;
-  douban_id?: string | null;
+}
+
+export interface CreateSubscriptionResult {
+  subscription: SubscriptionDetail;
+  /** 管理员可见的下载与入库路由预检；成员调用时为空 */
+  download_routing: DispatchPreview | null;
 }
 
 /** 投递路由预检（见 schemas.subscription.DispatchPreviewView）。 */
@@ -185,7 +263,7 @@ export interface DispatchPreview {
  * 投递路由预检：订阅弹窗选库时调用，预演下载会落到哪、能否自动入库。
  * `libraryId` 为 null 且带 `tmdbId` 时由后端按收藏范围路由选库并返回理由。
  */
-export function getDispatchPreview(
+export function previewSubscriptionDownloadRouting(
   kind: string,
   libraryId: number | null,
   tmdbId?: number | null,
@@ -194,7 +272,7 @@ export function getDispatchPreview(
   if (libraryId !== null) params.set("library_id", String(libraryId));
   if (tmdbId != null) params.set("tmdb_id", String(tmdbId));
   return unwrap(
-    request<ApiEnvelope<DispatchPreview>>(`/subscriptions/dispatch-preview?${params}`),
+    request<ApiEnvelope<DispatchPreview>>(`/subscriptions/download-routing-preview?${params}`),
   );
 }
 
@@ -276,14 +354,18 @@ export interface PipelineHealth {
 }
 
 /** 订阅链路体检：逐库预演「投递 → 转移 → 入库」，与真实投递同源判定。 */
-export function getPipelineHealth(init?: RequestInit): Promise<PipelineHealth> {
-  return unwrap(request<ApiEnvelope<PipelineHealth>>("/subscriptions/pipeline-health", init));
+export function checkSubscriptionAutomationReadiness(
+  init?: RequestInit,
+): Promise<PipelineHealth> {
+  return unwrap(request<ApiEnvelope<PipelineHealth>>("/subscriptions/automation-readiness", init));
 }
 
-/** 订阅预检：建档条目并返回季集结构（打开订阅弹层时调用，幂等）。 */
-export function prepareSubscription(payload: PreparePayload): Promise<PrepareResult> {
+/** Web 表单内部预览：按 Discover title_ref 返回季集、库存和现有订阅状态。 */
+export function previewSubscriptionTitle(
+  payload: SubscriptionTargetPreviewPayload,
+): Promise<PrepareResult> {
   return unwrap(
-    request<ApiEnvelope<PrepareResult>>("/subscriptions/prepare", {
+    request<ApiEnvelope<PrepareResult>>("/subscriptions/title-preview", {
       method: "POST",
       body: JSON.stringify(payload),
     }),
@@ -295,11 +377,11 @@ export function createSubscription(
   payload: CreateSubscriptionPayload,
 ): Promise<SubscriptionDetail> {
   return unwrap(
-    request<ApiEnvelope<SubscriptionDetail>>("/subscriptions", {
+    request<ApiEnvelope<CreateSubscriptionResult>>("/subscriptions", {
       method: "POST",
       body: JSON.stringify(payload),
     }),
-  );
+  ).then((result) => result.subscription);
 }
 
 /** 订阅列表（含工单进度）。kind 缺省返回全部。 */
@@ -311,12 +393,24 @@ export function listSubscriptions(
   return unwrap(request<ApiEnvelope<Subscription[]>>(`/subscriptions${query}`, init));
 }
 
+/** 今天待播或仍在下载/整理中的剧集；预计耗时已按各订阅历史校准。 */
+export function listTodaySubscriptionArrivals(
+  init?: RequestInit,
+): Promise<TodaySubscriptionArrival[]> {
+  return unwrap(
+    request<ApiEnvelope<TodaySubscriptionArrival[]>>(
+      "/subscriptions/today-arrivals",
+      init,
+    ),
+  );
+}
+
 /** 订阅详情（含工单明细）。 */
 export function getSubscription(id: number): Promise<SubscriptionDetail> {
   return unwrap(request<ApiEnvelope<SubscriptionDetail>>(`/subscriptions/${id}`));
 }
 
-/** 修改订阅（季选择/追新/规则组，后端 diff 重算工单）。 */
+/** 修改订阅（季选择/自动续订/规则组，后端 diff 重算工单）。 */
 export function updateSubscription(
   id: number,
   payload: {
@@ -336,11 +430,14 @@ export function updateSubscription(
 }
 
 /** 立即搜索：缺口工单跳过冷却重新排队（暂停中/无可搜缺口时后端报可读错误）。 */
-export function searchSubscriptionNow(id: number): Promise<{ reset_count: number }> {
+export function searchMissingSubscriptionResources(
+  id: number,
+): Promise<{ reset_count: number }> {
   return unwrap(
-    request<ApiEnvelope<{ reset_count: number }>>(`/subscriptions/${id}/search-now`, {
-      method: "POST",
-    }),
+    request<ApiEnvelope<{ reset_count: number }>>(
+      `/subscriptions/${id}/missing-resource-searches`,
+      { method: "POST" },
+    ),
   );
 }
 
@@ -361,30 +458,55 @@ export interface GrabPayload {
 }
 
 /** 手动选种：把一条搜索结果直接投给订阅（跳过规则组过滤；身份匹配照常）。 */
-export function grabForSubscription(
+export function downloadSelectedTorrentForSubscription(
   id: number,
   payload: GrabPayload,
 ): Promise<{ units: { season_number: number; episode_number: number }[] }> {
   return unwrap(
     request<ApiEnvelope<{ units: { season_number: number; episode_number: number }[] }>>(
-      `/subscriptions/${id}/grab`,
+      `/subscriptions/${id}/selected-torrent-downloads`,
       { method: "POST", body: JSON.stringify(payload) },
     ),
   );
 }
 
 /** 暂停 / 恢复订阅。 */
-export function pauseSubscription(id: number, paused: boolean): Promise<SubscriptionDetail> {
+export function setSubscriptionTrackingState(
+  id: number,
+  state: "active" | "paused",
+): Promise<SubscriptionDetail> {
   return unwrap(
-    request<ApiEnvelope<SubscriptionDetail>>(`/subscriptions/${id}/pause`, {
+    request<ApiEnvelope<SubscriptionDetail>>(`/subscriptions/${id}/tracking-state`, {
       method: "PATCH",
-      body: JSON.stringify({ paused }),
+      body: JSON.stringify({ state }),
     }),
   );
 }
 
-/** 删除订阅（不影响已下载内容）。 */
-export function deleteSubscription(id: number): Promise<Record<string, never>> {
+/** 独立开启 / 关闭剧集自动续订。 */
+export function setSubscriptionFollowFuture(
+  id: number,
+  enabled: boolean,
+): Promise<SubscriptionDetail> {
+  return unwrap(
+    request<ApiEnvelope<SubscriptionDetail>>(`/subscriptions/${id}/follow-future`, {
+      method: "PATCH",
+      body: JSON.stringify({ enabled }),
+    }),
+  );
+}
+
+/** 成员停止关注；服务端保证不影响仍在追踪的其他成员。 */
+export function unsubscribeFromSubscription(id: number): Promise<Record<string, never>> {
+  return unwrap(
+    request<ApiEnvelope<Record<string, never>>>(`/subscriptions/${id}/following`, {
+      method: "DELETE",
+    }),
+  );
+}
+
+/** 管理员永久删除订阅与追踪工单（不影响已下载内容）。 */
+export function deleteSubscriptionPermanently(id: number): Promise<Record<string, never>> {
   return unwrap(
     request<ApiEnvelope<Record<string, never>>>(`/subscriptions/${id}`, {
       method: "DELETE",
@@ -409,12 +531,15 @@ export interface SubscriptionDownload {
 }
 
 /** 订阅在途种子的实时下载进度（纯读快照，逐个查询下载器）。 */
-export function listSubscriptionDownloads(
+export function listActiveSubscriptionDownloads(
   id: number,
   init?: RequestInit,
 ): Promise<SubscriptionDownload[]> {
   return unwrap(
-    request<ApiEnvelope<SubscriptionDownload[]>>(`/subscriptions/${id}/downloads`, init),
+    request<ApiEnvelope<SubscriptionDownload[]>>(
+      `/subscriptions/${id}/active-downloads`,
+      init,
+    ),
   );
 }
 
@@ -436,7 +561,12 @@ export interface SubscriptionActivity {
     | "wanted_added"
     | "downloaded"
     | "imported"
-    | "import_failed";
+    | "import_failed"
+    | "download_stalled"
+    | "replacement_searched"
+    | "replacement_trial"
+    | "replacement_promoted"
+    | "replacement_cleanup";
   message: string;
   payload: Record<string, unknown>;
   created_at: string;

@@ -14,6 +14,7 @@ from pathlib import Path
 
 from movieclaw_cli.gen.spec_loader import load_baseline
 from movieclaw_cli.gen.tree_builder import (
+    DOMAIN_HELP,
     RESERVED_PARAM_NAMES,
     generated_command_paths,
     is_generable,
@@ -28,12 +29,29 @@ KNOWN_NON_GENERATED = {
     "images.asset",
     "images.proxy",
     "libraries.cover",  # 二进制图片直出（<img> 引用），CLI 无消费场景
+    "ui.library.files.preview-subtitles",  # 详情页弹窗按需读取，CLI 无交互消费场景
+    "ui.library.files.thumb",
+    "ui.library.items.ids",
+    "ui.library.items.index",
+    # 精选命令负责 preview → --yes 工作流，底层两段接口不直接进入命令树。
+    "workflow.library.organize-files.preview",
+    "workflow.library.organize-files.start",
+    "workflow.library.reconcile-paths.preview",
+    "workflow.library.reconcile-paths.start",
     "system.spec",
     "auth.login",  # 精选命令 mclaw login 负责（要持久化本地凭证）
     "auth.logout",  # 精选命令 mclaw logout 负责
-    "search.stream",
-    "agent.runs.stream",
+    "workflow.search.torrents.stream",
+    "session.follow",
     "fs.browse",  # 仅 Web 端目录选择器用；CLI/Agent 有 bash 等通用工具，不再暴露
+    "jobs.stream",  # 前端全局事件流；CLI 使用 jobs wait/events
+    "playback.recent",  # 按成员投影的 Web 首页卡片；CLI 暂无对应消费场景
+    "dl.tasks",  # 任务中心的下载器聚合投影；CLI 直接使用 downloader 命令
+    "dl.torrent.replace",  # 任务中心无进度下载的就地换源动作，仅供 Web 使用
+    "dl.torrent.delete",  # 任务中心 Web 操作；删除数据时具有破坏性，不开放给 CLI
+    "ui.discovery.get",  # Web 专用展示编排；CLI 使用 discover 领域命令
+    "discover.get-person-details",  # 发现页演职员下钻；CLI 暂无人物页消费场景
+    "ui.subscriptions.preview-title",
 }
 
 
@@ -47,6 +65,166 @@ def test_command_tree_matches_snapshot() -> None:
         "open('tests/cli/command_tree_snapshot.txt','w').write("
         "'\\n'.join(generated_command_paths(load_baseline()))+'\\n')\""
     )
+
+
+def test_domain_help_covers_every_generated_domain() -> None:
+    """域级 --help 是模型二次探索入口：每个命令域都必须有人工功能介绍。"""
+    domains = {
+        op["operation_id"].split(".")[0]
+        for op in iter_operations(load_baseline())
+        if is_generable(op)
+    }
+    assert set(DOMAIN_HELP) == domains, (
+        f"域简介与命令域不一致：缺少 {domains - set(DOMAIN_HELP)}，"
+        f"多出 {set(DOMAIN_HELP) - domains}"
+    )
+
+
+def test_domain_help_uses_frontend_user_language() -> None:
+    """一级帮助沿用页面心智，并在短描述里区分容易混淆的相邻域。"""
+    assert "TMDB/豆瓣" in DOMAIN_HELP["discover"]
+    assert "影视条目、PT 种子和本地媒体库" in DOMAIN_HELP["search"]
+    assert "自动搜索、下载和整理入库" in DOMAIN_HELP["subscriptions"]
+    assert "AI 对话入口" in DOMAIN_HELP["channels"]
+    assert "家庭成员" in DOMAIN_HELP["members"]
+    assert "首页背景" in DOMAIN_HELP["appearance"]
+    assert "界面质感" in DOMAIN_HELP["ui"]
+
+
+def test_discover_exposes_only_semantic_domain_commands() -> None:
+    """发现域不再把 layout/hero/row 等页面实现细节暴露给人或模型。"""
+    command_ids = {
+        op["operation_id"]
+        for op in iter_operations(load_baseline())
+        if is_generable(op) and op["operation_id"].startswith("discover.")
+    }
+    assert command_ids == {
+        "discover.list-collections",
+        "discover.browse-collection",
+        "discover.filter-options",
+        "discover.filter-titles",
+        "discover.get-title-details",
+    }
+
+
+def test_subscriptions_exposes_only_user_intent_commands() -> None:
+    """订阅域隐藏页面预检和旧术语，只保留模型能按用户意图选择的命令。"""
+    command_ids = {
+        op["operation_id"]
+        for op in iter_operations(load_baseline())
+        if is_generable(op) and op["operation_id"].startswith("subscriptions.")
+    }
+    assert command_ids == {
+        "subscriptions.check-automation-readiness",
+        "subscriptions.create",
+        "subscriptions.delete",
+        "subscriptions.download-selected-torrent",
+        "subscriptions.get",
+        "subscriptions.list",
+        "subscriptions.list-active-downloads",
+        "subscriptions.list-activities",
+        "subscriptions.list-today-arrivals",
+        "subscriptions.preview-download-routing",
+        "subscriptions.search-missing-resources",
+        "subscriptions.set-follow-future",
+        "subscriptions.set-tracking-state",
+        "subscriptions.unsubscribe",
+        "subscriptions.update",
+    }
+
+
+def test_session_exposes_only_message_semantic_operations() -> None:
+    """Session 公开面只保留会话/message 语义，不重新引入 run、turn 或 rewind。"""
+    operation_ids = {
+        op["operation_id"]
+        for op in iter_operations(load_baseline())
+        if op["operation_id"].startswith("session.")
+    }
+    assert operation_ids == {
+        "session.compact-context",
+        "session.delete",
+        "session.follow",
+        "session.get-transcript",
+        "session.list",
+        "session.rename",
+        "session.retry",
+        "session.start",
+        "session.stop",
+    }
+
+
+def test_library_exposes_only_semantic_domain_commands() -> None:
+    """媒体库域不再暴露 lib 缩写、页面实现词或含混的 identify-file(s)。"""
+    command_ids = {
+        op["operation_id"]
+        for op in iter_operations(load_baseline())
+        if is_generable(op) and op["operation_id"].startswith("library.")
+    }
+    assert command_ids == {
+        "library.artwork.download",
+        "library.artwork.list-candidates",
+        "library.artwork.select",
+        "library.create",
+        "library.delete",
+        "library.get",
+        "library.identification.assign-file-to-title",
+        "library.identification.assign-files-to-title",
+        "library.identification.ignore-all-unidentified-files",
+        "library.identification.ignore-file",
+        "library.identification.list-ignored-files",
+        "library.identification.list-review-cases",
+        "library.identification.list-unidentified-files",
+        "library.identification.mark-files-as-extras",
+        "library.identification.resolve-review",
+        "library.identification.restore-files",
+        "library.items.delete",
+        "library.items.delete-file",
+        "library.items.get",
+        "library.items.get-transfer-status",
+        "library.items.list",
+        "library.items.list-episodes",
+        "library.items.preview-reidentification",
+        "library.items.preview-transfer",
+        "library.items.refresh-metadata",
+        "library.items.reidentify",
+        "library.items.transfer",
+        "library.list",
+        "library.list-routing-options",
+        "library.metadata.get-refresh-status",
+        "library.metadata.refresh-library",
+        "library.metadata.stop-refresh",
+        "library.missing.clear-records",
+        "library.missing.list",
+        "library.missing.redownload",
+        "library.reorder",
+        "library.scan.start",
+        "library.scan.stop",
+        "library.set-default",
+        "library.subtitles.calibrate-timing",
+        "library.subtitles.generate",
+        "library.subtitles.preview-generation",
+        "library.update",
+    }
+
+
+def test_search_exposes_one_semantic_domain_for_all_search_targets() -> None:
+    """影视、种子、本地库、历史与预设统一位于 search 域。"""
+    command_ids = {
+        op["operation_id"]
+        for op in iter_operations(load_baseline())
+        if is_generable(op) and op["operation_id"].startswith("search.")
+    }
+    assert command_ids == {
+        "search.titles",
+        "search.torrents",
+        "search.library-items",
+        "search.history.list",
+        "search.history.get-results",
+        "search.history.delete",
+        "search.history.clear",
+        "search.presets.list",
+        "search.presets.update",
+    }
 
 
 def test_api_params_do_not_shadow_cli_flags() -> None:
@@ -79,9 +257,15 @@ def test_non_generated_endpoints_are_all_known() -> None:
 
 
 def test_dangerous_and_long_task_flow_into_commands() -> None:
-    """x-cli 标注确实驱动了命令行为：危险端点带 ⚠ 提示，长任务端点带 --wait。"""
+    """x-cli 标注驱动危险确认与两类后台等待协议。"""
     ops = {op["operation_id"]: op for op in iter_operations(load_baseline())}
-    assert ops["lib.items.delete"]["dangerous"] == "destructive"
-    assert ops["sub.delete"]["dangerous"] == "confirm"
-    assert ops["lib.scan.start"]["long_task"]["progress_op"] == "lib.show"
-    assert ops["lib.refresh.start"]["long_task"]["done_field"] == "refreshing"
+    assert ops["library.items.delete"]["dangerous"] == "destructive"
+    assert ops["subscriptions.delete"]["dangerous"] == "confirm"
+    assert ops["subscriptions.unsubscribe"]["dangerous"] == "confirm"
+    assert ops["library.scan.start"]["job"]["id_path"] == "job_id"
+    assert ops["library.metadata.refresh-library"]["job"]["id_path"] == "job_id"
+    assert ops["workflow.library.organize-files.start"]["job"]["id_path"] == "job_id"
+    assert ops["library.items.refresh-metadata"]["job"]["id_path"] == "job_id"
+    assert ops["library.items.transfer"]["dangerous"] == "confirm"
+    assert ops["library.items.transfer"]["job"]["id_path"] == "job_id"
+    assert ops["library.subtitles.generate"]["job"]["id_path"] == "id"

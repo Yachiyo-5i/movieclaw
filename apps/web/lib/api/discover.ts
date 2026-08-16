@@ -1,16 +1,16 @@
 import { request } from "@/lib/http";
 import { cachedImageUrl } from "@/lib/image-proxy";
+import type { DiscoveryFilters } from "@/lib/discovery-filters";
 import type {
-  DiscoverLayoutData,
   MediaLibraryLink,
   MediaLibraryStatus,
   MediaItem,
   MediaRowData,
-  MediaType,
   MediaSource,
+  MediaType,
 } from "@/lib/media-types";
 
-/** 后端统一响应信封（见 movieclaw_api.schemas.response.ApiResponse） */
+/** 后端统一响应信封（见 movieclaw_api.schemas.response.ApiResponse）。 */
 interface ApiEnvelope<T> {
   success: boolean;
   code: string;
@@ -23,25 +23,8 @@ async function unwrap<T>(promise: Promise<ApiEnvelope<T>>): Promise<T> {
 }
 
 // ---------------------------------------------------------------------------
-// 后端 DTO（snake_case，见 movieclaw_media.models）→ 前端类型的映射
+// Discover 领域 DTO（snake_case）→ 前端渲染模型（camelCase）
 // ---------------------------------------------------------------------------
-
-interface MediaCardDto {
-  id: string;
-  source: MediaSource;
-  type: MediaType;
-  title: string;
-  original_title: string;
-  year: number;
-  rating: number;
-  genres: string[];
-  extent: string;
-  badges: string[];
-  overview: string;
-  poster_url: string;
-  backdrop_url: string | null;
-  library_status?: MediaLibraryStatusDto | null;
-}
 
 interface MediaLibraryStatusDto {
   media_item_id: number;
@@ -55,36 +38,95 @@ interface MediaLibraryLinkDto {
   media_item_id: number;
 }
 
-interface MediaRowDto {
-  id: string;
+export interface DiscoveredTitleDto {
+  title_ref: string;
+  provider: MediaSource;
+  external_id: string;
+  media_type: MediaType | null;
   title: string;
-  items: MediaCardDto[];
+  original_title: string;
+  release_year: number | null;
+  provider_rating: number;
+  genres: string[];
+  extent_label: string;
+  overview: string;
+  poster_url: string;
+  backdrop_url: string | null;
+  library_status?: MediaLibraryStatusDto | null;
 }
 
-interface DiscoverLayoutDto {
-  has_hero: boolean;
-  rows: { id: string; title: string }[];
+interface DiscoveryCollectionDto {
+  collection_ref: string;
+  provider: MediaSource;
+  media_type: MediaType;
+  name: string;
+  description: string;
+  is_ranked: boolean;
+  default_limit: number;
+  supports_full_listing: boolean;
 }
 
-interface MediaSearchItemDto {
+interface DiscoveryCollectionTitlesDto {
+  collection: DiscoveryCollectionDto;
+  titles: DiscoveredTitleDto[];
+  returned_count: number;
+  truncated: boolean;
+  page: number;
+  total_pages: number;
+  total_results: number;
+  has_more: boolean;
+}
+
+interface DiscoveryFilterOptionsDto {
+  media_type: MediaType;
+  genres: Array<{ id: number; name: string }>;
+}
+
+interface DiscoveryTitlePageDto {
+  media_type: MediaType;
+  titles: DiscoveredTitleDto[];
+  page: number;
+  total_pages: number;
+  total_results: number;
+  has_more: boolean;
+}
+
+type DiscoveryPresentation = "hero" | "ranked-row" | "poster-row";
+
+interface DiscoveryPageDto {
+  provider: MediaSource;
+  media_type: MediaType;
+  sections: Array<{
+    collection_ref: string;
+    title: string;
+    presentation: DiscoveryPresentation;
+    preview_limit: number;
+    supports_full_listing: boolean;
+  }>;
+}
+
+interface TitleSearchProviderStatusDto {
+  provider: MediaSource;
+  success: boolean;
+  result_count: number;
+  message: string | null;
+}
+
+export interface TitleSearchDto {
+  query: string;
+  titles: DiscoveredTitleDto[];
+  providers: TitleSearchProviderStatusDto[];
+  history_id: number | null;
+}
+
+export interface MediaSearchItemDto {
   id: string;
-  source: "douban" | "tmdb";
+  source: MediaSource;
   title: string;
-  /** 豆瓣轻量搜索不提供年份/类型（旧快照也没有这两个字段），仅 TMDB 来源有值 */
   year?: number | null;
-  type?: "movie" | "tv" | null;
+  type?: MediaType | null;
   rating: number;
   poster_url: string;
-}
-
-export interface MediaSearchItem {
-  id: string;
-  source: "douban" | "tmdb";
-  title: string;
-  year?: number;
-  type?: "movie" | "tv";
-  rating: number;
-  posterUrl: string;
 }
 
 interface MediaCastMemberDto {
@@ -94,8 +136,9 @@ interface MediaCastMemberDto {
   tmdb_person_id: number | null;
 }
 
-interface MediaFactsDto {
+interface DiscoveredTitleMetadataDto {
   directors: string[];
+  director_credits: MediaCastMemberDto[];
   cast: MediaCastMemberDto[];
   country: string;
   language: string;
@@ -112,35 +155,96 @@ interface MediaImageDto {
   height: number;
 }
 
-interface MediaDetailDto {
-  card: MediaCardDto;
-  facts: MediaFactsDto;
+interface DiscoveredTitleDetailsDto {
+  title: DiscoveredTitleDto;
+  metadata: DiscoveredTitleMetadataDto;
   backdrops: MediaImageDto[];
   posters: MediaImageDto[];
-  related: MediaCardDto[];
+  collection: {
+    id: string;
+    name: string;
+    titles: DiscoveredTitleDto[];
+  } | null;
+  recommendations: DiscoveredTitleDto[];
   library_links?: MediaLibraryLinkDto[];
 }
 
-function toItem(dto: MediaCardDto): MediaItem {
-  return {
-    id: dto.id,
-    source: dto.source,
-    type: dto.type,
-    title: dto.title,
-    originalTitle: dto.original_title,
-    year: dto.year,
-    rating: dto.rating,
-    genres: dto.genres,
-    extent: dto.extent,
-    badges: dto.badges,
-    overview: dto.overview,
-    posterUrl: cachedImageUrl(dto.poster_url),
-    backdropUrl: dto.backdrop_url ? cachedImageUrl(dto.backdrop_url) : undefined,
-    libraryStatus: toLibraryStatus(dto.library_status),
-  };
+interface DiscoveredPersonDetailsDto {
+  tmdb_person_id: number;
+  name: string;
+  avatar_url: string | null;
+  titles: DiscoveredTitleDto[];
 }
 
-/** 库存字段只在 API 边界完成 snake_case 到 camelCase 的转换。 */
+export interface DiscoveryPageSection {
+  collectionRef: string;
+  title: string;
+  presentation: DiscoveryPresentation;
+  previewLimit: number;
+  supportsFullListing: boolean;
+}
+
+export interface DiscoveryPageData {
+  provider: MediaSource;
+  mediaType: MediaType;
+  sections: DiscoveryPageSection[];
+}
+
+export interface DiscoveredCollectionData {
+  collectionRef: string;
+  provider: MediaSource;
+  mediaType: MediaType;
+  name: string;
+  isRanked: boolean;
+  supportsFullListing: boolean;
+  items: MediaItem[];
+  returnedCount: number;
+  truncated: boolean;
+  page: number;
+  totalPages: number;
+  totalResults: number;
+  hasMore: boolean;
+}
+
+export interface DiscoveryGenre {
+  id: number;
+  name: string;
+}
+
+export interface FilteredDiscoveryData {
+  mediaType: MediaType;
+  items: MediaItem[];
+  page: number;
+  totalPages: number;
+  totalResults: number;
+  hasMore: boolean;
+}
+
+export interface MediaSearchItem {
+  /** 下一步读取详情时原样传回的稳定引用。旧历史快照没有该字段。 */
+  titleRef?: string;
+  id: string;
+  source: MediaSource;
+  title: string;
+  year?: number;
+  type?: MediaType;
+  rating: number;
+  posterUrl: string;
+}
+
+export interface TitleSearchProviderStatus {
+  provider: MediaSource;
+  success: boolean;
+  resultCount: number;
+  message?: string;
+}
+
+export interface TitleSearchData {
+  items: MediaSearchItem[];
+  providers: TitleSearchProviderStatus[];
+  historyId?: number;
+}
+
 function toLibraryStatus(dto: MediaLibraryStatusDto | null | undefined): MediaLibraryStatus | null {
   if (!dto) return null;
   return {
@@ -158,109 +262,140 @@ function toLibraryLink(dto: MediaLibraryLinkDto): MediaLibraryLink {
   };
 }
 
-function toRow(dto: MediaRowDto): MediaRowData {
-  return { id: dto.id, title: dto.title, items: dto.items.map(toItem) };
+/** 片单与详情中的条目字段完整；空值兜底只覆盖上游偶发缺失，不猜来源身份。 */
+function toItem(dto: DiscoveredTitleDto): MediaItem {
+  return {
+    titleRef: dto.title_ref,
+    id: dto.external_id,
+    source: dto.provider,
+    type: dto.media_type ?? "movie",
+    title: dto.title,
+    originalTitle: dto.original_title,
+    year: dto.release_year ?? 0,
+    rating: dto.provider_rating,
+    genres: dto.genres,
+    extent: dto.extent_label,
+    badges: [],
+    overview: dto.overview,
+    posterUrl: cachedImageUrl(dto.poster_url),
+    backdropUrl: dto.backdrop_url ? cachedImageUrl(dto.backdrop_url) : undefined,
+    libraryStatus: toLibraryStatus(dto.library_status),
+  };
+}
+
+export function toDiscoveredSearchItem(dto: DiscoveredTitleDto): MediaSearchItem {
+  return {
+    titleRef: dto.title_ref,
+    id: dto.external_id,
+    source: dto.provider,
+    title: dto.title,
+    year: dto.release_year ?? undefined,
+    type: dto.media_type ?? undefined,
+    rating: dto.provider_rating,
+    posterUrl: cachedImageUrl(dto.poster_url),
+  };
 }
 
 // ---------------------------------------------------------------------------
-// 发现页 / 条目详情
+// 发现页、片单与统一搜索
 // ---------------------------------------------------------------------------
 
-/**
- * 拉取发现页布局（行清单 + Hero 有无）。纯配置毫秒级返回；
- * 前端据此撑起整页骨架，再用 fetchDiscoverHero / fetchDiscoverRow 逐行填充。
- */
-export async function fetchDiscoverLayout(
-  type: MediaType,
-  source: MediaSource = "tmdb",
+/** 获取 Web 专用发现页编排；影视数据仍通过 collectionRef 从领域接口读取。 */
+export async function fetchDiscoveryPage(
+  mediaType: MediaType,
+  provider: MediaSource = "tmdb",
   init?: RequestInit,
-): Promise<DiscoverLayoutData> {
+): Promise<DiscoveryPageData> {
   const dto = await unwrap(
-    request<ApiEnvelope<DiscoverLayoutDto>>(`/discover/${type}/layout?source=${source}`, init),
-  );
-  return { hasHero: dto.has_hero, rows: dto.rows };
-}
-
-/** 拉取 Hero 大横幅精选；无 Hero 的数据源（豆瓣）返回空数组。 */
-export async function fetchDiscoverHero(
-  type: MediaType,
-  source: MediaSource = "tmdb",
-  init?: RequestInit,
-): Promise<MediaItem[]> {
-  const dto = await unwrap(
-    request<ApiEnvelope<MediaCardDto[]>>(`/discover/${type}/hero?source=${source}`, init),
-  );
-  return dto.map(toItem);
-}
-
-/** 拉取发现页的一行数据；条目太少的行后端返回空 items，由调用方收起。 */
-export async function fetchDiscoverRow(
-  type: MediaType,
-  rowId: string,
-  source: MediaSource = "tmdb",
-  init?: RequestInit,
-): Promise<MediaRowData> {
-  const dto = await unwrap(
-    request<ApiEnvelope<MediaRowDto>>(
-      `/discover/${type}/rows/${encodeURIComponent(rowId)}?source=${source}`,
+    request<ApiEnvelope<DiscoveryPageDto>>(
+      `/ui/discovery/${mediaType}?provider=${provider}`,
       init,
     ),
   );
-  return toRow(dto);
+  return {
+    provider: dto.provider,
+    mediaType: dto.media_type,
+    sections: dto.sections.map((section) => ({
+      collectionRef: section.collection_ref,
+      title: section.title,
+      presentation: section.presentation,
+      previewLimit: section.preview_limit,
+      supportsFullListing: section.supports_full_listing,
+    })),
+  };
 }
 
-/**
- * 拉取一份「看全部」落地页的完整豆瓣榜单（如 Top 250、豆瓣高分电影）。
- * 后端按白名单聚合分页并缓存；冷缓存时受豆瓣限速影响可能需要数秒。
- */
-export async function fetchDoubanCollection(
-  collectionId: string,
+/** 浏览一个片单；collectionRef 必须直接来自页面编排或 list-collections。 */
+export async function browseDiscoveryCollection(
+  collectionRef: string,
+  limit: number,
   init?: RequestInit,
-): Promise<MediaRowData> {
+  page = 1,
+): Promise<DiscoveredCollectionData> {
   const dto = await unwrap(
-    request<ApiEnvelope<MediaRowDto>>(`/discover/douban/collection/${collectionId}`, init),
-  );
-  return toRow(dto);
-}
-
-/**
- * 搜索豆瓣轻量影视候选；年份和类型需要后续详情/匹配阶段补齐。
- * options.history=true 时后端记录搜索历史并留存结果快照（统一搜索入口用；
- * 发现页工具栏等场景不传，不产生历史）。
- */
-export async function searchDoubanMedia(
-  query: string,
-  options?: { history?: boolean },
-  init?: RequestInit,
-): Promise<MediaSearchItem[]> {
-  const history = options?.history ? "&history=true" : "";
-  const items = await unwrap(
-    request<ApiEnvelope<MediaSearchItemDto[]>>(
-      `/discover/search?source=douban&q=${encodeURIComponent(query)}${history}`,
+    request<ApiEnvelope<DiscoveryCollectionTitlesDto>>(
+      `/discover/collections/${encodeURIComponent(collectionRef)}/titles?limit=${limit}&page=${page}`,
       init,
     ),
   );
-  return items.map(toSearchItem);
+  return {
+    collectionRef: dto.collection.collection_ref,
+    provider: dto.collection.provider,
+    mediaType: dto.collection.media_type,
+    name: dto.collection.name,
+    isRanked: dto.collection.is_ranked,
+    supportsFullListing: dto.collection.supports_full_listing,
+    items: dto.titles.map(toItem),
+    returnedCount: dto.returned_count,
+    truncated: dto.truncated,
+    page: dto.page,
+    totalPages: dto.total_pages,
+    totalResults: dto.total_results,
+    hasMore: dto.has_more,
+  };
 }
 
-/**
- * 搜索 TMDB 轻量影视候选（multi 搜索，电影/剧集按全局热度排序）。
- * 不记录搜索历史——搜索页对同一关键词并行搜豆瓣和 TMDB，历史只随豆瓣请求记一条。
- */
-export async function searchTmdbMedia(
-  query: string,
+export async function fetchDiscoveryGenres(
+  mediaType: MediaType,
   init?: RequestInit,
-): Promise<MediaSearchItem[]> {
-  const items = await unwrap(
-    request<ApiEnvelope<MediaSearchItemDto[]>>(
-      `/discover/search?source=tmdb&q=${encodeURIComponent(query)}`,
+): Promise<DiscoveryGenre[]> {
+  const dto = await unwrap(
+    request<ApiEnvelope<DiscoveryFilterOptionsDto>>(
+      `/discover/filters?media_type=${mediaType}`,
       init,
     ),
   );
-  return items.map(toSearchItem);
+  return dto.genres;
 }
 
-/** 轻量搜索条目 DTO → 前端视图（海报走缓存代理），搜索与快照回放共用。 */
+/** 六维筛选使用 TMDB discover 原生分页，URL 参数和 API 参数保持一一对应。 */
+export async function fetchFilteredDiscovery(
+  mediaType: MediaType,
+  filters: DiscoveryFilters,
+  page: number,
+  init?: RequestInit,
+): Promise<FilteredDiscoveryData> {
+  const params = new URLSearchParams({ media_type: mediaType, page: String(page) });
+  for (const genreId of filters.genreIds) params.append("genre_ids", String(genreId));
+  if (filters.originCountry) params.set("origin_country", filters.originCountry);
+  if (filters.year) params.set("year", String(filters.year));
+  if (filters.ratingGte !== undefined) params.set("rating_gte", String(filters.ratingGte));
+  if (filters.runtimeLte) params.set("runtime_lte", String(filters.runtimeLte));
+  params.set("sort", filters.sort);
+  const dto = await unwrap(
+    request<ApiEnvelope<DiscoveryTitlePageDto>>(`/discover/titles?${params}`, init),
+  );
+  return {
+    mediaType: dto.media_type,
+    items: dto.titles.map(toItem),
+    page: dto.page,
+    totalPages: dto.total_pages,
+    totalResults: dto.total_results,
+    hasMore: dto.has_more,
+  };
+}
+
+/** 旧媒体搜索快照 DTO → 前端视图；快照在迁移前已落库，因此继续兼容。 */
 export function toSearchItem(item: MediaSearchItemDto): MediaSearchItem {
   return {
     id: item.id,
@@ -273,19 +408,39 @@ export function toSearchItem(item: MediaSearchItemDto): MediaSearchItem {
   };
 }
 
-/** 演职员条的一行：姓名 + 饰演角色 + 头像（数据源缺哪项就是空，前端按占位渲染）。 */
+/** 从旧页面路由参数构造稳定引用；新的接口调用只消费此引用。 */
+export function titleRef(source: MediaSource, type: MediaType, id: string): string {
+  return source === "douban" ? `douban:${id}` : `tmdb:${type}:${id}`;
+}
+
+/** 把稳定片单引用转换为通用「看全部」页面地址。 */
+export function collectionHref(collectionRef: string): string | undefined {
+  const [provider, mediaType, ...idParts] = collectionRef.split(":");
+  const collectionId = idParts.join(":");
+  if (
+    (provider !== "tmdb" && provider !== "douban") ||
+    (mediaType !== "movie" && mediaType !== "tv") ||
+    !collectionId
+  ) {
+    return undefined;
+  }
+  return `/discover/${mediaType}/collections/${provider}/${encodeURIComponent(collectionId)}`;
+}
+
+// ---------------------------------------------------------------------------
+// 影视详情
+// ---------------------------------------------------------------------------
+
 export interface MediaCastMember {
   name: string;
   role?: string;
   avatarUrl?: string;
-  /** TMDB 影人 ID：有值时详情页把这一格链到人物页；豆瓣来源没有此 id */
   tmdbPersonId?: number;
 }
 
-/** 详情页「词条信息」卡的字段（导演 / 演职员 / 地区 / 语言 / 日期 / 平台）。 */
 export interface MediaDetailInfo {
   directors: string[];
-  /** 演职员（按数据源给出的主次顺序），详情页用横滚条呈现而不是塞进词条信息 */
+  directorCredits: MediaCastMember[];
   cast: MediaCastMember[];
   country: string;
   language: string;
@@ -295,7 +450,6 @@ export interface MediaDetailInfo {
   sourceUrl?: string;
 }
 
-/** 一张剧照/海报：横滚条用预览图，灯箱看原图 */
 export interface MediaImage {
   previewUrl: string;
   fullUrl: string;
@@ -304,17 +458,20 @@ export interface MediaImage {
 }
 
 export interface MediaDetailData {
-  /** 详情接口回填过 extent（片长/季数）的完整卡片字段 */
   item: MediaItem;
   info: MediaDetailInfo;
-  /** 剧照（16:9 宽幅） */
   backdrops: MediaImage[];
-  /** 海报（2:3 竖版，中文版优先） */
   posters: MediaImage[];
-  /** TMDB 推荐的相似作品 */
+  collection?: { id: string; name: string; items: MediaItem[] };
   related: MediaItem[];
-  /** 已入库时按后端稳定顺序返回的媒体库详情入口。 */
   libraryLinks: MediaLibraryLink[];
+}
+
+export interface DiscoveredPersonDetailsData {
+  tmdbPersonId: number;
+  name: string;
+  avatarUrl: string;
+  items: MediaItem[];
 }
 
 function toImage(dto: MediaImageDto): MediaImage {
@@ -326,51 +483,79 @@ function toImage(dto: MediaImageDto): MediaImage {
   };
 }
 
-/** 拉取单个条目的详情：词条信息 + 相似推荐。 */
-export async function fetchMediaDetail(
-  type: MediaType,
-  id: string,
-  init?: RequestInit,
-): Promise<MediaDetailData> {
-  const dto = await unwrap(
-    request<ApiEnvelope<MediaDetailDto>>(`/discover/${type}/${id}`, init),
-  );
-  return toDetail(dto);
-}
-
-/** 拉取独立豆瓣详情；电影/剧集类型由后端根据豆瓣响应识别。 */
-export async function fetchDoubanMediaDetail(
-  id: string,
-  init?: RequestInit,
-): Promise<MediaDetailData> {
-  const dto = await unwrap(
-    request<ApiEnvelope<MediaDetailDto>>(`/discover/douban/${id}`, init),
-  );
-  return toDetail(dto);
-}
-
-function toDetail(dto: MediaDetailDto): MediaDetailData {
+/** 统一转换演员与导演人物；头像都走同一份图片缓存，人物 ID 保持可选。 */
+function toCastMember(member: MediaCastMemberDto): MediaCastMember {
   return {
-    item: toItem(dto.card),
+    name: member.name,
+    role: member.role ?? undefined,
+    avatarUrl: member.avatar_url ? cachedImageUrl(member.avatar_url) : undefined,
+    tmdbPersonId: member.tmdb_person_id ?? undefined,
+  };
+}
+
+/** 读取一个稳定影视引用的详情；调用方无需再分别选择 TMDB/豆瓣端点。 */
+export async function fetchDiscoveredTitleDetails(
+  reference: string,
+  init?: RequestInit,
+): Promise<MediaDetailData> {
+  const dto = await unwrap(
+    request<ApiEnvelope<DiscoveredTitleDetailsDto>>(
+      `/discover/titles/${encodeURIComponent(reference)}`,
+      init,
+    ),
+  );
+  return {
+    item: toItem(dto.title),
     info: {
-      directors: dto.facts.directors,
-      cast: dto.facts.cast.map((c) => ({
-        name: c.name,
-        role: c.role ?? undefined,
-        // 头像走图片代理：豆瓣图床按 Referer 防盗链，直连会 403
-        avatarUrl: c.avatar_url ? cachedImageUrl(c.avatar_url) : undefined,
-        tmdbPersonId: c.tmdb_person_id ?? undefined,
-      })),
-      country: dto.facts.country,
-      language: dto.facts.language,
-      released: dto.facts.released,
-      network: dto.facts.network ?? undefined,
-      aliases: dto.facts.aliases,
-      sourceUrl: dto.facts.source_url ?? undefined,
+      directors: dto.metadata.directors,
+      // 豆瓣头像需要代理 Referer，TMDB 头像也统一复用图片缓存。
+      directorCredits: dto.metadata.director_credits.map(toCastMember),
+      cast: dto.metadata.cast.map(toCastMember),
+      country: dto.metadata.country,
+      language: dto.metadata.language,
+      released: dto.metadata.released,
+      network: dto.metadata.network ?? undefined,
+      aliases: dto.metadata.aliases,
+      sourceUrl: dto.metadata.source_url ?? undefined,
     },
     backdrops: dto.backdrops.map(toImage),
     posters: dto.posters.map(toImage),
-    related: dto.related.map(toItem),
+    collection: dto.collection
+      ? {
+          id: dto.collection.id,
+          name: dto.collection.name,
+          items: dto.collection.titles.map(toItem),
+        }
+      : undefined,
+    related: dto.recommendations.map(toItem),
     libraryLinks: (dto.library_links ?? []).map(toLibraryLink),
+  };
+}
+
+/** 读取发现页影人的完整 TMDB 影视履历；条目已包含当前账号可见的库存状态。 */
+export async function fetchDiscoveredPersonDetails(
+  tmdbPersonId: number | string,
+  init?: RequestInit,
+): Promise<DiscoveredPersonDetailsData> {
+  const dto = await unwrap(
+    request<ApiEnvelope<DiscoveredPersonDetailsDto>>(
+      `/discover/people/${tmdbPersonId}`,
+      init,
+    ),
+  );
+  return {
+    tmdbPersonId: dto.tmdb_person_id,
+    name: dto.name,
+    avatarUrl: dto.avatar_url ? cachedImageUrl(dto.avatar_url) : "",
+    items: dto.titles.map(toItem),
+  };
+}
+
+/** 横滚行组件仍消费 MediaRowData，此转换只属于前端展示层。 */
+export function collectionToRow(collection: DiscoveredCollectionData): MediaRowData {
+  return {
+    id: collection.collectionRef,
+    title: collection.name,
+    items: collection.items,
   };
 }

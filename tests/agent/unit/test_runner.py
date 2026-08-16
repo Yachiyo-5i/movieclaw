@@ -160,6 +160,7 @@ async def test_tool_loop_two_steps(monkeypatch):
     round2 = _probe["requests"][1]
     assert [m.role for m in round2.messages] == ["system", "user", "assistant", "tool"]
     assert round2.messages[0].text().startswith("你是 MovieClaw 影音助理")
+    assert "必须在当前轮次重新调用工具查询最新接口数据" in round2.messages[0].text()
     tool_msg = round2.messages[-1]
     assert tool_msg.tool_call_id == "c1"
     assert "找到 3 条资源" in tool_msg.text()

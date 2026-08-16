@@ -20,12 +20,17 @@ per-site 的自适应节奏藏在 ``SiteSyncCursor`` 里，对调度器透明。
 
 from __future__ import annotations
 
+import asyncio
 import logging
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 
 from movieclaw_api.services.site_access import (
     get_site_access,
     invalidate_site_access,
+)
+from movieclaw_api.services.subscription import (
+    effective_forecast_probe_at,
+    forecast_probe_times_by_site,
 )
 from movieclaw_api.services.verification import friendly_error, is_transient_error
 from movieclaw_db.engine import get_database
@@ -40,6 +45,7 @@ from movieclaw_db.repositories.torrent_repo import (
 )
 from movieclaw_enrich import ENRICH_VERSION, enrich
 from movieclaw_scheduler.registry import register_task
+from movieclaw_tracker.exceptions import TrackerParseError
 from movieclaw_tracker.models import TorrentListItem
 
 logger = logging.getLogger("movieclaw_api.torrent_sync")
@@ -52,6 +58,9 @@ _MIN_INTERVAL = 300  # 5 分钟：发布最快的站也不会比这更密（礼�
 _MAX_INTERVAL = 21600  # 6 小时：冷站最疏到此为止
 # 回补翻页上限：长时间宕机后避免失控狂爬；到顶仍未接上则记录缺口
 _MAX_BACKFILL_PAGES = 10
+# 站点时间最多允许比当前 UTC 快 15 分钟（容忍服务器轻微漂移）。超过通常意味着
+# 本地时间未归一化；整页拒绝入库，避免污染发布时间、高水位和订阅预测。
+_MAX_FUTURE_SKEW = timedelta(minutes=15)
 
 # -- 熔断参数 --------------------------------------------------------------
 # 连续失败达到该阈值、且当前这次失败为**非瞬时**（认证/解析类）时触发熔断：
@@ -117,7 +126,7 @@ def _to_observation(
         upload_volume_factor=item.upload_volume_factor if trust_volatile else None,
         free_deadline=item.free_deadline,
         hit_and_run=item.hit_and_run,
-        # 扩充属性在入库前算好（纯本地正则，微秒级）。exclude_defaults 只存
+        # 扩充属性在入库前算好（本地正则 + NER 推理）。exclude_defaults 只存
         # 真提取到的字段——没提取到任何字段时是 {}，与"从未扩充"（NULL）可区分
         attrs=enrich(item.title, item.subtitle, category_value).model_dump(
             mode="json", exclude_defaults=True
@@ -126,6 +135,48 @@ def _to_observation(
         detail_url=item.detail_url,
         download_url=item.download_url,
     )
+
+
+async def _to_observations(
+    site_id: str, items: list[TorrentListItem], *, trust_volatile: bool
+) -> list[TorrentObservation]:
+    """在线程池完成整页扩充，避免同步 NER 推理阻塞 API 事件循环。"""
+    return await asyncio.to_thread(
+        lambda: [_to_observation(site_id, item, trust_volatile=trust_volatile) for item in items]
+    )
+
+
+def _validate_page_times(
+    site_id: str, page_num: int, items: list[TorrentListItem]
+) -> None:
+    """在写库前验证一页发布时间，解析失效或时区错误时整页熔断。"""
+    values = [item.upload_time for item in items if item.upload_time is not None]
+    if not values:
+        raise TrackerParseError(
+            f"站点 {site_id} 第 {page_num} 页未解析到任何种子发布时间，"
+            "可能是页面结构已变化；本页已拒绝写入以保护同步游标"
+        )
+    if len(values) != len(items):
+        logger.warning(
+            "站点 %s 第 %d 页有 %d/%d 条未解析到发布时间；已保留为未知，"
+            "请检查站点选择器",
+            site_id,
+            page_num,
+            len(items) - len(values),
+            len(items),
+        )
+    ceiling = utcnow() + _MAX_FUTURE_SKEW
+    for value in values:
+        normalized = (
+            value.astimezone(UTC).replace(tzinfo=None)
+            if value.tzinfo is not None
+            else value
+        )
+        if normalized > ceiling:
+            raise TrackerParseError(
+                f"站点 {site_id} 第 {page_num} 页发布时间晚于当前时间超过 15 分钟，"
+                "可能是站点时区未正确归一化；本页已拒绝写入"
+            )
 
 
 def _volatile_trustworthy(items: list[TorrentListItem]) -> bool:
@@ -153,7 +204,8 @@ async def _plan_sync(
     """规划本轮 tick：返回（已到期站点列表，未到期站点中最近的到期还剩多少秒）。
 
     顺带对每个站 ensure_cursor：新站在此建立 t0（幂等），使得即便加站点时没显式
-    建游标，也能被自愈接管；``next_sync_at`` 为 NULL 视为立即到期。
+    建游标，也能被自愈接管；``next_sync_at`` 为 NULL 视为立即到期。追新预测的
+    探测点只会把同步提前，且由 ``last_sync_at`` 判定是否已被普通/预测同步消费。
 
     第二个返回值供 tick 打印"最近一个还差多久同步"，把静默跳过变成可见反馈。
     """
@@ -162,14 +214,37 @@ async def _plan_sync(
     soonest_wait: int | None = None
     async with get_database().session() as session:
         repo = TorrentRepository(session)
+        cursors = {}
         for cred in sites:
-            cursor = await repo.ensure_cursor(cred.site_id)
-            if cursor.next_sync_at is None or now >= cursor.next_sync_at:
+            cursors[cred.site_id] = await repo.ensure_cursor(cred.site_id)
+        probes_by_site = await forecast_probe_times_by_site(
+            session, site_ids=set(cursors)
+        )
+
+        for cred in sites:
+            cursor = cursors[cred.site_id]
+            normal_due = cursor.next_sync_at is None or now >= cursor.next_sync_at
+
+            # 只看上次同步之后的预测点：无论那次是普通轮询还是预测触发，都说明
+            # 更早探测已经被消费。若刚同步过，则把探测推迟到礼貌间隔之后。
+            forecast_due_at = effective_forecast_probe_at(
+                probes_by_site.get(cred.site_id, []),
+                last_sync_at=cursor.last_sync_at,
+            )
+
+            forecast_due = forecast_due_at is not None and now >= forecast_due_at
+            if normal_due or forecast_due:
                 due.append(cred)
             else:
-                wait = int((cursor.next_sync_at - now).total_seconds())
-                if soonest_wait is None or wait < soonest_wait:
-                    soonest_wait = wait
+                due_times = [
+                    value
+                    for value in (cursor.next_sync_at, forecast_due_at)
+                    if value is not None
+                ]
+                if due_times:
+                    wait = max(0, int((min(due_times) - now).total_seconds()))
+                    if soonest_wait is None or wait < soonest_wait:
+                        soonest_wait = wait
     return due, soonest_wait
 
 
@@ -197,6 +272,7 @@ async def _fetch_pages(site, site_id: str, *, is_first_sync: bool):
         items = page.items
         if not items:
             break
+        _validate_page_times(site_id, page_num, items)
 
         # 取整体最新（按发布时间），不假设站点一定严格倒序
         page_newest = max(items, key=lambda it: it.upload_time or datetime.min)
@@ -217,7 +293,7 @@ async def _fetch_pages(site, site_id: str, *, is_first_sync: bool):
                 site_id,
                 page_num,
             )
-        observations.extend(_to_observation(site_id, it, trust_volatile=trust) for it in items)
+        observations.extend(await _to_observations(site_id, items, trust_volatile=trust))
 
         if page_num == 1:
             first_page_all_new = not reached_known and len(ids) > 0
@@ -247,10 +323,11 @@ async def _sync_one_site(cred: SiteCredential) -> None:
     site_id = cred.site_id
     db = get_database()
 
-    # 首刷判定：游标里还没有已知最新种子，即从未真正同步过
+    # 首刷以“从未成功同步”判定。torrent_id 只是增量身份游标，不能代替成功台账：
+    # 某站发布时间选择器失效时 ID 可能长期为空，但成功记录仍应阻止反复首刷。
     async with db.session() as session:
         cursor = await TorrentRepository(session).ensure_cursor(site_id)
-        is_first_sync = cursor.newest_torrent_id is None
+        is_first_sync = cursor.last_success_at is None
         current_interval = cursor.sync_interval_seconds
         prev_failures = cursor.consecutive_failures
 

@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, Field, field_serializer, field_validator
+from pydantic import ConfigDict, Field, field_serializer, field_validator
 
+from movieclaw_api.schemas.base import BaseModel
 from movieclaw_db.models import AgentSession
 from movieclaw_db.repositories.agent_session_repo import is_running
+from movieclaw_llm import ChatMessage, ContentPart, TokenUsage, ToolCall
 
 
 def _iso_utc(value: datetime | None) -> str | None:
@@ -18,78 +20,60 @@ def _iso_utc(value: datetime | None) -> str | None:
     return value.isoformat()
 
 
-class AgentHistoryMessage(BaseModel):
-    """多轮会话的一条历史消息（前端会话页逐轮累积后随请求回传）。
+class SessionStartPayload(BaseModel):
+    """提交一条用户消息；有 session_id 时继续已有会话，否则开始新会话。"""
 
-    只接受 user / assistant 两种角色——system 由服务端编排、tool 结果
-    属于运行内部产物，都不该由前端注入。
-    """
+    model_config = ConfigDict(extra="forbid")
 
-    role: Literal["user", "assistant"]
-    content: str = Field(max_length=32000)
-
-
-class AgentStartPayload(BaseModel):
-    """启动一次 Agent 运行的请求体。
-
-    骨架版只暴露最小参数面：任务描述 + 多轮历史 + 可选模型引用。
-    system_prompt / 工具集 / 采样参数属于服务端的 agent 编排职责，
-    不开放给前端。
-    """
-
-    input: str = Field(min_length=1, max_length=4000, description="任务描述（自然语言）")
+    content: str = Field(min_length=1, max_length=4000, description="用户消息正文")
     session_id: str | None = Field(
         default=None,
+        min_length=1,
         max_length=64,
-        description="续聊已有会话的 id（历史由服务端从转录重建）；留空=新建会话。"
-        "给出时 history 字段被忽略",
+        description="已有会话编号；留空时创建新会话",
     )
-    # （过渡期兼容）调用方本地累积的历史；仅在未给 session_id 时用于拼装
-    # LLM 上下文，不会写入服务端转录
-    history: list[AgentHistoryMessage] = Field(
-        default_factory=list,
-        max_length=100,
-        description="本地历史消息数组（仅新建会话且需要预置上下文时用；一般留空）",
-    )
-    model: str = Field(default="", description="模型引用（留空用默认供应商的默认模型）")
+    model: str = Field(default="", description="模型 ID；留空时使用默认供应商的默认模型")
 
-    @field_validator("input", "model", mode="before")
+    @field_validator("content", "session_id", "model", mode="before")
     @classmethod
     def _strip(cls, value: str | None) -> str | None:
         return value.strip() if isinstance(value, str) else value
 
 
-class AgentStartView(BaseModel):
-    """异步 Agent 创建回执。
+class SessionMessageAcceptedView(BaseModel):
+    """用户消息已持久化并开始处理的回执。"""
 
-    run_id 用于订阅事件流或取消；session_id 是本轮所属的服务端会话
-    （新建会话时由服务端分配），前端续聊时原样带回。
-    """
-
-    run_id: str
-    session_id: str
-    #: 本轮用户输入在转录里的 entry uuid；前端拿它做「改写本轮重新提问」的截断锚点
-    entry_uuid: str
-
-
-class AgentSessionTruncatePayload(BaseModel):
-    """从某条用户提问处截断会话的请求体。"""
-
-    entry_uuid: str = Field(
-        min_length=1,
-        max_length=64,
-        description="要丢弃的那条用户提问的 entry uuid（它及其之后的记录全部删除）",
+    session_id: str = Field(description="会话稳定编号，后续 session 操作都使用它")
+    message_id: str = Field(
+        description="本次新建的 user message 稳定编号，可作为 retry 的定位锚点"
     )
 
 
-class AgentTruncateView(BaseModel):
-    """截断回执：删了多少条、还剩多少条（前端据此校对本地时间线）。"""
+class SessionRetryPayload(BaseModel):
+    """从指定用户消息处重试，可用新内容替换原问题。"""
 
-    removed_entries: int
-    entry_count: int
+    model_config = ConfigDict(extra="forbid")
+
+    message_id: str = Field(
+        min_length=1,
+        max_length=64,
+        description="要重新提问的 user message 编号",
+    )
+    content: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=4000,
+        description="替换后的用户消息正文；留空时原文重试",
+    )
+    model: str = Field(default="", description="模型 ID；留空时使用默认供应商的默认模型")
+
+    @field_validator("message_id", "content", "model", mode="before")
+    @classmethod
+    def _strip(cls, value: str | None) -> str | None:
+        return value.strip() if isinstance(value, str) else value
 
 
-class AgentSessionRenamePayload(BaseModel):
+class SessionRenamePayload(BaseModel):
     """重命名会话的请求体。
 
     标题只存索引表（元数据不入转录文件，见 agent_sessions 模块的
@@ -104,26 +88,23 @@ class AgentSessionRenamePayload(BaseModel):
         return value.strip() if isinstance(value, str) else value
 
 
-class AgentSessionListItem(BaseModel):
+class SessionSummary(BaseModel):
     """会话列表项（索引表投影 + 派生的运行状态）。"""
 
-    id: str
-    title: str | None
-    last_prompt: str | None
-    entry_count: int
-    #: 是否有存活的运行（active_run_id 非空且心跳在超时窗内）
-    running: bool
-    #: running 为 true 时前端可用它重新挂上 SSE 事件流
-    active_run_id: str | None
-    created_at: datetime
-    updated_at: datetime
+    id: str = Field(description="会话稳定编号（session_id）")
+    title: str | None = Field(description="会话标题；未命名时为空")
+    last_prompt: str | None = Field(description="最近一条用户消息的短预览")
+    entry_count: int = Field(description="完整轨迹的 entry 数量，包含 message 与 compaction")
+    running: bool = Field(description="当前是否有仍在处理的用户消息")
+    created_at: datetime = Field(description="会话创建时间（ISO 8601 UTC）")
+    updated_at: datetime = Field(description="会话最近活动时间（ISO 8601 UTC）")
 
     @field_serializer("created_at", "updated_at")
     def _serialize_utc(self, value: datetime | None) -> str | None:
         return _iso_utc(value)
 
     @classmethod
-    def from_model(cls, row: AgentSession) -> AgentSessionListItem:
+    def from_model(cls, row: AgentSession) -> SessionSummary:
         running = is_running(row)
         return cls(
             id=row.id,
@@ -131,32 +112,90 @@ class AgentSessionListItem(BaseModel):
             last_prompt=row.last_prompt,
             entry_count=row.entry_count,
             running=running,
-            active_run_id=row.active_run_id if running else None,
             created_at=row.created_at,
             updated_at=row.updated_at,
         )
 
 
-class AgentSessionDetailView(BaseModel):
-    """会话详情：列表项字段 + 完整消息 entry 回放。
+class SessionMessageView(BaseModel):
+    """会话中的一条协议消息。
 
-    entries 是转录文件里各 entry 的原样 JSON（信封 + API 格式消息），
-    前端按 type/message.role 分发渲染组件，tool 结果用 tool_call_id 合并进
-    对应调用卡片；缺回执的调用显示为进行中/已中断。
-
-    压缩行（type="compaction"）投影时**不含 replacement_history**——那是
-    resume 重建用的数据（可达几十 KB），渲染只需要摘要与前后 token 数。
+    user 是用户输入；assistant 是模型输出；tool 是工具执行回执；system 通常
+    只在运行时组装而不写入 transcript，但保留在完整消息定义中。
     """
 
-    session: AgentSessionListItem
-    entries: list[dict]
+    role: Literal["system", "user", "assistant", "tool"] = Field(
+        description="消息角色：用户输入、模型输出、工具回执或系统消息"
+    )
+    content: str | list[ContentPart] = Field(
+        default="", description="消息正文；可能是纯文本或 text/thinking/image 内容块"
+    )
+    tool_calls: list[ToolCall] | None = Field(
+        default=None, description="assistant 发起的工具调用；其他角色通常为空"
+    )
+    tool_call_id: str | None = Field(
+        default=None, description="tool 消息所回应的工具调用编号"
+    )
+    name: str | None = Field(default=None, description="tool 消息对应的工具名称")
+
+    @classmethod
+    def from_model(cls, message: ChatMessage) -> SessionMessageView:
+        return cls.model_validate(message.model_dump())
 
 
-class AgentCompactView(BaseModel):
+class SessionMessageEntryView(BaseModel):
+    """完整轨迹中的一条消息记录；message_id 是可寻址的持久化身份。"""
+
+    type: Literal["message"] = Field(default="message", description="轨迹类型判别值")
+    message_id: str = Field(description="这条持久化消息的稳定编号")
+    parent_id: str | None = Field(default=None, description="上一条轨迹 entry 的编号")
+    timestamp: str = Field(description="消息写入时间（ISO 8601 UTC）")
+    message: SessionMessageView = Field(description="LLM 协议格式的完整消息")
+    model: str | None = Field(default=None, description="assistant 消息实际使用的模型")
+    usage: TokenUsage | None = Field(default=None, description="assistant 消息的 token 用量")
+    finish_reason: str | None = Field(
+        default=None, description="assistant 消息的模型结束原因"
+    )
+
+
+class SessionCompactionEntryView(BaseModel):
+    """完整轨迹中的上下文压缩记录，不属于 message。"""
+
+    type: Literal["compaction"] = Field(default="compaction", description="轨迹类型判别值")
+    compaction_id: str = Field(description="这条上下文压缩记录的稳定编号")
+    parent_id: str | None = Field(default=None, description="上一条轨迹 entry 的编号")
+    timestamp: str = Field(description="压缩记录写入时间（ISO 8601 UTC）")
+    summary: str = Field(description="模型生成的历史交接摘要")
+    replacement_history: list[SessionMessageView] = Field(
+        description="后续模型请求实际采用的压缩后历史，不包含 system 消息"
+    )
+    tokens_before: int | None = Field(default=None, description="压缩前的估算 token 数")
+    tokens_after: int | None = Field(default=None, description="压缩后的估算 token 数")
+
+
+SessionTranscriptEntryView = Annotated[
+    SessionMessageEntryView | SessionCompactionEntryView,
+    Field(discriminator="type"),
+]
+
+
+class SessionTranscriptView(BaseModel):
+    """会话详情：列表项字段 + 完整轨迹回放。
+
+    message 与 compaction 是两种明确的 entry；各自使用 message_id 与
+    compaction_id，parent_id 只描述跨 entry 的线性轨迹链。
+    """
+
+    session: SessionSummary = Field(description="会话摘要与当前运行状态")
+    entries: list[SessionTranscriptEntryView] = Field(
+        description="按写入顺序排列的完整 message/compaction 轨迹"
+    )
+
+
+class SessionContextCompactionView(BaseModel):
     """手动压缩的回执：摘要与前后 token 估算（bytes/4 启发式，非精确值）。"""
 
-    summary: str
-    tokens_before: int
-    tokens_after: int
-    #: 写入转录的压缩行 uuid（前端可据此定位时间线上的压缩卡片）
-    entry_uuid: str
+    summary: str = Field(description="模型生成的历史交接摘要")
+    tokens_before: int = Field(description="压缩前的估算 token 数")
+    tokens_after: int = Field(description="压缩后的估算 token 数")
+    compaction_id: str = Field(description="写入完整轨迹的 compaction 记录编号")

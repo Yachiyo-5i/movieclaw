@@ -27,6 +27,82 @@ async def quickconnect_enabled() -> JSONResponse:
     return JSONResponse(False)
 
 
+@router.get("/Plugins", dependencies=[Depends(require_device)])
+async def plugins() -> JSONResponse:
+    # Infuse 验证媒体库时会拉取插件清单（issue #124）；无插件体系，空数组即可
+    return JSONResponse([])
+
+
+def _display_preferences_guid(raw: str) -> str:
+    """DisplayPreferencesDto.Id：对齐真 Jellyfin 的派生规则（10.10 源码）。
+
+    DisplayPreferencesController 先 Guid.TryParse，失败则取 ``GetMD5``：
+    字符串按 **UTF-16LE**（C# Encoding.Unicode）编码取 MD5，再经
+    .NET Guid(byte[]) 的小端重排——Python 里等价于 ``uuid.UUID(bytes_le=)``；
+    输出用 Guid 默认 "D" 格式（带连字符，与条目 Id 的 "N" 格式不同）。
+    金样：'usersettings' → 3ce5b65d-e116-d731-65d1-efc4a30ec35c。
+    """
+    import hashlib
+    import uuid
+
+    try:
+        return str(uuid.UUID(raw))
+    except ValueError:
+        digest = hashlib.md5(raw.encode("utf-16-le")).digest()  # noqa: S324
+        return str(uuid.UUID(bytes_le=digest))
+
+
+@router.get(
+    "/DisplayPreferences/{display_preferences_id}",
+    dependencies=[Depends(require_device)],
+)
+async def display_preferences(
+    display_preferences_id: str, client: str = "emby"
+) -> JSONResponse:
+    """默认 DisplayPreferencesDto（issue #124）。
+
+    Infuse 添加媒体库最后一步会请求 /DisplayPreferences/usersettings；
+    不落库、恒返回默认值——展示偏好由客户端本地维护即可。字段、类型与
+    默认值对齐真 Jellyfin 10.10 新用户首次请求的响应（实体默认值 +
+    DisplayPreferencesDto 构造默认；可空字段 ViewType/IndexBy 省略）。
+    """
+    return JSONResponse(
+        {
+            "Id": _display_preferences_guid(display_preferences_id),
+            "SortBy": "SortName",
+            "RememberIndexing": False,
+            "PrimaryImageHeight": 250,
+            "PrimaryImageWidth": 250,
+            # 真 Jellyfin 新建 DisplayPreferences 时的 CustomPrefs 快照
+            # （无 HomeSections → 无 homesectionN 键；布尔是 C# ToString 形态）
+            "CustomPrefs": {
+                "chromecastVersion": "stable",
+                "skipForwardLength": "30000",
+                "skipBackLength": "10000",
+                "enableNextVideoInfoOverlay": "False",
+                "tvhome": None,
+                "dashboardTheme": None,
+            },
+            "ScrollDirection": "Horizontal",
+            "ShowBackdrop": True,
+            "RememberSorting": False,
+            "SortOrder": "Ascending",
+            "ShowSidebar": False,
+            "Client": client,
+        }
+    )
+
+
+@router.post(
+    "/DisplayPreferences/{display_preferences_id}",
+    status_code=204,
+    dependencies=[Depends(require_device)],
+)
+async def update_display_preferences(display_preferences_id: str) -> Response:
+    # 客户端回写展示偏好：接受但不存储（与 GET 的恒默认值语义一致）
+    return Response(status_code=204)
+
+
 @router.get("/Sessions", dependencies=[Depends(require_device)])
 async def sessions() -> JSONResponse:
     return JSONResponse([])

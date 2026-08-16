@@ -43,12 +43,22 @@ import asyncio
 import logging
 import re
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass, field, replace
 from enum import StrEnum
 from pathlib import Path
+from uuid import uuid4
 
+from sqlalchemy import or_
+from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
+from movieclaw_api.services import jobs
+from movieclaw_api.services.library.bluray import (
+    enrich_spec_with_clpi,
+    read_clpi_languages,
+    streams_have_clpi_metadata,
+)
 from movieclaw_api.services.library.layout import (
     SCAN_VIDEO_EXTS,
     STRM_EXT,
@@ -67,16 +77,29 @@ from movieclaw_api.services.library.resolve import (
     parse_total_episodes,
     resolve_with_candidates,
 )
+from movieclaw_api.services.library.subtitles import discover_external_subtitles_async
 from movieclaw_api.services.media_discover import get_tmdb_client
 from movieclaw_api.services.media_library import MediaLibraryService
 from movieclaw_api.services.media_probe import probe_media
 from movieclaw_api.services.task_state import TaskState
 from movieclaw_db.engine import get_database
-from movieclaw_db.models import DownloadHint, FileSource, Library, LibraryFile, MediaItem, utcnow
+from movieclaw_db.models import (
+    DownloadHint,
+    FileSource,
+    Job,
+    JobResource,
+    JobStatus,
+    Library,
+    LibraryFile,
+    MediaItem,
+    utcnow,
+)
 from movieclaw_db.models.library_file import IdentitySource, UnidentifiedCode
 from movieclaw_db.models.scheduled_task import TriggerType
 from movieclaw_db.repositories.library_file_repo import LibraryFileRepository
+from movieclaw_db.repositories.library_repo import LibraryRepository
 from movieclaw_enrich import enrich
+from movieclaw_enrich.structure import title_candidates
 from movieclaw_media.models import MediaKind
 from movieclaw_scheduler.registry import register_task
 
@@ -293,6 +316,12 @@ class ScanSummary:
     unidentified: int = 0  # 落账但待识别
     kind_mismatched: int = 0  # 其中因"类型与本库不符"待识别的（库类型可能选错了）
     relinked: int = 0  # 改名归并：旧台账行迁到新路径（身份延续，不算新入账）
+    root_relinked: int = 0  # 改根路径后的同实体台账随迁（不算新入账）
+    # 根路径已经从配置中移除时的遗留台账收口。它和普通 missing 分开计数，
+    # 让用户能区分「磁盘删文件」与「容器挂载前缀改写」两类结果。
+    removed_root_marked_missing: int = 0
+    removed_root_cleared: int = 0
+    removed_root_conflicts: int = 0
     skipped_known: int = 0  # 已在台账、直接跳过
     skipped_ignored: int = 0  # 用户忽略过的文件，不再重走识别链
     marked_missing: int = 0  # 台账有但磁盘上已消失，标记 missing
@@ -309,6 +338,114 @@ class ScanSummary:
     # 本轮挂上身份锚的条目（去重）：扫描收尾统一补齐图片资产与媒体目录
     # 镜像（docs/design/metadata.md 4.1；对外接口不暴露）
     identified_item_ids: set[int] = field(default_factory=set)
+
+
+@dataclass
+class RootPathReconcilePreview:
+    """显式修复入口的只读预览结果。
+
+    历史上已经完成根路径切换的库不会再触发 ``update_library`` 的补扫，
+    因此需要一个不写数据库的入口，让管理员在执行前看到会合并、会标缺失
+    与因身份冲突而保留的台账。这里的统计只基于当前台账；正式执行仍会先
+    扫描新根，避免把预览当成瞬时的磁盘事实。
+    """
+
+    library_id: int
+    old_root: str
+    new_root: str
+    same_path_candidates: int = 0
+    safe_merges: int = 0
+    marked_missing: int = 0
+    conflicts: list[str] = field(default_factory=list)
+    unconfirmed: list[str] = field(default_factory=list)
+    old_rows_to_delete_from_ledger: int = 0
+    disk_files_to_delete: int = 0
+
+
+def scan_summary_payload(summary: ScanSummary) -> dict[str, object]:
+    """生成可持久化的扫描结论；内部调度字段不进入 Job JSON。"""
+    payload = asdict(summary)
+    payload.pop("recheck_delay_seconds", None)
+    payload.pop("identified_item_ids", None)
+    return payload
+
+
+@dataclass
+class _ScanJobBridge:
+    """把高频进程内扫描状态节流写入 Job，并轮询持久化取消请求。
+
+    台账逐文件提交才是真正的恢复检查点；这里保存的是观察进度。服务更新后
+    扫描重新盘点，已经入账的路径按增量语义秒过，因此不会重复建档，也不把
+    一份可能已过期的全盘路径快照塞进 SQLite。
+    """
+
+    context: jobs.JobContext
+    _last_phase: ScanPhase | None = None
+    _last_processed: int = -1
+    _last_update_at: float = 0.0
+    _last_cancel_check_at: float = 0.0
+    _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+    async def raise_if_cancelled(self, *, force: bool = False) -> None:
+        now = time.monotonic()
+        if not force and now - self._last_cancel_check_at < 0.5:
+            return
+        self._last_cancel_check_at = now
+        await self.context.raise_if_cancelled()
+
+    async def checkpoint(
+        self,
+        state: ScanState,
+        summary: ScanSummary,
+        *,
+        force: bool = False,
+        check_cancel: bool = True,
+        before_write: Callable[[], Awaitable[None]] | None = None,
+    ) -> None:
+        """阶段变化、约一秒或约 1% 时落一次进度，避免逐文件刷事件表。"""
+        async with self._lock:
+            if check_cancel:
+                await self.raise_if_cancelled()
+            now = time.monotonic()
+            step = max(1, state.total // 100) if state.total else 128
+            if (
+                not force
+                and state.phase == self._last_phase
+                and state.processed - self._last_processed < step
+                and now - self._last_update_at < 1.0
+            ):
+                return
+            if before_write is not None:
+                # 扫描主会话可能正持有 SQLite 读/写事务。先把领域数据提交成
+                # 安全检查点，再用 JobContext 的独立会话写观察进度，避免
+                # 两个写事务互相等待，也保证进度绝不跑到账实前面。
+                await before_write()
+            determinate = state.total > 0
+            percent = min(100.0, state.processed / state.total * 100) if determinate else None
+            phase_order = {
+                ScanPhase.WALKING: 1,
+                ScanPhase.INGESTING: 2,
+                ScanPhase.PROBING: 3,
+                ScanPhase.ASSETS: 4,
+            }
+            await self.context.update_progress(
+                mode="determinate" if determinate else "indeterminate",
+                phase=state.phase.value,
+                message=(
+                    f"{PHASE_LABELS[state.phase]}：{state.processed} / {state.total}"
+                    if determinate
+                    else f"{PHASE_LABELS[state.phase]}：已发现 {state.processed} 个文件"
+                ),
+                current=state.processed,
+                total=state.total if determinate else None,
+                percent=percent,
+                phase_index=phase_order.get(state.phase),
+                phase_count=4,
+                details=scan_summary_payload(summary),
+            )
+            self._last_phase = state.phase
+            self._last_processed = state.processed
+            self._last_update_at = now
 
 
 def is_scanning(library_id: int) -> bool:
@@ -375,21 +512,121 @@ def scan_progress(library_id: int) -> ScanState | None:
     return _scan_tasks.state_of(library_id)
 
 
+async def _refresh_stats_snapshot(library_id: int, summary: ScanSummary) -> None:
+    """用独立事务刷新库存快照；失败只记结论，不回滚已经提交的扫描成果。"""
+    try:
+        db = get_database()
+        async with db.session() as session:
+            await LibraryRepository(session).refresh_stats([library_id])
+    except Exception:  # noqa: BLE001 -- 统计失败不应把已完成的入库事务回滚
+        logger.exception("媒体库 #%s 库存统计刷新失败", library_id)
+        message = "库存统计刷新失败，将在下次扫描时重试"
+        if message not in summary.errors:
+            summary.errors.append(message)
+
+
+async def enqueue_scan_job(
+    session: AsyncSession,
+    library_id: int,
+    library_name: str,
+    *,
+    reconcile_root_change: bool = False,
+    previous_root_paths: list[str] | None = None,
+    reconcile_new_root_paths: list[str] | None = None,
+    actor_kind: str | None = None,
+    actor_name: str | None = None,
+    actor_id: str | None = None,
+    origin: str = "web",
+) -> jobs.CreateJobResult:
+    """创建用户可观察、可取消、可跨重启恢复的媒体库扫描作业。"""
+    input_data: dict[str, object] = {
+        "library_id": library_id,
+        "backfill_existing_specs": True,
+    }
+    if reconcile_root_change:
+        input_data.update(
+            reconcile_root_change=True,
+            previous_root_paths=previous_root_paths or [],
+            reconcile_new_root_paths=reconcile_new_root_paths or [],
+        )
+    return await jobs.create_job(
+        session,
+        job_type="library.scan",
+        subject=library_name,
+        input_data=input_data,
+        resources=[jobs.ResourceRef("library", library_id)],
+        dedupe_key=f"library.scan:{library_id}",
+        conflict_policy="return_existing",
+        handler_revision="library.scan.v1",
+        max_attempts=3,
+        actor_kind=actor_kind,
+        actor_name=actor_name,
+        actor_id=actor_id,
+        origin=origin,
+        progress=jobs.default_progress("等待扫描媒体库"),
+    )
+
+
 async def scan_library(
-    library_id: int, *, backfill_existing_specs: bool = True
+    library_id: int,
+    *,
+    backfill_existing_specs: bool = True,
+    reprobe_paths: set[str] | None = None,
+    reconcile_root_change: bool = False,
+    previous_root_paths: list[str] | None = None,
+    reconcile_new_root_paths: list[str] | None = None,
+    job_context: jobs.JobContext | None = None,
+    raise_unexpected: bool = False,
 ) -> ScanSummary:
     """扫描一个库的全部根路径（后台任务入口；自开会话，不向外抛异常）。
 
     ``backfill_existing_specs`` 只应由用户主动发起的扫描保持开启。历史规格
-    补探会对每个 ``audio_streams IS NULL`` 的在位文件运行一次 ffprobe；把它
-    绑到 watchdog、写入静默补扫或 6 小时对账，会让一次很小的目录事件演变为
-    对整个机械盘媒体库的长时间读取。新入库文件仍在主流程中即时探测，不受此
-    开关影响。
+    补探会对每个 ``audio_streams IS NULL`` 的在位文件、以及未补过 CLPI 语言的
+    存量 BDMV 运行一次 ffprobe；把它绑到 watchdog、写入静默补扫或 6 小时对账，
+    会让一次很小的目录事件演变为对整个机械盘媒体库的长时间读取。新入库文件
+    仍在主流程中即时探测，不受此开关影响。
+
+    ``reprobe_paths``：watchdog 点名的"内容被修改过"的视频路径集合
+    （jellyfin-subtitle.md §2.4）。秒过时对名单内的行 stat 比对
+    (size, mtime)，确认变化才重探——视频原地替换（洗版/重灌同路径）后
+    介质规格与内封字幕轨不再永久陈旧。手动扫描（backfill_existing_specs
+    开启）则对全部在位行做该比对，无需点名。
+
+    ``reconcile_root_change`` 仅由媒体库编辑根路径后的后台扫描传入，且必须
+    同时给出编辑前的 ``previous_root_paths``。它以旧/新根下相同的相对路径
+    为候选，用 inode（被替换的旧入口不可访问时退回台账指纹）确认同一实体，防止
+    挂载别名、软链接等换入口时重复入账。普通手动扫描/监听扫描不做这一步，
+    以免把已移除根目录下的历史记录误作迁移。
     """
     from movieclaw_api.services.library.organize import is_organizing
     from movieclaw_api.services.library.transfer import is_transferring
 
     summary = ScanSummary(library_id=library_id)
+    # watchdog 与定时对账仍是轻量直接触发，但必须服从 Job 的库级租约。
+    # Job 处理器传入自己的 id 后可穿过这道检查；其他直接扫描看到锁就让路。
+    db = get_database()
+    async with db.session() as lock_session:
+        queued_jobs = (
+            [
+                row
+                for row in await jobs.list_jobs(
+                    lock_session,
+                    active_only=True,
+                    resource_type="library",
+                    resource_id=library_id,
+                    limit=20,
+                )
+                if row.status is not JobStatus.BLOCKED
+            ]
+            if job_context is None
+            else []
+        )
+        lock_owner = await jobs.resource_lock_owner(lock_session, "library", library_id)
+    if queued_jobs or (
+        lock_owner is not None and (job_context is None or lock_owner != job_context.job_id)
+    ):
+        summary.errors.append("该库有后台作业正在执行，扫描已顺延到下一次触发")
+        return summary
     running = _scan_tasks.state_of(library_id)
     if running is not None:
         summary.errors.append(f"该库已有任务在进行中（{PHASE_LABELS[running.phase]}）")
@@ -412,23 +649,97 @@ async def scan_library(
     # "跑到哪了"都由同一个对象回答，接口不可能取到半截状态
     state = ScanState(phase=ScanPhase.WALKING)
     _scan_tasks.try_start(library_id, state)
+    bridge = _ScanJobBridge(job_context) if job_context is not None else None
+    finished_normally = False
     try:
-        return await _scan(
+        if bridge is not None:
+            await bridge.checkpoint(state, summary, force=True)
+        result = await _scan(
             library_id,
             summary,
             state,
             backfill_existing_specs=backfill_existing_specs,
+            reprobe_paths=reprobe_paths or set(),
+            reconcile_root_change=reconcile_root_change,
+            previous_root_paths=previous_root_paths or [],
+            reconcile_new_root_paths=reconcile_new_root_paths or [],
+            bridge=bridge,
         )
+        finished_normally = True
+        return result
+    except jobs.JobCancelled:
+        summary.cancelled = True
+        await _refresh_stats_snapshot(library_id, summary)
+        if bridge is not None:
+            # 取消结论也落进 progress.details；Job 的 cancelled 状态本身不写
+            # result，重启后库详情仍能还原“扫到哪里后停止”。
+            await bridge.checkpoint(state, summary, force=True, check_cancel=False)
+        raise
     except Exception:  # noqa: BLE001 -- 后台任务兜底
         logger.exception("媒体库 #%s 扫描时发生未知错误", library_id)
+        await _refresh_stats_snapshot(library_id, summary)
+        if raise_unexpected:
+            raise
         summary.errors.append("扫描中断：发生未知错误（详见后端日志）")
+        finished_normally = True
         return summary
     finally:
         _scan_tasks.finish(library_id, result=(utcnow(), summary))
         # 暂缓过文件的扫描要自己安排补扫：写入结束后不会再有事件叫醒我们
         # （手动停止的不自动补扫——用户的意图是"别扫了"）
-        if summary.deferred and not summary.cancelled:
+        if summary.deferred and not summary.cancelled and finished_normally:
             _arm_rescan(library_id, summary.recheck_delay_seconds)
+
+
+@jobs.register_job_handler("library.scan")
+async def _run_scan_job(
+    context: jobs.JobContext, input_data: dict[str, object]
+) -> dict[str, object]:
+    """持久化扫描处理器：重启后重新盘点，逐文件台账检查点自然续跑。"""
+    library_id = int(input_data["library_id"])
+    db = get_database()
+    async with db.session() as session:
+        library = await session.get(Library, library_id)
+    if library is None:
+        raise jobs.JobFailed(
+            "媒体库已不存在，无法继续扫描",
+            code="LIBRARY_NOT_FOUND",
+        )
+    running = _scan_tasks.state_of(library_id)
+    if running is not None:
+        raise jobs.JobRetry(
+            f"媒体库{PHASE_LABELS[running.phase]}，扫描作业稍后自动继续",
+            delay_seconds=10,
+        )
+    from movieclaw_api.services.library.organize import is_organizing
+    from movieclaw_api.services.library.transfer import is_transferring
+
+    if is_organizing(library_id) or is_transferring(library_id):
+        raise jobs.JobRetry("媒体库正在变更文件路径，扫描作业稍后自动继续", delay_seconds=10)
+    scan_kwargs: dict[str, object] = {
+        "backfill_existing_specs": bool(input_data.get("backfill_existing_specs", True)),
+        "job_context": context,
+        "raise_unexpected": True,
+    }
+    if input_data.get("reconcile_root_change") is True:
+        roots = input_data.get("previous_root_paths")
+        new_roots = input_data.get("reconcile_new_root_paths")
+        scan_kwargs.update(
+            reconcile_root_change=True,
+            previous_root_paths=([str(path) for path in roots] if isinstance(roots, list) else []),
+            reconcile_new_root_paths=(
+                [str(path) for path in new_roots] if isinstance(new_roots, list) else []
+            ),
+        )
+    summary = await scan_library(library_id, **scan_kwargs)
+    payload = scan_summary_payload(summary)
+    message = (
+        f"扫描完成：新入账 {summary.scanned - summary.relinked} 个文件，"
+        f"识别 {summary.identified} 个"
+    )
+    if summary.errors:
+        message += f"，{len(summary.errors)} 个问题已记录"
+    return {"message": message, **payload}
 
 
 async def _scan(
@@ -437,6 +748,11 @@ async def _scan(
     state: ScanState,
     *,
     backfill_existing_specs: bool,
+    reprobe_paths: set[str],
+    reconcile_root_change: bool,
+    previous_root_paths: list[str],
+    reconcile_new_root_paths: list[str],
+    bridge: _ScanJobBridge | None,
 ) -> ScanSummary:
     db = get_database()
     async with db.session() as session:
@@ -446,6 +762,9 @@ async def _scan(
             return summary
         repo = LibraryFileRepository(session)
         known = {row.file_path: row for row in await repo.list_by_library(library_id)}
+        # 显式历史修复只给出一个目标根；普通根路径编辑则默认取完整的新配置。
+        # 后续两个阶段必须使用同一组根，才能正确判断「旧根对应哪个新根」。
+        effective_reconcile_new_roots = reconcile_new_root_paths or list(library.root_paths)
         media_service = MediaLibraryService(session, get_tmdb_client())
         kind = MediaKind(library.kind)
         # 每轮扫描内的收敛缓存：同一部剧同一季几十集只查一次 TMDB
@@ -454,6 +773,9 @@ async def _scan(
         episodes_cache: dict[Path, int | None] = {}
         # 下载线索：手动下载提交时锚定的「条目目录 → 副标题」（拼音名种子的救赎）
         hints = await _load_hints(session)
+        # 一轮扫描里首次发现的所有文件共享批次号。已存在/回归的台账行不会
+        # 覆盖原批次，因此「最近添加」只描述真正的新入账，不把重扫冒充新增。
+        added_batch_id = uuid4().hex
 
         async def recover_failed_session() -> None:
             """单文件失败后的会话急救。失败若发生在半截事务里（如写台账时
@@ -476,13 +798,17 @@ async def _scan(
         # 不可信，自动清理必须整轮让路（见 _auto_clear_missing）
         unreadable_dirs: list[str] = []
         pending: list[tuple[Path, Path, bool]] = []  # (根, 文件, 是否原盘)
+        # 目录 → 文件名列表：遍历时顺手截获，外挂字幕发现零额外目录 IO
+        dir_files: dict[str, list[str]] = {}
         for root in library.root_paths:
+            if bridge is not None:
+                await bridge.raise_if_cancelled()
             root_path = Path(root)
             if not root_path.exists():
                 summary.errors.append(f"根路径不存在，已跳过：{root}")
                 continue
             scanned_roots.append(str(root_path))
-            for file, is_disc in _walk_videos(root_path, unreadable_dirs):
+            for file, is_disc in _walk_videos(root_path, unreadable_dirs, dir_files):
                 # 根路径互相嵌套时同一个文件会被遍历两次，去重后才是"每个文件
                 # 处理一次"：重复处理不只是白跑一趟识别链，第二趟还会拿着过期的
                 # 台账快照去插入已存在的路径
@@ -490,15 +816,47 @@ async def _scan(
                     continue
                 seen_paths.add(str(file))
                 pending.append((root_path, file, is_disc))
+                state.processed = len(pending)
+                if bridge is not None:
+                    await bridge.checkpoint(state, summary, before_write=session.commit)
+
+        # 根路径编辑后的同实体收敛：用户可能把 ``/media/movies`` 改成指向
+        # 同一目录的挂载别名/软链接。此时磁盘对象没有变，台账里的旧路径却已
+        # 不在当前根下；若直接按字符串入账，就会把同一文件显示成两份。
+        #
+        # 不把 inode 当作全局去重键：当前根里的两个硬链接可能是用户有意保留的
+        # 两个版本。只有「旧台账路径脱离当前根」且「本轮扫描路径在当前根」的
+        # 组合，才是根路径改写遗留的确定信号，见 _relink_legacy_root_paths。
+        if reconcile_root_change:
+            await _relink_legacy_root_paths(
+                session,
+                library,
+                known,
+                pending,
+                summary,
+                previous_root_paths=previous_root_paths,
+                new_root_paths=effective_reconcile_new_roots,
+            )
 
         assert library.id is not None
         # 分母定了，进入逐文件入账阶段
         state.phase = ScanPhase.INGESTING
         state.processed, state.total = 0, len(pending)
+        if bridge is not None:
+            await bridge.checkpoint(state, summary, force=True, before_write=session.commit)
         now_ts = time.time()
         min_remaining: float | None = None
         mtime_backfilled = 0
+        rows_refreshed = 0  # 秒过行的外挂字幕/规格刷新计数（批量一次 commit）
+
+        async def advance(done: int) -> None:
+            state.processed = done
+            if bridge is not None:
+                await bridge.checkpoint(state, summary, before_write=session.commit)
+
         for done, (root_path, file, is_disc) in enumerate(pending, start=1):
+            if bridge is not None:
+                await bridge.raise_if_cancelled()
             # 每进入新的一窗，先把这一窗要用到的 TMDB 档案并发拉回来（详见
             # _PREFETCH_WINDOW 的说明）。串行链路本身一行不改，只是轮到它
             # 建档时档案已经在手边了
@@ -531,7 +889,7 @@ async def _scan(
                     assert existing.id is not None
                     await repo.clear_missing_flag(existing.id)
                 summary.skipped_ignored += 1
-                state.processed = done
+                await advance(done)
                 continue
             # 已识别且在位的行秒过。「在位但待识别」的行不跳过——重走识别链，
             # 让「重新扫描」天然成为识别重试入口（TMDB 网络故障恢复后重扫即可，
@@ -568,13 +926,23 @@ async def _scan(
                 # 重扫不再 stat，秒过语义不变
                 if existing.file_mtime_ns is None:
                     try:
-                        existing.file_mtime_ns = (
-                            await asyncio.to_thread(file.stat)
-                        ).st_mtime_ns
+                        existing.file_mtime_ns = (await asyncio.to_thread(file.stat)).st_mtime_ns
                         mtime_backfilled += 1
                     except OSError:
                         pass
-                state.processed = done
+                # 外挂字幕重发现 + 视频变化重探（jellyfin-subtitle.md §2.4）。
+                # 前者纯内存匹配 + 对命中的少数字幕文件 stat，每轮都做；
+                # 后者要对视频本体 stat，只在手动扫描（backfill 开启）或
+                # watchdog 点名该路径时做——6 小时对账保持零视频 stat
+                if await _refresh_known_row(
+                    existing,
+                    file,
+                    dir_files.get(str(file.parent)),
+                    is_disc=is_disc,
+                    check_media_change=(backfill_existing_specs or path_str in reprobe_paths),
+                ):
+                    rows_refreshed += 1
+                await advance(done)
                 continue
             # 完整性检测：mtime 太新 = 疑似写入中（下载/拷贝进行时），本轮
             # 暂缓入账、稍后补扫——库不假设目录用途，根路径完全可能同时是
@@ -589,7 +957,7 @@ async def _scan(
                 min_remaining = (
                     remaining if min_remaining is None else min(min_remaining, remaining)
                 )
-                state.processed = done
+                await advance(done)
                 continue
             try:
                 await _ingest_file(
@@ -606,15 +974,41 @@ async def _scan(
                     is_disc=is_disc,
                     hint=_hint_for(file, hints),
                     existing=existing,
+                    dir_names=dir_files.get(str(file.parent)),
+                    added_batch_id=added_batch_id,
                 )
             except Exception as exc:  # noqa: BLE001 -- 单文件失败不断整轮
                 await recover_failed_session()
                 logger.exception("扫描文件失败：%s", file)
                 summary.errors.append(f"「{file.name}」处理失败：{exc}")
-            state.processed = done
+            await advance(done)
 
-        if mtime_backfilled:
+        if mtime_backfilled or rows_refreshed:
             await session.commit()
+        if rows_refreshed:
+            logger.info(
+                "媒体库 #%s：%d 个在位文件的外挂字幕/介质规格已刷新",
+                library_id,
+                rows_refreshed,
+            )
+
+        # ``known`` 是扫描开场的快照；新路径的行可能在逐文件入账时新建，也
+        # 可能被改名归并迁入。根路径迁移的第二阶段必须重新读取它，才能看到
+        # 已经存在的历史重复行，而不能只拿旧快照误判为「新路径还没有台账」。
+        removed_root_result = _RemovedRootReconcileResult()
+        if reconcile_root_change and not summary.cancelled:
+            known.clear()
+            known.update({row.file_path: row for row in await repo.list_by_library(library_id)})
+            removed_root_result = await _reconcile_removed_root_ledger_rows(
+                session,
+                library,
+                known,
+                summary,
+                previous_root_paths=previous_root_paths,
+                new_root_paths=effective_reconcile_new_roots,
+                seen_paths=seen_paths,
+                roots_with_files={str(root_path) for root_path, _, _ in pending},
+            )
 
         # 收尾感知删除：在位根路径下、台账有但本轮没遍历到 → 标记 missing。
         # 不存在的根整个不参与（挂载失败/掉盘时不误伤），文件回归时
@@ -645,6 +1039,13 @@ async def _scan(
             roots_with_files={str(root_path) for root_path, _, _ in pending},
             unreadable_dirs=unreadable_dirs,
         )
+        await _auto_clear_removed_root_ledger(
+            repo,
+            library,
+            summary,
+            file_ids=removed_root_result.clearable_ids,
+            unreadable_dirs=unreadable_dirs,
+        )
         # 收尾后台账里仍标记丢失的条数：扫描结论要把"为什么 file_count 比
         # 磁盘上的文件多"说清楚，并给出收口路径，否则用户只能自己猜
         stale_missing = len(await repo.list_missing(library_id))
@@ -656,7 +1057,20 @@ async def _scan(
         # 没有这一步，「装好 ffmpeg 再重新扫描」这个最直觉的动作就是无效的，
         # 用户只能一个条目一个条目点开、靠详情页那点限量补探慢慢磨。
         if backfill_existing_specs:
-            await _probe_backfill(session, library_id, summary, state)
+            await _probe_backfill(session, library_id, summary, state, bridge=bridge)
+
+    # 文件台账已经收口就立刻发布统计，不等后续可能耗时数分钟的图片资产
+    # 下载。扫描仍显示进行中，但首页的作品数与容量已经是本轮最新结果。
+    await _refresh_stats_snapshot(library_id, summary)
+
+    # AI 字幕自动生成挂钩（G2，subtitle-ai-translate.md §6）：开关默认关，
+    # fire-and-forget 后台批次，绝不阻塞/影响扫描收尾
+    try:
+        from movieclaw_api.services.subtitle_gen.auto import queue_after_scan
+
+        queue_after_scan(library_id)
+    except Exception:  # noqa: BLE001 -- 自动生成不可用不能拖垮扫描
+        logger.exception("自动字幕生成挂钩失败（不影响扫描结论）")
 
     if min_remaining is not None:
         summary.recheck_delay_seconds = max(5.0, min(min_remaining + 1.0, NEW_FILE_QUIET_SECONDS))
@@ -703,8 +1117,8 @@ async def _scan(
         )
     logger.info(
         "媒体库 #%s 文件入账完成：新入账 %d（已识别 %d / 待识别 %d），识别重试 %d，"
-        "身份复核 %d（存疑 %d），改名归并 %d，跳过已知 %d，跳过已忽略 %d，"
-        "标记丢失 %d，清理丢失 %d，暂缓 %d，问题 %d",
+        "身份复核 %d（存疑 %d），改名归并 %d，根路径随迁 %d，跳过已知 %d，跳过已忽略 %d，"
+        "标记丢失 %d（旧根 %d），清理丢失 %d（旧根 %d），旧根冲突 %d，暂缓 %d，问题 %d",
         library_id,
         summary.scanned - summary.relinked,
         summary.identified,
@@ -713,10 +1127,14 @@ async def _scan(
         summary.reviewed,
         summary.review_flagged,
         summary.relinked,
+        summary.root_relinked,
         summary.skipped_known,
         summary.skipped_ignored,
         summary.marked_missing,
+        summary.removed_root_marked_missing,
         summary.cleared_missing,
+        summary.removed_root_cleared,
+        summary.removed_root_conflicts,
         summary.deferred,
         len(summary.errors),
     )
@@ -737,6 +1155,8 @@ async def _scan(
         item_ids = sorted(summary.identified_item_ids)
         state.phase = ScanPhase.ASSETS
         state.processed, state.total = 0, len(item_ids)
+        if bridge is not None:
+            await bridge.checkpoint(state, summary, force=True)
         logger.info("媒体库 #%s 开始补齐 %d 个条目的图片资产", library_id, len(item_ids))
         queue: asyncio.Queue[int] = asyncio.Queue()
         for item_id in item_ids:
@@ -752,8 +1172,12 @@ async def _scan(
                 # 刷新入口自愈，没有理由让用户点了停止还得干等
                 if _scan_tasks.stop_requested(library_id):
                     return
+                if bridge is not None:
+                    await bridge.raise_if_cancelled()
                 await ensure_assets(item_id)
                 state.processed += 1
+                if bridge is not None:
+                    await bridge.checkpoint(state, summary)
 
         await asyncio.gather(*(_asset_worker() for _ in range(_ASSET_CONCURRENCY)))
         if _scan_tasks.stop_requested(library_id):
@@ -763,6 +1187,8 @@ async def _scan(
                 state.processed,
                 len(item_ids),
             )
+    if bridge is not None:
+        await bridge.checkpoint(state, summary, force=True)
     return summary
 
 
@@ -853,6 +1279,350 @@ async def _auto_clear_missing(
     )
 
 
+@dataclass
+class _RemovedRootReconcileResult:
+    """已移除根路径的本轮收口结果，供安全清理阶段继续判断。"""
+
+    clearable_ids: list[int] = field(default_factory=list)
+
+
+def _normalise_root_path(root: str | Path) -> str:
+    """按配置语义规范化根路径，只消除尾部斜杠，不解析软链接。
+
+    这里刻意不用 ``resolve()``：旧根在当前容器里正是不可访问的对象，解析
+    会把「配置上的挂载前缀」意外变成宿主可见路径，破坏这次迁移的边界。
+    """
+    value = str(Path(root))
+    return value if value == "/" else value.rstrip("/")
+
+
+def _removed_root_paths(previous_root_paths: list[str], new_root_paths: list[str]) -> list[Path]:
+    """找出本次编辑中真正退出配置的根，重复配置只保留第一次。"""
+    current = {_normalise_root_path(root) for root in new_root_paths}
+    removed: list[Path] = []
+    seen: set[str] = set()
+    for root in previous_root_paths:
+        normalised = _normalise_root_path(root)
+        if normalised in current or normalised in seen:
+            continue
+        seen.add(normalised)
+        removed.append(Path(normalised))
+    return removed
+
+
+def _row_under_root(row: LibraryFile, root: Path) -> Path | None:
+    """返回台账路径相对某个根的部分；不在该根下时返回 ``None``。"""
+    try:
+        return Path(row.file_path).relative_to(root)
+    except ValueError:
+        return None
+
+
+def _has_same_identity(old: LibraryFile, current: LibraryFile) -> bool:
+    """已移除根的宽松合并仍要求两侧身份锚完整且完全相同。
+
+    旧根不可访问时，尺寸与 mtime 已不足以作为实体证明；但若两个台账已经
+    指向同一媒体条目和同一季集，再结合根迁移后的相同相对路径，才允许消除
+    历史重复。任何一侧未识别都不做猜测，改为保留新行并把旧行收进 missing。
+    """
+    return (
+        old.media_item_id is not None
+        and current.media_item_id is not None
+        and old.media_item_id == current.media_item_id
+        and (old.season_number, old.episode_number)
+        == (current.season_number, current.episode_number)
+    )
+
+
+def _has_identity_conflict(old: LibraryFile, current: LibraryFile) -> bool:
+    """两侧都已识别却不一致时，必须留下人工可处理的冲突。"""
+    return (
+        old.media_item_id is not None
+        and current.media_item_id is not None
+        and not _has_same_identity(old, current)
+    )
+
+
+def _target_roots_by_old_root(
+    previous_root_paths: list[str], new_root_paths: list[str]
+) -> dict[str, set[str]]:
+    """推导每个旧根可被自动清理时所依赖的新根。
+
+    只有「恰好一个旧根被替换为恰好一个新根」才有足够证据自动清理。多根
+    编辑中按索引猜测配对会把 A→C 的旧行错误归到仍保留的 B，最终可能误删
+    台账；无法确认配对时仍可标 missing 和合并重复行，但不自动删除。
+    """
+    result: dict[str, set[str]] = {}
+    old = [_normalise_root_path(root) for root in previous_root_paths]
+    new = [_normalise_root_path(root) for root in new_root_paths]
+    current = set(new)
+    removed = {root for root in old if root not in current}
+    added = {root for root in new if root not in set(old)}
+    if len(removed) == len(added) == 1:
+        result[next(iter(removed))] = {next(iter(added))}
+    return result
+
+
+async def _subtitle_job_running(session: AsyncSession, row: LibraryFile) -> bool:
+    """合并前确认是否有运行中的字幕任务，避免删除运行中任务正在读取的行。"""
+    assert row.id is not None
+    return bool(
+        await jobs.list_jobs(
+            session,
+            active_only=True,
+            job_type="subtitle.generate",
+            resource_type="library_file",
+            resource_id=row.id,
+            limit=1,
+        )
+    )
+
+
+async def _merge_removed_root_duplicate(
+    session: AsyncSession,
+    old: LibraryFile,
+    current: LibraryFile,
+    *,
+    target_path: str,
+) -> tuple[LibraryFile, int] | None:
+    """合并已移除旧根和当前新根的重复台账，默认保留新路径行。
+
+    若旧行正在生成字幕，保留其主键并把路径迁到新入口；任务可无中断继续。
+    两边都有运行任务时没有安全的保留方，返回 ``None`` 交给调用方报告冲突。
+    """
+    old_running, current_running = await asyncio.gather(
+        _subtitle_job_running(session, old),
+        _subtitle_job_running(session, current),
+    )
+    if old_running and current_running:
+        return None
+    survivor, duplicate = (old, current) if old_running else (current, old)
+    assert duplicate.id is not None
+    duplicate_id = duplicate.id
+    await _merge_same_file_rows(session, survivor, duplicate, file_path=target_path)
+    return survivor, duplicate_id
+
+
+async def _cleanup_subtitle_checkpoints(file_ids: list[int]) -> None:
+    """删除已被合并台账的旧字幕断点；持久作业引用已在事务中改写。"""
+    for file_id in file_ids:
+        for path in Path("data/cache/subtitle_gen").glob(f"{file_id}.*.checkpoint.json"):
+            try:
+                path.unlink(missing_ok=True)
+            except OSError as exc:
+                logger.warning("清理重复台账的字幕断点失败：file=%s %s", file_id, exc)
+
+
+async def _reconcile_removed_root_ledger_rows(
+    session: AsyncSession,
+    library: Library,
+    known: dict[str, LibraryFile],
+    summary: ScanSummary,
+    *,
+    previous_root_paths: list[str],
+    new_root_paths: list[str],
+    seen_paths: set[str],
+    roots_with_files: set[str],
+) -> _RemovedRootReconcileResult:
+    """收口根路径编辑遗留的旧前缀台账，绝不删除磁盘文件。
+
+    此逻辑只由 ``reconcile_root_change`` 调用。严格 inode/指纹迁移已经在扫
+    描前完成；这里针对的是旧容器挂载点已经消失、且历史上已经形成新旧两行
+    的情形。身份完全一致才合并；无法确认时只把旧行标 missing，身份冲突则
+    保留两行以免吞掉人工认领。自动清理另由下一阶段按本轮可信度决定。
+    """
+    selected_new_roots = new_root_paths or list(library.root_paths)
+    removed_roots = _removed_root_paths(previous_root_paths, selected_new_roots)
+    if not removed_roots or not selected_new_roots:
+        return _RemovedRootReconcileResult()
+
+    root_available = {
+        _normalise_root_path(root): await asyncio.to_thread(root.exists) for root in removed_roots
+    }
+    trusted_new_roots = {_normalise_root_path(root) for root in roots_with_files}
+    cleanup_targets = _target_roots_by_old_root(previous_root_paths, selected_new_roots)
+    result = _RemovedRootReconcileResult()
+    now = utcnow()
+    changed = False
+    removed_subtitle_file_ids: list[int] = []
+    warned_accessible_roots: set[str] = set()
+
+    for old in list(known.values()):
+        if old.missing_since is not None:
+            continue
+        old_root = next(
+            (root for root in removed_roots if _row_under_root(old, root) is not None), None
+        )
+        if old_root is None:
+            continue
+        relative = _row_under_root(old, old_root)
+        assert relative is not None
+        old_root_key = _normalise_root_path(old_root)
+        # 根和该文件仍能访问时，不能把它当成被卸载的旧入口；保留原台账，
+        # 避免用户只是暂时调整根路径配置时被误收口。文件本身已经不存在时，
+        # 则仍按本次「旧根已移除」的语义标记缺失。
+        if root_available[old_root_key] and await asyncio.to_thread(Path(old.file_path).exists):
+            if old_root_key not in warned_accessible_roots:
+                logger.warning(
+                    "媒体库 #%s：已移除根「%s」仍可访问，暂不自动收口其旧路径台账",
+                    library.id,
+                    old_root,
+                )
+                warned_accessible_roots.add(old_root_key)
+            continue
+
+        candidates = [Path(root) / relative for root in selected_new_roots]
+        # 只有本轮确实遍历到的候选才参与合并；Path.exists 对网络挂载的权限/IO
+        # 错误会吞成 False，不把它当成「文件不存在」来合并。
+        current_rows = {
+            row.id: row
+            for candidate in candidates
+            if str(candidate) in seen_paths and str(candidate) in known
+            for row in [known[str(candidate)]]
+            if row is not old
+        }
+        existing_candidates = [
+            candidate for candidate in candidates if str(candidate) in seen_paths
+        ]
+        if len(current_rows) == 1:
+            current = next(iter(current_rows.values()))
+            target_path = current.file_path
+            if _has_same_identity(old, current):
+                old_path = old.file_path
+                merged = await _merge_removed_root_duplicate(
+                    session, old, current, target_path=target_path
+                )
+                if merged is None:
+                    summary.removed_root_conflicts += 1
+                    summary.errors.append(
+                        "旧根重复台账各有一个字幕任务在运行，暂不合并："
+                        f"{old.file_path} ↔ {target_path}"
+                    )
+                    continue
+                survivor, duplicate_id = merged
+                known.pop(old_path, None)
+                known[target_path] = survivor
+                removed_subtitle_file_ids.append(duplicate_id)
+                summary.root_relinked += 1
+                changed = True
+                logger.info("已合并已移除根的重复台账：%s → %s", old_path, target_path)
+                continue
+            if _has_identity_conflict(old, current):
+                summary.removed_root_conflicts += 1
+                summary.errors.append(
+                    f"已移除根存在身份冲突台账，未自动合并：{old.file_path} ↔ {target_path}"
+                )
+                logger.warning(
+                    "媒体库 #%s：已移除根的同相对路径台账身份冲突，已保留两行：%s ↔ %s",
+                    library.id,
+                    old.file_path,
+                    target_path,
+                )
+                continue
+        elif len(current_rows) > 1:
+            summary.removed_root_conflicts += 1
+            summary.errors.append(f"已移除根在多个新根有同相对路径记录，未自动合并：{old.file_path}")
+            continue
+
+        # 无新文件，或新行无法确认身份时，旧容器路径已不可用，不应继续被详情
+        # 页、缩略图刷新等业务当作在位文件。只标台账缺失，磁盘从不触碰。
+        old.missing_since = now
+        old.updated_at = now
+        summary.marked_missing += 1
+        summary.removed_root_marked_missing += 1
+        changed = True
+        # 删除条件需要一个明确、且本轮实际扫到文件的新根。没有可确定配对时
+        # 不删，保留 missing 供管理员在预览后手工处理；有同路径但身份未确认
+        # 时也可删旧行——旧容器路径已确认不可用，新行仍会完整保留。唯一例外
+        # 是候选已遍历却没有新台账（通常是写入静默窗暂缓）：等下轮入账后再说。
+        targets = cleanup_targets.get(old_root_key, set())
+        if targets and targets & trusted_new_roots and (not existing_candidates or current_rows):
+            assert old.id is not None
+            result.clearable_ids.append(old.id)
+        if existing_candidates:
+            logger.info(
+                "媒体库 #%s：旧根台账无法确认与新路径为同一媒体，已标记 missing：%s",
+                library.id,
+                old.file_path,
+            )
+
+    if changed:
+        await session.commit()
+        await _cleanup_subtitle_checkpoints(removed_subtitle_file_ids)
+    return result
+
+
+async def _auto_clear_removed_root_ledger(
+    repo: LibraryFileRepository,
+    library: Library,
+    summary: ScanSummary,
+    *,
+    file_ids: list[int],
+    unreadable_dirs: list[str],
+) -> None:
+    """按普通自动清理同等可信条件，删除本轮确认的旧根台账。"""
+    if not file_ids or not library.auto_clear_missing:
+        return
+    if summary.cancelled or unreadable_dirs:
+        logger.info(
+            "媒体库 #%s：本轮扫描未完全可信，已移除根的缺失台账只标记、不自动清理",
+            library.id,
+        )
+        return
+    cleared = await repo.delete_by_ids(file_ids)
+    summary.cleared_missing += cleared
+    summary.removed_root_cleared += cleared
+    if cleared:
+        logger.warning(
+            "媒体库 #%s：已清理 %d 条已移除根的遗留台账（仅数据库记录，磁盘未动）",
+            library.id,
+            cleared,
+        )
+
+
+async def preview_root_path_reconcile(
+    session: AsyncSession,
+    library: Library,
+    *,
+    old_root: str,
+    new_root: str,
+) -> RootPathReconcilePreview:
+    """预览历史根路径迁移修复，不扫描也不修改任何台账。"""
+    old_root_path = Path(_normalise_root_path(old_root))
+    new_root_path = Path(_normalise_root_path(new_root))
+    rows = await LibraryFileRepository(session).list_by_library(library.id)  # type: ignore[arg-type]
+    by_path = {row.file_path: row for row in rows}
+    old_root_available = await asyncio.to_thread(old_root_path.exists)
+    preview = RootPathReconcilePreview(
+        library_id=library.id,  # type: ignore[arg-type]
+        old_root=str(old_root_path),
+        new_root=str(new_root_path),
+    )
+    for old in rows:
+        if old.missing_since is not None:
+            continue
+        relative = _row_under_root(old, old_root_path)
+        if relative is None:
+            continue
+        if old_root_available and await asyncio.to_thread(Path(old.file_path).exists):
+            continue
+        candidate = new_root_path / relative
+        current = by_path.get(str(candidate))
+        if current is None:
+            preview.marked_missing += 1
+            continue
+        preview.same_path_candidates += 1
+        if _has_same_identity(old, current):
+            preview.safe_merges += 1
+            preview.old_rows_to_delete_from_ledger += 1
+        elif _has_identity_conflict(old, current):
+            preview.conflicts.append(f"{old.file_path} ↔ {candidate}")
+        else:
+            preview.marked_missing += 1
+            preview.unconfirmed.append(f"{old.file_path} ↔ {candidate}")
+    return preview
+
+
 def _is_disc_dir(directory: Path) -> bool:
     """原盘目录判定：蓝光（BDMV）或 DVD（VIDEO_TS）结构。"""
     return (directory / "BDMV").is_dir() or (directory / "VIDEO_TS").is_dir()
@@ -891,7 +1661,11 @@ def _disc_total_size(disc_dir: Path) -> int:
     return total
 
 
-def _walk_videos(root: Path, unreadable: list[str] | None = None):
+def _walk_videos(
+    root: Path,
+    unreadable: list[str] | None = None,
+    dir_files: dict[str, list[str]] | None = None,
+):
     """深度遍历，产出 (路径, 是否原盘目录)。
 
     原盘目录（BDMV/VIDEO_TS 结构）整体作为**一个条目**产出、不再下钻——
@@ -901,6 +1675,10 @@ def _walk_videos(root: Path, unreadable: list[str] | None = None):
     会把路径记进来。读不动的目录只能跳过——但**跳过不等于目录是空的**，
     它底下的文件会因为"本轮没遍历到"被判丢失。标记 missing 时这无伤大雅
     （回归自动恢复），自动清理必须知情：这一轮的"没遍历到"不可信。
+
+    ``dir_files``：调用方传入的目录清单收集器（目录路径 → 文件名列表）。
+    外挂字幕发现（jellyfin-subtitle.md §2.1）靠它做零额外 IO 的前缀匹配
+    ——目录本轮已经列过，不再为字幕单独列第二遍。
     """
     stack = [root]
     while stack:
@@ -911,6 +1689,8 @@ def _walk_videos(root: Path, unreadable: list[str] | None = None):
             if unreadable is not None:
                 unreadable.append(str(current))
             continue
+        if dir_files is not None:
+            dir_files[str(current)] = [e.name for e in entries if not e.is_dir()]
         for entry in entries:
             name = entry.name
             if entry.is_dir():
@@ -936,6 +1716,384 @@ def _walk_videos(root: Path, unreadable: list[str] | None = None):
             yield entry, False
 
 
+async def _relink_legacy_root_paths(
+    session,
+    library: Library,
+    known: dict[str, LibraryFile],
+    pending: list[tuple[Path, Path, bool]],
+    summary: ScanSummary,
+    *,
+    previous_root_paths: list[str],
+    new_root_paths: list[str],
+) -> None:
+    """根路径编辑后，将同一实体的旧台账路径迁到当前扫描路径。
+
+    根编辑请求同时带来修改前后的根列表。只将同一旧根/新根组合下**相同
+    相对路径**的文件配对：这既让新增软链接别名根也能复用原行，又不会把
+    同库不同目录里用户有意保留的硬链接误合并。旧入口能访问时必须同 inode；
+    旧挂载点已经撤掉时，则由台账中已记录的尺寸和 mtime 双重校验兜底。
+
+    不扫描历史 ``missing`` 行：它们的路径不一定仍对应用户本次编辑的根，
+    静默复活会污染缺失清单。一个新路径有多个候选时同样不处理，宁可本轮
+    重新走原有入账链路，也不能猜测并吞掉人工台账。
+    """
+    old_roots = [Path(root) for root in previous_root_paths]
+    new_roots = [Path(root) for root in (new_root_paths or list(library.root_paths))]
+    if not old_roots or not new_roots:
+        return
+
+    def _stat(path: Path):
+        try:
+            return path.stat()
+        except OSError:
+            return None
+
+    pending_by_path = {str(file): file for _root, file, _is_disc in pending}
+    # 记录候选所属的旧根：旧根仍在新配置中时，跨设备号的尺寸/mtime 一致
+    # 不足以证明同一实体（两个独立根也可能恰好有同名、同大小的文件）。
+    candidates_by_path: dict[str, list[tuple[LibraryFile, Path]]] = {}
+    for row in known.values():
+        if row.missing_since is not None:
+            continue
+        old_path = Path(row.file_path)
+        for old_root in old_roots:
+            try:
+                relative = old_path.relative_to(old_root)
+            except ValueError:
+                continue
+            for new_root in new_roots:
+                new_path = str(new_root / relative)
+                if new_path != row.file_path and new_path in pending_by_path:
+                    candidates_by_path.setdefault(new_path, []).append((row, old_root))
+            break
+
+    changed = False
+    removed_subtitle_file_ids: list[int] = []
+    for path_str, old_rows in candidates_by_path.items():
+        if len(old_rows) != 1:
+            continue
+        old, old_root = old_rows[0]
+        file = pending_by_path[path_str]
+        current_stat, old_stat = await asyncio.gather(
+            asyncio.to_thread(_stat, file),
+            asyncio.to_thread(_stat, Path(old.file_path)),
+        )
+        if current_stat is None:
+            continue
+        if old_stat is not None and old_stat.st_dev == current_stat.st_dev:
+            # 同一文件系统中 inode 不同就是不同实体，不能由尺寸/mtime 推翻。
+            if old_stat.st_ino != current_stat.st_ino:
+                continue
+        elif old_root in new_roots or not _matches_ledger_fingerprint(old, current_stat):
+            # 保留旧根又新增另一根时，跨设备号不能只凭持久化指纹合并：两个
+            # 独立目录可能刚好同大小、同 mtime。仅在旧根已被替换时，才允许
+            # 旧入口不可达/跨挂载命名空间时的指纹回退；它不替代同文件系统
+            # 内明确的 inode 反证。
+            continue
+        current = known.get(path_str)
+        if current is old:
+            continue
+        if current is None:
+            # 新增的是原根的别名时，原路径仍会在这一轮被遍历。保留它作为
+            # 主台账路径，并把别名映射到同一行，扫描主循环因此两边都秒过，
+            # 而不是把原行迁到别名后又把原路径重新入账。
+            if old.file_path in pending_by_path:
+                known[path_str] = old
+                summary.root_relinked += 1
+                logger.info("根路径新增别名，同一文件复用原台账：%s ↔ %s", old.file_path, path_str)
+                continue
+            old_path = old.file_path
+            _relocate_root_ledger_row(old, path_str)
+            known.pop(old_path, None)
+            known[path_str] = old
+            summary.root_relinked += 1
+            changed = True
+            logger.info("根路径变更，同一文件台账已随迁：%s → %s", old_path, path_str)
+            continue
+        # 当前路径已经有行，说明此前一次重扫已经造成重复。只有身份完全一致
+        # （或一边还未识别）才自动合并；互相冲突时宁可保留两行并记问题，不能
+        # 静默吞掉用户人工认领的结论。
+        if not _can_merge_same_file_rows(old, current):
+            summary.errors.append(f"同一文件存在冲突台账，未自动合并：{old.file_path} ↔ {path_str}")
+            logger.warning(
+                "根路径变更发现同一文件的台账身份冲突，未自动合并：%s ↔ %s",
+                old.file_path,
+                path_str,
+            )
+            continue
+        assert old.id is not None and current.id is not None
+        old_running = bool(
+            await jobs.list_jobs(
+                session,
+                active_only=True,
+                job_type="subtitle.generate",
+                resource_type="library_file",
+                resource_id=old.id,
+                limit=1,
+            )
+        )
+        current_running = bool(
+            await jobs.list_jobs(
+                session,
+                active_only=True,
+                job_type="subtitle.generate",
+                resource_type="library_file",
+                resource_id=current.id,
+                limit=1,
+            )
+        )
+        if old_running and current_running:
+            summary.errors.append(f"同一文件的重复台账有两个字幕任务在运行，暂不合并：{path_str}")
+            continue
+        survivor, duplicate = (current, old) if current_running else (old, current)
+        assert duplicate.id is not None
+        old_path = old.file_path
+        old_path_is_still_scanned = old_path in pending_by_path
+        await _merge_same_file_rows(
+            session,
+            survivor,
+            duplicate,
+            # 保留原根又新增别名时，两个入口本轮都会被遍历。若无运行任务，
+            # 原路径仍是更早的权威台账地址；若要保留新路径的运行任务，则它
+            # 本来就已指向别名路径。无论哪种情况，下面都会让两个 key 指向
+            # 同一行，避免主循环把另一个入口重新入账。
+            file_path=(old_path if old_path_is_still_scanned and survivor is old else path_str),
+        )
+        known.pop(old_path, None)
+        if old_path_is_still_scanned:
+            known[old_path] = survivor
+        known[path_str] = survivor
+        removed_subtitle_file_ids.append(duplicate.id)
+        summary.root_relinked += 1
+        changed = True
+        logger.info(
+            "根路径变更的重复台账已合并：%s → %s%s",
+            old_path,
+            path_str,
+            "（保留正在生成字幕的当前台账行）" if current_running else "",
+        )
+    if changed:
+        # 根路径改写往往涉及整库几千行；必须作为一次事务提交，而不是每个
+        # 文件一次 SQLite fsync。任何中途异常都会由 session 上下文回滚，
+        # 不会留下半迁移台账。
+        await session.commit()
+        # 旧版断点以 file_id 命名；持久作业已经在事务内改指向保留行，提交后
+        # 才清理被删行的残留断点，避免事务回滚却提前丢失可恢复状态。
+        for file_id in removed_subtitle_file_ids:
+            for path in Path("data/cache/subtitle_gen").glob(f"{file_id}.*.checkpoint.json"):
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError as exc:
+                    logger.warning("清理重复台账的字幕断点失败：file=%s %s", file_id, exc)
+
+
+def _matches_ledger_fingerprint(row: LibraryFile, stat) -> bool:
+    """旧根不可访问时，确认新文件仍是原台账记录的受限回退证据。
+
+    inode 只能在同一挂载命名空间中比较；用户把 ``/mnt/media`` 换成另一个
+    容器挂载点后，旧路径常已不可见、``st_dev`` 也会变化。此时只有尺寸和
+    mtime 均在旧行中存在且精确一致才允许迁移，缺一项就放弃，不能用弱指纹
+    把同尺寸洗版误认为同一文件。
+    """
+    return (
+        row.size_bytes == stat.st_size
+        and row.file_mtime_ns is not None
+        and row.file_mtime_ns == stat.st_mtime_ns
+    )
+
+
+def _can_merge_same_file_rows(old: LibraryFile, current: LibraryFile) -> bool:
+    """同一实体的两行台账能否无损自动合并。
+
+    同一文件原则上身份应当相同；允许一边尚未识别，或同一 media item 的季集
+    号尚有旧数据缺失。人工认领和机器结果互相指向不同单元时必须由用户处理。
+    """
+    if old.media_item_id is not None and current.media_item_id is not None:
+        if old.media_item_id != current.media_item_id:
+            return False
+        return (old.season_number, old.episode_number) == (
+            current.season_number,
+            current.episode_number,
+        )
+    return True
+
+
+def _relocate_root_ledger_row(row: LibraryFile, file_path: str) -> None:
+    """原地改写台账路径，保留主键及全部既有识别、规格与来源信息。"""
+    row.file_path = file_path
+    row.missing_since = None
+    row.updated_at = utcnow()
+
+
+async def _merge_same_file_rows(
+    session, survivor: LibraryFile, duplicate: LibraryFile, *, file_path: str
+) -> None:
+    """把根路径编辑产生的重复行合并进保留行，再删除另一行。
+
+    常规路径保留根编辑前的原台账行，Jellyfin 来源 ID 等外部引用因此不中断；
+    但若新路径行正在生成字幕，保留它才能让任务继续按原 file_id 取行。重复
+    行中更完整的人工身份、规格和来源信息会补回保留行；被删行关联的持久作业
+    同步改指向保留行，历史任务与后续重试都不会留下悬空 file_id。
+    """
+    survivor_is_manual = survivor.identity_source == IdentitySource.MANUAL
+    duplicate_is_manual = duplicate.identity_source == IdentitySource.MANUAL
+    if duplicate.media_item_id is not None and (
+        survivor.media_item_id is None or duplicate_is_manual and not survivor_is_manual
+    ):
+        survivor.media_item_id = duplicate.media_item_id
+        survivor.season_number = duplicate.season_number
+        survivor.episode_number = duplicate.episode_number
+        survivor.identity_source = duplicate.identity_source
+        survivor.resolved_version = duplicate.resolved_version
+        survivor.review_suggestion = duplicate.review_suggestion
+        survivor.unidentified_reason = None
+        survivor.unidentified_code = None
+        survivor.unidentified_candidates = None
+    if survivor.file_mtime_ns is None:
+        survivor.file_mtime_ns = duplicate.file_mtime_ns
+    if survivor.container is None:
+        survivor.container = duplicate.container
+    for field_name in (
+        "resolution",
+        "video_codec",
+        "hdr",
+        "bit_depth",
+        "duration_seconds",
+        "bit_rate",
+        "frame_rate",
+        "color_space",
+        "audio_streams",
+        "subtitle_streams",
+        "external_subtitles",
+        "media_source",
+        "release_group",
+        "site_id",
+        "torrent_id",
+    ):
+        if getattr(survivor, field_name) is None:
+            setattr(survivor, field_name, getattr(duplicate, field_name))
+    if survivor.source == FileSource.SCANNED and duplicate.source == FileSource.IMPORTED:
+        survivor.source = duplicate.source
+    if survivor.ignored_at is None:
+        survivor.ignored_at = duplicate.ignored_at
+    if survivor.media_item_id is None:
+        for field_name in (
+            "unidentified_reason",
+            "unidentified_code",
+            "unidentified_candidates",
+        ):
+            if getattr(survivor, field_name) is None:
+                setattr(survivor, field_name, getattr(duplicate, field_name))
+    assert survivor.id is not None and duplicate.id is not None
+    await _retarget_library_file_jobs(session, duplicate.id, survivor.id)
+    # file_path 有唯一索引，必须先让重复行的 DELETE 落到数据库，才能把原行
+    # 迁到新路径；同一事务保证外界只会看到合并前或合并后的完整状态。
+    await session.delete(duplicate)
+    await session.flush()
+    survivor.file_path = file_path
+    survivor.missing_since = None
+    survivor.updated_at = utcnow()
+
+
+async def _retarget_library_file_jobs(
+    session: AsyncSession, duplicate_id: int, survivor_id: int
+) -> None:
+    """合并台账时同步迁移任务资源，并修正字幕任务的可重试输入。"""
+    resources = list(
+        (
+            await session.execute(
+                select(JobResource).where(
+                    JobResource.resource_type == "library_file",
+                    JobResource.resource_id == str(duplicate_id),
+                )
+            )
+        ).scalars()
+    )
+    for resource in resources:
+        existing_id = (
+            await session.execute(
+                select(JobResource.id).where(
+                    JobResource.job_id == resource.job_id,
+                    JobResource.resource_type == resource.resource_type,
+                    JobResource.resource_id == str(survivor_id),
+                    JobResource.relation == resource.relation,
+                )
+            )
+        ).scalar_one_or_none()
+        if existing_id is None:
+            resource.resource_id = str(survivor_id)
+        else:
+            await session.delete(resource)
+
+        job = await session.get(Job, resource.job_id)
+        if job is None or job.job_type != "subtitle.generate":
+            continue
+        input_data = dict(job.input_data)
+        if str(input_data.get("file_id")) != str(duplicate_id):
+            continue
+        input_data["file_id"] = survivor_id
+        job.input_data = input_data
+        prefix = f"subtitle.generate:{duplicate_id}:"
+        if job.dedupe_key and job.dedupe_key.startswith(prefix):
+            job.dedupe_key = f"subtitle.generate:{survivor_id}:{job.dedupe_key[len(prefix) :]}"
+
+
+async def _refresh_known_row(
+    row: LibraryFile,
+    file: Path,
+    dir_names: list[str] | None,
+    *,
+    is_disc: bool,
+    check_media_change: bool,
+) -> bool:
+    """秒过行的增量刷新：外挂字幕重发现 +（点名时）视频变化重探。
+
+    返回是否改动了行（调用方批量 commit，与 mtime 回填同一提交点）。
+
+    - 外挂字幕：每轮都做——纯内存前缀匹配 + 对命中的少数字幕文件 stat，
+      不触碰视频本体；旧行（NULL）顺带回填。原盘条目恒 []（§2.1）；
+    - 视频变化重探（§2.4）：只在 ``check_media_change`` 时 stat 视频本体，
+      (size, mtime) 确认变化才 ffprobe；**探测成功才回写**规格与新鲜度键
+      ——半截写入的替换文件探测会失败，保留旧值让下一轮重试。strm 无
+      媒体流，不参与重探。
+    """
+    changed = False
+    if is_disc:
+        discovered: list[dict] = []
+    else:
+        discovered = await discover_external_subtitles_async(file, dir_names)
+    if row.external_subtitles != discovered:
+        row.external_subtitles = discovered
+        row.updated_at = utcnow()
+        changed = True
+
+    is_strm = not is_disc and file.suffix.lower() == STRM_EXT
+    if check_media_change and not is_disc and not is_strm:
+        try:
+            st = await asyncio.to_thread(file.stat)
+        except OSError:
+            return changed
+        if (st.st_size, st.st_mtime_ns) != (row.size_bytes, row.file_mtime_ns):
+            spec = await asyncio.to_thread(probe_media, file)
+            if spec is not None:
+                row.size_bytes = st.st_size
+                row.file_mtime_ns = st.st_mtime_ns
+                row.resolution = spec.resolution
+                row.video_codec = spec.video_codec
+                row.hdr = spec.hdr
+                row.bit_depth = spec.bit_depth
+                row.duration_seconds = spec.duration_seconds
+                row.bit_rate = spec.bit_rate
+                row.frame_rate = spec.frame_rate
+                row.color_space = spec.color_space
+                row.audio_streams = list(spec.audio_streams)
+                row.subtitle_streams = list(spec.subtitle_streams)
+                row.updated_at = utcnow()
+                changed = True
+                logger.info("视频文件内容已变化，介质规格与内封字幕轨已重探：%s", file)
+    return changed
+
+
 async def _ingest_file(
     session,
     repo: LibraryFileRepository,
@@ -951,6 +2109,8 @@ async def _ingest_file(
     is_disc: bool = False,
     hint: _SubtitleHint | None = None,
     existing: LibraryFile | None = None,
+    dir_names: list[str] | None = None,
+    added_batch_id: str,
 ) -> None:
     """把一个文件识别并写入台账。``existing`` 是该路径已有的台账行：
     在位但待识别 → 本次是识别重试；标记过 missing → 文件回归。"""
@@ -965,6 +2125,12 @@ async def _ingest_file(
     is_strm = not is_disc and file.suffix.lower() == STRM_EXT
     probe_target = None if is_strm else (disc_main_stream(file) if is_disc else file)
     spec = await asyncio.to_thread(probe_media, probe_target) if probe_target is not None else None
+    if spec is not None and is_disc and (file / "BDMV").is_dir():
+        # m2ts 常常不带语言描述符；同编号 CLPI 用 PID 补齐，已有 ffprobe
+        # 语言保持不动。缺失/损坏 CLPI 只降级，不影响原盘入账。
+        languages = await asyncio.to_thread(read_clpi_languages, probe_target)
+        if languages is not None:
+            spec = enrich_spec_with_clpi(spec, languages)
     if is_disc:
         size_bytes = await asyncio.to_thread(_disc_total_size, file)
         container = "bluray" if (file / "BDMV").is_dir() else "dvd"
@@ -985,13 +2151,17 @@ async def _ingest_file(
     # strm 不参与归并：指纹靠"尺寸 + 时长"，而 strm 只有几百字节且无时长，
     # 同剧各集的 URL 长度往往完全相同，尺寸毫无区分度——错并会把身份锚
     # 挂到另一集头上，宁可当新文件重走识别链
-    if existing is None and not is_strm and await _try_relink(
-        repo,
-        library,
-        file,
-        size_bytes=size_bytes,
-        container=container,
-        duration_seconds=spec.duration_seconds if spec else None,
+    if (
+        existing is None
+        and not is_strm
+        and await _try_relink(
+            repo,
+            library,
+            file,
+            size_bytes=size_bytes,
+            container=container,
+            duration_seconds=spec.duration_seconds if spec else None,
+        )
     ):
         summary.relinked += 1
         return
@@ -1035,6 +2205,11 @@ async def _ingest_file(
             if unidentified_code == UnidentifiedCode.KIND_MISMATCH:
                 summary.kind_mismatched += 1
     attrs = enrich(unit_name(file, is_disc))
+    # 外挂字幕发现（jellyfin-subtitle.md §2.1）：原盘恒 []，其余（含 strm）
+    # 用遍历时截获的目录清单做前缀匹配
+    external_subtitles: list[dict] = (
+        [] if is_disc else await discover_external_subtitles_async(file, dir_names)
+    )
     assert library.id is not None
     await repo.upsert_by_path(
         LibraryFile(
@@ -1052,11 +2227,15 @@ async def _ingest_file(
             bit_depth=spec.bit_depth if spec else None,
             duration_seconds=spec.duration_seconds if spec else None,
             bit_rate=spec.bit_rate if spec else None,
+            frame_rate=spec.frame_rate if spec else None,
+            color_space=spec.color_space if spec else None,
             audio_streams=list(spec.audio_streams) if spec else None,
             subtitle_streams=list(spec.subtitle_streams) if spec else None,
+            external_subtitles=external_subtitles,
             media_source=attrs.media_source,
             release_group=attrs.release_group,
             source=FileSource.SCANNED,
+            added_batch_id=added_batch_id,
             unidentified_reason=None if item_id is not None else unidentified_reason,
             unidentified_code=None if item_id is not None else unidentified_code,
             unidentified_candidates=None if item_id is not None else (candidates or None),
@@ -1170,12 +2349,18 @@ _RELINK_DURATION_TOLERANCE_SECONDS = 2
 
 
 async def _probe_backfill(
-    session, library_id: int, summary: ScanSummary, state: ScanState
+    session,
+    library_id: int,
+    summary: ScanSummary,
+    state: ScanState,
+    *,
+    bridge: _ScanJobBridge | None = None,
 ) -> None:
-    """给本库里「在位、却从没探测过介质规格」的台账行补上 ffprobe 结果。
+    """补齐未探测规格，并给存量 BDMV 回填 CLPI 语言。
 
     判据用 ``audio_streams IS NULL``：它是"这行从没探测成功过"的标记
-    （空列表 = 探过、文件确实没有音轨，两者必须分开）。
+    （空列表 = 探过、文件确实没有音轨，两者必须分开）。BDMV 另以流 JSON
+    内的 CLPI 版本戳判断：已有数组但未读过 CLPI 的旧行也进入一次补探。
 
     不限量、但有自己的分子分母与停止响应——整库补探在网络挂载上可能是
     小时级的活，用户要看得到进度、也要停得下来。ffprobe 不可用时整段跳过，
@@ -1191,7 +2376,10 @@ async def _probe_backfill(
             await session.execute(
                 select(LibraryFile).where(
                     LibraryFile.library_id == library_id,
-                    LibraryFile.audio_streams.is_(None),  # type: ignore[union-attr]
+                    or_(
+                        LibraryFile.audio_streams.is_(None),  # type: ignore[union-attr]
+                        LibraryFile.container == "bluray",
+                    ),
                     LibraryFile.missing_since.is_(None),  # type: ignore[union-attr]
                     LibraryFile.ignored_at.is_(None),  # type: ignore[union-attr]
                 )
@@ -1200,6 +2388,17 @@ async def _probe_backfill(
         .scalars()
         .all()
     )
+    # 普通文件仍只补 audio_streams=NULL；蓝光旧行即使已有流数组，也要在
+    # CLPI 版本戳缺失时做一次 PID 级重探。版本写进 JSON，后续手动扫描秒过。
+    rows = [
+        row
+        for row in rows
+        if row.audio_streams is None
+        or (
+            row.container == "bluray"
+            and not streams_have_clpi_metadata(row.audio_streams, row.subtitle_streams)
+        )
+    ]
     # strm 占位文件永远探不出规格（本体没有媒体流），不进分母——否则
     # strm 库每轮扫描都会报"待补 N、探测 0"，像坏了一样
     rows = [row for row in rows if not row.file_path.lower().endswith(STRM_EXT)]
@@ -1207,13 +2406,27 @@ async def _probe_backfill(
         return
     state.phase = ScanPhase.PROBING
     state.processed, state.total = 0, len(rows)
+    if bridge is not None:
+        await bridge.checkpoint(state, summary, force=True, before_write=session.commit)
     logger.info("媒体库 #%s 开始补探 %d 个文件的介质规格", library_id, len(rows))
 
-    def _tick() -> bool:
+    async def _tick() -> bool:
         state.processed += 1
+        if bridge is not None:
+            await bridge.raise_if_cancelled()
         return not _scan_tasks.stop_requested(library_id)
 
-    summary.probed = await backfill_streams(session, rows, limit=None, on_probed=_tick)
+    async def _checkpoint() -> None:
+        if bridge is not None:
+            await bridge.checkpoint(state, summary, force=True)
+
+    summary.probed = await backfill_streams(
+        session,
+        rows,
+        limit=None,
+        on_processed=_tick,
+        on_checkpoint=_checkpoint,
+    )
     logger.info(
         "媒体库 #%s 介质规格补探结束：探测 %d / 待补 %d%s",
         library_id,
@@ -1797,6 +3010,14 @@ def guess_evidence(
         title = (attrs.titles_zh[0] if attrs.titles_zh else None) or (
             attrs.titles_en[0] if attrs.titles_en else None
         )
+        # 短中文片名（实测《两生花》）在 NER 换代后可能整段漏抽。仅当这个
+        # 干净分段也确实出现在文件自身名称里时，才把结构候选当查询词；这样
+        # 「大陆/欧美」等纯分组目录不会凭空变成作品名。最终仍须通过 TMDB
+        # 标题门槛与年份/时长证据验证，不会降低自动挂载标准。
+        if title is None:
+            fallback_titles = title_candidates(text, [])
+            if fallback_titles and normalize_title(fallback_titles[0]) in normalize_title(own):
+                title = fallback_titles[0]
         # "Title (Year)"惯例（Emby/TMM 整理过的目录名）：先剥掉 [tmdbid=N]
         # 这类方括号标记组再匹配，允许年份后还挂着画质等尾巴。500 库实测：
         # 惯例名是**高置信来源**——NER 面向脏乱种子名训练，对整理过的干净
@@ -1871,9 +3092,7 @@ def _unit_for(kind: MediaKind, file: Path) -> tuple[int, int]:
     if episode_nfo and episode_nfo.season is not None and episode_nfo.episode is not None:
         return episode_nfo.season, episode_nfo.episode
     attrs = enrich(file.stem)
-    episode = (
-        attrs.episodes[0] if attrs.episodes else (trailing_index_episode(file.stem) or 0)
-    )
+    episode = attrs.episodes[0] if attrs.episodes else (trailing_index_episode(file.stem) or 0)
     dir_season = season_from_dir(file.parent)
     if len(set(attrs.seasons)) > 1 and dir_season in attrs.seasons:
         return dir_season, episode
@@ -2182,6 +3401,7 @@ async def _reidentify(
         elif new_ids:
             # 分裂成多个条目（如剧集目录混入了别的剧）：不给单一跳转目标
             summary.changed = True
+        await LibraryRepository(session).refresh_stats([library_id])
     logger.info(
         "媒体库 #%s 条目 #%s 重新识别完成：%d 个文件（识别 %d / 待识别 %d），新身份 %s%s",
         library_id,

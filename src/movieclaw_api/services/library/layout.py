@@ -53,6 +53,11 @@ STRM_EXT = ".strm"
 # （监听导入 ingest）刻意不收 strm**：那里的 ffprobe 完整性门禁
 # （挡残缺文件）对 strm 必然失败，会陷入"探测失败自动重试"的死循环。
 SCAN_VIDEO_EXTS = VIDEO_EXTS | {STRM_EXT}
+
+# 外挂字幕扩展名（发现对象，docs/design/jellyfin-subtitle.md §2.1）。
+# 只收语义明确的文本字幕：.sub 有 MicroDVD/VobSub 歧义、.sup/.idx 是
+# 图形字幕（无法转换、播放器支持参差），均不收。
+SUBTITLE_EXTS = {".srt", ".ass", ".ssa", ".vtt"}
 # 文件名/路径含这些标记的视频不入库（样品片段等）
 _IGNORE_MARKERS = ("sample",)
 

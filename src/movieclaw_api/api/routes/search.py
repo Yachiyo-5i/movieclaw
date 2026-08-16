@@ -7,28 +7,37 @@ from fastapi import APIRouter, Depends, Query
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from movieclaw_api.api.deps import (
+    require_admin,
+    require_login,
+    require_search_capability,
+    require_subscribe_capability,
+)
 from movieclaw_api.exceptions import BadRequestException, NotFoundException
 from movieclaw_api.schemas.response import ApiResponse, ok
 from movieclaw_api.schemas.search import (
     CategoryTabItem,
-    MediaSearchSnapshotView,
     PresetTabItem,
     SearchHistoryItem,
-    SearchPreferencesUpdate,
-    SearchPreferencesView,
+    SearchHistoryResultsView,
+    SearchPresetListView,
+    SearchPresetUpdate,
     SearchResponse,
-    SearchSnapshotView,
     SearchStreamDone,
     SearchTabItem,
     SiteSearchStatus,
     SiteStreamResult,
+    TitleSearchHistoryResultsView,
     TorrentHit,
+    TorrentSearchHistoryResultsView,
 )
+from movieclaw_api.services.auth import Principal
 from movieclaw_api.services.site_catalog import SiteCatalogService
 from movieclaw_api.services.site_search import (
     search_all_sites,
     stream_search_all_sites,
 )
+from movieclaw_api.services.site_visibility import usable_site_ids
 from movieclaw_api.settings.schemas import (
     MAX_SEARCH_PRESETS,
     SearchCategoryTab,
@@ -46,11 +55,16 @@ logger = logging.getLogger("movieclaw_api.search")
 router = APIRouter(prefix="/search", tags=["search"])
 
 
+def _history_owner(principal: Principal) -> int:
+    """搜索历史的归属 id：成员用自己的 id，超管/PAT/Agent 共用哨兵 0。"""
+    return principal.member_id if principal.member_id is not None else 0
+
+
 @router.get(
-    "",
+    "/torrents",
     response_model=ApiResponse[SearchResponse],
     summary="跨站点并发搜索种子资源（支持多分类与站点子集）",
-    operation_id="search.run",
+    operation_id="search.torrents",
 )
 async def search_torrents(
     keyword: str = Query(..., min_length=1, description="搜索关键词，支持 IMDb ID"),
@@ -69,19 +83,33 @@ async def search_torrents(
         description="发起搜索时的图览模式偏好，仅随历史留存，用于点历史重搜/看快照时还原展示模式",
     ),
     page: int = Query(1, ge=1, description="页码（各站点独立分页）"),
+    principal: Principal = Depends(require_search_capability),
     session: AsyncSession = Depends(get_session),
 ) -> ApiResponse[SearchResponse]:
     """对「已启用且验证通过」的站点（可用 ``sites`` 圈定子集）并发发起搜索，合并结果后返回。
 
     单个站点失败（认证过期 / 网络异常等）不影响整体：其结果为空，并在
     ``data.sites[].error`` 里给出可读原因，供前端提示。
+    成员的搜索面被其可用站点白名单进一步收窄（服务端强制，勾选绕不过）。
     """
     result = await search_all_sites(
-        keyword=keyword, categories=categories, site_ids=sites, label=label, page=page
+        keyword=keyword,
+        categories=categories,
+        site_ids=sites,
+        label=label,
+        page=page,
+        allowed_site_ids=await usable_site_ids(session, principal),
     )
     if not no_history:
         history_id = await _record_history(
-            session, keyword, categories, sites, label, page, poster_mode
+            session,
+            keyword,
+            categories,
+            sites,
+            label,
+            page,
+            poster_mode,
+            member_id=_history_owner(principal),
         )
         if history_id is not None:
             await _save_snapshot(history_id, result.items, result.sites, result.total)
@@ -96,6 +124,7 @@ async def _record_history(
     label: str | None,
     page: int,
     poster_mode: bool = False,
+    member_id: int = 0,
 ) -> int | None:
     """只在第 1 页记录搜索历史：翻页是同一次搜索的延续，不该重复计数。
 
@@ -112,6 +141,7 @@ async def _record_history(
             categories=[c.value for c in categories] if categories else None,
             site_ids=sites,
             poster_mode=poster_mode,
+            member_id=member_id,
         )
     except Exception:  # noqa: BLE001 —— 历史写入失败不能拖垮搜索本身
         logger.warning("搜索历史写入失败（不影响本次搜索结果）", exc_info=True)
@@ -147,10 +177,13 @@ async def _save_snapshot(
 
 
 @router.get(
-    "/stream",
+    "/torrents/stream",
     summary="跨站点流式搜索（SSE）：站点开始/返回结果/失败逐事件实时推送",
-    operation_id="search.stream",
-    openapi_extra={"x-cli-stream": {"terminal_events": ["done"]}},
+    operation_id="workflow.search.torrents.stream",
+    openapi_extra={
+        "x-cli-hidden": True,
+        "x-cli-stream": {"terminal_events": ["done"]},
+    },
 )
 async def search_torrents_stream(
     keyword: str = Query(..., min_length=1, description="搜索关键词，支持 IMDb ID"),
@@ -169,20 +202,30 @@ async def search_torrents_stream(
         description="发起搜索时的图览模式偏好，仅随历史留存，用于点历史重搜/看快照时还原展示模式",
     ),
     page: int = Query(1, ge=1, description="页码（各站点独立分页）"),
+    principal: Principal = Depends(require_search_capability),
     session: AsyncSession = Depends(get_session),
 ) -> StreamingResponse:
-    """``/search`` 的流式版本：以 Server-Sent Events 逐事件推送搜索过程与结果。
+    """``/search/torrents`` 的流式版本：以 SSE 逐事件推送搜索过程与结果。
 
     事件序列 ``start → site_start × N → (site_result | site_error) × N → done``，
     快的站点先出结果，前端边收边渲染，不再被最慢的站点拖住。载荷结构见
     schemas.search 的流式事件段；错误隔离口径与阻塞版一致（单站失败仅产生
     ``site_error`` 事件，不中断整个流）。
     """
-    # 历史在流开始前落库：流式响应返回后请求级 session 的生命周期不再可靠
+    # 历史在流开始前落库：流式响应返回后请求级 session 的生命周期不再可靠；
+    # 站点白名单同理（流式生成器运行时请求级 session 已不可用）
+    allowed = await usable_site_ids(session, principal)
     history_id: int | None = None
     if not no_history:
         history_id = await _record_history(
-            session, keyword, categories, sites, label, page, poster_mode
+            session,
+            keyword,
+            categories,
+            sites,
+            label,
+            page,
+            poster_mode,
+            member_id=_history_owner(principal),
         )
 
     async def event_source():
@@ -191,7 +234,12 @@ async def search_torrents_stream(
         collected: list[TorrentHit] = []
         done: SearchStreamDone | None = None
         async for event, payload in stream_search_all_sites(
-            keyword=keyword, categories=categories, site_ids=sites, label=label, page=page
+            keyword=keyword,
+            categories=categories,
+            site_ids=sites,
+            label=label,
+            page=page,
+            allowed_site_ids=allowed,
         ):
             if isinstance(payload, SiteStreamResult):
                 collected.extend(payload.items)
@@ -215,8 +263,8 @@ async def search_torrents_stream(
     )
 
 
-def _preferences_view(tabs: list[SearchTab]) -> SearchPreferencesView:
-    """把存储层的标签列表转成 API 视图（str id → 枚举）。"""
+def _preset_list_view(tabs: list[SearchTab]) -> SearchPresetListView:
+    """把存储层的资源搜索标签转成公开预设视图（str id → 枚举）。"""
     items: list[SearchTabItem] = []
     for tab in tabs:
         if isinstance(tab, SearchCategoryTab):
@@ -233,16 +281,16 @@ def _preferences_view(tabs: list[SearchTab]) -> SearchPreferencesView:
                     skip_history=tab.skip_history,
                 )
             )
-    return SearchPreferencesView(tabs=items)
+    return SearchPresetListView(presets=items)
 
 
-def _validate_tabs(payload: SearchPreferencesUpdate) -> None:
+def _validate_presets(payload: SearchPresetUpdate) -> None:
     """保存前的业务校验（结构校验已由 Pydantic 完成），全部中文报错。"""
-    category_ids = [t.id for t in payload.tabs if isinstance(t, CategoryTabItem)]
+    category_ids = [t.id for t in payload.presets if isinstance(t, CategoryTabItem)]
     if len(category_ids) != len(set(category_ids)):
         raise BadRequestException("分类列表存在重复项，请刷新页面后重试")
 
-    presets = [t for t in payload.tabs if isinstance(t, PresetTabItem)]
+    presets = [t for t in payload.presets if isinstance(t, PresetTabItem)]
     if len(presets) > MAX_SEARCH_PRESETS:
         raise BadRequestException(f"自定义分类最多创建 {MAX_SEARCH_PRESETS} 个")
     preset_ids = [p.id for p in presets]
@@ -265,38 +313,42 @@ def _validate_tabs(payload: SearchPreferencesUpdate) -> None:
 
 
 @router.get(
-    "/preferences",
-    response_model=ApiResponse[SearchPreferencesView],
-    summary="读取搜索偏好（标签栏：内置分类 + 自定义分类）",
-    operation_id="search.prefs.show",
+    "/presets",
+    response_model=ApiResponse[SearchPresetListView],
+    summary="列出资源搜索的内置分类与自定义站点组合预设",
+    operation_id="search.presets.list",
+    dependencies=[Depends(require_search_capability)],
 )
-async def get_preferences() -> ApiResponse[SearchPreferencesView]:
+async def list_search_presets() -> ApiResponse[SearchPresetListView]:
     """返回全量标签的有序列表（含隐藏项）。
 
     搜索面板据此渲染分类栏（只取 visible=True 的），设置页则完整渲染
     供用户调整。偏好存服务端，跨设备一次保存处处生效。
     """
-    return ok(_preferences_view(await get_search_tabs()))
+    return ok(_preset_list_view(await get_search_tabs()))
 
 
 @router.put(
-    "/preferences",
-    response_model=ApiResponse[SearchPreferencesView],
-    summary="保存搜索偏好（标签栏：内置分类 + 自定义分类）",
-    operation_id="search.prefs.update",
+    "/presets",
+    response_model=ApiResponse[SearchPresetListView],
+    summary="整体保存资源搜索的分类与站点组合预设",
+    operation_id="search.presets.update",
+    # 标签栏是全局共享配置（唯一编辑入口在管理员的「资源站点」设置页），
+    # 成员可读不可写——写开放给成员会互相覆盖
+    dependencies=[Depends(require_admin)],
 )
-async def update_preferences(
-    payload: SearchPreferencesUpdate,
-) -> ApiResponse[SearchPreferencesView]:
+async def update_search_presets(
+    payload: SearchPresetUpdate,
+) -> ApiResponse[SearchPresetListView]:
     """整体覆盖式保存标签配置，返回保存后的完整列表。
 
     校验：未知分类/名称超长在请求解析阶段被拒（422）；重复项、超出预设数量
     上限、勾选了不存在的站点报 400；缺失的内置分类由后端按默认可见性自动
     补齐到末尾（前端版本落后时也不丢数据）。
     """
-    _validate_tabs(payload)
+    _validate_presets(payload)
     tabs: list[SearchTab] = []
-    for item in payload.tabs:
+    for item in payload.presets:
         if isinstance(item, CategoryTabItem):
             tabs.append(SearchCategoryTab(id=item.id.value, visible=item.visible))
         else:
@@ -312,7 +364,7 @@ async def update_preferences(
                 )
             )
     saved = await save_search_tabs(tabs)
-    return ok(_preferences_view(saved), message="搜索设置已保存")
+    return ok(_preset_list_view(saved), message="资源搜索预设已保存")
 
 
 @router.get(
@@ -323,24 +375,28 @@ async def update_preferences(
 )
 async def list_search_history(
     limit: int = Query(10, ge=1, le=50, description="返回关键词组数上限"),
+    principal: Principal = Depends(require_login),
     session: AsyncSession = Depends(get_session),
 ) -> ApiResponse[list[SearchHistoryItem]]:
-    """返回最近的关键词组；组内保留媒体及各资源分类的独立记录与快照。"""
-    rows = await SearchHistoryRepository(session).list_recent_groups(limit)
+    """返回**本人**最近的关键词组；组内保留媒体及各资源分类的独立记录与快照。"""
+    rows = await SearchHistoryRepository(session).list_recent_groups(
+        limit, member_id=_history_owner(principal)
+    )
     return ok([SearchHistoryItem.from_model(r) for r in rows])
 
 
 @router.get(
-    "/history/{history_id}/snapshot",
-    response_model=ApiResponse[SearchSnapshotView],
-    summary="读取某条搜索历史的结果快照",
-    operation_id="search.history.snapshot",
+    "/history/{history_id}/results",
+    response_model=ApiResponse[SearchHistoryResultsView],
+    summary="读取一条历史搜索保存的影视条目或种子结果",
+    operation_id="search.history.get-results",
 )
-async def get_search_snapshot(
+async def get_search_history_results(
     history_id: int,
+    principal: Principal = Depends(require_login),
     session: AsyncSession = Depends(get_session),
-) -> ApiResponse[SearchSnapshotView]:
-    """返回该历史行最近一次搜索的完整结果快照（items/sites/total + 快照时间）。
+) -> ApiResponse[SearchHistoryResultsView]:
+    """返回历史行最近一次完整结果；``vertical`` 决定结果结构。
 
     前端点历史记录先渲染快照（秒开、不打扰站点），页顶提示条告知快照年龄，
     需要新数据时再「重新搜索」。历史不存在或尚无快照均报 404，前端据此
@@ -348,65 +404,41 @@ async def get_search_snapshot(
     """
     repo = SearchHistoryRepository(session)
     row = await repo.get_by_id(history_id)
-    if row is None:
+    if row is None or row.member_id != _history_owner(principal):
         raise NotFoundException("该搜索历史不存在或已被删除")
-    if row.vertical != "torrent":
-        raise NotFoundException("该历史是影视搜索，请改用 media-snapshot 接口读取快照")
     if not row.snapshot_json or row.snapshot_at is None:
         raise NotFoundException("该搜索历史还没有结果快照，重新搜索后会自动生成")
     data = json.loads(row.snapshot_json)
     assert row.id is not None  # 从库里读出的记录必有主键
-    return ok(
-        SearchSnapshotView(
-            history_id=row.id,
-            keyword=row.keyword,
-            label=row.label,
-            categories=repo.parse_snapshot(row.categories_json),
-            site_ids=repo.parse_snapshot(row.site_ids_json),
-            snapshot_at=row.snapshot_at,
-            total=data["total"],
-            # 老快照（加字段前生成的）没有 elapsed_ms 键，get 兜底为 None
-            elapsed_ms=data.get("elapsed_ms"),
-            items=data["items"],
-            sites=data["sites"],
+    if row.vertical == "torrent":
+        # 资源搜索权限在回放历史时仍需检查，不能用历史快照绕过成员能力开关。
+        await require_search_capability(principal)
+        return ok(
+            TorrentSearchHistoryResultsView(
+                history_id=row.id,
+                keyword=row.keyword,
+                label=row.label,
+                categories=repo.parse_snapshot(row.categories_json),
+                site_ids=repo.parse_snapshot(row.site_ids_json),
+                snapshot_at=row.snapshot_at,
+                total=data["total"],
+                elapsed_ms=data.get("elapsed_ms"),
+                items=data["items"],
+                sites=data["sites"],
+            )
         )
-    )
-
-
-@router.get(
-    "/history/{history_id}/media-snapshot",
-    response_model=ApiResponse[MediaSearchSnapshotView],
-    summary="读取某条媒体搜索历史的结果快照",
-    operation_id="search.history.media-snapshot",
-)
-async def get_media_search_snapshot(
-    history_id: int,
-    session: AsyncSession = Depends(get_session),
-) -> ApiResponse[MediaSearchSnapshotView]:
-    """返回该媒体搜索历史（vertical=media）最近一次的豆瓣条目快照。
-
-    与种子快照分成两个端点：载荷结构完全不同，前端从历史行的 ``vertical``
-    即知该调哪个。历史不存在 / 不是媒体搜索 / 尚无快照均报 404，前端据此
-    回退为直接发起实时搜索。
-    """
-    row = await SearchHistoryRepository(session).get_by_id(history_id)
-    if row is None:
-        raise NotFoundException("该搜索历史不存在或已被删除")
-    if row.vertical != "media":
-        raise NotFoundException("该历史是站点资源搜索，请改用 snapshot 接口读取快照")
-    if not row.snapshot_json or row.snapshot_at is None:
-        raise NotFoundException("该搜索历史还没有结果快照，重新搜索后会自动生成")
-    data = json.loads(row.snapshot_json)
-    assert row.id is not None  # 从库里读出的记录必有主键
-    return ok(
-        MediaSearchSnapshotView(
-            history_id=row.id,
-            keyword=row.keyword,
-            snapshot_at=row.snapshot_at,
-            total=data["total"],
-            items=data["items"],
+    if row.vertical == "media":
+        await require_subscribe_capability(principal)
+        return ok(
+            TitleSearchHistoryResultsView(
+                history_id=row.id,
+                keyword=row.keyword,
+                snapshot_at=row.snapshot_at,
+                total=data["total"],
+                items=data["items"],
+            )
         )
-    )
+    raise NotFoundException("该搜索历史的类型已不受支持")
 
 
 @router.delete(
@@ -418,9 +450,12 @@ async def get_media_search_snapshot(
 )
 async def delete_search_history(
     history_id: int,
+    principal: Principal = Depends(require_login),
     session: AsyncSession = Depends(get_session),
 ) -> ApiResponse[None]:
-    deleted = await SearchHistoryRepository(session).delete_by_id(history_id)
+    deleted = await SearchHistoryRepository(session).delete_by_id(
+        history_id, member_id=_history_owner(principal)
+    )
     if not deleted:
         raise NotFoundException("该搜索历史不存在或已被删除")
     return ok(None, message="已删除")
@@ -434,7 +469,8 @@ async def delete_search_history(
     openapi_extra={"x-cli-dangerous": "confirm"},
 )
 async def clear_search_history(
+    principal: Principal = Depends(require_login),
     session: AsyncSession = Depends(get_session),
 ) -> ApiResponse[None]:
-    count = await SearchHistoryRepository(session).clear()
+    count = await SearchHistoryRepository(session).clear(member_id=_history_owner(principal))
     return ok(None, message=f"已清空 {count} 条搜索历史")

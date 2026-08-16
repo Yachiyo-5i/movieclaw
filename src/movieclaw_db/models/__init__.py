@@ -18,11 +18,22 @@ from movieclaw_db.models.downloader_client import ClientType, DownloaderClient
 from movieclaw_db.models.import_watch import ImportWatch
 from movieclaw_db.models.ingest_entry import IngestEntry, IngestStatus
 from movieclaw_db.models.jellyfin_device import JellyfinDevice
+from movieclaw_db.models.job import (
+    ACTIVE_JOB_STATUSES,
+    TERMINAL_JOB_STATUSES,
+    Job,
+    JobEvent,
+    JobLock,
+    JobResource,
+    JobStatus,
+)
 from movieclaw_db.models.library import Library
 from movieclaw_db.models.library_file import FileSource, LibraryFile
 from movieclaw_db.models.llm_provider import LlmProvider
+from movieclaw_db.models.manual_download_intent import ManualDownloadIntent
 from movieclaw_db.models.media_item import MediaItem, MediaSeason
 from movieclaw_db.models.media_metadata import MediaEpisode, MediaMetadata
+from movieclaw_db.models.member import Member, MemberLibraryAccess, MemberSiteAccess
 from movieclaw_db.models.person import MediaItemPerson, Person
 from movieclaw_db.models.playback_state import PlaybackState
 from movieclaw_db.models.rule_set import RuleSet
@@ -42,7 +53,10 @@ from movieclaw_db.models.site_torrent import (
 )
 from movieclaw_db.models.site_user_profile import SiteUserProfile
 from movieclaw_db.models.subscription import (
+    DownloadAttemptStatus,
     Subscription,
+    SubscriptionDownloadAttempt,
+    SubscriptionFollower,
     SubscriptionStatus,
     WantedItem,
     WantedStatus,
@@ -74,18 +88,32 @@ __all__ = [
     "IngestEntry",
     "IngestStatus",
     "JellyfinDevice",
+    "Job",
+    "JobEvent",
+    "JobLock",
+    "JobResource",
+    "JobStatus",
+    "ACTIVE_JOB_STATUSES",
+    "TERMINAL_JOB_STATUSES",
     "Library",
     "LibraryFile",
     "LlmProvider",
+    "ManualDownloadIntent",
     "MediaEpisode",
     "MediaItemPerson",
     "MediaItem",
     "MediaMetadata",
+    "Member",
+    "MemberLibraryAccess",
+    "MemberSiteAccess",
     "Person",
     "PlaybackState",
     "MediaSeason",
     "RuleSet",
     "Subscription",
+    "SubscriptionDownloadAttempt",
+    "DownloadAttemptStatus",
+    "SubscriptionFollower",
     "SubscriptionStatus",
     "WantedItem",
     "WantedStatus",

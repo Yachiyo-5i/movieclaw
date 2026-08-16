@@ -4,6 +4,7 @@
 更新重验、删除连带清理。验证流程被替换为"假验证"，不发真实网络请求，
 使状态流转可确定性断言。
 """
+
 from __future__ import annotations
 
 import httpx
@@ -63,10 +64,11 @@ def client(tmp_path, monkeypatch):
 
     from movieclaw_api.api.deps import require_login
     from movieclaw_api.app import create_app
+    from movieclaw_api.services.auth import Principal
 
     app = create_app()
     # 本文件只测站点配置业务，登录鉴权用依赖覆盖绕过（鉴权本身在 test_auth 覆盖）
-    app.dependency_overrides[require_login] = lambda: "tester"
+    app.dependency_overrides[require_login] = lambda: Principal(kind="admin", name="tester")
     with TestClient(app) as c:  # with 块内触发 lifespan：建库、迁移、加载目录
         yield c
     get_settings.cache_clear()
@@ -360,6 +362,81 @@ async def test_sync_stats_view_handles_count_without_cursor(db) -> None:
     assert view.torrent_count == 5
     assert view.last_sync_at is None
     assert view.sync_interval_seconds is None
+
+
+async def test_bulk_upsert_batches_existing_row_lookup(db) -> None:
+    """批量同步只做批次级查询，不能随种子数逐条 SELECT 而拖死事件循环。"""
+    from sqlalchemy import event
+
+    from movieclaw_db.models.site_torrent import TorrentSource
+    from movieclaw_db.repositories.torrent_repo import (
+        TorrentObservation,
+        TorrentRepository,
+    )
+
+    def observation(torrent_id: str, *, seeders: int) -> TorrentObservation:
+        return TorrentObservation(
+            site_id="mteam",
+            torrent_id=torrent_id,
+            title=f"种子{torrent_id}",
+            source=TorrentSource.LIST,
+            seeders=seeders,
+        )
+
+    async with db.session() as session:
+        await TorrentRepository(session).upsert(observation("known", seeders=1))
+
+    selects: list[str] = []
+
+    def record_select(_conn, _cursor, statement, _parameters, _context, _executemany) -> None:
+        if statement.lstrip().upper().startswith("SELECT") and "site_torrent" in statement:
+            selects.append(statement)
+
+    event.listen(db.engine.sync_engine, "before_cursor_execute", record_select)
+    try:
+        async with db.session() as session:
+            stats = await TorrentRepository(session).bulk_upsert(
+                [
+                    observation("known", seeders=2),
+                    observation("new-1", seeders=3),
+                    observation("new-2", seeders=4),
+                    observation("new-2", seeders=999),  # 同批重复仍保留首条
+                ]
+            )
+    finally:
+        event.remove(db.engine.sync_engine, "before_cursor_execute", record_select)
+
+    assert stats.inserted == 2
+    assert stats.updated == 1
+    assert len(selects) == 1
+
+    async with db.session() as session:
+        repo = TorrentRepository(session)
+        assert (await repo.get("mteam", "known")).seeders == 2
+        assert (await repo.get("mteam", "new-2")).seeders == 4
+
+
+async def test_torrent_sync_offloads_page_enrichment(monkeypatch) -> None:
+    """整页 NER 扩充必须在线程池执行，不能阻塞 FastAPI 的健康检查。"""
+    import threading
+
+    import movieclaw_api.services.torrent_sync as torrent_sync
+
+    caller_thread = threading.get_ident()
+    worker_threads: list[int] = []
+
+    def fake_to_observation(site_id, item, *, trust_volatile):
+        assert site_id == "mteam"
+        assert trust_volatile is True
+        worker_threads.append(threading.get_ident())
+        return item
+
+    monkeypatch.setattr(torrent_sync, "_to_observation", fake_to_observation)
+    items = [object(), object()]
+
+    assert await torrent_sync._to_observations("mteam", items, trust_volatile=True) == items
+    assert worker_threads
+    assert all(thread_id != caller_thread for thread_id in worker_threads)
 
 
 # ---------------------------------------------------------------------------

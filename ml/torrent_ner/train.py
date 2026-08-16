@@ -113,6 +113,8 @@ def main() -> None:
     parser.add_argument("--epochs", type=int, default=15)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=5e-5)
+    parser.add_argument("--seed", type=int, default=42,
+                        help="随机种子（多种子训练消除转正决策噪声，见训练前审查 5.3）")
     parser.add_argument("--train-fraction", type=float, default=1.0,
                         help="只用训练集的前 N 比例（学习曲线实验用，dev/test 不动）")
     parser.add_argument("--extra-train", default="ml/data/labeled/augmented.jsonl",
@@ -149,6 +151,7 @@ def main() -> None:
             num_train_epochs=args.epochs,
             per_device_train_batch_size=args.batch_size,
             learning_rate=args.lr,
+            seed=args.seed,
             eval_strategy="epoch",
             save_strategy="epoch",
             load_best_model_at_end=True,

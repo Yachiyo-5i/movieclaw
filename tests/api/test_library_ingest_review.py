@@ -38,6 +38,8 @@ _FAKE_SPEC = SimpleNamespace(
     bit_depth=10,
     duration_seconds=3600,
     bit_rate=None,
+    frame_rate=23.976,
+    color_space="BT.709",
     audio_streams=[],
     subtitle_streams=[],
 )
@@ -96,10 +98,8 @@ async def _sweep(db, rule_id: int, times: int = 1) -> None:
         async with db.session() as session:
             rule = await session.get(ImportWatch, rule_id)
             assert rule is not None
-            library = (
-                await session.get(Library, rule.library_id) if rule.library_id else None
-            )
-        await ingest_mod._sweep_dir(rule, library)
+            library = await session.get(Library, rule.library_id) if rule.library_id else None
+        await ingest_mod._sweep_dir(rule, library, execute_inline=True)
 
 
 def _stub_identify(monkeypatch, item):
@@ -118,9 +118,7 @@ def _stub_media_library(monkeypatch):
 
         async def ensure_media_item(self, kind, tmdb_id):
             return (
-                await self._session.execute(
-                    select(MediaItem).where(MediaItem.tmdb_id == tmdb_id)
-                )
+                await self._session.execute(select(MediaItem).where(MediaItem.tmdb_id == tmdb_id))
             ).scalar_one()
 
     monkeypatch.setattr(ingest_mod, "MediaLibraryService", Fake)
@@ -224,7 +222,7 @@ async def test_stale_rule_object_cannot_double_baseline(db, tmp_path, monkeypatc
     )
     async with db.session() as session:
         library = await session.get(Library, library_id)
-    await ingest_mod._sweep_dir(stale, library)
+    await ingest_mod._sweep_dir(stale, library, execute_inline=True)
 
     # 新片没有被错误盖章为已忽略；后续巡检正常处理它
     records = await _records(db)
@@ -330,7 +328,7 @@ async def test_claim_entry_imports_immediately(db, tmp_path, monkeypatch):
     assert records[0].status == IngestStatus.PENDING
 
     async with db.session() as session:
-        row = await ingest_mod.claim_entry(session, records[0].id, 300)
+        row = await ingest_mod.claim_entry(session, records[0].id, 300, execute_inline=True)
         assert row.status == IngestStatus.IMPORTED
         assert "认领电影" in (row.message or "")
     async with db.session() as session:
@@ -342,7 +340,7 @@ async def test_claim_entry_imports_immediately(db, tmp_path, monkeypatch):
         with pytest.raises(BadRequestException):
             await ingest_mod.ignore_entry(session, records[0].id)
         with pytest.raises(BadRequestException):
-            await ingest_mod.claim_entry(session, records[0].id, 300)
+            await ingest_mod.claim_entry(session, records[0].id, 300, execute_inline=True)
 
 
 @pytest.mark.asyncio
@@ -378,7 +376,7 @@ async def test_claimed_identity_survives_failed_retry(db, tmp_path, monkeypatch)
     monkeypatch.setattr(ingest_mod, "ffprobe_available", lambda: True)
     monkeypatch.setattr(ingest_mod, "probe_media", lambda p: None)
     async with db.session() as session:
-        row = await ingest_mod.claim_entry(session, records[0].id, 300)
+        row = await ingest_mod.claim_entry(session, records[0].id, 300, execute_inline=True)
         assert row.status == IngestStatus.FAILED
         assert row.claimed_tmdb_id == 300
         assert row.claimed_kind == "movie"
@@ -415,9 +413,7 @@ async def test_nfo_identity_preferred(db, tmp_path, monkeypatch):
     entry = watch / "third.party.release.2019"
     entry.mkdir()
     (entry / "video.mkv").write_bytes(b"x")
-    (entry / "movie.nfo").write_text(
-        "<movie><tmdbid>300</tmdbid></movie>", encoding="utf-8"
-    )
+    (entry / "movie.nfo").write_text("<movie><tmdbid>300</tmdbid></movie>", encoding="utf-8")
 
     await _sweep(db, rule_id, times=2)
     records = await _records(db)

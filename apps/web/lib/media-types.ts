@@ -23,8 +23,16 @@ export interface MediaLibraryLink {
   mediaItemId: number;
 }
 
+/** 海报 hover 的两行紧凑上下文；用于补充卡片底部不常显的信息。 */
+export interface MediaOverlayDetails {
+  primary: string;
+  secondary?: string;
+}
+
 export interface MediaItem {
-  /** TMDB 条目 ID（字符串形态，仅作不透明键使用） */
+  /** 服务端签发的稳定引用；站内跳详情时优先原样使用。 */
+  titleRef?: string;
+  /** 来源站条目 ID（字符串形态，仅用于路由展示与现有业务兼容） */
   id: string;
   /** 来源与 id 共同构成媒体条目的稳定身份 */
   source?: MediaSource;
@@ -44,6 +52,8 @@ export interface MediaItem {
   badges: string[];
   /** 一句话简介（卡片 hover 与 Hero 横幅展示） */
   overview: string;
+  /** hover 专用的紧凑上下文，不进入海报下方的常显元信息。 */
+  overlayDetails?: MediaOverlayDetails;
   posterUrl: string;
   /** 仅 Hero 精选项需要的宽幅背景图 */
   backdropUrl?: string;
@@ -56,17 +66,4 @@ export interface MediaRowData {
   id: string;
   title: string;
   items: MediaItem[];
-}
-
-/** 发现页布局里的一行占位（只有标识与标题，数据由单行接口逐行到达） */
-export interface DiscoverRowStub {
-  id: string;
-  title: string;
-}
-
-/** 发现页布局：Hero 有无 + 行清单。纯配置毫秒级返回，用于先撑起整页骨架 */
-export interface DiscoverLayoutData {
-  /** 是否有 Hero 大横幅（豆瓣视角没有） */
-  hasHero: boolean;
-  rows: DiscoverRowStub[];
 }

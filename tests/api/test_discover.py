@@ -10,13 +10,18 @@ from movieclaw_api.services.auth import reset_auth_state
 from movieclaw_api.services.media_discover import reset_media_service
 from movieclaw_api.settings.store import reset_setting_store
 from movieclaw_db.crypto import reset_secret_box
+from movieclaw_media import TmdbNetworkError
 from movieclaw_media.models import (
     DiscoverLayout,
     DiscoverRowStub,
     MediaCard,
+    MediaCastMember,
+    MediaCollection,
     MediaDetail,
     MediaFacts,
     MediaKind,
+    MediaPage,
+    MediaPersonDetail,
     MediaRow,
     MediaSearchItem,
     MediaSource,
@@ -104,131 +109,338 @@ class _StubService:
         )
 
 
-def test_discover_layout_success(client: TestClient, monkeypatch) -> None:
-    """布局端点：返回 Hero 有无与行清单（行只有标识与标题，无条目数据）。"""
-    from movieclaw_api.api.routes import discover as discover_route
+class _StubTmdbService(_StubService):
+    """新 Discover 领域接口用的 TMDB 桩，签名与真实 provider 保持一致。"""
 
-    monkeypatch.setattr(discover_route, "get_media_service", lambda: _StubService())
+    async def search(self, keyword: str) -> list[MediaSearchItem]:
+        return [
+            MediaSearchItem(
+                id="438631",
+                source=MediaSource.TMDB,
+                type=MediaKind.MOVIE,
+                title=keyword,
+                year=2021,
+                rating=8.1,
+                poster_url="https://image.tmdb.org/t/p/w342/dune.jpg",
+            )
+        ]
 
-    resp = client.get("/api/v1/discover/movie/layout")
-    assert resp.status_code == 200
-    data = resp.json()["data"]
-    assert data["has_hero"] is True
-    assert data["rows"] == [{"id": "popular", "title": "热门电影", "ranked": False}]
+    async def discover_page(
+        self, kind: MediaKind, row_id: str, page: int = 1
+    ) -> MediaPage | None:
+        if row_id != "popular":
+            return None
+        card = _sample_card()
+        card.type = kind
+        return MediaPage(
+            id=row_id,
+            title="热门电影",
+            items=[card],
+            page=page,
+            total_pages=3,
+            total_results=41,
+        )
 
+    async def discovery_genres(self, kind: MediaKind) -> dict[int, str]:
+        return {878: "科幻", 28: "动作"}
 
-def test_discover_hero_success(client: TestClient, monkeypatch) -> None:
-    """Hero 端点：返回大横幅精选卡片列表。"""
-    from movieclaw_api.api.routes import discover as discover_route
+    async def discover_filtered(self, kind: MediaKind, **kwargs) -> MediaPage:
+        card = _sample_card()
+        card.type = kind
+        return MediaPage(
+            id="filtered",
+            title="筛选结果",
+            items=[card],
+            page=kwargs["page"],
+            total_pages=2,
+            total_results=21,
+        )
 
-    monkeypatch.setattr(discover_route, "get_media_service", lambda: _StubService())
+    async def media_detail(self, kind: MediaKind, tmdb_id: int) -> MediaDetail:
+        card = _sample_card()
+        card.id = str(tmdb_id)
+        card.type = kind
+        series_card = _sample_card()
+        series_card.id = "43"
+        return MediaDetail(
+            card=card,
+            facts=MediaFacts(
+                directors=["示例导演"],
+                director_credits=[
+                    MediaCastMember(
+                        name="示例导演",
+                        avatar_url="https://image.tmdb.org/t/p/w185/director.jpg",
+                        tmdb_person_id=99,
+                    )
+                ],
+                aliases=["示例别名"],
+                source_url="https://www.themoviedb.org/",
+            ),
+            collection=MediaCollection(id="7", name="示例系列", items=[card, series_card]),
+        )
 
-    resp = client.get("/api/v1/discover/movie/hero")
-    assert resp.status_code == 200
-    data = resp.json()["data"]
-    assert data[0]["poster_url"].startswith("https://image.tmdb.org")
-
-
-def test_discover_row_success(client: TestClient, monkeypatch) -> None:
-    """单行端点：返回统一信封包装的一行数据，字段为 snake_case。"""
-    from movieclaw_api.api.routes import discover as discover_route
-
-    monkeypatch.setattr(discover_route, "get_media_service", lambda: _StubService())
-
-    resp = client.get("/api/v1/discover/movie/rows/popular")
-    assert resp.status_code == 200
-    data = resp.json()["data"]
-    assert data["title"] == "热门电影"
-    assert data["ranked"] is False
-    assert data["items"][0]["id"] == "42"
-
-
-def test_discover_row_unknown_returns_404(client: TestClient, monkeypatch) -> None:
-    """row_id 不在布局里：404 而不是 500。"""
-    from movieclaw_api.api.routes import discover as discover_route
-
-    monkeypatch.setattr(discover_route, "get_media_service", lambda: _StubService())
-    resp = client.get("/api/v1/discover/movie/rows/nonexistent")
-    assert resp.status_code == 404
-
-
-def test_discover_douban_source_uses_independent_service(client: TestClient, monkeypatch) -> None:
-    """豆瓣视角不依赖 TMDB Key，并路由到独立榜单服务。"""
-    from movieclaw_api.api.routes import discover as discover_route
-
-    monkeypatch.setattr(discover_route, "get_douban_media_service", lambda: _StubService())
-    resp = client.get("/api/v1/discover/movie/rows/popular?source=douban")
-    assert resp.status_code == 200
-    assert resp.json()["data"]["title"] == "热门电影"
-
-
-def test_douban_search_returns_lightweight_results(client: TestClient, monkeypatch) -> None:
-    """豆瓣搜索走独立静态路由，不会被 /{kind} 路由误判为非法媒体类型。"""
-    from movieclaw_api.api.routes import discover as discover_route
-
-    monkeypatch.setattr(discover_route, "get_douban_media_service", lambda: _StubService())
-    resp = client.get("/api/v1/discover/search?source=douban&q=流浪地球")
-    assert resp.status_code == 200
-    item = resp.json()["data"][0]
-    assert item["id"] == "26266893"
-    assert item["title"] == "流浪地球"
-    assert item["source"] == "douban"
-
-
-def test_tmdb_search_returns_typed_results(client: TestClient, monkeypatch) -> None:
-    """TMDB 搜索来源：走 TMDB 服务，条目带年份与 movie/tv 类型。"""
-    from movieclaw_api.api.routes import discover as discover_route
-
-    class _StubTmdbSearch:
-        async def search(self, keyword: str) -> list[MediaSearchItem]:
-            return [
-                MediaSearchItem(
-                    id="693134",
-                    source=MediaSource.TMDB,
-                    title=keyword,
-                    year=2024,
-                    type=MediaKind.MOVIE,
-                    rating=8.2,
-                    poster_url="https://image.tmdb.org/t/p/w342/d.jpg",
-                )
-            ]
-
-    monkeypatch.setattr(discover_route, "get_media_service", lambda: _StubTmdbSearch())
-    resp = client.get("/api/v1/discover/search?source=tmdb&q=沙丘")
-    assert resp.status_code == 200
-    item = resp.json()["data"][0]
-    assert item["source"] == "tmdb"
-    assert item["year"] == 2024
-    assert item["type"] == "movie"
+    async def person_detail(self, tmdb_person_id: int) -> MediaPersonDetail:
+        movie = _sample_card()
+        tv = _sample_card()
+        tv.id = "77"
+        tv.type = MediaKind.TV
+        tv.title = "示例剧集"
+        return MediaPersonDetail(
+            tmdb_person_id=tmdb_person_id,
+            name="示例影人",
+            avatar_url="https://image.tmdb.org/t/p/w300/person.jpg",
+            credits=[movie, tv],
+        )
 
 
-def test_tmdb_search_without_key_returns_guidance(client: TestClient) -> None:
-    """TMDB 未配置 Key 时搜索报 502 + 中文配置引导（前端据此在区域内提示）。"""
-    resp = client.get("/api/v1/discover/search?source=tmdb&q=沙丘")
+class _StubDoubanService(_StubService):
+    """新 Discover 领域接口用的豆瓣桩。"""
+
+    async def full_collection(self, collection_id: str) -> MediaRow:
+        return MediaRow(
+            id=collection_id,
+            title="完整榜单",
+            items=[_sample_card()],
+        )
+
+
+def _patch_title_discovery_providers(monkeypatch) -> None:
+    """替换领域服务懒加载的两个 provider，保证新接口测试不出网。"""
+    from movieclaw_api.services import media_discover
+
+    monkeypatch.setattr(media_discover, "get_media_service", lambda: _StubTmdbService())
+    monkeypatch.setattr(media_discover, "get_douban_media_service", lambda: _StubDoubanService())
+
+
+def test_search_titles_without_key_returns_guidance(client: TestClient) -> None:
+    """TMDB 未配置 Key 时，统一搜索返回中文配置引导。"""
+    resp = client.post(
+        "/api/v1/search/titles",
+        json={"query": "沙丘", "provider": "tmdb", "save_history": False},
+    )
     assert resp.status_code == 502
     assert "TMDB_API_KEY" in resp.json()["message"]
 
 
-def test_douban_detail_uses_independent_route(client: TestClient, monkeypatch) -> None:
-    from movieclaw_api.api.routes import discover as discover_route
+def test_discovery_ui_rejects_unknown_media_type(client: TestClient) -> None:
+    """展示编排只接受 movie / tv，其余按参数校验拒绝。"""
+    assert client.get("/api/v1/ui/discovery/book").status_code == 422
 
-    monkeypatch.setattr(discover_route, "get_douban_media_service", lambda: _StubService())
-    resp = client.get("/api/v1/discover/douban/26266893")
-    assert resp.status_code == 200
+
+# ---------------------------------------------------------------------------
+# 新 Discover 领域契约：片单、统一搜索、稳定引用与详情
+# ---------------------------------------------------------------------------
+
+
+def test_list_collections_returns_stable_refs(client: TestClient, monkeypatch) -> None:
+    _patch_title_discovery_providers(monkeypatch)
+
+    resp = client.get(
+        "/api/v1/discover/collections",
+        params={"media_type": "movie", "provider": "tmdb"},
+    )
+
+    assert resp.status_code == 200, resp.text
     data = resp.json()["data"]
-    assert data["card"]["id"] == "26266893"
-    assert data["facts"]["aliases"] == ["示例别名"]
+    assert data["provider"] == "tmdb"
+    assert [item["collection_ref"] for item in data["collections"]] == [
+        "tmdb:movie:featured-weekly",
+        "tmdb:movie:popular",
+    ]
+    assert data["collections"][0]["name"] == "本周精选"
 
 
-def test_discover_rejects_unknown_kind(client: TestClient) -> None:
-    """kind 只接受 movie / tv，其余按参数校验 422 拒绝。"""
-    assert client.get("/api/v1/discover/book/layout").status_code == 422
+def test_browse_collection_returns_titles_with_stable_refs(
+    client: TestClient, monkeypatch
+) -> None:
+    _patch_title_discovery_providers(monkeypatch)
+
+    resp = client.get(
+        "/api/v1/discover/collections/tmdb:movie:popular/titles",
+        params={"limit": 20},
+    )
+
+    assert resp.status_code == 200, resp.text
+    data = resp.json()["data"]
+    assert data["collection"]["collection_ref"] == "tmdb:movie:popular"
+    assert data["titles"][0]["title_ref"] == "tmdb:movie:42"
+    assert data["titles"][0]["external_id"] == "42"
+    assert data["returned_count"] == 1
+    assert data["page"] == 1
+    assert data["total_pages"] == 3
+    assert data["total_results"] == 41
+    assert data["has_more"] is True
 
 
-def test_discover_without_key_returns_guidance(client: TestClient) -> None:
-    """TMDB_API_KEY 置空（禁用内置 Key）：布局端点 502 + 中文引导信息。"""
-    resp = client.get("/api/v1/discover/movie/layout")
-    assert resp.status_code == 502
-    body = resp.json()
-    assert body["success"] is False
-    assert "TMDB_API_KEY" in body["message"]
+def test_filter_options_and_combined_discovery(client: TestClient, monkeypatch) -> None:
+    _patch_title_discovery_providers(monkeypatch)
+
+    options = client.get("/api/v1/discover/filters", params={"media_type": "movie"})
+    assert options.status_code == 200, options.text
+    assert options.json()["data"]["genres"] == [
+        {"id": 878, "name": "科幻"},
+        {"id": 28, "name": "动作"},
+    ]
+
+    result = client.get(
+        "/api/v1/discover/titles",
+        params=[
+            ("media_type", "movie"),
+            ("genre_ids", "878"),
+            ("genre_ids", "28"),
+            ("origin_country", "jp"),
+            ("year", "2025"),
+            ("rating_gte", "7"),
+            ("runtime_lte", "90"),
+            ("sort", "rating"),
+            ("page", "1"),
+        ],
+    )
+    assert result.status_code == 200, result.text
+    data = result.json()["data"]
+    assert data["titles"][0]["title_ref"] == "tmdb:movie:42"
+    assert data["total_results"] == 21
+    assert data["has_more"] is True
+
+
+def test_search_titles_combines_providers_and_returns_refs(
+    client: TestClient, monkeypatch
+) -> None:
+    _patch_title_discovery_providers(monkeypatch)
+
+    resp = client.post(
+        "/api/v1/search/titles",
+        json={"query": "沙丘", "provider": "all", "save_history": False},
+    )
+
+    assert resp.status_code == 200, resp.text
+    data = resp.json()["data"]
+    assert {item["title_ref"] for item in data["titles"]} == {
+        "tmdb:movie:438631",
+        "douban:26266893",
+    }
+    assert data["providers"] == [
+        {"provider": "douban", "success": True, "result_count": 1, "message": None},
+        {"provider": "tmdb", "success": True, "result_count": 1, "message": None},
+    ]
+
+
+def test_search_titles_can_save_one_combined_history(client: TestClient, monkeypatch) -> None:
+    _patch_title_discovery_providers(monkeypatch)
+
+    resp = client.post(
+        "/api/v1/search/titles",
+        json={"query": "沙丘", "provider": "all", "save_history": True},
+    )
+
+    assert resp.status_code == 200, resp.text
+    history_id = resp.json()["data"]["history_id"]
+    assert isinstance(history_id, int)
+    results = client.get(f"/api/v1/search/history/{history_id}/results")
+    assert results.status_code == 200, results.text
+    assert results.json()["data"]["vertical"] == "titles"
+    assert {item["source"] for item in results.json()["data"]["items"]} == {
+        "tmdb",
+        "douban",
+    }
+
+
+def test_search_titles_preserves_successful_provider_on_partial_failure(
+    client: TestClient, monkeypatch
+) -> None:
+    from movieclaw_api.services import media_discover
+
+    class _UnavailableTmdb(_StubTmdbService):
+        async def search(self, keyword: str) -> list[MediaSearchItem]:
+            raise TmdbNetworkError("TMDB 暂时不可达")
+
+    monkeypatch.setattr(media_discover, "get_media_service", lambda: _UnavailableTmdb())
+    monkeypatch.setattr(media_discover, "get_douban_media_service", lambda: _StubDoubanService())
+
+    resp = client.post(
+        "/api/v1/search/titles",
+        json={"query": "沙丘", "provider": "all"},
+    )
+
+    assert resp.status_code == 200, resp.text
+    data = resp.json()["data"]
+    assert [item["title_ref"] for item in data["titles"]] == ["douban:26266893"]
+    assert data["providers"][1] == {
+        "provider": "tmdb",
+        "success": False,
+        "result_count": 0,
+        "message": "TMDB 暂时不可达",
+    }
+
+
+def test_get_title_details_consumes_title_ref(client: TestClient, monkeypatch) -> None:
+    _patch_title_discovery_providers(monkeypatch)
+
+    resp = client.get("/api/v1/discover/titles/tmdb:movie:438631")
+
+    assert resp.status_code == 200, resp.text
+    data = resp.json()["data"]
+    assert data["title"]["title_ref"] == "tmdb:movie:438631"
+    assert data["metadata"]["aliases"] == ["示例别名"]
+    assert data["metadata"]["director_credits"] == [
+        {
+            "name": "示例导演",
+            "role": None,
+            "avatar_url": "https://image.tmdb.org/t/p/w185/director.jpg",
+            "tmdb_person_id": 99,
+        }
+    ]
+    assert data["collection"]["name"] == "示例系列"
+    assert [item["title_ref"] for item in data["collection"]["titles"]] == [
+        "tmdb:movie:438631",
+        "tmdb:movie:43",
+    ]
+
+
+def test_get_person_details_returns_complete_tmdb_titles(
+    client: TestClient, monkeypatch
+) -> None:
+    _patch_title_discovery_providers(monkeypatch)
+
+    resp = client.get("/api/v1/discover/people/9340")
+
+    assert resp.status_code == 200, resp.text
+    data = resp.json()["data"]
+    assert data["tmdb_person_id"] == 9340
+    assert data["name"] == "示例影人"
+    assert data["avatar_url"].endswith("/w300/person.jpg")
+    assert [item["title_ref"] for item in data["titles"]] == [
+        "tmdb:movie:42",
+        "tmdb:tv:77",
+    ]
+
+
+def test_invalid_stable_refs_return_readable_400(client: TestClient, monkeypatch) -> None:
+    _patch_title_discovery_providers(monkeypatch)
+
+    collection = client.get("/api/v1/discover/collections/not-a-ref/titles")
+    title = client.get("/api/v1/discover/titles/438631")
+
+    assert collection.status_code == 400
+    assert "list-collections" in collection.json()["message"]
+    assert title.status_code == 400
+    assert "搜索或片单接口" in title.json()["message"]
+
+
+def test_discovery_ui_manifest_references_domain_collections(
+    client: TestClient, monkeypatch
+) -> None:
+    _patch_title_discovery_providers(monkeypatch)
+
+    resp = client.get("/api/v1/ui/discovery/movie", params={"provider": "tmdb"})
+
+    assert resp.status_code == 200, resp.text
+    sections = resp.json()["data"]["sections"]
+    assert sections[0] == {
+        "collection_ref": "tmdb:movie:featured-weekly",
+        "title": "本周精选",
+        "presentation": "hero",
+        "preview_limit": 6,
+        "supports_full_listing": False,
+    }
+    assert sections[1]["supports_full_listing"] is True

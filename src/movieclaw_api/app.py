@@ -1,5 +1,6 @@
 from fastapi import FastAPI
 
+from movieclaw_api import __version__
 from movieclaw_api.api.router import api_router
 from movieclaw_api.core.config import get_settings
 from movieclaw_api.core.logging import configure_logging
@@ -18,7 +19,7 @@ def create_app() -> FastAPI:
 
     app = FastAPI(
         title=settings.app_name,
-        version="0.1.0",
+        version=__version__,
         openapi_url=f"{settings.api_v1_prefix}/openapi.json" if docs_enabled else None,
         docs_url="/docs" if docs_enabled else None,
         redoc_url="/redoc" if docs_enabled else None,

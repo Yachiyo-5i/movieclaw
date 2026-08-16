@@ -16,10 +16,13 @@ from movieclaw_db.engine import dispose_db, get_database, init_db
 from movieclaw_db.migrations import run_migrations
 from movieclaw_db.models import FileSource, Library, LibraryFile, MediaItem, utcnow
 from movieclaw_media.models import (
+    DiscoverLayout,
+    DiscoverRowStub,
     MediaCard,
     MediaDetail,
     MediaFacts,
     MediaKind,
+    MediaPersonDetail,
     MediaRow,
     MediaSource,
 )
@@ -45,9 +48,10 @@ def client(tmp_path, monkeypatch):
 
     from movieclaw_api.api.deps import require_login
     from movieclaw_api.app import create_app
+    from movieclaw_api.services.auth import Principal
 
     app = create_app()
-    app.dependency_overrides[require_login] = lambda: "tester"
+    app.dependency_overrides[require_login] = lambda: Principal(kind="admin", name="tester")
     with TestClient(app) as test_client:
         yield test_client
     get_settings.cache_clear()
@@ -263,6 +267,12 @@ async def test_detail_links_are_sorted_and_related_cards_keep_summary_only(db) -
 
 
 class _TmdbDiscoverStub:
+    def layout(self, kind: MediaKind) -> DiscoverLayout:
+        return DiscoverLayout(
+            has_hero=True,
+            rows=[DiscoverRowStub(id="popular", title="热门")],
+        )
+
     async def discover_hero(self, kind: MediaKind) -> list[MediaCard]:
         return [_card("42")]
 
@@ -280,8 +290,25 @@ class _TmdbDiscoverStub:
             related=[_card("7", kind=MediaKind.TV, title="示例剧集")],
         )
 
+    async def person_detail(self, tmdb_person_id: int) -> MediaPersonDetail:
+        return MediaPersonDetail(
+            tmdb_person_id=tmdb_person_id,
+            name="示例影人",
+            credits=[
+                _card("42"),
+                _card("7", kind=MediaKind.TV, title="示例剧集"),
+                _card("100", title="不在库作品"),
+            ],
+        )
+
 
 class _DoubanDiscoverStub:
+    def layout(self, kind: MediaKind) -> DiscoverLayout:
+        return DiscoverLayout(
+            has_hero=False,
+            rows=[DiscoverRowStub(id="douban-movie_top250", title="豆瓣电影 Top 250")],
+        )
+
     async def full_collection(self, collection_id: str) -> MediaRow:
         return MediaRow(
             id=f"douban-{collection_id}",
@@ -300,13 +327,17 @@ def test_discover_endpoints_serialize_summary_and_detail_links(
     client: TestClient, monkeypatch
 ) -> None:
     """Hero、行、豆瓣完整榜单和两类详情都走同一投影，列表不泄漏文件明细。"""
-    from movieclaw_api.api.routes import discover as discover_route
+    from movieclaw_api.services import media_discover
 
     ids = client.portal.call(_seed_library_status, get_database())
-    monkeypatch.setattr(discover_route, "get_media_service", lambda: _TmdbDiscoverStub())
-    monkeypatch.setattr(discover_route, "get_douban_media_service", lambda: _DoubanDiscoverStub())
+    monkeypatch.setattr(media_discover, "get_media_service", lambda: _TmdbDiscoverStub())
+    monkeypatch.setattr(
+        media_discover, "get_douban_media_service", lambda: _DoubanDiscoverStub()
+    )
 
-    hero = client.get("/api/v1/discover/movie/hero").json()["data"]
+    hero = client.get(
+        "/api/v1/discover/collections/tmdb:movie:featured-weekly/titles"
+    ).json()["data"]["titles"]
     assert hero[0]["library_status"] == {
         "media_item_id": ids["movie"],
         "library_count": 2,
@@ -315,21 +346,31 @@ def test_discover_endpoints_serialize_summary_and_detail_links(
     assert "library_links" not in hero[0]
     assert not {"file_path", "audio_streams", "subtitle_streams"} & set(hero[0])
 
-    row = client.get("/api/v1/discover/tv/rows/popular").json()["data"]
-    assert row["items"][0]["library_status"]["media_item_id"] == ids["tv"]
+    row = client.get(
+        "/api/v1/discover/collections/tmdb:tv:popular/titles"
+    ).json()["data"]
+    assert row["titles"][0]["library_status"]["media_item_id"] == ids["tv"]
 
-    collection = client.get("/api/v1/discover/douban/collection/top250").json()["data"]
-    assert collection["items"][0]["library_status"]["media_item_id"] == ids["douban_movie"]
+    collection = client.get(
+        "/api/v1/discover/collections/douban:movie:movie_top250/titles",
+        params={"limit": 250},
+    ).json()["data"]
+    assert collection["titles"][0]["library_status"]["media_item_id"] == ids["douban_movie"]
 
-    tmdb_detail = client.get("/api/v1/discover/movie/42").json()["data"]
+    tmdb_detail = client.get("/api/v1/discover/titles/tmdb:movie:42").json()["data"]
     assert [link["library_name"] for link in tmdb_detail["library_links"]] == [
         "优先电影库",
         "次要电影库",
     ]
-    assert tmdb_detail["related"][0]["library_status"]["media_item_id"] == ids["tv"]
-    assert "library_links" not in tmdb_detail["related"][0]
+    assert tmdb_detail["recommendations"][0]["library_status"]["media_item_id"] == ids["tv"]
+    assert "library_links" not in tmdb_detail["recommendations"][0]
 
-    douban_detail = client.get("/api/v1/discover/douban/db-42").json()["data"]
+    person = client.get("/api/v1/discover/people/9340").json()["data"]
+    assert person["titles"][0]["library_status"]["media_item_id"] == ids["movie"]
+    assert person["titles"][1]["library_status"]["media_item_id"] == ids["tv"]
+    assert person["titles"][2]["library_status"] is None
+
+    douban_detail = client.get("/api/v1/discover/titles/douban:db-42").json()["data"]
     assert douban_detail["library_links"] == [
         {
             "library_id": ids["priority_library"],

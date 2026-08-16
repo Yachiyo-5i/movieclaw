@@ -28,11 +28,10 @@ selectors:
   # TTG 种子行：table#torrent_table 内有 id 属性的 tr（无 id 的是表头行）
   torrent_row_css: "table#torrent_table > tr[id]"
 
-  # 发布时间：直接存放在 td:nth-child(5) 文本中，格式为 "%Y-%m-%d%H:%M:%S"
-  # （日期与时间之间没有空格，与标准格式不同）
-  torrent_time_css: "td:nth-child(5)::text"
+  # 日期和时间是同一 td 下的两个文本节点，取元素递归文本后会以空格连接。
+  torrent_time_css: "td:nth-child(5)"
   torrent_time_fallback_css: ""
-  torrent_time_fmt: "%Y-%m-%d%H:%M:%S"
+  torrent_time_fmt: "%Y-%m-%d %H:%M:%S"
 
   # ── 促销 ──────────────────────────────────────────────────────────
   # TTG 通过 img[alt] 属性标记促销类型，与标准 NexusPHP 的 img.pro_* 不同

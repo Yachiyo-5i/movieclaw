@@ -46,7 +46,7 @@ class Api:
         self.debug = debug
         self.last_message: str | None = None
         cookies = {}
-        headers = {"Accept": "application/json"}
+        headers = {"Accept": "application/json", "X-MovieClaw-Client": "cli"}
         # Bearer 令牌通道：PAT 或产品内 Agent 工作区注入的短时效令牌。
         # 有令牌时**不再附带本地 Cookie**——服务端鉴权 Cookie 优先，
         # 过期的旧 Cookie 会把有效令牌拖成 401

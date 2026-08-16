@@ -105,8 +105,8 @@ VIDEO_TS 取最大视频文件探测）、扫描忽略规则（sample/@eaDir/bon
 | `transfer_sources` | JSON | `[{source_path, mapped_path?, transfer_type}]` 下载区→本库的整理来源；`transfer_type`: hardlink（默认）/copy/move；`mapped_path` 预留容器路径映射（见第 6 节风险③）。**L2 实装整理器时才加列**（配置与消费同期落地原则） |
 | `is_default` | bool | 每 kind 至多一个默认库（订阅/手动下载不选库时用它）。不变量由 Repository 维护：同 kind 首库自动默认、删默认自动交接 |
 | `settings` | JSON | `use_nfo`、`enable_monitoring` 等每库开关——**随各自消费功能（L3/L4）加列** |
-| `total_items` / `total_size` | int | 统计缓存（扫描/对账时更新）——**L3 加列** |
-| `scanned_at` | datetime? | 上次扫描完成时间——**L3 加列** |
+| `stats_*` | int | 库存统计快照：在位作品/剧集分集/文件/字节数，以及待识别、missing、忽略数；扫描及其他台账写路径收尾时批量更新，管理端与 Jellyfin 统计共用 |
+| `stats_refreshed_at` | datetime? | 统计快照最近一次重算时间；未扫描的新库为 NULL |
 
 **命名规范内置且不开放模板**（v1）：Plex/Emby 兼容——
 电影 `{主根}/{title} ({year})/文件`；剧集 `{主根}/{title} ({year})/Season {NN}/文件`。
@@ -177,7 +177,8 @@ walk 全部根路径 → 每视频文件:
 - 定期低频任务：已落账文件是否仍在（消失→标记 `missing_since`，不删记录）；
   根路径下新文件补走 M2。
 - 自动清理丢失记录（库级开关 `library.auto_clear_missing`，**默认关**）：
-  开启后扫描收尾把已确认丢失的记录清出台账，`file_count` 扫完即与磁盘对齐，
+  在位统计（`stats_file_count` / `stats_total_size_bytes`）标记 missing 后即与
+  磁盘对齐；开启自动清理后，扫描收尾再把已确认丢失的历史记录清出台账，
   自己在磁盘上删片的用户不必再手动清一次缺失。默认关是因为 missing 行是
   缺失清单「重新下载」与跨轮次改名归并的依据，且行上带着不可再生的介质
   规格与来源种子——清理不可恢复，须由用户明确表态。
@@ -212,7 +213,7 @@ walk 全部根路径 → 每视频文件:
 ### L2 入库管线（下载区/库区解耦）——✅ 已完成（2026-07-19）
 | # | 事项 | 验证 |
 |---|---|---|
-| 2.1 | `BaseDownloader.get_torrent(info_hash)`（qB/Tr 实现）+ `check_download_progress` 任务（60s tick；`wanted_item.info_hash` 在真实投递时记录，dry-run 无 hash 不进管线）。种子被手动删除 → 工单退回 wanted 冷却重搜 | ✅ mock 下载器状态推进 + 退回语义测试 |
+| 2.1 | `BaseDownloader.get_torrent(info_hash)`（qB/Tr 实现）+ `check_download_progress` 任务；`wanted_item.info_hash` 在真实投递时记录，dry-run 无 hash 不进管线。现行救援以 5 分钟完成字节心跳判断，15 分钟提醒、30 分钟并行试用同品质替代源，不再清空工单退回 wanted | ✅ 下载器可达性、15/30 分钟状态机、换源晋升与安全保留测试 |
 | 2.2 | 整理器：文件→集分配（enrich 复用；整季包季号缺省用工单季兜底）、ffprobe（缺失降级跳过）、硬链+**文件级规范命名**（`标题 (年份) - SxxEyy.ext`，硬链改名零成本且免 NFO 零歧义）、`library_file` 落账；跨文件系统/路径不可达中文报错，失败指数退避（5min→2h）绝不误删 | ✅ e2e：整季包分集硬链（同 inode 断言）+ 落账 + 失败退避不刷屏 |
 | 2.3 | `imported` 终态 + completed 判定收紧（imported 硬满足；dry-run 的 grabbed 无 hash 维持 P4 语义，切真实投递自然收紧，零开关）+ 时间线 DOWNLOADED/IMPORTED/IMPORT_FAILED 活动 + 前端进度含 imported | ✅ e2e：完成→硬链→台账→时间线→订阅收齐 |
 | 2.4 | 投递 save_path 切换为下载区（下载器默认目录），GRABBED 活动文案"下载完成后将入库到 X：路径" | ✅ 管线测试回归 |
@@ -252,8 +253,14 @@ save_path（同机/同挂载假设），路径不可达时给容器映射引导�
 6. 扫描识别未做**时长消歧**（需逐候选拉 TMDB 详情），以"无年份必须标题精确相等"
    的保守验收替代——歧义宁进待识别；识别率不够时再补时长信号；
 7. 原盘目录（BDMV/VIDEO_TS/ISO）识别未做，此类文件当前会进待识别清单人工认领；
-8. 库存统计不建缓存列（library_file 查询时现算，单机规模足够），scanned_at
-   亦未落库（扫描态用进程内标记 + 前端轮询）。
+8. **库存统计改为 `library` 行上的预计算快照**（2026-08-15）：媒体库首页
+   曾在每次请求时读取全部 `library_file` 标量列并在 Python 聚合，库存增长后
+   查询成本与文件数线性增长。现在扫描、监听入库、转移、删除、认领/忽略等
+   台账写路径只在批次收尾做一次 `GROUP BY`，列表和详情只读库行；在位作品、
+   文件和容量排除 missing 历史记录，missing 数仍单独保留。Jellyfin 库卡片
+   与常见的单电影库/单剧集库统计同样读这份快照；同类型多库时，因同一
+   作品可能跨库，`/Items/Counts` 保留基于覆盖索引的去重聚合，不盲目相加。
+   扫描态继续使用持久 Job + 前端轮询，不与统计快照混为一体。
 9. **「修正识别结果」是两阶段拍板，不是一键重跑**（2026-08-10，issue #107）：
    决策 4 的「不静默错挂」只覆盖了机器**知道自己认不出**的那一半；机器
    高置信认错时，三条既有通道（待识别认领 / 身份复核 / 重新识别）全都不
@@ -262,7 +269,7 @@ save_path（同机/同挂载假设），路径不可达时给容器映射引导�
    按结论分组摆给用户，拍板落库复用人工认领通道（身份记 manual + 纠正
    矛盾 NFO）。面板里搜索框是一等公民（正确答案常常压根不在候选里），
    并留「这不是独立作品」出口——花絮错挂时用户要说的不是"改挂到条目 Y"。
-   写库版的 `POST .../reidentify` 保留给 CLI/自动化，界面不再暴露。
+   写库版的 `POST .../reidentifications` 保留给 CLI/自动化，界面不再暴露。
 10. **电影的「Title (Year)」条目目录名压过文件名**（2026-08-10，issue #107）：
     「一个电影条目目录 = 一部片」是 Emby/Plex/Jellyfin 的共同语义。此前
     电影按 `[文件名, 目录名]` 取证，正片旁边的花絮/片段就会按自己的文件名

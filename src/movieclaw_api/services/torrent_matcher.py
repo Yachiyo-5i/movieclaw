@@ -23,6 +23,8 @@ from movieclaw_api.services.subscription import (
     MATCH_BATCH_SIZE,
     evaluate_and_dispatch,
     load_match_context,
+    refresh_release_forecasts,
+    try_replacement_candidates,
 )
 from movieclaw_api.settings.base import SettingSchema, register_setting
 from movieclaw_api.settings.store import get_setting_store
@@ -55,6 +57,10 @@ async def process_new_torrents() -> None:
     try:
         async with _lock:
             await _process_locked()
+            # 新种子的发布时间本身就是下一集预测的新观测。匹配水位推进后立即
+            # 重算活跃追新工单，不依赖另一套 observation 表或独立定时任务。
+            async with get_database().session() as session:
+                await refresh_release_forecasts(session)
     except Exception:  # noqa: BLE001 -- 背景匹配失败只记日志，等下一轮
         logger.exception("被动匹配执行失败，等待下一轮触发")
 
@@ -102,6 +108,9 @@ async def _process_locked() -> None:
             contexts = await load_match_context(session)
             if contexts:
                 await evaluate_and_dispatch(session, rows, source="被动匹配")
+            # 换源退避只约束主动跨站搜索；刚同步进索引的新种是新的事实，
+            # 应立即抢跑评估，不能让用户等到 1h/3h/12h/24h 的下个时间点。
+            await try_replacement_candidates(session, rows)
         await store.set(MatchWatermark(last_id=rows[-1].id or watermark))
 
         if len(rows) < MATCH_BATCH_SIZE:

@@ -24,15 +24,19 @@ export interface CastRowPerson {
   name: string;
   /** 饰演角色；数据源未提供为空 */
   role?: string | null;
+  /** 导演等非演员岗位；有值时直接展示，不添加「饰」前缀。 */
+  credit?: string | null;
   /** 头像地址（调用方负责走图片代理）；数据源未提供为空 */
   avatarUrl?: string | null;
   /**
-   * TMDB 影人 ID：有值时这一格链到人物页（/people/[id]）。姓名不是身份，
+   * TMDB 影人 ID：有值时这一格链到调用方指定的人物页。姓名不是身份，
    * 没有 id 就不给链接——宁可不可点，也不能点开一个同名的另一个人。
    * 豆瓣来源、以及第三方刮削器写的老 NFO 都可能没有这个 id。
    */
   tmdbPersonId?: number | null;
 }
+
+type PersonHrefPrefix = "/people" | "/discover/people";
 
 /**
  * 姓名 → 头像占位里显示的字。
@@ -48,7 +52,16 @@ function initialsOf(name: string): string {
   return (words[0][0] + words[words.length - 1][0]).toUpperCase();
 }
 
-export function CastRow({ cast, title = "演职员" }: { cast: CastRowPerson[]; title?: string }) {
+export function CastRow({
+  cast,
+  title = "演职员",
+  personHrefPrefix = "/people",
+}: {
+  cast: CastRowPerson[];
+  title?: string;
+  /** 媒体库默认进入库内人物页；发现详情显式改为 TMDB 全作品页。 */
+  personHrefPrefix?: PersonHrefPrefix;
+}) {
   if (cast.length === 0) return null;
   return (
     <section>
@@ -56,10 +69,14 @@ export function CastRow({ cast, title = "演职员" }: { cast: CastRowPerson[]; 
         {title}
       </h2>
       <HScroller className="-mx-1 gap-3 px-1 pb-1">
-        {/* 同一个人可能出现多次（一人分饰两角；NFO 里还可能既是编剧又是演员），
-            姓名+角色不足以唯一，附加下标兜底 */}
+        {/* 同一个人可能出现多次（一人分饰两角；也可能既是导演又是演员），
+            姓名+岗位不足以唯一，附加下标兜底。 */}
         {cast.map((person, index) => (
-          <CastCard key={`${person.name}-${person.role ?? ""}-${index}`} person={person} />
+          <CastCard
+            key={`${person.name}-${person.credit ?? person.role ?? ""}-${index}`}
+            person={person}
+            personHrefPrefix={personHrefPrefix}
+          />
         ))}
       </HScroller>
     </section>
@@ -67,7 +84,14 @@ export function CastRow({ cast, title = "演职员" }: { cast: CastRowPerson[]; 
 }
 
 /** 一格演员：有 TMDB 影人 ID 时整格是通往人物页的链接，否则是静态块。 */
-function CastCard({ person }: { person: CastRowPerson }) {
+function CastCard({
+  person,
+  personHrefPrefix,
+}: {
+  person: CastRowPerson;
+  personHrefPrefix: PersonHrefPrefix;
+}) {
+  const subtitle = person.credit ?? (person.role ? `饰 ${person.role}` : null);
   const body = (
     <>
       <div className="aspect-[2/3] overflow-hidden rounded-xl bg-[#141824] ring-1 ring-white/[0.08] transition-all duration-300 ease-out group-hover/cast:-translate-y-1 group-hover/cast:shadow-[0_16px_38px_rgba(0,0,0,0.5)] group-hover/cast:ring-white/25">
@@ -86,8 +110,8 @@ function CastCard({ person }: { person: CastRowPerson }) {
         />
       </div>
       <p className="mt-1.5 truncate text-sub font-medium text-[var(--text)]">{person.name}</p>
-      {person.role && (
-        <p className="truncate text-caption text-[var(--text-faint)]">饰 {person.role}</p>
+      {subtitle && (
+        <p className="truncate text-caption text-[var(--text-faint)]">{subtitle}</p>
       )}
     </>
   );
@@ -97,7 +121,7 @@ function CastCard({ person }: { person: CastRowPerson }) {
   }
   return (
     <Link
-      href={`/people/${person.tmdbPersonId}` as Route}
+      href={`${personHrefPrefix}/${person.tmdbPersonId}` as Route}
       aria-label={`查看 ${person.name} 的影人页`}
       className="group/cast w-[104px] shrink-0 rounded-xl outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent-ring)]"
     >

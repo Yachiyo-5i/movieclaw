@@ -7,8 +7,8 @@ import { useConfirm } from "@/components/feedback";
 import { SearchIcon } from "@/components/icons";
 import {
   clearSearchHistory,
-  deleteSearchHistory,
-  fetchSearchHistory,
+  deleteSearchHistoryEntry,
+  listSearchHistory,
   type SearchHistoryItem,
 } from "@/lib/api/search";
 import {
@@ -19,6 +19,7 @@ import {
   type SearchTab,
   type SearchVertical,
 } from "@/lib/categories";
+import { useSearchAccess } from "@/lib/search-access";
 import { useSearchPrefs } from "@/lib/search-prefs";
 import { formatRelativeTime } from "@/lib/time";
 
@@ -132,6 +133,7 @@ export function SearchCommand({
   // 移动端 44px：iOS HIG 最小可点目标（触屏），桌面保持 32px 紧凑图标键
   triggerClassName = "glass-row !size-8 shrink-0 justify-center !p-0 max-md:!size-11",
 }: SearchCommandProps) {
+  const searchAccess = useSearchAccess();
   const [open, setOpen] = useState(false);
   // 面板是全屏浮层，Portal 到 body：避免被 sidebar 玻璃面板的 isolation:isolate
   // 层叠上下文困住。portalReady 规避 SSR。
@@ -155,6 +157,8 @@ export function SearchCommand({
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
   }, []);
+
+  if (searchAccess.ready && searchAccess.available.length === 0) return null;
 
   return (
     <>
@@ -198,6 +202,7 @@ function SearchPalette({
   onSearch: (keyword: string, scope: SearchScope, options?: SearchSubmitOptions) => void;
 }) {
   const { visibleTabs, loading: tabsLoading } = useSearchPrefs();
+  const searchAccess = useSearchAccess();
   const confirm = useConfirm();
   const [keyword, setKeyword] = useState("");
   // 面板每次重新挂载，但模式与资源分类从浏览器级记忆恢复。
@@ -213,10 +218,24 @@ function SearchPalette({
   // 键盘高亮的关键词组下标；-1 = 未选中（此时回车提交输入的关键词）
   const [sel, setSel] = useState(-1);
   const inputRef = useRef<HTMLInputElement>(null);
+  const availableModes = searchAccess.available;
 
   // 挂载即聚焦输入框：effect 执行时 DOM 已提交，直接同步 focus（不要用 rAF，
   // 后台标签页里 rAF 会被挂起导致聚焦丢失）
   useEffect(() => inputRef.current?.focus(), []);
+
+  useEffect(() => {
+    if (!searchAccess.ready) return;
+    if (availableModes.length === 0) {
+      onClose();
+      return;
+    }
+    if (!availableModes.includes(mode)) {
+      const nextMode = searchAccess.firstAvailable ?? availableModes[0];
+      setMode(nextMode);
+      writeSearchPaletteState({ mode: nextMode, tabKey });
+    }
+  }, [availableModes, mode, onClose, searchAccess.firstAvailable, searchAccess.ready, tabKey]);
 
   // 等服务端搜索偏好加载完成后再校验。若上次分类已隐藏或删除，回退到「全部」，
   // 避免界面没有选中项但提交时悄悄按全部搜索。
@@ -232,6 +251,7 @@ function SearchPalette({
   }, [mode, tabKey, tabsLoading, visibleTabs]);
 
   const changeMode = (nextMode: SearchVertical) => {
+    if (!availableModes.includes(nextMode)) return;
     setMode(nextMode);
     writeSearchPaletteState({ mode: nextMode, tabKey });
   };
@@ -244,7 +264,7 @@ function SearchPalette({
   // 历史存在后端（search_history 表）；limit 按关键词组计算，组内范围会完整返回。
   useEffect(() => {
     let cancelled = false;
-    fetchSearchHistory(8)
+    listSearchHistory(8)
       .then((list) => !cancelled && setItems(list))
       .catch(() => !cancelled && setItems([]));
     return () => {
@@ -252,7 +272,15 @@ function SearchPalette({
     };
   }, []);
 
-  const groups = useMemo(() => groupHistory(items ?? []), [items]);
+  const groups = useMemo(
+    () =>
+      groupHistory(
+        (items ?? []).filter((item) =>
+          item.vertical === "titles" ? searchAccess.canMedia : searchAccess.canTorrent,
+        ),
+      ),
+    [items, searchAccess.canMedia, searchAccess.canTorrent],
+  );
 
   // 输入即过滤关键词组（子串匹配）；匹配后 UI 自动展开该组的所有具体范围。
   const filteredGroups = useMemo(() => {
@@ -269,6 +297,7 @@ function SearchPalette({
   const submit = () => {
     const kw = keyword.trim();
     if (!kw) return;
+    if (!availableModes.includes(mode)) return;
     if (mode === "torrent") {
       const tab = visibleTabs.find((t) => tabKeyOf(t) === tabKey);
       onSearch(kw, tab ? scopeOfTab(tab) : SCOPE_ALL, { vertical: "torrent" });
@@ -281,7 +310,7 @@ function SearchPalette({
   /** 点开一条历史：按记录自身的垂直回放，有快照进快照预览，没有发起实时搜索。 */
   const pick = (item: SearchHistoryItem) => {
     const snapshotId = item.has_snapshot ? item.id : undefined;
-    if (item.vertical === "media") {
+    if (item.vertical === "titles") {
       onSearch(item.keyword, SCOPE_ALL, { vertical: "media", snapshotId });
       return;
     }
@@ -310,7 +339,10 @@ function SearchPalette({
       // 焦点移动在这里没有意义，挪用作模式切换（与页脚提示文案呼应）
       case "Tab":
         event.preventDefault();
-        changeMode(mode === "media" ? "torrent" : mode === "torrent" ? "library" : "media");
+        if (availableModes.length > 1) {
+          const index = availableModes.indexOf(mode);
+          changeMode(availableModes[(index + 1) % availableModes.length]);
+        }
         break;
       case "ArrowDown":
         event.preventDefault();
@@ -348,7 +380,7 @@ function SearchPalette({
 
   const removeOne = (id: number) => {
     setItems((prev) => (prev ? prev.filter((i) => i.id !== id) : prev));
-    deleteSearchHistory(id).catch(() => undefined);
+    deleteSearchHistoryEntry(id).catch(() => undefined);
   };
 
   const removeGroup = async (group: HistoryGroup) => {
@@ -364,7 +396,7 @@ function SearchPalette({
     }
     const ids = new Set(group.items.map((item) => item.id));
     setItems((prev) => (prev ? prev.filter((item) => !ids.has(item.id)) : prev));
-    Promise.all(group.items.map((item) => deleteSearchHistory(item.id))).catch(() => undefined);
+    Promise.all(group.items.map((item) => deleteSearchHistoryEntry(item.id))).catch(() => undefined);
   };
 
   const toggleGroup = (groupKey: string) => {
@@ -423,7 +455,7 @@ function SearchPalette({
             spellCheck={false}
             className="h-[52px] min-w-0 flex-1 bg-transparent text-body-lg text-[var(--text)] outline-none placeholder:text-[var(--text-faint)]"
           />
-          <ModeSwitch mode={mode} onChange={changeMode} />
+          <ModeSwitch mode={mode} modes={availableModes} onChange={changeMode} />
         </div>
 
         {/* —— 分类 chips（仅资源模式；影视/媒体库搜索没有分类维度）—— */}
@@ -529,23 +561,27 @@ function SearchPalette({
  *  （豆瓣条目），资源 = 去哪儿下（跨站点种子），媒体库 = 我有没有（本地已入库）。 */
 function ModeSwitch({
   mode,
+  modes,
   onChange,
 }: {
   mode: SearchVertical;
+  modes: SearchVertical[];
   onChange: (mode: SearchVertical) => void;
 }) {
   const options: { id: SearchVertical; label: string; hint: string }[] = [
     { id: "media", label: "影视", hint: "影视条目（豆瓣）" },
     { id: "torrent", label: "资源", hint: "跨站点种子搜索" },
     { id: "library", label: "媒体库", hint: "已入库的本地影片" },
-  ];
+  ] satisfies { id: SearchVertical; label: string; hint: string }[];
+  const visibleOptions = options.filter((option) => modes.includes(option.id));
+  if (visibleOptions.length <= 1) return null;
   return (
     <div
       role="radiogroup"
       aria-label="搜索范围"
       className="flex shrink-0 gap-0.5 rounded-lg bg-white/[0.06] p-0.5"
     >
-      {options.map((opt) => {
+      {visibleOptions.map((opt) => {
         const active = opt.id === mode;
         return (
           <button
@@ -623,7 +659,7 @@ function HistoryGroupRow({
   onRemoveGroup: () => void;
 }) {
   const latest = group.items[0];
-  const mediaCount = group.items.filter((item) => item.vertical === "media").length;
+  const mediaCount = group.items.filter((item) => item.vertical === "titles").length;
   const torrentCount = group.items.length - mediaCount;
 
   // 单条记录不制造「只有一个孩子的分组」：沿用旧版扁平行，点击即进入该记录。
@@ -795,7 +831,7 @@ function HistoryVariantRow({
         className="flex min-w-0 flex-1 items-center gap-2 py-1.5 pl-2 text-left"
       >
         <span className="min-w-0 flex-1 truncate text-sub text-[var(--text-muted)]">
-          {item.vertical === "media" ? "影视" : `资源 · ${item.label ?? "全部"}`}
+          {item.vertical === "titles" ? "影视" : `资源 · ${item.label ?? "全部"}`}
         </span>
         {item.has_snapshot && (
           <span className="shrink-0 rounded-md bg-[#6aa7ff]/15 px-1.5 py-0.5 text-micro text-[#9cc2ff]">
@@ -807,7 +843,7 @@ function HistoryVariantRow({
         </span>
       </button>
       <DeleteHistoryButton
-        label={`删除搜索历史：${item.keyword}（${item.vertical === "media" ? "影视" : item.label ?? "资源全部"}）`}
+        label={`删除搜索历史：${item.keyword}（${item.vertical === "titles" ? "影视" : item.label ?? "资源全部"}）`}
         onClick={onRemove}
         className="touch-reveal mr-1 opacity-0 group-hover/variant:opacity-100"
       />
@@ -817,7 +853,7 @@ function HistoryVariantRow({
 
 /** 单记录组在主行直接显示垂直与资源分类，不必展开才能辨认。 */
 function HistoryTypeBadges({ item }: { item: SearchHistoryItem }) {
-  const isMedia = item.vertical === "media";
+  const isMedia = item.vertical === "titles";
   return (
     <>
       <span

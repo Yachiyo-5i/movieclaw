@@ -1,7 +1,7 @@
 """搜索结果快照的端到端测试。
 
 覆盖：流式/阻塞搜索完成后自动落快照、历史项的 has_snapshot 标记、
-快照端点回读（items/sites/total/snapshot_at）、重搜覆盖旧快照、
+快照端点回读（items/sites/total/results_at）、重搜覆盖旧快照、
 无痕搜索不产生快照、不存在的历史报 404。
 站点访问同 test_search 用假实现替换。
 """
@@ -64,9 +64,10 @@ def client(tmp_path, monkeypatch):
 
     from movieclaw_api.api.deps import require_login
     from movieclaw_api.app import create_app
+    from movieclaw_api.services.auth import Principal
 
     app = create_app()
-    app.dependency_overrides[require_login] = lambda: "tester"
+    app.dependency_overrides[require_login] = lambda: Principal(kind="admin", name="tester")
     with TestClient(app) as c:
         yield c
     get_settings.cache_clear()
@@ -86,12 +87,13 @@ def test_stream_search_saves_snapshot(client: TestClient, monkeypatch) -> None:
         },
     )
 
-    client.get("/api/v1/search/stream", params={"keyword": "沙丘", "label": "电影"})
+    client.get("/api/v1/search/torrents/stream", params={"keyword": "沙丘", "label": "电影"})
 
     history = _latest_history(client)
     assert history["has_snapshot"] is True
 
-    snap = client.get(f"/api/v1/search/history/{history['id']}/snapshot").json()["data"]
+    snap = client.get(f"/api/v1/search/history/{history['id']}/results").json()["data"]
+    assert snap["vertical"] == "torrents"
     assert snap["history_id"] == history["id"]
     assert snap["keyword"] == "沙丘"
     assert snap["label"] == "电影"
@@ -110,28 +112,28 @@ def test_stream_search_saves_snapshot(client: TestClient, monkeypatch) -> None:
 
 
 def test_blocking_search_saves_snapshot(client: TestClient, monkeypatch) -> None:
-    """阻塞版 /search 与流式版同口径落快照。"""
+    """阻塞版 /search/torrents 与流式版同口径落快照。"""
     _wire(monkeypatch, {"mteam": _FakeSite(items=[_item("m1", "奥本海默")])})
 
-    client.get("/api/v1/search", params={"keyword": "奥本海默"})
+    client.get("/api/v1/search/torrents", params={"keyword": "奥本海默"})
 
     history = _latest_history(client)
     assert history["has_snapshot"] is True
-    snap = client.get(f"/api/v1/search/history/{history['id']}/snapshot").json()["data"]
+    snap = client.get(f"/api/v1/search/history/{history['id']}/results").json()["data"]
     assert snap["total"] == 1
 
 
 def test_research_overwrites_snapshot(client: TestClient, monkeypatch) -> None:
     """同一组合重搜：历史行不新增，快照被最新结果覆盖。"""
     _wire(monkeypatch, {"mteam": _FakeSite(items=[_item("old1", "沙丘")])})
-    client.get("/api/v1/search/stream", params={"keyword": "沙丘"})
+    client.get("/api/v1/search/torrents/stream", params={"keyword": "沙丘"})
 
     _wire(monkeypatch, {"mteam": _FakeSite(items=[_item("new1", "沙丘"), _item("new2", "沙丘2")])})
-    client.get("/api/v1/search/stream", params={"keyword": "沙丘"})
+    client.get("/api/v1/search/torrents/stream", params={"keyword": "沙丘"})
 
     rows = client.get("/api/v1/search/history").json()["data"]
     assert len(rows) == 1  # 去重：同关键词同组合仍是一行
-    snap = client.get(f"/api/v1/search/history/{rows[0]['id']}/snapshot").json()["data"]
+    snap = client.get(f"/api/v1/search/history/{rows[0]['id']}/results").json()["data"]
     assert {i["torrent_id"] for i in snap["items"]} == {"new1", "new2"}
 
 
@@ -139,7 +141,7 @@ def test_no_history_search_saves_nothing(client: TestClient, monkeypatch) -> Non
     """无痕搜索不落历史，自然也没有快照。"""
     _wire(monkeypatch, {"mteam": _FakeSite(items=[_item("m1", "沙丘")])})
 
-    client.get("/api/v1/search/stream", params={"keyword": "沙丘", "no_history": "true"})
+    client.get("/api/v1/search/torrents/stream", params={"keyword": "沙丘", "no_history": "true"})
     assert client.get("/api/v1/search/history").json()["data"] == []
 
 
@@ -152,7 +154,7 @@ def test_poster_mode_persisted_in_history(client: TestClient, monkeypatch) -> No
     _wire(monkeypatch, {"mteam": _FakeSite(items=[_item("m1", "沙丘")])})
 
     client.get(
-        "/api/v1/search/stream",
+        "/api/v1/search/torrents/stream",
         params={"keyword": "沙丘", "label": "4K 图览", "poster_mode": "true"},
     )
     history = _latest_history(client)
@@ -160,15 +162,15 @@ def test_poster_mode_persisted_in_history(client: TestClient, monkeypatch) -> No
 
     # 不带该参数（列表模式）默认 false
     _wire(monkeypatch, {"mteam": _FakeSite(items=[_item("m1", "奥本海默")])})
-    client.get("/api/v1/search/stream", params={"keyword": "奥本海默"})
+    client.get("/api/v1/search/torrents/stream", params={"keyword": "奥本海默"})
     assert _latest_history(client)["poster_mode"] is False
 
 
 def test_poster_mode_refreshed_on_research(client: TestClient, monkeypatch) -> None:
     """poster_mode 不进去重键：同组合换展示模式重搜，仍是一条历史、值刷新为最新。"""
     _wire(monkeypatch, {"mteam": _FakeSite(items=[_item("m1", "沙丘")])})
-    client.get("/api/v1/search/stream", params={"keyword": "沙丘", "poster_mode": "true"})
-    client.get("/api/v1/search/stream", params={"keyword": "沙丘"})  # 列表模式重搜
+    client.get("/api/v1/search/torrents/stream", params={"keyword": "沙丘", "poster_mode": "true"})
+    client.get("/api/v1/search/torrents/stream", params={"keyword": "沙丘"})  # 列表模式重搜
 
     rows = client.get("/api/v1/search/history").json()["data"]
     assert len(rows) == 1
@@ -176,5 +178,5 @@ def test_poster_mode_refreshed_on_research(client: TestClient, monkeypatch) -> N
 
 
 def test_snapshot_of_missing_history_returns_404(client: TestClient) -> None:
-    resp = client.get("/api/v1/search/history/9999/snapshot")
+    resp = client.get("/api/v1/search/history/9999/results")
     assert resp.status_code == 404

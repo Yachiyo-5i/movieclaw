@@ -1,9 +1,10 @@
 """「已播 / 在位」口径的仓储层唯一实现测试。
 
-订阅预检与海报墙缺集统计如今共用 aired_units_many / owned_units_many，
-本文件锚定这两个方法自身的口径：已播=air_date≤今天、特别季开关、
-在位=跨库且 missing 不算、批量与单条结果一致。
+订阅预检与海报墙统计共用 list_seasons_many / aired_units_many / owned_units_many，
+本文件锚定这些方法自身的口径：季骨架批量返回、已播=air_date≤今天、
+特别季开关、在位=跨库且 missing 不算、批量与单条结果一致。
 """
+
 from __future__ import annotations
 
 from datetime import timedelta
@@ -13,7 +14,7 @@ import pytest_asyncio
 from movieclaw_api.core.config import get_settings
 from movieclaw_db.engine import dispose_db, get_database, init_db
 from movieclaw_db.migrations import run_migrations
-from movieclaw_db.models import LibraryFile, MediaItem
+from movieclaw_db.models import LibraryFile, MediaItem, MediaSeason
 from movieclaw_db.models.base import utcnow
 from movieclaw_db.models.media_metadata import MediaEpisode
 from movieclaw_db.repositories.library_file_repo import LibraryFileRepository
@@ -47,6 +48,12 @@ async def test_aired_and_owned_calibers(db) -> None:
         await session.refresh(item)
         session.add_all(
             [
+                MediaSeason(
+                    media_item_id=item.id,
+                    season_number=1,
+                    name="第 1 季",
+                    episode_count=3,
+                ),
                 # 已播两集 + 未播一集 + 特别季一集（已播）
                 MediaEpisode(
                     media_item_id=item.id, season_number=1, episode_number=1, air_date=today
@@ -102,6 +109,10 @@ async def test_aired_and_owned_calibers(db) -> None:
         media_repo = MediaItemRepository(session)
         file_repo = LibraryFileRepository(session)
 
+        seasons = await media_repo.list_seasons_many([item.id])
+        assert [row.season_number for row in seasons[item.id]] == [1]
+        assert seasons[item.id][0].episode_count == 3
+
         # 已播：默认排除特别季；include_specials=True 时带上
         aired = await media_repo.aired_units_many([item.id])
         assert aired[item.id] == {(1, 1), (1, 2)}
@@ -116,4 +127,5 @@ async def test_aired_and_owned_calibers(db) -> None:
 
         # 空入参不炸
         assert await media_repo.aired_units_many([]) == {}
+        assert await media_repo.list_seasons_many([]) == {}
         assert await file_repo.owned_units_many([]) == {}

@@ -41,10 +41,34 @@ from movieclaw_db.engine import get_database
 from movieclaw_db.models.site_credential import ConfigStatus, SiteCredential
 from movieclaw_db.repositories.credential_repo import CredentialRepository
 from movieclaw_enrich import enrich
-from movieclaw_tracker.models import SearchQuery, TorrentCategory
+from movieclaw_tracker.models import SearchQuery, TorrentCategory, TorrentListItem
 from movieclaw_tracker.registry import SiteNotFoundError, get_site_config
 
 logger = logging.getLogger("movieclaw_api.site_search")
+
+
+def _build_hits(site_id: str, name: str, items: list[TorrentListItem]) -> list[TorrentHit]:
+    """把单站结果映射为 TorrentHit（含扩充属性计算）。**必须在工作线程调用**。
+
+    ``enrich`` 自 v3 起含同步 NER 模型推理（CPU 密集，弱机型单条可达几十毫秒），
+    整页上百条在事件循环里内联算会卡住 SSE 流、健康检查与其它并发请求——
+    口径与种子同步侧一致（torrent_sync._to_observations）。多站并发完成时本函数
+    会在多个线程同时执行：模型层的懒加载有锁，ONNX session 与 tokenizer 的
+    推理调用本身线程安全。
+    """
+    return [
+        TorrentHit(
+            site_id=site_id,
+            site_name=name,
+            attrs=enrich(
+                item.title,
+                item.subtitle,
+                item.category.value if item.category else None,
+            ),
+            **item.model_dump(),
+        )
+        for item in items
+    ]
 
 
 def _display_name(site_id: str) -> str:
@@ -81,20 +105,8 @@ async def _search_one(
     try:
         site = await get_site_access().get(site_id)  # 已认证共享实例，勿 close
         result = await site.search(query)
-        # 给每条结果挂上来源站点标识 + 扩充属性（纯本地正则，微秒级，直接内联算）
-        hits = [
-            TorrentHit(
-                site_id=site_id,
-                site_name=name,
-                attrs=enrich(
-                    item.title,
-                    item.subtitle,
-                    item.category.value if item.category else None,
-                ),
-                **item.model_dump(),
-            )
-            for item in result.items
-        ]
+        # 给每条结果挂上来源站点标识 + 扩充属性；扩充含 NER 推理，整批进工作线程
+        hits = await asyncio.to_thread(_build_hits, site_id, name, result.items)
         return hits, SiteSearchStatus(
             site_id=site_id, site_name=name, count=len(hits), elapsed_ms=elapsed()
         )
@@ -112,6 +124,7 @@ async def stream_search_all_sites(
     site_ids: list[str] | None = None,
     label: str | None = None,
     page: int = 1,
+    allowed_site_ids: set[str] | None = None,
 ) -> AsyncIterator[tuple[str, BaseModel]]:
     """流式跨站搜索：按「站点实际完成的先后」逐个产出事件，供 SSE 端点直接转发。
 
@@ -129,8 +142,13 @@ async def stream_search_all_sites(
         （禁用/验证未通过）时直接跳过，不产生错误——口径与「全部站点」一致。
     :param label: 本次搜索的展示名（分类中文名/自定义分类名），原样回显给前端。
     :param page: 页码（各站点独立分页，不做跨站统一分页）。
+    :param allowed_site_ids: 成员的可用站点白名单（None=不受限）。这是站点
+        可见性的**服务端强制点**：白名单外的站点静默排除（不产生错误事件，
+        白名单外的站点名因此不出现在任何响应里），前端勾选也绕不过。
     """
     sites = await _active_sites()
+    if allowed_site_ids is not None:
+        sites = [c for c in sites if c.site_id in allowed_site_ids]
     if site_ids:
         wanted = set(site_ids)
         sites = [c for c in sites if c.site_id in wanted]
@@ -209,6 +227,7 @@ async def search_all_sites(
     site_ids: list[str] | None = None,
     label: str | None = None,
     page: int = 1,
+    allowed_site_ids: set[str] | None = None,
 ) -> SearchResponse:
     """并发搜索可用站点并合并结果（阻塞版：等全部站点返回后一次性给出）。
 
@@ -218,7 +237,12 @@ async def search_all_sites(
     items: list[TorrentHit] = []
     statuses: list[SiteSearchStatus] = []
     async for event, payload in stream_search_all_sites(
-        keyword=keyword, categories=categories, site_ids=site_ids, label=label, page=page
+        keyword=keyword,
+        categories=categories,
+        site_ids=site_ids,
+        label=label,
+        page=page,
+        allowed_site_ids=allowed_site_ids,
     ):
         if event == "site_result":
             assert isinstance(payload, SiteStreamResult)

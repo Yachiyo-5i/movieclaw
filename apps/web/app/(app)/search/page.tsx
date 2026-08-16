@@ -16,6 +16,7 @@ import {
   type SearchVertical,
 } from "@/lib/categories";
 import { useSearchPrefs } from "@/lib/search-prefs";
+import { useSearchAccess } from "@/lib/search-access";
 import { buildSearchPath, parseSearchQuery } from "@/lib/search-url";
 import { usePageTitle } from "@/lib/use-page-title";
 
@@ -124,6 +125,7 @@ function SearchVerticals({
   onResearch: (keyword: string, scope: SearchScope) => void;
 }) {
   const { visibleTabs } = useSearchPrefs();
+  const searchAccess = useSearchAccess();
   // 各垂直是否已被访问过：访问过才挂载、之后保活
   const [visited, setVisited] = useState<Record<SearchVertical, boolean>>(() => ({
     media: vertical === "media",
@@ -133,18 +135,38 @@ function SearchVerticals({
   useEffect(() => {
     setVisited((prev) => (prev[vertical] ? prev : { ...prev, [vertical]: true }));
   }, [vertical]);
+  useEffect(() => {
+    if (!searchAccess.ready || searchAccess.available.length === 0) return;
+    if (!searchAccess.available.includes(vertical) && searchAccess.firstAvailable) {
+      onSwitch(searchAccess.firstAvailable);
+    }
+  }, [onSwitch, searchAccess.available, searchAccess.firstAvailable, searchAccess.ready, vertical]);
+
+  const visibleVerticalTabs = VERTICAL_TABS.filter((tab) =>
+    searchAccess.available.includes(tab.id),
+  );
+
+  if (searchAccess.ready && visibleVerticalTabs.length === 0) {
+    return (
+      <div className="flex h-full items-center justify-center px-6 text-center">
+        <p className="text-on-image text-body text-[rgba(243,245,249,0.72)]">
+          当前账号没有可用的搜索入口，请联系管理员调整成员权限。
+        </p>
+      </div>
+    );
+  }
 
   return (
     <div className="flex h-full flex-col">
       {/* 垂直选项卡（Google 式「综合/图片」）：深色胶囊分段，压在背景大图上 */}
-      <div className="shrink-0 px-6 pt-5 max-md:px-4 max-md:pt-3">
+      <div className="shrink-0 px-6 pt-7 max-md:px-4 max-md:pt-4">
         <div className="flex flex-wrap items-center gap-2">
           <div
             role="tablist"
             aria-label="搜索垂直类别"
             className="inline-flex gap-1 rounded-full bg-black/25 p-1 backdrop-blur-sm"
           >
-            {VERTICAL_TABS.map((tab) => {
+            {visibleVerticalTabs.map((tab) => {
               const active = tab.id === vertical;
               return (
                 <button
@@ -193,7 +215,7 @@ function SearchVerticals({
         </div>
       </div>
 
-      {visited.media && (
+      {searchAccess.canMedia && visited.media && (
         <div className={vertical === "media" ? "min-h-0 flex-1" : "hidden"}>
           <MediaSearchResults
             keyword={query.keyword}
@@ -201,11 +223,11 @@ function SearchVerticals({
             // 媒体快照的「重新搜索」= 留在媒体垂直、丢掉 snapshot 参数：
             // onSwitch 本身会剥离 snapshot，目标还是 media 时即为原地重搜
             onResearch={() => onSwitch("media")}
-            onSwitchToTorrent={() => onSwitch("torrent")}
+            onSwitchToTorrent={searchAccess.canTorrent ? () => onSwitch("torrent") : undefined}
           />
         </div>
       )}
-      {visited.torrent && (
+      {searchAccess.canTorrent && visited.torrent && (
         <div className={vertical === "torrent" ? "min-h-0 flex-1" : "hidden"}>
           <SearchResults
             query={query}
@@ -214,11 +236,11 @@ function SearchVerticals({
           />
         </div>
       )}
-      {visited.library && (
+      {searchAccess.canLibrary && visited.library && (
         <div className={vertical === "library" ? "min-h-0 flex-1" : "hidden"}>
           <LibrarySearchResults
             keyword={query.keyword}
-            onSwitchToMedia={() => onSwitch("media")}
+            onSwitchToMedia={searchAccess.canMedia ? () => onSwitch("media") : undefined}
           />
         </div>
       )}

@@ -1,7 +1,7 @@
 """spec → click 命令树（docs/design/cli.md §3.2 参数映射规则）。
 
-命令名完全由 operation_id 决定：`sub.list` → `mclaw sub list`，
-`lib.items.claim` → `mclaw lib items claim`。help 来自 summary/description，
+命令名完全由 operation_id 决定：`subscriptions.list` → `mclaw subscriptions list`，
+`library.items.get` → `mclaw library items get`。help 来自 summary/description，
 参数来自 parameters / requestBody——spec 写好，命令即成，CLI 侧零手工维护。
 
 P1 全量映射（除 x-cli-hidden 与 x-cli-stream 外全部生成）：
@@ -27,7 +27,7 @@ from movieclaw_cli.core.errors import CliError, ExitCode
 from movieclaw_cli.core.http import Api
 from movieclaw_cli.core.output import emit
 
-# 允许写在子命令尾部的全局标志（kubectl 惯例：`mclaw sub list -o json`）。
+# 允许写在子命令尾部的全局标志（kubectl 惯例：`mclaw subscriptions list -o json`）。
 # 根组上的同名标志依然有效，叶子上的取值优先。
 _OVERRIDE_VALUE_OPTS = ("output", "server", "timeout")
 _OVERRIDE_FLAG_OPTS = ("quiet", "debug", "yes")
@@ -36,32 +36,51 @@ RESERVED_PARAM_NAMES = (
     | set(_OVERRIDE_FLAG_OPTS)
     | {"file", "output_file", "wait", "wait_timeout"}
 )
-# "input" 不在保留清单：API 字段叫 input 时（如 agent.start 的用户输入），
+# "input" 不在保留清单：API 字段叫 input 时（如 session.start 的用户输入），
 # API 字段优先，该命令放弃 --input 整体替代形态（逐字段传参仍完整可用）
 
-# 域分组的一行简介（click group 的 help；生成命令自身的 help 来自 spec）
+# 域分组的一行产品能力简介（click group 的 help；生成命令自身的参数与详细
+# 说明来自 spec）。模型会先看 mclaw 工具目录、再用域级 --help 探索命令，
+# 因此这里要用用户语义区分相邻域，不能只重复内部对象名。
 DOMAIN_HELP = {
-    "auth": "账号、会话与 API 令牌",
-    "appearance": "外观（背景图库）",
-    "agent": "AI 助手会话与运行",
-    "channels": "通知渠道（微信绑定）",
-    "discover": "发现页与影视元数据",
-    "dl": "下载器与一键下载",
+    "app": "外部访问设置、应用重启、版本升级/回退与 NER 模型更新",
+    "appearance": "首页背景与图库",
+    "auth": "个人信息、会话与 API 令牌",
+    "channels": "微信、Telegram、Discord 消息推送与 AI 对话入口",
+    "discover": "浏览 TMDB/豆瓣电影与剧集片单，并读取影视条目完整资料",
+    "dl": "qBittorrent/Transmission 下载器、路径映射与种子投递",
     "extension": "浏览器插件 Cookie 同步",
-    "health": "服务健康检查",
-    "lib": "媒体库",
-    "llm": "AI 模型供应商",
-    "logs": "系统日志",
-    "net": "网络与代理",
+    "health": "API 存活检查",
+    "jobs": "后台作业查询、事件、等待、取消与重试",
+    "library": "管理本地电影/剧集媒体库、库存文件、识别结果、元数据、图片与字幕",
+    "llm": "OpenAI、阿里云百炼及 OpenAI 兼容模型接入与验证",
+    "logs": "系统日志查看与实时跟随",
+    "members": "家庭成员账号、能力开关与可见范围",
+    "net": "全局/指定服务代理、镜像地址与连通性测试",
     "notices": "系统待处理事项",
-    "people": "影人档案（本地库）",
-    "rules": "订阅规则组",
-    "search": "站点资源搜索",
-    "site": "PT 站点配置",
-    "sub": "订阅",
-    "ui": "界面偏好",
-    "watch": "监听导入",
-    "webhook": "事件 Webhook 出站推送",
+    "people": "本地媒体库影人档案与作品",
+    "rules": "订阅资源质量与过滤规则组",
+    "search": "统一搜索影视条目、PT 种子和本地媒体库，并管理搜索预设与历史",
+    "session": "AI 会话开始/继续、指定消息重试、SSE 跟随、完整轨迹与上下文管理",
+    "site": "PT 资源站点接入、鉴权验证与缓存状态",
+    "subscriptions": "持续追踪电影/剧集缺失资源并自动搜索、下载和整理入库",
+    "ui": "Web 界面质感、布局与显示偏好",
+    "watch": "下载完成目录监听、自动识别、标准命名与入库",
+    "webhook": "播放、收藏等事件的 Webhook 推送与投递记录",
+}
+
+# 二级分组同样是模型的探索入口，必须说明“这里解决什么问题”。只给一级域
+# 描述会让 items / identification / metadata 等孤立名词失去选择依据。
+COMMAND_GROUP_HELP = {
+    "library.artwork": "查看、下载和选定媒体条目的海报或背景图",
+    "library.identification": "处理待识别、错识别和已忽略文件，明确指定文件所属影视条目",
+    "library.items": "查看和管理已经入库的电影、剧集条目及其物理文件",
+    "library.metadata": "刷新整个媒体库的 TMDB 元数据并查看或停止刷新任务",
+    "library.missing": "查看磁盘上已经缺失的库存记录、重新下载或清理台账",
+    "library.scan": "扫描媒体库根路径，把存量文件识别并登记到库存台账",
+    "library.subtitles": "预检和生成 AI 字幕，或校准外挂字幕时间轴",
+    "search.history": "列出、回放、删除或清空影视条目与 PT 种子搜索历史",
+    "search.presets": "列出或更新 PT 种子搜索的分类与站点组合预设",
 }
 
 _SIMPLE_TYPES = {"string", "integer", "number", "boolean"}
@@ -192,6 +211,7 @@ def iter_operations(spec: dict[str, Any]) -> list[dict[str, Any]]:
                     "stream": op.get("x-cli-stream"),
                     "dangerous": op.get("x-cli-dangerous"),
                     "long_task": op.get("x-cli-long-task"),
+                    "job": op.get("x-cli-job"),
                 }
             )
     return ops
@@ -228,7 +248,7 @@ def _load_input_body(value: str) -> Any:
 
 def _build_body(op: dict[str, Any], kwargs: dict[str, Any]) -> Any:
     """从命令标志组装 JSON 请求体（或采用 --input 整体替代）。"""
-    # API 字段本身叫 input 时（如 agent.start），该命令没有整体替代形态，
+    # API 字段本身叫 input 时（如 session.start），该命令没有整体替代形态，
     # kwargs 里的 input 是普通字段值，不能在这里消费掉
     has_input_field = any(f["name"] == "input" for f in op["body_fields"])
     if not has_input_field and (input_value := kwargs.pop("input", None)):
@@ -358,6 +378,77 @@ def wait_long_task(
         raise click.exceptions.Abort() from None
 
 
+def _value_at_path(value: Any, path: str) -> Any:
+    """按点分路径读取响应字段；不存在返回 None。"""
+    for token in path.split("."):
+        if not isinstance(value, dict):
+            return None
+        value = value.get(token)
+    return value
+
+
+def wait_persistent_job(
+    api: Api,
+    start_data: Any,
+    metadata: dict[str, Any],
+    wait_timeout: float,
+) -> None:
+    """等待统一 Job 终态；本地停止等待不会取消服务端任务。"""
+    job_id = _value_at_path(start_data, metadata.get("id_path", "id"))
+    if not isinstance(job_id, str) or not job_id:
+        raise CliError(
+            "服务端已接收任务，但响应中没有可追踪的任务 ID",
+            exit_code=ExitCode.BUSINESS,
+            hint="请用 mclaw jobs list --active-only 查找刚创建的任务",
+        )
+    started = time.monotonic()
+    revision = 0
+    last_line = ""
+    terminal = {"succeeded", "failed", "cancelled", "blocked"}
+    try:
+        while True:
+            remaining = wait_timeout - (time.monotonic() - started)
+            if remaining <= 0:
+                raise CliError(
+                    f"等待超时（{wait_timeout:.0f} 秒），任务仍在后台执行",
+                    exit_code=ExitCode.TASK_FAILED,
+                    hint=f"稍后执行 mclaw jobs show {job_id}，或调大 --wait-timeout",
+                )
+            payload = api.request(
+                "GET",
+                f"/jobs/{job_id}/wait",
+                params={"after_revision": revision, "wait_seconds": min(25.0, remaining)},
+            )
+            job = (payload or {}).get("job") or {}
+            revision = max(revision, int(job.get("revision") or 0))
+            status = str(job.get("status") or "")
+            progress = job.get("progress") or {}
+            line = str(progress.get("message") or status or "等待执行")
+            percent = progress.get("percent")
+            if percent is not None:
+                line = f"{line}（{percent:g}%）"
+            if line != last_line:
+                print(f"{job_id} · {line}", file=sys.stderr)
+                last_line = line
+            if status not in terminal:
+                continue
+            if status == "succeeded":
+                print(f"任务已完成：{job_id}", file=sys.stderr)
+                return
+            error = job.get("error") or {}
+            message = error.get("message") or progress.get("message") or f"任务状态：{status}"
+            hint = f"执行 mclaw jobs show {job_id} 查看详情"
+            if any(action.get("type") == "handoff_agent" for action in error.get("actions") or []):
+                hint += "；也可以交给 MovieClaw Agent 处理"
+            raise CliError(str(message), exit_code=ExitCode.TASK_FAILED, hint=hint)
+    except KeyboardInterrupt:
+        print(
+            f"已停止等待，任务 {job_id} 仍在后台执行；需要取消时运行 mclaw jobs cancel {job_id}",
+            file=sys.stderr,
+        )
+        raise click.exceptions.Abort() from None
+
+
 def _make_command(op: dict[str, Any], ops_by_id: dict[str, dict[str, Any]]) -> click.Command:
     path_params = [p for p in op["params"] if p["in"] == "path"]
     query_params = [p for p in op["params"] if p["in"] == "query"]
@@ -398,7 +489,9 @@ def _make_command(op: dict[str, Any], ops_by_id: dict[str, dict[str, Any]]) -> c
             if api.last_message and not settings.quiet:
                 print(api.last_message, file=sys.stderr)
             emit(data, output=settings.output, quiet=settings.quiet)
-            if op["long_task"] and wait:
+            if op["job"] and wait:
+                wait_persistent_job(api, data, op["job"], wait_timeout)
+            elif op["long_task"] and wait:
                 wait_long_task(op, ops_by_id, api, kwargs, wait_timeout)
         finally:
             api.close()
@@ -422,6 +515,8 @@ def _make_command(op: dict[str, Any], ops_by_id: dict[str, dict[str, Any]]) -> c
     for f in op["body_fields"]:
         schema = f["schema"]
         help_text = f["description"] or ""
+        if f["required"]:
+            help_text = f"[必填] {help_text}".rstrip()
         if f["kind"] == "json":
             help_text = (
                 (help_text + "（JSON 字面量）").strip("（） ")
@@ -459,13 +554,17 @@ def _make_command(op: dict[str, Any], ops_by_id: dict[str, dict[str, Any]]) -> c
         cli_params.append(
             click.Option(["--output-file"], required=True, help="下载内容保存到的本地路径")
         )
-    if op["long_task"]:
+    if op["long_task"] or op["job"]:
         cli_params.append(
             click.Option(
                 ["--wait/--no-wait"],
-                default=True,
+                default=not bool(op["job"]),
                 show_default=True,
-                help="等待任务完成（轮询进度到终态）；--no-wait 启动后立即返回",
+                help=(
+                    "等待持久化任务完成；默认立即返回任务 ID"
+                    if op["job"]
+                    else "等待任务完成（轮询进度到终态）；--no-wait 启动后立即返回"
+                ),
             )
         )
         cli_params.append(
@@ -503,11 +602,15 @@ def _example_line(op: dict[str, Any]) -> str:
     parts = ["mclaw", *op["operation_id"].split(".")]
     parts += [f"<{p['name']}>" for p in op["params"] if p["in"] == "path"]
     parts += [
-        f"--{p['name'].replace('_', '-')} <值>"
+        f"--{p['name'].replace('_', '-')} {_example_value(p['name'], p['schema'])}"
         for p in op["params"]
         if p["in"] == "query" and p["required"]
     ]
-    parts += [f"{_flag_name(f)} <值>" for f in op["body_fields"] if f["required"]]
+    parts += [
+        f"{_flag_name(f)} {_example_value(f['name'], f['schema'], json_value=f['kind'] == 'json')}"
+        for f in op["body_fields"]
+        if f["required"]
+    ]
     if op["is_upload"]:
         parts.append("--file <本地文件>")
     if op["is_download"]:
@@ -517,6 +620,32 @@ def _example_line(op: dict[str, Any]) -> str:
     return " ".join(parts)
 
 
+def _example_value(name: str, schema: dict[str, Any], *, json_value: bool = False) -> str:
+    """为自动示例选择可直接理解的值，避免对人和模型都无信息量的 ``<值>``。"""
+    semantic = {
+        "title_ref": "tmdb:movie:438631",
+        "collection_ref": "tmdb:movie:popular",
+        "media_type": "movie",
+        "provider": "tmdb",
+        "kind": "movie",
+        "state": "active",
+        "root_paths": "'[\"/media/movies\"]'",
+        "file_ids": "'[101,102]'",
+        "ordered_ids": "'[1,2]'",
+    }
+    if name in semantic:
+        return semantic[name]
+    if enum := schema.get("enum"):
+        return str(enum[0])
+    if json_value:
+        return "'[1,2]'" if schema.get("type") == "array" else "'<JSON>'"
+    if schema.get("type") == "boolean":
+        return "true"
+    if schema.get("type") in {"integer", "number"}:
+        return "1"
+    return f"<{name}>"
+
+
 def build_tree(root: click.Group, spec: dict[str, Any]) -> None:
     """把生成命令挂到根命令组。已存在的同名命令（精选层）优先，不覆盖。"""
     ops = [op for op in iter_operations(spec) if is_generable(op)]
@@ -524,10 +653,14 @@ def build_tree(root: click.Group, spec: dict[str, Any]) -> None:
     for op in ops:
         segments = op["operation_id"].split(".")
         group = root
-        for segment in segments[:-1]:
+        for index, segment in enumerate(segments[:-1]):
             existing = group.commands.get(segment)
             if existing is None:
-                existing = click.Group(name=segment, help=DOMAIN_HELP.get(segment))
+                prefix = ".".join(segments[: index + 1])
+                existing = click.Group(
+                    name=segment,
+                    help=DOMAIN_HELP.get(segment) or COMMAND_GROUP_HELP.get(prefix),
+                )
                 group.add_command(existing)
             elif not isinstance(existing, click.Group):
                 break  # 精选层占了同名命令，生成命令让位

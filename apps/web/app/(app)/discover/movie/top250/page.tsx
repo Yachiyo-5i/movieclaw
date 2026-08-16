@@ -1,14 +1,6 @@
-import type { Metadata } from "next";
+import { redirect } from "next/navigation";
 
-import { CollectionGridView } from "@/components/collection-grid-view";
-
-export const metadata: Metadata = { title: "豆瓣电影 Top 250" };
-
-/** 豆瓣电影 Top 250 完整榜单：网格浏览、片名搜索与分批加载。 */
+/** 兼容旧书签；片单页面已统一使用稳定 collectionRef 路由。 */
 export default function Top250Page() {
-  return (
-    <div className="flex h-full flex-col">
-      <CollectionGridView collectionId="movie_top250" title="豆瓣电影 Top 250" />
-    </div>
-  );
+  redirect("/discover/movie/collections/douban/movie_top250");
 }

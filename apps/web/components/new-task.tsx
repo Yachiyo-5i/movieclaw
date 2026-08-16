@@ -10,7 +10,7 @@ import { LlmSetupNotice, useLlmConfigured } from "@/components/llm-gate";
 import { useAgentConversations } from "@/lib/agent-conversations";
 
 /* —— 新任务（路由 /）：仅一个居中输入框，大图氛围页直出。
-     发起任务 = 创建会话并立即跳转到会话页（/runs/[id]），流式过程在会话页渲染。 —— */
+     发起任务 = 创建会话并立即跳转到会话页（/sessions/[id]），流式过程在会话页渲染。 —— */
 export function NewTask() {
   const router = useRouter();
   const { start } = useAgentConversations();
@@ -27,7 +27,7 @@ export function NewTask() {
     setError(null);
     start(text)
       .then((id) => {
-        router.push(`/runs/${id}` as Route);
+        router.push(`/sessions/${id}` as Route);
       })
       .catch((e) => {
         setError((e as Error).message);

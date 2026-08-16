@@ -1,50 +1,198 @@
 "use client";
 
-import { useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useDeferredValue,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import type { Route } from "next";
 
 import { PageNav } from "@/components/page-nav";
 import { SearchIcon } from "@/components/icons";
 import { PosterCard } from "@/components/poster-card";
-import { fetchDoubanCollection } from "@/lib/api/discover";
+import { browseDiscoveryCollection } from "@/lib/api/discover";
 import type { MediaItem } from "@/lib/media-types";
+import { useScrollRestoration } from "@/lib/use-scroll-restoration";
 
-const PAGE_SIZE = 50;
+const TMDB_PAGE_SIZE = 20;
+const DOUBAN_FULL_LIMIT = 500;
+const MAX_COLLECTION_SNAPSHOTS = 32;
+
+interface CollectionGridSnapshot {
+  items: MediaItem[];
+  title: string;
+  isRanked: boolean;
+  nextPage: number;
+  totalResults: number;
+  hasMore: boolean;
+}
+
+const collectionGridSnapshots = new Map<string, CollectionGridSnapshot>();
+
+function getCollectionGridSnapshot(collectionRef: string) {
+  return collectionGridSnapshots.get(collectionRef);
+}
+
+function rememberCollectionGridSnapshot(
+  collectionRef: string,
+  snapshot: CollectionGridSnapshot,
+) {
+  collectionGridSnapshots.delete(collectionRef);
+  collectionGridSnapshots.set(collectionRef, snapshot);
+  while (collectionGridSnapshots.size > MAX_COLLECTION_SNAPSHOTS) {
+    const oldest = collectionGridSnapshots.keys().next().value;
+    if (oldest === undefined) break;
+    collectionGridSnapshots.delete(oldest);
+  }
+}
 
 /**
- * 豆瓣完整榜单落地页（「看全部」的目的地）：用纵向网格承载大量条目，
- * 避免几百张海报挤在一条横滚行。Top 250 与豆瓣高分等榜单共用本组件，
- * 数据来自后端的榜单聚合接口（服务端分页聚合并缓存）；前端只分批挂载
- * 图片节点，控制首屏开销。
+ * 完整片单落地页（「看全部」的目的地）：用纵向网格承载大量条目。
+ * collectionRef 同时携带来源、媒体类型和片单身份，页面不再为豆瓣榜单
+ * 硬编码专用接口；前端只分批挂载图片节点，控制首屏开销。
  */
 export function CollectionGridView({
-  collectionId,
-  title,
+  collectionRef,
 }: {
-  /** 后端白名单内的豆瓣榜单 ID，如 movie_top250 / movie_high_score */
-  collectionId: string;
-  /** 榜单展示名，用于标题与返回导航 */
-  title: string;
+  /** 由发现页展示清单返回的稳定片单引用。 */
+  collectionRef: string;
 }) {
-  const [items, setItems] = useState<MediaItem[] | null>(null);
+  const initialSnapshot = getCollectionGridSnapshot(collectionRef);
+  const scrollRef = useScrollRestoration(`collection:${collectionRef}`);
+  const [items, setItems] = useState<MediaItem[] | null>(() => initialSnapshot?.items ?? null);
+  const [title, setTitle] = useState(() => initialSnapshot?.title ?? "影视片单");
+  const [isRanked, setIsRanked] = useState(() => initialSnapshot?.isRanked ?? false);
   const [query, setQuery] = useState("");
   const [selectedGenres, setSelectedGenres] = useState<string[]>([]);
-  const [visibleCount, setVisibleCount] = useState(PAGE_SIZE);
+  const [nextPage, setNextPage] = useState(() => initialSnapshot?.nextPage ?? 2);
+  const [totalResults, setTotalResults] = useState(() => initialSnapshot?.totalResults ?? 0);
+  const [hasMore, setHasMore] = useState(() => initialSnapshot?.hasMore ?? false);
+  const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const loadMoreRef = useRef<HTMLDivElement>(null);
+  const loadingMoreRef = useRef(false);
+  const pageControllerRef = useRef<AbortController | null>(null);
+  const activeCollectionRef = useRef(collectionRef);
+  const [provider, mediaType] = collectionRef.split(":");
+
+  // 片单返回时先复用已加载窗口，避免滚动恢复目标对应的分页内容被重置掉。
+  useLayoutEffect(() => {
+    if (activeCollectionRef.current !== collectionRef || !items) return;
+    rememberCollectionGridSnapshot(collectionRef, {
+      items,
+      title,
+      isRanked,
+      nextPage,
+      totalResults,
+      hasMore,
+    });
+  }, [collectionRef, hasMore, isRanked, items, nextPage, title, totalResults]);
 
   useEffect(() => {
-    let cancelled = false;
-    fetchDoubanCollection(collectionId)
-      .then((row) => {
-        if (!cancelled) setItems(row.items);
+    const controller = new AbortController();
+    activeCollectionRef.current = collectionRef;
+    pageControllerRef.current?.abort();
+    pageControllerRef.current = null;
+    loadingMoreRef.current = false;
+    setError(null);
+    setQuery("");
+    setSelectedGenres([]);
+
+    const cached = getCollectionGridSnapshot(collectionRef);
+    if (cached) {
+      setItems(cached.items);
+      setTitle(cached.title);
+      setIsRanked(cached.isRanked);
+      setNextPage(cached.nextPage);
+      setTotalResults(cached.totalResults);
+      setHasMore(cached.hasMore);
+      setLoadingMore(false);
+      return () => {
+        controller.abort();
+        if (activeCollectionRef.current === collectionRef) pageControllerRef.current?.abort();
+      };
+    }
+
+    // 同一动态路由切换片单时组件可能被 React 复用，先清掉上一片单的展示态，
+    // 避免新请求完成前短暂显示旧榜单，或失败后把旧数据误当成新结果。
+    setItems(null);
+    setTitle("影视片单");
+    setIsRanked(false);
+    setLoadingMore(false);
+    setNextPage(2);
+    setTotalResults(0);
+    setHasMore(false);
+    browseDiscoveryCollection(
+      collectionRef,
+      provider === "tmdb" ? TMDB_PAGE_SIZE : DOUBAN_FULL_LIMIT,
+      { signal: controller.signal },
+      1,
+    )
+      .then((collection) => {
+        if (controller.signal.aborted) return;
+        setItems(collection.items);
+        setTitle(collection.name);
+        setIsRanked(collection.isRanked);
+        setTotalResults(collection.totalResults);
+        setHasMore(provider === "tmdb" && collection.hasMore);
+        setNextPage(collection.page + 1);
       })
       .catch((reason: Error) => {
-        if (!cancelled) setError(reason.message || "榜单加载失败，请稍后重试");
+        if (!controller.signal.aborted) setError(reason.message || "榜单加载失败，请稍后重试");
       });
     return () => {
-      cancelled = true;
+      controller.abort();
+      if (activeCollectionRef.current === collectionRef) pageControllerRef.current?.abort();
     };
-  }, [collectionId]);
+  }, [collectionRef, provider]);
+
+  const loadNextPage = useCallback(async () => {
+    if (provider !== "tmdb" || !hasMore || loadingMoreRef.current) return;
+    const requestedCollectionRef = collectionRef;
+    const controller = new AbortController();
+    pageControllerRef.current = controller;
+    loadingMoreRef.current = true;
+    setLoadingMore(true);
+    setError(null);
+    try {
+      const collection = await browseDiscoveryCollection(
+        collectionRef,
+        TMDB_PAGE_SIZE,
+        { signal: controller.signal },
+        nextPage,
+      );
+      if (
+        controller.signal.aborted ||
+        activeCollectionRef.current !== requestedCollectionRef
+      ) {
+        return;
+      }
+      setItems((current) => {
+        const existing = new Set((current ?? []).map((item) => item.titleRef ?? item.id));
+        return [
+          ...(current ?? []),
+          ...collection.items.filter((item) => !existing.has(item.titleRef ?? item.id)),
+        ];
+      });
+      setTotalResults(collection.totalResults);
+      setHasMore(collection.hasMore);
+      setNextPage(collection.page + 1);
+    } catch (reason) {
+      if (!controller.signal.aborted && activeCollectionRef.current === requestedCollectionRef) {
+        setError((reason as Error).message || "下一页加载失败，请稍后重试");
+      }
+    } finally {
+      if (pageControllerRef.current === controller) {
+        pageControllerRef.current = null;
+        loadingMoreRef.current = false;
+        if (activeCollectionRef.current === requestedCollectionRef) setLoadingMore(false);
+      }
+    }
+  }, [collectionRef, hasMore, nextPage, provider]);
 
   const genres = useMemo(() => {
     if (!items) return [];
@@ -80,28 +228,32 @@ export function CollectionGridView({
       return matchesGenre && matchesKeyword;
     });
   }, [items, deferredQuery, selectedGenres]);
+  const filteringLoadedItems = query.trim().length > 0 || selectedGenres.length > 0;
 
-  const hasMore = visibleCount < filtered.length;
-
-  // 接近列表底部时自动追加一批；依赖筛选后的总数，切换类型后按新结果重新观察。
+  // TMDB 榜单按上游原生页码续载。观察根必须是应用内部的滚动容器；若使用
+  // 浏览器视口，overflow 裁剪会让预取距离失效，直到哨兵真正露出才会加载。
+  // 本地筛选会主动缩短网格，此时暂停续载，避免无匹配时在后台一路拉到末页。
   useEffect(() => {
     const target = loadMoreRef.current;
-    if (!target || !hasMore) return;
+    if (!target || !hasMore || loadingMore || error || filteringLoadedItems) return;
+    const scrollRoot = target.closest<HTMLElement>("[data-scroll-root]");
+    if (!scrollRoot) return;
+    const preloadDistance = Math.max(800, Math.round(scrollRoot.clientHeight * 1.25));
     const observer = new IntersectionObserver(
       ([entry]) => {
-        if (entry.isIntersecting) {
-          setVisibleCount((count) => Math.min(count + PAGE_SIZE, filtered.length));
-        }
+        if (entry.isIntersecting) void loadNextPage();
       },
-      { rootMargin: "500px 0px" },
+      {
+        root: scrollRoot,
+        rootMargin: `${preloadDistance}px 0px`,
+      },
     );
     observer.observe(target);
     return () => observer.disconnect();
-  }, [filtered.length, hasMore]);
+  }, [error, filteringLoadedItems, hasMore, loadNextPage, loadingMore]);
 
   const updateQuery = (value: string) => {
     setQuery(value);
-    setVisibleCount(PAGE_SIZE);
   };
 
   const toggleGenre = (value: string) => {
@@ -110,36 +262,43 @@ export function CollectionGridView({
         ? current.filter((selected) => selected !== value)
         : [...current, value],
     );
-    setVisibleCount(PAGE_SIZE);
   };
 
   const clearGenres = () => {
     setSelectedGenres([]);
-    setVisibleCount(PAGE_SIZE);
   };
 
   return (
-    <div className="scroll-thin scroll-safe flex-1 overflow-y-auto px-6 pb-12 max-md:px-4">
+    <div
+      ref={scrollRef}
+      data-scroll-root
+      className="scroll-thin scroll-safe flex-1 overflow-y-auto px-6 pb-12 max-md:px-4"
+    >
       {/* 顶栏：返回发现电影（保留豆瓣数据源视角）+ 吸顶榜单名；
           容器已有 px-6，用 -mx-6 让吸顶蒙版铺满整宽 */}
       <PageNav
-        items={[
-          { label: "发现电影", href: "/discover/movie?source=douban" },
-          { label: title },
-        ]}
+        title={title}
+        fallback={{
+          label: mediaType === "tv" ? "发现剧集" : "发现电影",
+          href: `/discover/${mediaType === "tv" ? "tv" : "movie"}?source=${provider === "douban" ? "douban" : "tmdb"}` as Route,
+        }}
         className="-mx-6 max-md:-mx-4"
       />
       <header className="mx-auto max-w-[1500px]">
         <div className="mt-1 flex flex-col justify-between gap-5 sm:flex-row sm:items-end">
           <div>
             <p className="text-sub font-semibold tracking-[0.18em] text-[var(--accent-2)]">
-              DOUBAN RANKING
+              {provider.toLocaleUpperCase()} COLLECTION
             </p>
             <h1 className="mt-1 text-3xl font-bold tracking-[-0.03em] text-[var(--text)]">
               {title}
             </h1>
             <p className="mt-2 text-body text-[var(--text-muted)]">
-              {items ? `完整收录 ${items.length} 部影片` : "正在读取完整榜单…"}
+              {items
+                ? provider === "tmdb"
+                  ? `已加载 ${items.length} / ${totalResults.toLocaleString("zh-CN")} 部影片`
+                  : `完整收录 ${items.length} 部影片`
+                : "正在读取完整榜单…"}
             </p>
           </div>
           <label className="flex h-10 w-full items-center gap-2 rounded-full border border-white/10 bg-black/25 px-4 text-[var(--text-muted)] backdrop-blur-sm sm:w-72">
@@ -147,15 +306,17 @@ export function CollectionGridView({
             <input
               value={query}
               onChange={(event) => updateQuery(event.target.value)}
-              placeholder="搜索片名"
-              aria-label="搜索榜单片名"
+              placeholder={provider === "tmdb" ? "搜索已加载片名" : "搜索片名"}
+              aria-label={provider === "tmdb" ? "搜索已加载的榜单片名" : "搜索榜单片名"}
               className="min-w-0 flex-1 bg-transparent text-body text-[var(--text)] outline-none placeholder:text-[var(--text-muted)]"
             />
           </label>
         </div>
         {genres.length > 0 && (
           <div className="mt-6 flex flex-wrap items-center gap-2 max-md:mt-4">
-            <span className="mr-1 text-sub font-semibold text-[var(--text-muted)]">类型</span>
+            <span className="mr-1 text-sub font-semibold text-[var(--text-muted)]">
+              {provider === "tmdb" ? "已加载类型" : "类型"}
+            </span>
             <button
               type="button"
               aria-pressed={selectedGenres.length === 0}
@@ -197,7 +358,7 @@ export function CollectionGridView({
         )}
       </header>
 
-      {error && (
+      {error && !items && (
         <div className="mx-auto mt-16 max-w-md rounded-2xl border border-white/10 bg-black/25 p-8 text-center text-body text-[var(--text-muted)]">
           {error}
         </div>
@@ -213,11 +374,11 @@ export function CollectionGridView({
             </div>
           ) : (
             <div className="grid grid-cols-2 gap-x-4 gap-y-7 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 2xl:grid-cols-8">
-              {filtered.slice(0, visibleCount).map((item) => {
+              {filtered.map((item) => {
                 const rank = rankById.get(item.id) ?? 0;
                 return (
                   <div key={item.id} className="relative min-w-0">
-                    <RankBadge rank={rank} />
+                    {isRanked && <RankBadge rank={rank} />}
                     <PosterCard item={item} />
                   </div>
                 );
@@ -225,17 +386,29 @@ export function CollectionGridView({
             </div>
           )}
 
-          <div
-            ref={loadMoreRef}
-            className="mt-8 flex h-10 items-center justify-center text-sub text-[var(--text-muted)]"
-            aria-live="polite"
-          >
-            {hasMore
-              ? `继续滚动加载（已显示 ${visibleCount} / ${filtered.length}）`
-              : filtered.length > 0
-                ? `已显示全部 ${filtered.length} 部影片`
+          {error && (
+            <div className="mt-8 flex flex-wrap items-center justify-center gap-3 rounded-xl border border-white/[0.08] bg-black/20 px-4 py-3 text-sub text-[var(--text-muted)]">
+              <span>{error}</span>
+              {hasMore && (
+                <button
+                  type="button"
+                  onClick={() => void loadNextPage()}
+                  className="font-semibold text-[var(--accent-2)] transition hover:text-white"
+                >
+                  重试下一页
+                </button>
+              )}
+            </div>
+          )}
+
+          <div ref={loadMoreRef} className="h-px" aria-hidden="true" />
+          <p className="sr-only" role="status">
+            {loadingMore
+              ? "正在加载下一页"
+              : !hasMore && filtered.length > 0
+                ? `已加载全部 ${items.length} 部影片`
                 : ""}
-          </div>
+          </p>
         </main>
       )}
     </div>

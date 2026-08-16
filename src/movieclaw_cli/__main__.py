@@ -19,13 +19,22 @@ from movieclaw_cli.core.errors import CliError
 from movieclaw_cli.core.http import Api
 from movieclaw_cli.gen import spec_loader
 from movieclaw_cli.gen.tree_builder import DOMAIN_HELP, build_tree
-from movieclaw_cli.overlay.agent_cmds import agent_attach, agent_run
 from movieclaw_cli.overlay.auth_cmds import login, logout, status
 from movieclaw_cli.overlay.groups import DefaultCommandGroup
-from movieclaw_cli.overlay.lib_cmds import lib_organize
+from movieclaw_cli.overlay.jobs_cmds import jobs_wait
+from movieclaw_cli.overlay.library_cmds import library_organize_files, library_reconcile_paths
 from movieclaw_cli.overlay.logs_cmds import logs_tail
-from movieclaw_cli.overlay.search_cmds import download, search
-from movieclaw_cli.overlay.sub_cmds import sub_create
+from movieclaw_cli.overlay.search_cmds import (
+    download,
+    search_library_items,
+    search_titles,
+    search_torrents,
+)
+from movieclaw_cli.overlay.session_cmds import (
+    session_follow,
+    session_retry,
+    session_start,
+)
 
 
 @dataclass
@@ -50,7 +59,8 @@ class Settings:
 @click.group(
     name="mclaw",
     context_settings={"help_option_names": ["-h", "--help"], "max_content_width": 100},
-    help="movieclaw 命令行工具：搜索、订阅、媒体库、下载、设置——页面能做的这里都能做。\n\n"
+    help="movieclaw 命令行工具：发现电影/剧集、搜索和下载 PT 资源、订阅追更、"
+    "管理本地媒体库；覆盖页面的主要业务流程和管理设置。\n\n"
     "探索方式：mclaw <域> --help 看该域全部命令，mclaw <域> <命令> --help 看参数与示例。\n"
     "机器输出：加 -o json（非终端环境默认即 JSON）。",
 )
@@ -83,30 +93,35 @@ def _assemble() -> None:
     cli.add_command(download)
 
     # 预建带精选子命令的组：生成层会把该域其余命令并入同一个组。
-    # search 组是「默认子命令组」：mclaw search "沙丘2" = mclaw search run "沙丘2"，
+    # search 组是「默认子命令组」：mclaw search "沙丘2" = mclaw search torrents "沙丘2"，
     # 与 mclaw search history list 等生成命令共存。
     search_group = DefaultCommandGroup(
-        name="search", default_command="run", help=DOMAIN_HELP.get("search")
+        name="search", default_command="torrents", help=DOMAIN_HELP.get("search")
     )
-    search_group.add_command(search)
+    search_group.add_command(search_titles)
+    search_group.add_command(search_torrents)
+    search_group.add_command(search_library_items)
     cli.add_command(search_group)
 
-    sub_group = click.Group(name="sub", help=DOMAIN_HELP.get("sub"))
-    sub_group.add_command(sub_create)
-    cli.add_command(sub_group)
+    library_group = click.Group(name="library", help=DOMAIN_HELP.get("library"))
+    # 两个命令各自编排「预览 → 明确确认 → 执行」，隐藏底层工作流端点。
+    library_group.add_command(library_organize_files)
+    library_group.add_command(library_reconcile_paths)
+    cli.add_command(library_group)
 
-    lib_group = click.Group(name="lib", help=DOMAIN_HELP.get("lib"))
-    lib_group.add_command(lib_organize)  # 整体覆盖生成层的 lib organize preview/start
-    cli.add_command(lib_group)
-
-    agent_group = click.Group(name="agent", help=DOMAIN_HELP.get("agent"))
-    agent_group.add_command(agent_run)
-    agent_group.add_command(agent_attach)
-    cli.add_command(agent_group)
+    session_group = click.Group(name="session", help=DOMAIN_HELP.get("session"))
+    session_group.add_command(session_start)
+    session_group.add_command(session_retry)
+    session_group.add_command(session_follow)
+    cli.add_command(session_group)
 
     logs_group = click.Group(name="logs", help=DOMAIN_HELP.get("logs"))
     logs_group.add_command(logs_tail)
     cli.add_command(logs_group)
+
+    jobs_group = click.Group(name="jobs", help=DOMAIN_HELP.get("jobs"))
+    jobs_group.add_command(jobs_wait)
+    cli.add_command(jobs_group)
 
     server = spec_loader.guess_server_for_startup(sys.argv[1:])
     spec, from_cache = spec_loader.load_active(server)

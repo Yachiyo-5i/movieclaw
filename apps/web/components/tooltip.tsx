@@ -1,6 +1,6 @@
 "use client";
 
-import { cloneElement, isValidElement, useRef, useState } from "react";
+import { cloneElement, isValidElement, useEffect, useRef, useState, type Ref } from "react";
 import {
   arrow,
   autoUpdate,
@@ -12,9 +12,11 @@ import {
   shift,
   useDismiss,
   useFloating,
+  useClick,
   useFocus,
   useHover,
   useInteractions,
+  useMergeRefs,
   useRole,
   useTransitionStyles,
   type Placement,
@@ -36,29 +38,53 @@ export function Tooltip({
   children,
   placement = "top",
   maxWidth = 380,
+  openOnClick = false,
+  disabled = false,
+  dismissOnReferencePress = false,
 }: {
   content: React.ReactNode;
   /** 触发元素：必须是可接收 ref 的单个元素（原生标签即可） */
   children: React.ReactElement<Record<string, unknown>>;
   placement?: Placement;
   maxWidth?: number;
+  /** 触屏或需显式点按的提示可开启；默认仍只响应悬停与键盘聚焦。 */
+  openOnClick?: boolean;
+  /** 临时停用提示；用于详情弹窗打开时保证两种浮层互斥。 */
+  disabled?: boolean;
+  /** 按下触发器就关闭提示，避免可点击按钮同时保留 Tooltip。 */
+  dismissOnReferencePress?: boolean;
 }) {
   const [open, setOpen] = useState(false);
   const arrowRef = useRef<SVGSVGElement | null>(null);
+  const effectiveOpen = open && !disabled;
+
+  useEffect(() => {
+    if (disabled) setOpen(false);
+  }, [disabled]);
 
   const { refs, floatingStyles, context } = useFloating({
-    open,
-    onOpenChange: setOpen,
+    open: effectiveOpen,
+    onOpenChange: (nextOpen) => setOpen(disabled ? false : nextOpen),
     placement,
     whileElementsMounted: autoUpdate,
     middleware: [offset(8), flip({ padding: 8 }), shift({ padding: 8 }), arrow({ element: arrowRef })],
   });
 
   const { getReferenceProps, getFloatingProps } = useInteractions([
-    useHover(context, { move: false, delay: { open: 250 }, handleClose: safePolygon() }),
-    useFocus(context),
-    useDismiss(context),
-    useRole(context, { role: "tooltip" }),
+    useHover(context, {
+      enabled: !disabled,
+      move: false,
+      delay: { open: 250 },
+      handleClose: safePolygon(),
+    }),
+    useClick(context, { enabled: !disabled && openOnClick }),
+    useFocus(context, { enabled: !disabled }),
+    useDismiss(context, {
+      enabled: !disabled,
+      referencePress: dismissOnReferencePress,
+      referencePressEvent: "pointerdown",
+    }),
+    useRole(context, { enabled: !disabled, role: "tooltip" }),
   ]);
 
   const { isMounted, styles: transitionStyles } = useTransitionStyles(context, {
@@ -66,11 +92,15 @@ export function Tooltip({
     initial: { opacity: 0, transform: "translateY(3px) scale(0.98)" },
   });
 
+  const childRef = isValidElement(children)
+    ? (children.props as { ref?: Ref<Element> }).ref
+    : undefined;
+  const referenceRef = useMergeRefs<Element>([refs.setReference, childRef]);
   if (!isValidElement(children)) return children;
 
   return (
     <>
-      {cloneElement(children, getReferenceProps({ ref: refs.setReference, ...children.props }))}
+      {cloneElement(children, getReferenceProps({ ...children.props, ref: referenceRef }))}
       {isMounted && (
         <FloatingPortal>
           <div

@@ -1,11 +1,3 @@
-agent runs cancel
-agent sessions compact
-agent sessions delete
-agent sessions list
-agent sessions rename
-agent sessions show
-agent sessions truncate
-agent start
 app restart
 app set
 app show
@@ -46,17 +38,16 @@ channels weixin accounts unbind
 channels weixin bindings start
 channels weixin bindings status
 channels weixin bindings verify
-discover douban collection
-discover douban show
-discover hero
-discover layout
-discover row
-discover search
-discover show
+discover browse-collection
+discover filter-options
+discover filter-titles
+discover get-title-details
+discover list-collections
 dl add
 dl default set
 dl delete
 dl list
+dl resolve-target
 dl show
 dl status set
 dl submit
@@ -69,52 +60,56 @@ extension token create
 extension token revoke
 extension token show
 health check
-lib create
-lib default set
-lib delete
-lib files claim
-lib files claim-batch
-lib files detach
-lib files ignore
-lib files restore
-lib files thumb
-lib ignored list
-lib items artwork-candidates
-lib items artwork-download
-lib items artwork-select
-lib items delete
-lib items episodes
-lib items files delete
-lib items ids
-lib items index
-lib items list
-lib items refresh
-lib items reidentify
-lib items reidentify preview
-lib items show
-lib items transfer
-lib items transfer preview
-lib list
-lib missing clear
-lib missing list
-lib missing redownload
-lib order set
-lib organize preview
-lib organize start
-lib refresh progress
-lib refresh start
-lib refresh stop
-lib review list
-lib review resolve
-lib routing-options
-lib scan start
-lib scan stop
-lib search
-lib show
-lib transfer status
-lib unidentified clear
-lib unidentified list
-lib update
+jobs cancel
+jobs events
+jobs health
+jobs list
+jobs retry
+jobs show
+jobs wait
+library artwork download
+library artwork list-candidates
+library artwork select
+library create
+library delete
+library get
+library identification assign-file-to-title
+library identification assign-files-to-title
+library identification ignore-all-unidentified-files
+library identification ignore-file
+library identification list-ignored-files
+library identification list-review-cases
+library identification list-unidentified-files
+library identification mark-files-as-extras
+library identification resolve-review
+library identification restore-files
+library items delete
+library items delete-file
+library items get
+library items get-transfer-status
+library items list
+library items list-episodes
+library items preview-reidentification
+library items preview-transfer
+library items refresh-metadata
+library items reidentify
+library items transfer
+library list
+library list-routing-options
+library metadata get-refresh-status
+library metadata refresh-library
+library metadata stop-refresh
+library missing clear-records
+library missing list
+library missing redownload
+library reorder
+library scan start
+library scan stop
+library set-default
+library subtitles calibrate-timing
+library subtitles generate
+library subtitles preview-generation
+library update
 llm presets
 llm provider delete
 llm provider set
@@ -122,6 +117,14 @@ llm provider show
 llm provider verify
 logs days
 logs read
+members avatar download
+members create
+members delete
+members list
+members password reset
+members show
+members status set
+members update
 net set
 net show
 net test
@@ -135,12 +138,21 @@ rules list
 rules update
 search history clear
 search history delete
+search history get-results
 search history list
-search history media-snapshot
-search history snapshot
-search prefs show
-search prefs update
-search run
+search library-items
+search presets list
+search presets update
+search titles
+search torrents
+session compact-context
+session delete
+session get-transcript
+session list
+session rename
+session retry
+session start
+session stop
 site add
 site catalog
 site delete
@@ -150,19 +162,21 @@ site stats
 site status set
 site update
 site verify
-sub activities
-sub create
-sub delete
-sub dispatch-preview
-sub downloads
-sub grab
-sub health
-sub list
-sub pause
-sub prepare
-sub search-now
-sub show
-sub update
+subscriptions check-automation-readiness
+subscriptions create
+subscriptions delete
+subscriptions download-selected-torrent
+subscriptions get
+subscriptions list
+subscriptions list-active-downloads
+subscriptions list-activities
+subscriptions list-today-arrivals
+subscriptions preview-download-routing
+subscriptions search-missing-resources
+subscriptions set-follow-future
+subscriptions set-tracking-state
+subscriptions unsubscribe
+subscriptions update
 ui prefs show
 ui prefs update
 watch create

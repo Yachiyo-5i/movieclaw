@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from pydantic import BaseModel, Field
+from pydantic import Field
+
+from movieclaw_api.schemas.base import BaseModel
 
 
 class BootstrapStatus(BaseModel):
@@ -57,6 +59,14 @@ class ApiTokenCreatedView(ApiTokenView):
     token: str = Field(description="令牌明文；服务端只存哈希，之后无法再次查看")
 
 
+class SessionCapabilities(BaseModel):
+    """当前主体的能力开关快照（前端据此裁剪入口；安全边界仍在后端 403）。"""
+
+    allow_subscribe: bool = True
+    allow_search: bool = True
+    allow_direct_download: bool = True
+
+
 class SessionView(BaseModel):
     """当前登录状态（GET /auth/me 与登录成功后的返回体）。"""
 
@@ -64,4 +74,9 @@ class SessionView(BaseModel):
     nickname: str
     avatar_url: str | None = Field(
         default=None, description="头像相对 URL（含版本号）；未上传过头像时为空"
+    )
+    role: str = Field(default="admin", description="admin=超级管理员；member=成员")
+    capabilities: SessionCapabilities = Field(
+        default_factory=SessionCapabilities,
+        description="能力开关快照；管理员恒为全开",
     )

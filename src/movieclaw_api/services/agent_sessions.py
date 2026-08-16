@@ -4,13 +4,13 @@
 
 1. **一个会话一个 append-only JSONL 文件**：首行是会话头，之后每行一条
    消息 entry。历史行永不改写——中断、重启都只会追加，不会破坏已有内容。
-   唯一例外是 ``truncate_from``（用户显式确认的「改写某轮重问」），见该方法
+   唯一例外是 ``discard_from_user_message``（retry 的历史替换），见该方法
    的说明；除它以外，任何写入路径都只准 append。
 2. **只落定稿消息，不落流式 delta**：SSE 增量属于 UI 通道；文件里的
    ``message`` 就是 LLM API 原样格式（ChatMessage），resume 重建上下文
    零转换。
 3. **entry 带 uuid / parent_uuid**：v1 是纯线性链（parent 永远指向上一
-   条），字段先留好，将来做回退分支时无需迁移文件格式。
+   条），字段先留好，将来做历史分支时无需迁移文件格式。
 4. **SQLite 的 agent_session 表只是查询索引**：任何时候都能由本目录的
    文件整体重建（见 repository 层的 rebuild），因此写入顺序固定为
    「先 append 文件、后更新 DB」，两步之间崩溃只会让索引落后，不会产生
@@ -67,7 +67,7 @@ class SessionHeader(BaseModel):
     created_at: str
 
 
-class SessionEntry(BaseModel):
+class SessionMessageEntry(BaseModel):
     """JSONL 消息行：信封 + LLM API 原样消息。
 
     ``model / usage / finish_reason`` 仅 assistant 消息携带（运行元数据，
@@ -85,7 +85,7 @@ class SessionEntry(BaseModel):
     finish_reason: str | None = None
 
 
-class CompactionEntry(BaseModel):
+class SessionCompactionEntry(BaseModel):
     """JSONL 压缩行：摘要 + 完整替换历史（codex Compacted 记录同款）。
 
     ``replacement_history`` 是压缩后模型上下文的精确内容（不含 system——
@@ -105,8 +105,13 @@ class CompactionEntry(BaseModel):
 
 
 #: 消息行与压缩行的联合类型；_read 逐行按 type 判别解析
-AnyEntry = Annotated[SessionEntry | CompactionEntry, Field(discriminator="type")]
-_entry_adapter: TypeAdapter[SessionEntry | CompactionEntry] = TypeAdapter(AnyEntry)
+SessionTranscriptEntry = Annotated[
+    SessionMessageEntry | SessionCompactionEntry,
+    Field(discriminator="type"),
+]
+_entry_adapter: TypeAdapter[SessionMessageEntry | SessionCompactionEntry] = TypeAdapter(
+    SessionTranscriptEntry
+)
 
 
 class SessionSummary(BaseModel):
@@ -124,20 +129,22 @@ class SessionSummary(BaseModel):
     last_timestamp: str
 
 
-def _last_compaction_index(entries: list[SessionEntry | CompactionEntry]) -> int:
+def _last_compaction_index(
+    entries: list[SessionMessageEntry | SessionCompactionEntry],
+) -> int:
     """最后一条压缩行的下标；没有压缩行时返回 -1。"""
     for i in range(len(entries) - 1, -1, -1):
-        if isinstance(entries[i], CompactionEntry):
+        if isinstance(entries[i], SessionCompactionEntry):
             return i
     return -1
 
 
 def _messages_after_last_compaction(
-    entries: list[SessionEntry | CompactionEntry],
+    entries: list[SessionMessageEntry | SessionCompactionEntry],
 ) -> list[ChatMessage]:
     """最后一条压缩行之后的消息（无压缩行时即全部消息）。"""
     last = _last_compaction_index(entries)
-    return [e.message for e in entries[last + 1 :] if isinstance(e, SessionEntry)]
+    return [e.message for e in entries[last + 1 :] if isinstance(e, SessionMessageEntry)]
 
 
 class AgentSessionStore:
@@ -181,7 +188,7 @@ class AgentSessionStore:
         model: str | None = None,
         usage: TokenUsage | None = None,
         finish_reason: str | None = None,
-    ) -> SessionEntry:
+    ) -> SessionMessageEntry:
         """追加一条定稿消息，自动接到当前链尾，返回写入的 entry。"""
         path = self.path(session_id)
         if not path.is_file():
@@ -189,7 +196,7 @@ class AgentSessionStore:
         if session_id not in self._leaf_cache:
             _, entries, _ = self._read(path)
             self._leaf_cache[session_id] = entries[-1].uuid if entries else None
-        entry = SessionEntry(
+        entry = SessionMessageEntry(
             uuid=uuid_mod.uuid4().hex[:12],
             parent_uuid=self._leaf_cache[session_id],
             timestamp=_now_iso(),
@@ -203,7 +210,9 @@ class AgentSessionStore:
         self._leaf_cache[session_id] = entry.uuid
         return entry
 
-    def append_compaction(self, session_id: str, result: CompactionResult) -> CompactionEntry:
+    def append_compaction(
+        self, session_id: str, result: CompactionResult
+    ) -> SessionCompactionEntry:
         """追加一条压缩行，与 append 同款接到当前链尾（parent 链线性穿过压缩行）。"""
         path = self.path(session_id)
         if not path.is_file():
@@ -211,7 +220,7 @@ class AgentSessionStore:
         if session_id not in self._leaf_cache:
             _, entries, _ = self._read(path)
             self._leaf_cache[session_id] = entries[-1].uuid if entries else None
-        entry = CompactionEntry(
+        entry = SessionCompactionEntry(
             uuid=uuid_mod.uuid4().hex[:12],
             parent_uuid=self._leaf_cache[session_id],
             timestamp=_now_iso(),
@@ -255,11 +264,11 @@ class AgentSessionStore:
                 sealed += 1
         return sealed
 
-    def truncate_from(self, session_id: str, entry_uuid: str) -> int:
-        """删除 entry_uuid 这条用户提问及其之后的全部 entry，返回删除条数。
+    def discard_from_user_message(self, session_id: str, message_id: str) -> int:
+        """删除指定 user message 及其之后的全部 entry，返回删除条数。
 
-        「改写某轮重新提问」的落盘动作（前端在弹窗二次确认后调用）：把这一轮
-        及其后的所有往返从事实源上抹掉，会话链尾回到上一轮结束处，下一次
+        retry 的落盘动作（前端二次确认后调用）：把目标消息及其后的所有往返
+        从事实源上抹掉，会话链尾回到该消息之前，下一次
         ``append`` 自然接在那里，重建出的 LLM 上下文里也不再有被丢弃的内容。
 
         **这是本模块唯一改写历史行的方法**，与顶部「append-only」的约定相悖，
@@ -275,14 +284,14 @@ class AgentSessionStore:
         ——它们本就不参与任何读取路径，清掉无损。
         """
         header, entries = self.read(session_id)
-        index = next((i for i, e in enumerate(entries) if e.uuid == entry_uuid), None)
+        index = next((i for i, e in enumerate(entries) if e.uuid == message_id), None)
         if index is None:
             raise NotFoundException("会话中没有这条记录，可能已被改写")
         target = entries[index]
-        # 只允许从「用户提问」处截断：从 assistant/tool 中间切一刀会留下没有
+        # 只允许从 user message 重试：从 assistant/tool 中间切一刀会留下没有
         # 回执的 tool_call，重建出的上下文喂回模型直接 400
-        if not isinstance(target, SessionEntry) or target.message.role != "user":
-            raise BadRequestException("只能从用户提问处截断会话")
+        if not isinstance(target, SessionMessageEntry) or target.message.role != "user":
+            raise BadRequestException("只能重试用户消息")
 
         kept = entries[:index]
         path = self.path(session_id)
@@ -303,7 +312,9 @@ class AgentSessionStore:
     # ------------------------------------------------------------------
     # 读取
     # ------------------------------------------------------------------
-    def read(self, session_id: str) -> tuple[SessionHeader, list[SessionEntry | CompactionEntry]]:
+    def read(
+        self, session_id: str
+    ) -> tuple[SessionHeader, list[SessionMessageEntry | SessionCompactionEntry]]:
         """读取整个会话（头 + 全部 entry，含压缩行），坏行静默跳过。"""
         path = self.path(session_id)
         if not path.is_file():
@@ -330,10 +341,10 @@ class AgentSessionStore:
         _, entries = self.read(session_id)
         last = _last_compaction_index(entries)
         if last < 0:
-            return [e.message for e in entries if isinstance(e, SessionEntry)]
+            return [e.message for e in entries if isinstance(e, SessionMessageEntry)]
         return [
             *entries[last].replacement_history,
-            *(e.message for e in entries[last + 1 :] if isinstance(e, SessionEntry)),
+            *(e.message for e in entries[last + 1 :] if isinstance(e, SessionMessageEntry)),
         ]
 
     def summarize(self, session_id: str) -> SessionSummary:
@@ -343,7 +354,9 @@ class AgentSessionStore:
         user_texts = [
             e.message.text().strip()
             for e in entries
-            if isinstance(e, SessionEntry) and e.message.role == "user" and e.message.text().strip()
+            if isinstance(e, SessionMessageEntry)
+            and e.message.role == "user"
+            and e.message.text().strip()
         ]
         return SessionSummary(
             session_id=header.session_id,
@@ -370,12 +383,14 @@ class AgentSessionStore:
                 logger.warning("会话文件无法解析，重建索引时已跳过：%s", path.name)
         return summaries
 
-    def _read(self, path: Path) -> tuple[SessionHeader, list[SessionEntry | CompactionEntry], int]:
+    def _read(
+        self, path: Path
+    ) -> tuple[SessionHeader, list[SessionMessageEntry | SessionCompactionEntry], int]:
         """逐行解析文件；返回（头、entry 列表、坏行数）。
 
         首行必须是合法会话头（否则整个文件视为损坏抛错）；其余行坏了只跳过。
         """
-        entries: list[SessionEntry | CompactionEntry] = []
+        entries: list[SessionMessageEntry | SessionCompactionEntry] = []
         bad = 0
         header: SessionHeader | None = None
         with path.open("r", encoding="utf-8") as f:

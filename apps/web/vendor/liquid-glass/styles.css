@@ -97,6 +97,10 @@
   z-index: 4;
   left: -32px;
   top: -32px;
+  /* 渲染器按下时才创建；静止态必须先给 canvas 与 32px 绘制外扩一致的
+     CSS 尺寸，否则浏览器会采用 canvas 默认的 300×150，透明画布仍会撑宽页面。 */
+  width: calc(100% + 64px);
+  height: calc(100% + 64px);
   pointer-events: none;
   opacity: var(--lg-glass-opacity);
 }

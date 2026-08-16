@@ -6,7 +6,7 @@ import { Modal } from "@/components/modal";
 import {
   type ArtworkCandidate,
   type ArtworkCandidates,
-  getArtworkCandidates,
+  listArtworkCandidates,
   selectArtwork,
 } from "@/lib/api/libraries";
 import { cachedImageUrl } from "@/lib/image-proxy";
@@ -43,7 +43,7 @@ export function ArtworkPickerDialog({
   const load = useCallback(() => {
     setFailed(false);
     setData(null);
-    getArtworkCandidates(libraryId, mediaItemId)
+    listArtworkCandidates(libraryId, mediaItemId)
       .then(setData)
       .catch(() => setFailed(true));
   }, [libraryId, mediaItemId]);

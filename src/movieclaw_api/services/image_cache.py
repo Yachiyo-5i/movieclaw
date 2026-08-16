@@ -26,6 +26,7 @@ import json
 import logging
 import os
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -41,6 +42,11 @@ class CachedImage:
 
     path: Path
     content_type: str
+    # 内容写入版本；派生缓存把它纳入键，原图被重新回源后不会继续命中旧缩略图。
+    version: str = "0"
+
+
+CacheProducer = Callable[[], Awaitable[tuple[bytes, str]]]
 
 
 class ImageCache:
@@ -55,26 +61,27 @@ class ImageCache:
         self._bytes_since_purge = 0
         self._inflight: dict[str, asyncio.Task[CachedImage]] = {}
 
-    def _entry_paths(self, url: str) -> tuple[Path, Path]:
-        """URL -> (内容文件, 元数据文件)。sha256 全量 URL 参与哈希，域名不同则键必不同。"""
-        digest = hashlib.sha256(url.encode("utf-8")).hexdigest()
+    def _entry_paths(self, cache_key: str) -> tuple[Path, Path]:
+        """缓存键 -> (内容文件, 元数据文件)；原图的键仍是完整 URL。"""
+        digest = hashlib.sha256(cache_key.encode("utf-8")).hexdigest()
         content = self._dir / digest[:2] / digest
         return content, content.with_suffix(".json")
 
     # ---- 磁盘操作（均为同步函数，调用方用 asyncio.to_thread 包装） ----------
 
     @staticmethod
-    def _read_hit(content_path: Path, meta_path: Path) -> str | None:
-        """命中则返回 Content-Type 并刷新 mtime（供 LRU 排序），未命中返回 None。"""
+    def _read_hit(content_path: Path, meta_path: Path) -> tuple[str, str] | None:
+        """命中则返回类型/版本并刷新 mtime（供 LRU 排序），未命中返回 None。"""
         try:
             meta = json.loads(meta_path.read_text(encoding="utf-8"))
             content_type = str(meta["content_type"])
+            version = str(meta.get("version") or meta.get("fetched_at") or "0")
             if not content_path.is_file():
                 return None
             os.utime(content_path)
         except (OSError, ValueError, KeyError):
             return None
-        return content_type
+        return content_type, version
 
     @staticmethod
     def _atomic_write(path: Path, data: bytes) -> None:
@@ -82,12 +89,28 @@ class ImageCache:
         tmp.write_bytes(data)
         os.replace(tmp, path)
 
-    def _store(self, url: str, content_path: Path, meta_path: Path, data: bytes, ct: str) -> None:
+    def _store(
+        self,
+        cache_key: str,
+        content_path: Path,
+        meta_path: Path,
+        data: bytes,
+        ct: str,
+        metadata: dict[str, str] | None,
+    ) -> str:
         content_path.parent.mkdir(parents=True, exist_ok=True)
         # 先写内容、后写元数据：元数据文件的出现即"条目已完整"的提交点
         self._atomic_write(content_path, data)
-        meta = {"url": url, "content_type": ct, "fetched_at": int(time.time())}
+        version = str(time.time_ns())
+        meta = {
+            "cache_key": cache_key,
+            "content_type": ct,
+            "fetched_at": int(time.time()),
+            "version": version,
+            **(metadata or {}),
+        }
         self._atomic_write(meta_path, json.dumps(meta, ensure_ascii=False).encode("utf-8"))
+        return version
 
     def _purge_if_over_limit(self) -> None:
         """总量超上限时按 mtime 淘汰最旧条目，直到降至上限的 90%。"""
@@ -122,28 +145,70 @@ class ImageCache:
 
     async def get_or_fetch(self, url: str) -> CachedImage:
         """命中直接返回本地文件；未命中回源下载并落盘（同 URL 并发只回源一次）。"""
-        content_path, meta_path = self._entry_paths(url)
-        content_type = await asyncio.to_thread(self._read_hit, content_path, meta_path)
-        if content_type is not None:
-            return CachedImage(content_path, content_type)
+        return await self.get_or_create(
+            url,
+            lambda: self._proxy.fetch(url),
+            metadata={"url": url},
+        )
+
+    async def get_or_create(
+        self,
+        cache_key: str,
+        producer: CacheProducer,
+        *,
+        metadata: dict[str, str] | None = None,
+    ) -> CachedImage:
+        """缓存任意图片产物；远程原图与缩略派生图共享 singleflight 和 LRU。
+
+        ``cache_key`` 必须完整描述产物身份；``producer`` 只在未命中时执行。
+        这让图片变体服务无需再造一套落盘、并发去重和容量清理机制。
+        """
+        content_path, meta_path = self._entry_paths(cache_key)
+        hit = await asyncio.to_thread(self._read_hit, content_path, meta_path)
+        if hit is not None:
+            content_type, version = hit
+            return CachedImage(content_path, content_type, version)
 
         key = content_path.name
         task = self._inflight.get(key)
         if task is None:
-            task = asyncio.create_task(self._fetch_and_store(url, content_path, meta_path))
+            task = asyncio.create_task(
+                self._produce_and_store(
+                    cache_key,
+                    content_path,
+                    meta_path,
+                    producer,
+                    metadata,
+                )
+            )
             self._inflight[key] = task
             task.add_done_callback(lambda _t: self._inflight.pop(key, None))
-        # shield：浏览器中途取消某个 <img> 请求时，不连累共享同一下载的其他请求
+        # shield：浏览器中途取消某个 <img> 请求时，不连累共享同一产物的其他请求
         return await asyncio.shield(task)
 
-    async def _fetch_and_store(self, url: str, content_path: Path, meta_path: Path) -> CachedImage:
-        data, content_type = await self._proxy.fetch(url)
-        await asyncio.to_thread(self._store, url, content_path, meta_path, data, content_type)
+    async def _produce_and_store(
+        self,
+        cache_key: str,
+        content_path: Path,
+        meta_path: Path,
+        producer: CacheProducer,
+        metadata: dict[str, str] | None,
+    ) -> CachedImage:
+        data, content_type = await producer()
+        version = await asyncio.to_thread(
+            self._store,
+            cache_key,
+            content_path,
+            meta_path,
+            data,
+            content_type,
+            metadata,
+        )
         self._bytes_since_purge += len(data)
         if self._bytes_since_purge >= self._purge_interval:
             self._bytes_since_purge = 0
             await asyncio.to_thread(self._purge_if_over_limit)
-        return CachedImage(content_path, content_type)
+        return CachedImage(content_path, content_type, version)
 
 
 _cache: ImageCache | None = None

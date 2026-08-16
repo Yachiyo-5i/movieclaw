@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import date
 from typing import Any
 
 import pytest
@@ -122,12 +123,13 @@ async def test_hero_requires_backdrop_and_overview() -> None:
 
 
 async def test_ranked_row_limits_to_top10() -> None:
-    """今日热榜行是 Top 10 排名行：ranked=True 且最多 10 条。"""
+    """今日热榜预览是排名行，发现页最多展示 10 条。"""
     trending_day = {"results": [_movie(i) for i in range(1, 15)]}
     svc = _service({"trending/movie/day": trending_day})
     top = await svc.discover_row(MediaKind.MOVIE, "trending-day")
 
     assert top is not None
+    assert top.title == "今日热榜"
     assert top.ranked is True
     assert len(top.items) == 10
 
@@ -142,6 +144,7 @@ async def test_layout_lists_all_configured_rows_in_order() -> None:
 
     tv_layout = svc.layout(MediaKind.TV)
     assert [r.id for r in tv_layout.rows] == [s.row_id for s in _tv_rows()]
+    assert tv_layout.rows[0].title == "今日热榜"
     assert tv_layout.rows[0].ranked
 
     client: StubTmdbClient = svc._client  # type: ignore[assignment]
@@ -195,6 +198,89 @@ async def test_row_and_hero_are_cached() -> None:
     await svc.discover_row(MediaKind.MOVIE, "popular")
     await svc.discover_hero(MediaKind.MOVIE)
     assert len(client.calls) == calls_after_first
+
+
+def test_p0_dynamic_rows_and_tv_update_rows_have_expected_tmdb_params() -> None:
+    """P0 专题必须是可随日期滚动的 discover 查询，今日/本周使用官方端点。"""
+    today = date(2026, 8, 15)
+    movies = {row.row_id: row for row in _movie_rows("CN", today)}
+    assert movies["recent-acclaimed"].params["primary_release_date.gte"] == "2024-08-15"
+    assert movies["this-year"].params["primary_release_year"] == 2026
+    assert movies["short-runtime"].params["with_runtime.lte"] == 90
+
+    tv = {row.row_id: row for row in _tv_rows(today, "Asia/Shanghai")}
+    assert tv["airing-today"].path == "tv/airing_today"
+    assert tv["airing-today"].params["timezone"] == "Asia/Shanghai"
+    assert tv["on-the-air"].title == "本周更新"
+    assert tv["completed-miniseries"].params["with_type"] == 2
+    assert tv["completed-miniseries"].params["with_status"] == 3
+
+
+def test_invalid_timezone_falls_back_for_tv_row_params() -> None:
+    """非法部署时区不仅要让日期可算，还必须把 TMDB 查询参数同步回退。"""
+    svc = MediaDiscoverService(
+        StubTmdbClient({}),
+        image_base_url=_IMAGE_BASE,
+        timezone="Invalid/Timezone",
+    )
+
+    rows = {row.row_id: row for row in svc._row_specs(MediaKind.TV)}
+
+    assert rows["airing-today"].params["timezone"] == "Asia/Shanghai"
+
+
+async def test_collection_page_uses_tmdb_native_pagination_and_cache() -> None:
+    svc = _service(
+        {
+            "movie/popular": {
+                "page": 2,
+                "total_pages": 9,
+                "total_results": 171,
+                "results": [_movie(i) for i in range(21, 25)],
+            }
+        }
+    )
+    page = await svc.discover_page(MediaKind.MOVIE, "popular", 2)
+    assert page is not None
+    assert (page.page, page.total_pages, page.total_results) == (2, 9, 171)
+    client: StubTmdbClient = svc._client  # type: ignore[assignment]
+    assert ("movie/popular", {"language": "zh-CN", "page": 2}) in client.calls
+    calls_after_first = len(client.calls)
+    await svc.discover_page(MediaKind.MOVIE, "popular", 2)
+    assert len(client.calls) == calls_after_first
+
+
+async def test_filtered_discovery_maps_all_six_dimensions() -> None:
+    svc = _service(
+        {
+            "discover/movie": {
+                "page": 3,
+                "total_pages": 4,
+                "total_results": 66,
+                "results": [_movie(31)],
+            }
+        }
+    )
+    result = await svc.discover_filtered(
+        MediaKind.MOVIE,
+        genre_ids=[878, 28],
+        origin_country="JP",
+        year=2025,
+        rating_gte=7,
+        runtime_lte=90,
+        sort="rating",
+        page=3,
+    )
+    assert (result.page, result.total_pages, result.total_results) == (3, 4, 66)
+    client: StubTmdbClient = svc._client  # type: ignore[assignment]
+    _, params = next(call for call in client.calls if call[0] == "discover/movie")
+    assert params["with_genres"] == "878|28"
+    assert params["with_origin_country"] == "JP"
+    assert params["primary_release_year"] == 2025
+    assert params["vote_average.gte"] == 7
+    assert params["with_runtime.lte"] == 90
+    assert params["sort_by"] == "vote_average.desc"
+    assert params["vote_count.gte"] == 50
 
 
 # ---------------------------------------------------------------------------
@@ -256,6 +342,61 @@ async def test_search_is_cached() -> None:
 
 
 # ---------------------------------------------------------------------------
+# 影人作品
+# ---------------------------------------------------------------------------
+
+
+async def test_person_detail_keeps_and_deduplicates_all_tmdb_credits() -> None:
+    """参演与幕后履历合并去重；缺海报/日期的作品仍属于“全部作品”。"""
+    movie = _movie(10, media_type="movie", release_date="2025-03-01")
+    tv_without_artwork = {
+        "id": 20,
+        "media_type": "tv",
+        "name": "未定档剧集",
+        "original_name": "Coming Soon",
+        "first_air_date": "",
+        "poster_path": None,
+        "genre_ids": [16],
+        "vote_average": 8.24,
+    }
+    svc = _service(
+        {
+            "person/9340": {
+                "id": 9340,
+                "name": "示例影人",
+                "profile_path": "/person.jpg",
+                "combined_credits": {
+                    "cast": [movie, tv_without_artwork],
+                    # 同一部电影既参演又执导只展示一次；其他幕后岗位同样纳入履历。
+                    "crew": [
+                        {**movie, "job": "Director"},
+                        _movie(30, media_type="movie", release_date="2024-01-01"),
+                    ],
+                },
+            }
+        }
+    )
+
+    detail = await svc.person_detail(9340)
+
+    assert detail.name == "示例影人"
+    assert detail.avatar_url == f"{_IMAGE_BASE}/w300/person.jpg"
+    assert [(card.type.value, card.id) for card in detail.credits] == [
+        ("movie", "10"),
+        ("movie", "30"),
+        ("tv", "20"),
+    ]
+    assert detail.credits[0].genres == ["科幻", "动作"]
+    assert detail.credits[-1].year == 0
+    assert detail.credits[-1].poster_url == ""
+
+    client: StubTmdbClient = svc._client  # type: ignore[assignment]
+    calls_after_first = len(client.calls)
+    await svc.person_detail(9340)
+    assert len(client.calls) == calls_after_first
+
+
+# ---------------------------------------------------------------------------
 # 条目详情
 # ---------------------------------------------------------------------------
 
@@ -268,7 +409,12 @@ _MOVIE_DETAIL = {
     "production_countries": [{"iso_3166_1": "US", "name": "United States of America"}],
     "credits": {
         "crew": [
-            {"name": "莉莉·沃卓斯基", "job": "Director"},
+            {
+                "id": 9340,
+                "name": "莉莉·沃卓斯基",
+                "job": "Director",
+                "profile_path": "/director.jpg",
+            },
             {"name": "某制片", "job": "Producer"},
         ],
         # 演职员：带头像与角色名，且刻意给一个缺 profile_path 的人（头像取不到
@@ -300,6 +446,10 @@ async def test_movie_detail_fields() -> None:
 
     assert detail.card.extent == "136 分钟"
     assert detail.facts.directors == ["莉莉·沃卓斯基"]
+    assert detail.facts.director_credits[0].avatar_url == (
+        f"{_IMAGE_BASE}/w185/director.jpg"
+    )
+    assert detail.facts.director_credits[0].tmdb_person_id == 9340
     # 演职员条：按 TMDB 给的主次顺序整段带回（上限 16），姓名/角色/头像齐全
     assert len(detail.facts.cast) == 9
     assert detail.facts.cast[0].name == "演员0"
@@ -312,6 +462,31 @@ async def test_movie_detail_fields() -> None:
     assert detail.facts.language == "英语"
     assert detail.facts.network is None
     assert len(detail.related) == 10  # 相似推荐截断到 10 部
+
+
+async def test_movie_detail_loads_and_orders_full_collection() -> None:
+    detail_response = {
+        **_MOVIE_DETAIL,
+        "belongs_to_collection": {"id": 2344, "name": "矩阵系列"},
+    }
+    svc = _service(
+        {
+            "movie/603": detail_response,
+            "collection/2344": {
+                "id": 2344,
+                "name": "黑客帝国系列",
+                "parts": [
+                    _movie(605, release_date="2003-11-05"),
+                    _movie(603, release_date="1999-03-30"),
+                    _movie(604, release_date="2003-05-15"),
+                ],
+            },
+        }
+    )
+    detail = await svc.media_detail(MediaKind.MOVIE, 603)
+    assert detail.collection is not None
+    assert detail.collection.name == "黑客帝国系列"
+    assert [card.id for card in detail.collection.items] == ["603", "604", "605"]
 
 
 async def test_detail_images_mapping() -> None:
@@ -348,7 +523,9 @@ async def test_tv_detail_fields() -> None:
         "number_of_seasons": 3,
         "original_language": "ja",
         "origin_country": ["JP"],
-        "created_by": [{"name": "主创A"}],
+        "created_by": [
+            {"id": 42, "name": "主创A", "profile_path": "/creator.jpg"}
+        ],
         "networks": [{"name": "TV Tokyo"}],
         "credits": {"cast": [{"name": "声优1"}]},
         "recommendations": {"results": []},
@@ -359,6 +536,10 @@ async def test_tv_detail_fields() -> None:
     assert detail.card.extent == "3 季"
     assert detail.card.year == 2024
     assert detail.facts.directors == ["主创A"]
+    assert detail.facts.director_credits[0].avatar_url == (
+        f"{_IMAGE_BASE}/w185/creator.jpg"
+    )
+    assert detail.facts.director_credits[0].tmdb_person_id == 42
     assert detail.facts.country == "日本"
     assert detail.facts.language == "日语"
     assert detail.facts.network == "TV Tokyo"

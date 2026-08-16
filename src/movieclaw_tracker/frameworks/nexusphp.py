@@ -235,6 +235,7 @@ class NexusPHPSite(BaseSite):
                         deadline = datetime.strptime(
                             match.group(0), sel.torrent_promo_deadline_fmt
                         )
+                        deadline = self._to_utc(deadline)
                     except ValueError:
                         logger.debug(
                             "促销截止时间解析失败: raw=%r fmt=%s",
@@ -264,10 +265,12 @@ class NexusPHPSite(BaseSite):
 
         raw = raw.strip()
         try:
-            return datetime.strptime(raw, sel.torrent_time_fmt)
+            parsed = datetime.strptime(raw, sel.torrent_time_fmt)
         except ValueError:
             logger.debug("发布时间解析失败: raw=%r fmt=%s", raw, sel.torrent_time_fmt)
             return None
+
+        return self._to_utc(parsed)
 
     def _parse_torrent_rows(self, doc: Selector) -> list[TorrentListItem]:
         rows = doc.css(self.selectors.torrent_row_css)
@@ -509,4 +512,7 @@ class NexusPHPSite(BaseSite):
         try:
             return float(cleaned)
         except ValueError:
-            return None
+            # 数值可能被说明文字或符号包裹（如魔力值 "]:1651637.4["），
+            # 退回提取首个数字再解析。
+            match = re.search(r"-?\d+(?:\.\d+)?", cleaned)
+            return float(match.group()) if match else None

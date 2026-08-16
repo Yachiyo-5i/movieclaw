@@ -22,17 +22,19 @@ import { MediaRow } from "@/components/media-row";
 import { PosterImage } from "@/components/poster-image";
 import { SubscribeDialog, type SubscribeTarget } from "@/components/subscribe-dialog";
 import {
-  fetchDoubanMediaDetail,
-  fetchMediaDetail,
+  fetchDiscoveredTitleDetails,
+  titleRef,
   type MediaDetailData,
   type MediaImage,
 } from "@/lib/api/discover";
 import { useSubscribeEntry } from "@/components/subscribe-entry";
+import { useBackNavigation } from "@/lib/back-navigation";
 import { useBackdrop } from "@/lib/backdrop";
 import { buildDiscoveryReturnPath } from "@/lib/discovery-return-path";
 import { useDoubanAppHref } from "@/lib/douban-app-link";
-import { getMediaOrigin, getMediaSeed, useMediaDetail } from "@/lib/media-detail";
+import { getMediaSeed } from "@/lib/media-detail";
 import { usePageTitle } from "@/lib/use-page-title";
+import { usePermissions } from "@/lib/permissions";
 import type { MediaSource, MediaType } from "@/lib/media-types";
 import {
   subscriptionProgressNote,
@@ -49,24 +51,21 @@ import {
  * 片源规格与文件区。
  *
  * 页面纵向结构：
- *   1. 沉浸背景 —— 进入本页时把全站背景临时换成该片剧照（setOverrideBackdrop），
- *      页面本身不再画 Hero 卡片：大图直出、零边界。顶栏首屏只有一颗返回键浮在
- *      剧照上。没有横幅剧照的条目退回海报（背景层自己会铺满并模糊）。
- *      豆瓣来源例外：图源只有小尺寸海报，铺满是糊图，索性保留用户配置的背景。
- *   2. 氛围留白 + 渐变内容层 —— 留一段什么都不放的高度让剧照呼吸，其下从全透明
- *      渐入页面底色，与背景之间没有接缝。
- *   3. 头部信息区 —— 海报 + 标题 / 元信息 / 外部词条链接 / 订阅操作，
+ *   1. 局部 Hero —— 剧照只铺顶部有限高度，cover 等比裁切，不再用全站背景拉满页面；
+ *      顶栏首屏只有一颗返回键浮在剧照上，没有横幅剧照时退回海报作氛围图。
+ *   2. 氛围留白 + 渐变内容层 —— 渐变从标题上方开始压暗，并在基础信息之后落成纯黑。
+ *   3. 头部信息区 —— 标题 / 核心元信息 / 地区、语言与类型 / 上映日期 / 订阅操作，
  *      已订阅的影片额外显示订阅状态与追更进度。
- *   4. 剧情简介。
- *   5. 演职员 —— 带头像的横滚条（与条目详情页同一套版式），数据来自 TMDB
- *      credits / 豆瓣 actors，含角色名。
- *   6. 词条信息玻璃卡（上映 / 地区 / 语言 / 平台 / 别名）——「主演」已经由
- *      演职员条完整呈现，不在这里重复成一行文字。
- *   7. 剧照与海报 —— Apple TV+ 式横滚图片条，胶囊标签切换类型，点图开灯箱。
+ *   4. 剧情简介 —— 四行折叠，只有真实溢出才显示展开入口。
+ *   5. 演职员 —— 导演 / 主创与演员合并为同一条人物横滚条。
+ *   6. 剧照与海报 —— Apple TV+ 式横滚图片条，胶囊标签切换类型，点图开灯箱。
+ *   7. 系列电影 —— 展示完整系列。
  *   8. 相似推荐 —— 复用 MediaRow，点击可继续跳详情。
+ *   9. 相关链接 —— 与媒体库详情一致，外部词条统一弱化到底部。
  *
  * 数据分两段呈现：点卡片时已有的列表字段（标题/海报/简介）立即渲染，
- * 词条信息与相似推荐从 /discover/{type}/{id} 异步补齐（回填片长/季数）。
+ * 地区、语言、上映日期、演职员、系列电影与相似推荐从稳定 titleRef 对应的详情接口
+ * 异步补齐（同时回填片长/季数）。
  */
 export function MediaDetailView({
   type,
@@ -77,171 +76,145 @@ export function MediaDetailView({
   id: string;
   source?: MediaSource;
 }) {
-  const { close } = useMediaDetail();
+  const { canSearch } = usePermissions();
   const [detail, setDetail] = useState<MediaDetailData | null>(null);
   // 详情拉取失败状态：仅在无 seed（硬刷新/分享直达）时才需要整页兜底
   const [loadFailed, setLoadFailed] = useState(false);
   // 该条目的订阅：与海报卡片同一份全站订阅状态（subscribe-entry 收口），
   // 订阅/取消后 refresh 一次，详情页与所有卡片同步更新
-  const { subscriptionOf, refresh: refreshSubscriptions } = useSubscribeEntry();
+  const {
+    canSubscribe,
+    subscriptionOf,
+    refresh: refreshSubscriptions,
+  } = useSubscribeEntry();
   const sub = subscriptionOf({ id, source, type: type ?? "movie" });
   // 订阅弹层的打开参数；null = 关闭
   const [subscribeTarget, setSubscribeTarget] = useState<SubscribeTarget | null>(null);
   // 站内点卡片跳转时预存的列表字段（标题/海报/简介），用于首屏零白屏；
-  // 硬刷新 / 分享链接直达时为空，此时全靠 /discover/{type}/{id} 拉取。
+  // 硬刷新 / 分享链接直达时为空，此时全靠 Discover 详情接口拉取。
   const listItem = getMediaSeed(source, id);
+  const fallbackType = listItem?.type ?? type ?? "movie";
+  const navFallback = {
+    label: fallbackType === "tv" ? "发现剧集" : "发现电影",
+    href: `/discover/${fallbackType}` as Route,
+  };
+  const back = useBackNavigation(navFallback.href);
+  // 站内跳转优先沿用列表响应给出的稳定引用；硬刷新没有 seed 时，详情 URL
+  // 本身已携带等价的来源/类型/ID，再据此恢复引用。
+  const reference = listItem?.titleRef ?? titleRef(source, type ?? "movie", id);
 
   useEffect(() => {
     setDetail(null);
     setLoadFailed(false);
-    let cancelled = false;
-    const request =
-      source === "douban"
-        ? fetchDoubanMediaDetail(id)
-        : fetchMediaDetail(type ?? "movie", id);
-    request
+    const controller = new AbortController();
+    fetchDiscoveredTitleDetails(reference, {
+      signal: controller.signal,
+    })
       .then((data) => {
-        if (!cancelled) setDetail(data);
+        if (!controller.signal.aborted) setDetail(data);
       })
       .catch(() => {
         // 有 seed 时详情拉取失败不打断页面：列表字段仍可完整展示；
         // 无 seed（直达）时则没有任何可渲染内容，标记失败以显示兜底。
-        if (!cancelled) setLoadFailed(true);
+        if (!controller.signal.aborted) setLoadFailed(true);
       });
-    return () => {
-      cancelled = true;
-    };
-  }, [id, source, type]);
+    return () => controller.abort();
+  }, [reference]);
 
   // 详情接口回填过 extent（片长/季数）等字段，未返回前先用列表字段渲染
   const item = detail?.item ?? listItem;
   usePageTitle(item?.title);
 
-  // 沉浸背景：进入本页把全站背景临时换成该片剧照，离开即恢复用户配置的背景。
-  // 与媒体库条目详情页同一条链路（见 lib/backdrop.tsx 的 overrideUrl）。
-  // 没有横幅剧照时退回海报——背景层自己会铺满，竖图拉伸后本就是一层氛围色。
-  //
-  // 豆瓣来源不换背景：豆瓣只有小尺寸海报、没有高清横幅剧照，铺成全屏背景是一片
-  // 糊图，比用户自己配置的背景差得多。宁可保持原背景，也不要为了"沉浸"降质。
-  const { setOverrideBackdrop } = useBackdrop();
-  const immersiveUrl =
-    source === "douban" ? "" : item?.backdropUrl || item?.posterUrl || "";
-  useEffect(() => {
-    if (!immersiveUrl) return;
-    setOverrideBackdrop(immersiveUrl);
-    return () => setOverrideBackdrop(null);
-  }, [immersiveUrl, setOverrideBackdrop]);
-
   // 豆瓣外链的移动端 App 直跳：无悬停设备把「豆瓣」外链换成官方分发地址，
   // 装了豆瓣 App 直接拉起进词条页（桌面/未命中时为 null，回落网页地址）
   const doubanAppHref = useDoubanAppHref(source === "douban" ? id : null);
 
-  // 来路祖先（与影片标题无关）：加载/失败兜底与正常内容共用同一条回跳链路。
   // 兜底态也必须渲染 PageNav——它向外壳登记「本页自带顶栏」，否则移动端的
   // 全局顶栏（☰ + logo）会在数据到达前先显示、随后又消失，顶部闪一下；
   // 顺带让用户在转圈期间就有返回键可点。
-  const ancestors = getMediaOrigin(source, id) ?? [
-    (item?.type ?? type ?? "movie") === "movie"
-      ? { label: "发现电影", href: "/discover/movie" }
-      : { label: "发现剧集", href: "/discover/tv" },
-  ];
-
   // 无 seed 且详情尚未到达：直达链接的加载态（或失败兜底）。
   if (!item) {
     return (
       <div className="flex h-full flex-col">
-        {/* 当前页标题未知，末项留空——只为立起返回键并认领顶栏 */}
-        <PageNav items={[...ancestors, { label: "" }]} />
-        <DetailFallback failed={loadFailed} onBack={close} />
+        {/* 当前页标题未知，留空——只为立起返回键并认领顶栏 */}
+        <PageNav title="" fallback={navFallback} />
+        <DetailFallback failed={loadFailed} onBack={back} />
       </div>
     );
   }
 
   const info = detail?.info;
+  const itemBackdropUrl = item.backdropUrl || item.posterUrl;
+  const collection = detail?.collection;
   const related = detail?.related ?? [];
   const libraryLinks = detail?.libraryLinks ?? [];
   // 发现详情路由是媒体库页可安全返回的唯一来源；不从标题或媒体库数据反推条目。
   const libraryReturnTo = buildDiscoveryReturnPath(source, type ?? item.type, id);
 
   const isMovie = item.type === "movie";
-  // 词条信息卡里是否还剩下至少一格（导演已上提到元信息行、主演已交给演职员条）
-  const hasFacts = Boolean(
-    info &&
-      (info.released ||
-        info.network ||
-        info.country ||
-        info.language ||
-        item.extent ||
-        info.aliases.length > 0 ||
-        item.badges.length > 0),
-  );
+  const directorCast =
+    info?.directorCredits.length
+      ? info.directorCredits.map((director) => ({
+          ...director,
+          credit: isMovie ? "导演" : "主创",
+        }))
+      : [...new Set(info?.directors ?? [])].map((name) => ({
+          name,
+          credit: isMovie ? "导演" : "主创",
+        }));
+  const people = info ? [...directorCast, ...info.cast] : [];
 
-  /** 打开订阅弹层：TMDB 入口直接带 tmdb_id；豆瓣入口交给后端收敛。 */
+  /** 打开订阅弹层：稳定引用原样交给订阅 API，页面不再拆解来源与外部 ID。 */
   const openSubscribe = () =>
     setSubscribeTarget({
+      titleRef: reference,
       kind: item.type,
-      source,
-      tmdbId: source === "tmdb" ? Number(id) : undefined,
-      doubanId: source === "douban" ? id : undefined,
       title: item.title,
       year: item.year || undefined,
     });
 
-  // 来路：站内点进来按来的列表页作返回目标；直达/刷新按影片类型兜底
-  const trail = [...ancestors, { label: item.title }];
-
   return (
-    // rounded-2xl + overflow 裁切：内容渐变到底部是近实色的深色板，方角会与
+    // rounded-2xl + overflow 裁切：顶部剧照渐变到纯黑内容板，方角会与
     // 全站「浮起圆角卡片」的形状语言冲突——按侧栏同规格圆角收尾。
     // max-md:rounded-none：圆角只在桌面成立（外壳 p-3.5 的留白托着卡片）；
     // 窄屏通栏满屏，圆角会直接压在屏幕边上，把吸顶顶栏裁成一块贴在屏幕顶上的
     // 圆角色块——与 library-item-detail-view 同一处理。
-    <div className="scroll-thin scroll-safe h-full overflow-y-auto rounded-2xl max-md:rounded-none">
-      {/* min-h-full + flex 纵向：内容不足一屏时（简介/演职员/剧照都缺的小众条目）
-          内容层仍要撑满剩余高度。否则渐变板只到内容底部就断了，下面直接露出
-          沉浸背景，板子底边成了一道硬边界——正是这套「无缝渐入」要避免的东西。
-          PageNav 仍在滚动容器内（sticky 参照的是最近滚动祖先，中间这层普通 div
-          不影响），其活动范围由这层的高度决定，覆盖整个可滚动区间。 */}
-      <div className="flex min-h-full flex-col">
-      {/* —— 1. 顶栏：不再有任何 Hero 卡片图层——全站背景此刻就是本片剧照
-          （沉浸覆盖 + 本页豁免全局蒙版，见 app-shell 的 isHome），大图直出、
-          零边界。首屏只有一颗圆形返回键浮在剧照上 —— */}
-      <PageNav items={trail} />
+    <div className="scroll-thin scroll-safe relative isolate h-full overflow-y-auto rounded-2xl bg-black max-md:rounded-none">
+      {/* 背景只属于顶部 Hero：有限高度、随页面滚走；cover 始终等比例缩放，
+          只裁切超出的边缘，不改变图片宽高比。图片自身先在较长区间内淡出到
+          完全透明，真正的容器底边因此只剩下同色黑底，不会形成一条切边。 */}
+      {itemBackdropUrl && (
+        <div
+          aria-hidden="true"
+          className="pointer-events-none absolute inset-x-0 top-0 z-0 h-[calc(30vh+360px)] min-h-[540px] bg-cover bg-center bg-no-repeat max-md:h-[calc(22vh+340px)] max-md:min-h-[460px]"
+          style={{
+            backgroundImage: `url(${JSON.stringify(itemBackdropUrl)})`,
+            WebkitMaskImage:
+              "linear-gradient(to bottom,#000 0%,#000 50%,rgba(0,0,0,.92) 60%,rgba(0,0,0,.65) 72%,rgba(0,0,0,.3) 84%,rgba(0,0,0,.08) 93%,transparent 98%,transparent 100%)",
+            maskImage:
+              "linear-gradient(to bottom,#000 0%,#000 50%,rgba(0,0,0,.92) 60%,rgba(0,0,0,.65) 72%,rgba(0,0,0,.3) 84%,rgba(0,0,0,.08) 93%,transparent 98%,transparent 100%)",
+          }}
+        />
+      )}
 
-      {/* 氛围留白：这一段什么都不放，让剧照完整呼吸。shrink-0 是必须的——
-          它是 flex 子项，不加会在内容长的时候被压扁 */}
-      <div className="h-[30vh] min-h-[180px] shrink-0 max-md:h-[22vh] max-md:min-h-[120px]" />
+      {/* 顶栏首屏只有返回键浮在局部剧照上。 */}
+      <PageNav title={item.title} fallback={navFallback} />
 
-      {/* —— 2. 内容层：从全透明渐入页面底色，与背景之间没有任何接缝 —— */}
-      <div className="flex-1 bg-[linear-gradient(180deg,rgba(7,9,14,0)_0,rgba(7,9,14,0.66)_130px,rgba(7,9,14,0.88)_360px,rgba(7,9,14,0.93)_100%)] pb-12">
+      {/* 氛围留白：这一段什么都不放，让剧照完整呼吸。 */}
+      <div className="h-[30vh] min-h-[180px] max-md:h-[22vh] max-md:min-h-[120px]" />
+
+      {/* 内容遮罩与图片透明衰减交叠：用更多低跨度色阶缓慢落黑，避免在某个
+          固定高度突然结束渐变；基础信息附近已经接近纯黑，下面保持全黑。 */}
+      <div className="relative z-10 -mt-28 bg-[linear-gradient(180deg,rgba(0,0,0,0)_0,rgba(0,0,0,0.16)_42px,rgba(0,0,0,0.34)_78px,rgba(0,0,0,0.55)_120px,rgba(0,0,0,0.73)_165px,rgba(0,0,0,0.87)_210px,rgba(0,0,0,0.96)_255px,#000_315px,#000_100%)] pb-12 pt-28">
       {/* —— 3. 头部信息区 —— */}
-      <div className="relative z-10 flex items-end gap-7 px-12 pt-6 max-md:gap-4 max-md:px-4 max-md:pt-3">
-        <div className="w-[186px] shrink-0 overflow-hidden rounded-xl bg-[#141824] shadow-[0_26px_60px_rgba(0,0,0,0.6)] ring-1 ring-white/15 max-md:w-[104px]">
-          <PosterImage
-            src={item.posterUrl}
-            alt={`${item.title} 海报`}
-            className="aspect-[2/3] w-full object-cover"
-          />
-        </div>
-
-        <div className="min-w-0 flex-1 pb-1">
-          <p className="text-caption font-semibold uppercase tracking-[0.22em] text-[var(--accent-2)]">
-            {source === "douban" ? "豆瓣" : "TMDB"} · {isMovie ? "电影" : "剧集"}
-            {item.genres.length > 0 ? ` · ${item.genres.join(" / ")}` : ""}
-          </p>
-          <h1 className="text-on-image mt-2 text-[38px] font-bold leading-[1.1] tracking-[-0.02em] text-white max-md:mt-1 max-md:text-[21px]">
+      <div className="relative z-10 px-12 pt-6 max-md:px-4 max-md:pt-3">
+        <div className="min-w-0 max-w-5xl pb-1">
+          <h1 className="text-on-image text-[42px] font-bold leading-[1.1] tracking-[-0.02em] text-white max-md:text-[28px]">
             {item.title}
           </h1>
-          {/* 原名：与中文标题相同就不渲染——国产片在 TMDB 的 original_title
-              往往就是中文名本身，照原样渲染会在标题下面重复一行 */}
-          {item.originalTitle && item.originalTitle !== item.title && (
-            <p className="text-on-image mt-1.5 truncate text-body text-white/55 max-md:mt-0.5 max-md:text-sub">
-              {item.originalTitle}
-            </p>
-          )}
 
-          {/* 元信息行：评分 / 年份 / 规模 / 质量徽章 */}
-          <div className="tnum mt-3.5 flex flex-wrap items-center gap-x-3.5 gap-y-2 text-ui text-white/80 max-md:mt-2 max-md:gap-x-2.5 max-md:gap-y-1 max-md:text-sub">
+          {/* 元信息行与媒体库详情保持同一层级：评分 / 年份 / 片长或季数 / 质量。 */}
+          <div className="tnum mt-3.5 flex flex-wrap items-center gap-x-3 gap-y-2 text-ui text-white/80 max-md:mt-2 max-md:gap-x-2 max-md:text-sub">
             {/* 评分 0 = 数据源暂无评分（新片/小众条目），不能照原样渲染成「0.0」
                 ——那读起来是「烂到 0 分」。海报卡片与条目详情页都是这个口径 */}
             {item.rating > 0 && (
@@ -250,40 +223,51 @@ export function MediaDetailView({
                 <span className="text-title-sm font-bold text-white">{item.rating.toFixed(1)}</span>
               </span>
             )}
-            {!!item.year && <span>{item.year}</span>}
-            {item.extent && <span>{item.extent}</span>}
-            {info && info.directors.length > 0 && (
-              <span className="text-white/65">
-                {isMovie ? "导演" : "主创"} {info.directors.join(" / ")}
+            {!!item.year && (
+              <span className="flex items-center gap-3 max-md:gap-2">
+                {item.rating > 0 && <span aria-hidden="true">·</span>}
+                <span>{item.year}</span>
+              </span>
+            )}
+            {item.extent && (
+              <span className="flex items-center gap-3 max-md:gap-2">
+                {(item.rating > 0 || !!item.year) && <span aria-hidden="true">·</span>}
+                <span>{item.extent}</span>
               </span>
             )}
             {item.badges.length > 0 && (
-              <span className="flex gap-1.5">
-                {item.badges.map((b) => (
-                  <span
-                    key={b}
-                    className="rounded border border-white/25 px-1.5 py-px text-micro font-semibold tracking-wide text-white/85"
-                  >
-                    {b}
-                  </span>
-                ))}
+              <span className="flex items-center gap-3 max-md:gap-2">
+                {(item.rating > 0 || !!item.year || !!item.extent) && (
+                  <span aria-hidden="true">·</span>
+                )}
+                <span>{item.badges.join(" / ")}</span>
               </span>
             )}
           </div>
-
-          {/* 外部信息源：本条目在数据源站点上的词条地址，用于核对信息或看更多。
-              与条目详情页同一处理——压到元信息行下方的小字，不与主操作争视觉权重 */}
-          <div className="mt-3 flex flex-wrap items-center gap-x-3.5 gap-y-1">
-            {source === "tmdb" && (
-              <SourceLink
-                href={`https://www.themoviedb.org/${item.type}/${item.id}`}
-                label="TMDB"
-              />
-            )}
-            {info?.sourceUrl && (
-              <SourceLink href={doubanAppHref ?? info.sourceUrl} label="豆瓣" />
-            )}
-          </div>
+          {(info?.country || info?.language || item.genres.length > 0) && (
+            <p className="text-on-image mt-3 flex flex-wrap items-center gap-x-3 gap-y-1.5 text-ui leading-6 text-white/72 max-md:mt-2 max-md:text-sub">
+              {info && (info.country || info.language) && (
+                <span className="whitespace-nowrap text-white/65">
+                  {[info.country, info.language].filter(Boolean).join(" · ")}
+                </span>
+              )}
+              {item.genres.length > 0 && (
+                <span className="flex min-w-0 items-start gap-3">
+                  {info && (info.country || info.language) && (
+                    <span aria-hidden="true" className="shrink-0 text-white/25">
+                      ｜
+                    </span>
+                  )}
+                  <span>{item.genres.join(" · ")}</span>
+                </span>
+              )}
+            </p>
+          )}
+          {info?.released && (
+            <p className="tnum text-on-image mt-1.5 text-sub leading-6 text-white/55">
+              {isMovie ? "上映日期" : "首播日期"} · {info.released}
+            </p>
+          )}
 
           {/* 在库是详情状态，不与外部词条链接混在一起；每个链接保持后端给出的库顺序。 */}
           {libraryLinks.length > 0 && (
@@ -308,7 +292,7 @@ export function MediaDetailView({
 
           {/* 操作区：已订阅的影片主按钮变为状态展示（点击进入管理弹层可取消订阅） */}
           <div className="mt-5 flex flex-wrap items-center gap-3 max-md:mt-3.5 max-md:gap-2">
-            {sub ? (
+            {canSubscribe && (sub ? (
               <button
                 type="button"
                 onClick={openSubscribe}
@@ -329,15 +313,15 @@ export function MediaDetailView({
                 <BellIcon className="size-4" />
                 订阅追踪
               </button>
-            )}
+            ))}
             {/* 搜索资源：不订阅、只想手动找种子下一次的直达口（此前只能回 ⌘K 重打片名） */}
-            <Link
+            {canSearch && <Link
               href={`/search?q=${encodeURIComponent(item.title)}` as Route}
               className="btn-glass flex h-10 items-center gap-2 bg-white/10 px-5 text-ui font-medium backdrop-blur-md transition hover:bg-white/15"
             >
               <SearchIcon className="size-4" />
               搜索资源
-            </Link>
+            </Link>}
             {sub && (
               <span className="text-on-image flex items-center gap-1.5 text-sub text-[var(--text-muted)]">
                 <span
@@ -351,60 +335,29 @@ export function MediaDetailView({
         </div>
       </div>
 
-      {/* 订阅弹层：prepare → 季选择/追新/规则组 → 创建；已订阅时为管理态 */}
+      {/* 订阅弹层：prepare → 季选择/自动续订/规则组 → 创建；已订阅时为管理态 */}
       <SubscribeDialog
         target={subscribeTarget}
         onClose={() => setSubscribeTarget(null)}
         onChanged={refreshSubscriptions}
       />
 
-      {/* —— 4~6. 剧情简介 / 演职员 / 词条信息 —— */}
-      <div className="mt-9 space-y-8 px-12 max-md:mt-6 max-md:space-y-6 max-md:px-4">
-        {item.overview && (
-          <section>
-            <h2 className="text-on-image mb-3 text-body-lg font-semibold tracking-[-0.01em] text-[var(--text)]">
-              剧情简介
-            </h2>
-            <p className="text-on-image max-w-3xl text-body leading-7 text-white/78">
-              {item.overview}
-            </p>
-          </section>
-        )}
+      {/* 简介承接标题与基础信息；四行确实溢出时才提供展开入口。 */}
+      {item.overview && (
+        <div className="mt-4 px-12 max-md:px-4">
+          <ExpandablePlot text={item.overview} />
+        </div>
+      )}
 
-        {/* 演职员：与条目详情页同一套横滚版式，头像来自 TMDB credits / 豆瓣 actors */}
-        {info && <CastRow cast={info.cast} />}
+      {/* —— 5. 演职员 —— */}
+      {people.length > 0 && (
+        <div className="mt-9 px-12 max-md:mt-6 max-md:px-4">
+          {/* 导演 / 主创放在演员之前，共用同一条人物横滚；演员头像仍来自数据源 credits。 */}
+          <CastRow cast={people} personHrefPrefix="/discover/people" />
+        </div>
+      )}
 
-        {/* 词条信息：一格都没有时整段不渲染。把导演与主演移走之后，小众条目
-            很容易落到「每一格都是空」的状态，那时候留下的是一个空玻璃盒子 */}
-        {hasFacts && info && (
-          <section>
-            <h2 className="text-on-image mb-3 text-body-lg font-semibold tracking-[-0.01em] text-[var(--text)]">
-              词条信息
-            </h2>
-            <div className="rounded-2xl border border-white/[0.07] bg-[rgba(14,16,22,0.45)] p-6 backdrop-blur-xl max-md:p-4">
-              {/* 「导演」已经在元信息行、「主演」已经由上面的演职员条完整呈现，
-                  这里不再重复成一行文字——词条信息只留它们之外的档案字段 */}
-              <dl className="grid gap-x-10 gap-y-5 sm:grid-cols-2 xl:grid-cols-3">
-                {info.released && (
-                  <Fact label={isMovie ? "上映日期" : "首播日期"} value={info.released} />
-                )}
-                {info.network && <Fact label="播出平台" value={info.network} />}
-                {info.country && <Fact label="制片地区" value={info.country} />}
-                {info.language && <Fact label="语言" value={info.language} />}
-                {item.extent && <Fact label={isMovie ? "片长" : "规模"} value={item.extent} />}
-                {info.aliases.length > 0 && (
-                  <Fact label="别名" value={info.aliases.join(" / ")} />
-                )}
-                {item.badges.length > 0 && (
-                  <Fact label="资源规格" value={item.badges.join(" · ")} />
-                )}
-              </dl>
-            </div>
-          </section>
-        )}
-      </div>
-
-      {/* —— 7. 剧照与海报 —— */}
+      {/* —— 6. 剧照与海报 —— */}
       {detail && (detail.backdrops.length > 0 || detail.posters.length > 0) && (
         <div className="mt-9 px-12 max-md:mt-6 max-md:px-4">
           <PhotoWall
@@ -415,26 +368,116 @@ export function MediaDetailView({
         </div>
       )}
 
+      {/* —— 7. 系列电影：使用 TMDB collection 的完整作品顺序，不混入相似推荐。 —— */}
+      {collection && collection.items.length > 1 && (
+        <div className="mt-9">
+          <MediaRow
+            row={{
+              id: `collection-${collection.id}`,
+              title: collection.name,
+              items: collection.items,
+            }}
+          />
+        </div>
+      )}
+
       {/* —— 8. 相似推荐 —— */}
       {related.length > 0 && (
         <div className="mt-9">
           <MediaRow row={{ id: `related-${item.id}`, title: "相似推荐", items: related }} />
         </div>
       )}
-      </div>
+
+      {/* —— 9. 相关链接：与媒体库详情一致，固定在正文所有内容之后。 —— */}
+      {(source === "tmdb" || info?.sourceUrl) && (
+        <nav
+          aria-label="外部词条"
+          className="mx-12 mt-9 flex flex-wrap items-center gap-x-4 gap-y-2 border-t border-white/[0.04] pt-4 text-caption max-md:mx-4"
+        >
+          <span className="text-[var(--text-faint)]">相关链接</span>
+          {source === "tmdb" && (
+            <SourceLink
+              href={`https://www.themoviedb.org/${item.type}/${item.id}`}
+              label="TMDB"
+            />
+          )}
+          {info?.sourceUrl && (
+            <SourceLink href={doubanAppHref ?? info.sourceUrl} label="豆瓣" />
+          )}
+        </nav>
+      )}
       </div>
     </div>
   );
 }
 
-/** 外部信息源链接：弱化的小字，与条目详情页同款 */
+/**
+ * 与媒体库详情一致的四行简介。只有真实发生溢出时才显示展开入口；详情数据
+ * 异步回填或页内切换作品时恢复折叠并重新测量，避免沿用上一部影片的状态。
+ */
+function ExpandablePlot({ text }: { text: string }) {
+  const paragraphRef = useRef<HTMLParagraphElement>(null);
+  const [expanded, setExpanded] = useState(false);
+  const [hasOverflow, setHasOverflow] = useState(false);
+
+  useEffect(() => {
+    setExpanded(false);
+    setHasOverflow(false);
+  }, [text]);
+
+  useEffect(() => {
+    if (expanded) return;
+    const paragraph = paragraphRef.current;
+    if (!paragraph) return;
+
+    const measure = () => {
+      setHasOverflow(paragraph.scrollHeight > paragraph.clientHeight + 1);
+    };
+    const frame = window.requestAnimationFrame(measure);
+    const observer =
+      typeof ResizeObserver === "undefined" ? null : new ResizeObserver(measure);
+    observer?.observe(paragraph);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      observer?.disconnect();
+    };
+  }, [expanded, text]);
+
+  return (
+    <div className="max-w-3xl">
+      <p
+        ref={paragraphRef}
+        className={`text-on-image text-body-lg leading-7 text-white/78 ${
+          expanded ? "" : "line-clamp-4"
+        }`}
+      >
+        {text}
+      </p>
+      {(hasOverflow || expanded) && (
+        <button
+          type="button"
+          aria-expanded={expanded}
+          onClick={() => setExpanded((value) => !value)}
+          className="mt-1.5 inline-flex items-center gap-1 text-sub font-medium text-white/55 transition hover:text-white/85 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent-2)]"
+        >
+          {expanded ? "收起" : "展开全文"}
+          <ChevronRightIcon
+            className={`size-3.5 transition-transform ${expanded ? "-rotate-90" : "rotate-90"}`}
+          />
+        </button>
+      )}
+    </div>
+  );
+}
+
+/** 外部信息源链接：固定在正文底部，与媒体库详情使用同一弱化样式。 */
 function SourceLink({ href, label }: { href: string; label: string }) {
   return (
     <a
       href={href}
       target="_blank"
       rel="noreferrer"
-      className="text-sub text-[var(--text-faint)] underline-offset-4 transition-colors hover:text-[var(--text)] hover:underline"
+      className="text-caption text-[var(--text-muted)] underline decoration-white/20 underline-offset-2 transition hover:text-white/80"
     >
       {label} ↗
     </a>
@@ -666,16 +709,6 @@ function DetailFallback({ failed, onBack }: { failed: boolean; onBack: () => voi
           正在加载详情…
         </div>
       )}
-    </div>
-  );
-}
-
-/** 词条信息的单个条目：弱化的标签 + 常规值 */
-function Fact({ label, value }: { label: string; value: string }) {
-  return (
-    <div>
-      <dt className="text-sub text-[var(--text-faint)]">{label}</dt>
-      <dd className="mt-1 text-ui leading-6 text-[var(--text)]">{value}</dd>
     </div>
   );
 }

@@ -5,6 +5,13 @@ import { LibraryItemDetailView } from "@/components/library-item-detail-view";
 /** 兜底标题；影片名要等接口返回，就绪后由视图内的 usePageTitle 覆盖。 */
 export const metadata: Metadata = { title: "影片详情" };
 
+/** 只接受单个非负整数查询参数；重复、负数和非数字一律按缺失处理。 */
+function queryNumber(value: string | string[] | undefined): number | undefined {
+  if (typeof value !== "string" || !/^\d+$/.test(value)) return undefined;
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) ? parsed : undefined;
+}
+
 /**
  * 媒体库条目详情页（/library/[id]/item/[mediaItemId]）：
  * 展示"我拥有的这份拷贝"——本地刮削元数据 + 文件本体的真实介质规格，
@@ -15,7 +22,12 @@ export default async function LibraryItemDetailPage({
   searchParams,
 }: {
   params: Promise<{ id: string; mediaItemId: string }>;
-  searchParams: Promise<{ returnTo?: string | string[] }>;
+  searchParams: Promise<{
+    returnTo?: string | string[];
+    from?: string | string[];
+    season?: string | string[];
+    episode?: string | string[];
+  }>;
 }) {
   const { id, mediaItemId } = await params;
   const query = await searchParams;
@@ -27,6 +39,9 @@ export default async function LibraryItemDetailPage({
         libraryId={Number(id)}
         mediaItemId={Number(mediaItemId)}
         returnTo={returnTo}
+        fromRecent={query.from === "recent"}
+        initialSeason={queryNumber(query.season)}
+        initialEpisode={queryNumber(query.episode)}
       />
     </div>
   );

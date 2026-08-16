@@ -1,7 +1,7 @@
 """SSE（Server-Sent Events）客户端（docs/design/cli.md §8.3）。
 
-一次实现、两处复用：搜索流（/search/stream）与 Agent 运行流
-（/agent/runs/{id}/stream）。与前端刻意不用 EventSource 的理由相同：
+一次实现、两处复用：种子搜索流（/search/torrents/stream）与 Agent 运行流
+（/sessions/{id}/events）。与前端刻意不用 EventSource 的理由相同：
 搜索流断线不应自动重放整次搜索，Agent 流要用 Last-Event-ID 精确续传。
 
 帧协议：`event:` / `data:` / `id:` 行组成一帧，空行分帧；`:` 开头是

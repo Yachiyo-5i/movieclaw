@@ -19,6 +19,10 @@ span 字段语义（与标注规范 annotate.py 中的提示词保持一致）�
 - SEASON         季数表达（"S01"、"第三季"）
 - EPISODE        当前集号 / 集号区间（"E10"、"第50集"、"E01-E12"）——指这是第几集
 - EPISODE_TOTAL  总集数 / 完结合集表达（"全12集"、"12集全"、"全26话"）——指这是共 N 集的合集
+- SUBTITLE       字幕声明片段（"内封简繁英SUP特效字幕"、"无字幕"、"中字"）——
+                 含否定式与泛称；语义解析（语言/载体/否定裁决）由运行时微解析器做
+- AUDIO          音轨/配音语言声明（"国语"、"粤语音轨"、"国英双语"）——
+                 不含音频编码/声道（DDP/Atmos 走正则通道）与无语言的数量词（"双音轨"）
 
 EPISODE vs EPISODE_TOTAL、以及 MEDIA_TYPE 的判定都由模型完成（它擅长理解语义），
 不靠下游正则事后猜——这正是"让模型理解、代码只做机械转换"的分工体现。
@@ -27,7 +31,12 @@ EPISODE vs EPISODE_TOTAL、以及 MEDIA_TYPE 的判定都由模型完成（它�
 from __future__ import annotations
 
 # 实体字段，顺序即 label id 顺序（追加新字段务必放在末尾，保持旧 id 稳定）
-FIELDS: tuple[str, ...] = ("TITLE_ZH", "TITLE_EN", "YEAR", "SEASON", "EPISODE", "EPISODE_TOTAL")
+# SUBTITLE/AUDIO 为 v12 追加（字幕/音轨声明两轴），设计见
+# docs/design/subtitle-audio-ner.md
+FIELDS: tuple[str, ...] = (
+    "TITLE_ZH", "TITLE_EN", "YEAR", "SEASON", "EPISODE", "EPISODE_TOTAL",
+    "SUBTITLE", "AUDIO",
+)
 
 # span 的来源字段：0 段是英文种子名，1 段是中文副标题（与双段编码顺序一致）
 SOURCES: tuple[str, ...] = ("title", "subtitle")
@@ -67,12 +76,16 @@ ID2LABEL: dict[int, str] = {i: label for i, label in enumerate(LABELS)}
 # 约 10% 样本的副标题尾部；训练/推理都是动态 padding，加大上限对典型样本零成本。
 MAX_LENGTH = 256
 
-# 跨字段 span 冲突时的优先级：结构化字段 > 片名（数值小者优先保留）
+# 跨字段 span 冲突时的优先级：结构化字段 > 字幕/音轨声明 > 片名
+# （数值小者优先保留）。SUBTITLE/AUDIO 压过片名：与标签词冲突时片名本就该
+# 剥离标签（片名精修规则同向），delta 补标合并存量时也依赖这个次序。
 FIELD_PRIORITY: dict[str, int] = {
     "YEAR": 0,
     "SEASON": 1,
     "EPISODE": 2,
     "EPISODE_TOTAL": 3,
-    "TITLE_EN": 4,
-    "TITLE_ZH": 5,
+    "SUBTITLE": 4,
+    "AUDIO": 5,
+    "TITLE_EN": 6,
+    "TITLE_ZH": 7,
 }

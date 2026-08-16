@@ -6,10 +6,12 @@ import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import yaml
 
 from movieclaw_tracker.base import BaseSite
+from movieclaw_tracker.datetime_utils import DEFAULT_SITE_TIMEZONE
 from movieclaw_tracker.exceptions import SiteNotFoundError
 from movieclaw_tracker.models import TorrentCategory
 
@@ -53,6 +55,8 @@ class SiteConfig:
     # 该站点支持的授权类型（供上层"可选项"展示，用户从中选一种来配置）
     # 用字符串元组，取值为 cookie / apikey / credential
     supported_auth_types: tuple[str, ...] = ()
+    # 页面/API 的 naive 时间所属时区；当前全部内置站点默认使用中国标准时间。
+    timezone: str = DEFAULT_SITE_TIMEZONE
 
 
 # ---------------------------------------------------------------------------
@@ -145,11 +149,19 @@ def _parse_selectors(raw: dict[str, Any], selector_cls: type) -> Any:
     """
     defaults = selector_cls()
     overrides = raw.get("selectors", {})
-    for rule_key in ("promo_download_rules", "promo_upload_rules"):
+    for rule_key in (
+        "promo_download_rules",
+        "promo_upload_rules",
+        "login_extra_form_data",
+        "login_select_defaults",
+    ):
         if rule_key in overrides and isinstance(overrides[rule_key], dict):
             overrides[rule_key] = tuple(
-                (css, float(factor)) for css, factor in overrides[rule_key].items()
+                (key, str(value)) for key, value in overrides[rule_key].items()
             )
+    for rule_key in ("promo_download_rules", "promo_upload_rules"):
+        if rule_key in overrides and isinstance(overrides[rule_key], tuple):
+            overrides[rule_key] = tuple((css, float(factor)) for css, factor in overrides[rule_key])
     return dataclasses.replace(defaults, **overrides) if overrides else defaults
 
 
@@ -185,6 +197,9 @@ def _load_site_yaml(
         framework = raw.get("framework", "")
         category_map = _parse_category_map(raw)
         supported_auth_types = _parse_supported_auth_types(raw, framework)
+        timezone = str(raw.get("timezone", DEFAULT_SITE_TIMEZONE) or "")
+        # 启动时验证 IANA 时区，错误配置必须整站跳过，不能静默污染同步高水位。
+        ZoneInfo(timezone)
 
         # 确定站点类和选择器
         # 若同时指定了 custom_class 和 framework，则：
@@ -230,6 +245,7 @@ def _load_site_yaml(
             max_retries=raw.get("max_retries", 3),
             min_request_interval=raw.get("min_request_interval"),
             supported_auth_types=supported_auth_types,
+            timezone=timezone,
         )
     except Exception:
         logger.exception("站点配置文件 %s 解析失败（字段写法有误？），已跳过", yaml_file)

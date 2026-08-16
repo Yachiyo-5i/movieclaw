@@ -92,6 +92,7 @@ async def create_site(
         "base_url": config.base_url,
         "client": client,
         "auth_manager": auth_manager,
+        "timezone": config.timezone,
     }
 
     # 网页访问域名与请求域名不同的站点（如 M-Team），额外注入 web_base_url

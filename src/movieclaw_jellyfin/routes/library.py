@@ -6,12 +6,16 @@
 
 from __future__ import annotations
 
+import asyncio
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import JSONResponse
 from sqlmodel.ext.asyncio.session import AsyncSession
 
+from movieclaw_api.services.library.access import member_visible_ids
 from movieclaw_db.engine import get_database
 from movieclaw_db.models import Library
 from movieclaw_jellyfin.catalog import (
@@ -26,7 +30,6 @@ from movieclaw_jellyfin.catalog import (
     library_view_dto,
     list_libraries,
     load_bundles,
-    load_library_stats,
     movie_dto,
     movie_library_page,
     next_up_item_ids,
@@ -40,6 +43,7 @@ from movieclaw_jellyfin.ids import (
     EntityKind,
     decode_guid,
     is_empty_guid,
+    library_guid,
 )
 from movieclaw_jellyfin.routes.common import (
     dto_context,
@@ -49,9 +53,62 @@ from movieclaw_jellyfin.routes.common import (
     parse_pipe,
     query_result,
 )
-from movieclaw_jellyfin.security import require_device
+from movieclaw_jellyfin.security import RequestIdentity, require_device
 
 router = APIRouter(dependencies=[Depends(require_device)])
+
+
+async def _item_visible(session: AsyncSession, item_id: int, scope: ViewerScope) -> bool:
+    """条目对该观看者是否可见：在其可见库里有任一在位文件。
+
+    直接按条目 GUID 访问（/Items/{id}、Shows/*、ids= 查询）不经过库枚举，
+    必须单独判定——GUID 是可枚举的结构化编码，只挡浏览不挡直达等于没挡。
+    """
+    if scope.visible is None:
+        return True
+    from sqlalchemy import select as sa_select
+
+    from movieclaw_db.models import LibraryFile
+
+    row = (
+        await session.execute(
+            sa_select(LibraryFile.id)
+            .where(
+                LibraryFile.media_item_id == item_id,
+                LibraryFile.missing_since.is_(None),
+                LibraryFile.library_id.in_(scope.visible),
+            )
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    return row is not None
+
+
+@dataclass(frozen=True)
+class ViewerScope:
+    """一次请求的观看者范围：身份 + 可见库（None=不受限）。
+
+    多用户投影的两个自由度都在这里：``member_id`` 决定 UserData（进度/
+    已看/收藏）装谁的行，``visible`` 决定库/条目枚举的范围。
+    """
+
+    member_id: int
+    visible: set[int] | None
+
+    def library_hidden(self, library_id: int) -> bool:
+        return self.visible is not None and library_id not in self.visible
+
+
+async def viewer_scope(
+    identity: RequestIdentity = Depends(require_device),
+) -> ViewerScope:
+    """从设备凭据解析观看者范围（require_device 有依赖缓存，不重复查库）。"""
+    member_id = identity.device.member_id
+    if member_id == 0:
+        return ViewerScope(0, None)
+    async with get_database().session() as session:
+        visible = await member_visible_ids(session, member_id)
+    return ViewerScope(member_id, visible)
 
 # (type, bundle, season, episode)：查询管线里的一条候选
 Entry = tuple[str, ItemBundle, int, int]
@@ -97,16 +154,117 @@ async def _cover_tag(library_id: int) -> str | None:
 
 @router.get("/UserViews")
 @router.get("/Users/{user_id}/Views")
-async def user_views(user_id: str | None = None) -> JSONResponse:
+async def user_views(
+    user_id: str | None = None,
+    scope: ViewerScope = Depends(viewer_scope),
+) -> JSONResponse:
     ctx = await dto_context()
     async with get_database().session() as session:
-        libraries = await list_libraries(session)
-        stats = await load_library_stats(session)
+        libraries = await list_libraries(session, visible_ids=scope.visible)
     dtos = [
-        library_view_dto(ctx, lib, stats.get(lib.id), await _cover_tag(lib.id))
+        library_view_dto(ctx, lib, await _cover_tag(lib.id))
         for lib in libraries
     ]
     return JSONResponse(query_result(dtos, len(dtos)))
+
+
+@router.get("/UserViews/GroupingOptions")
+@router.get("/Users/{user_id}/GroupingOptions")
+async def user_views_grouping_options(
+    user_id: str | None = None,
+    scope: ViewerScope = Depends(viewer_scope),
+) -> JSONResponse:
+    """可分组视图清单（issue #124，Infuse 添加媒体库时请求）。
+
+    对齐 UserViewsController.GetGroupingOptions：movies/tvshows 库天然可
+    分组（IsEligibleForGrouping），映射可见库、按名称排序；legacy 路由
+    /Users/{userId}/GroupingOptions 一并注册。
+    """
+    async with get_database().session() as session:
+        libraries = await list_libraries(session, visible_ids=scope.visible)
+    return JSONResponse(
+        [
+            {"Name": lib.name, "Id": library_guid(lib.id)}
+            for lib in sorted(libraries, key=lambda lib: lib.name)
+        ]
+    )
+
+
+def _refresh_status(library_id: int) -> tuple[str, float | None]:
+    """把本库的扫描/元数据刷新任务线映射到 Jellyfin 的三态语义（LibraryManager.cs）。
+
+    真实现：有进度值 → Active，在队列里 → Queued，其余 → Idle；RefreshProgress
+    是 0~100 的百分数，非 Active 时为 null（省略输出）。我们两条任务线
+    （scan 扫描 + media_scrape 整库元数据刷新）任一在跑即 Active——分母未知的
+    遍历阶段报 0.0（客户端画不确定态转圈）；元数据刷新"已启动但状态尚未就绪"
+    的间隙映射为 Queued。
+    """
+    from movieclaw_api.services import media_scrape
+    from movieclaw_api.services.library.scan import scan_progress
+
+    for state in (
+        scan_progress(library_id),
+        media_scrape.library_refresh_state(library_id),
+    ):
+        if state is not None:
+            if state.total > 0:
+                return "Active", round(state.processed / state.total * 100, 1)
+            return "Active", 0.0
+    if media_scrape.is_library_refreshing(library_id):
+        return "Queued", None
+    return "Idle", None
+
+
+@router.get("/Library/VirtualFolders")
+async def library_virtual_folders(
+    scope: ViewerScope = Depends(viewer_scope),
+) -> JSONResponse:
+    """媒体库 → VirtualFolderInfo 映射（issue #124，Infuse 添加媒体库时请求）。
+
+    真 Jellyfin 此接口仅管理员可用（RequiresElevation）；这里放开给已认证
+    设备（Infuse 普通链路也会请求），但成员设备只见白名单库、服务器文件
+    系统路径只对主账号设备下发。LibraryOptions 按真实现的实体默认值给一份
+    静态子集——客户端只读，我们不开放库管理写端点。
+    """
+    async with get_database().session() as session:
+        libraries = await list_libraries(session, visible_ids=scope.visible)
+    infos = []
+    for lib in libraries:
+        roots = [str(p) for p in (lib.root_paths or [])] if scope.member_id == 0 else []
+        status, progress = _refresh_status(lib.id)
+        infos.append(
+            {
+                "Name": lib.name,
+                "Locations": roots,
+                "CollectionType": "movies" if lib.kind == "movie" else "tvshows",
+                "ItemId": library_guid(lib.id),
+                "RefreshStatus": status,
+                "LibraryOptions": {
+                    "Enabled": True,
+                    "EnablePhotos": False,
+                    "EnableRealtimeMonitor": True,
+                    "EnableChapterImageExtraction": False,
+                    "ExtractChapterImagesDuringLibraryScan": False,
+                    "EnableTrickplayImageExtraction": False,
+                    "ExtractTrickplayImagesDuringLibraryScan": False,
+                    "PathInfos": [{"Path": p} for p in roots],
+                    "SaveLocalMetadata": False,
+                    "EnableAutomaticSeriesGrouping": False,
+                    "EnableEmbeddedTitles": False,
+                    "EnableEmbeddedExtrasTitles": False,
+                    "EnableEmbeddedEpisodeInfos": False,
+                    "AutomaticRefreshIntervalDays": 0,
+                    "SeasonZeroDisplayName": "Specials",
+                    "DisabledLocalMetadataReaders": [],
+                    "DisabledSubtitleFetchers": [],
+                    "SubtitleFetcherOrder": [],
+                },
+            }
+        )
+        # 对齐真实现：RefreshProgress 仅 Active 时输出（可空 double 的 null 省略约定）
+        if progress is not None:
+            infos[-1]["RefreshProgress"] = progress
+    return JSONResponse(infos)
 
 
 # ---------------------------------------------------------------------------
@@ -277,7 +435,7 @@ def _entry_dto(ctx: DtoContext, entry: Entry, options: DtoOptions) -> dict[str, 
     return episode_dto(ctx, bundle, season, episode, options)
 
 
-async def _query_items(request: Request) -> JSONResponse:
+async def _query_items(request: Request, scope: ViewerScope) -> JSONResponse:
     q = request.query_params
     ctx = await dto_context()
     options = dto_options(
@@ -323,6 +481,13 @@ async def _query_items(request: Request) -> JSONResponse:
             and start_index >= 0
             and limit >= 0
         )
+        if (
+            parent_ref is not None
+            and parent_ref.kind == EntityKind.LIBRARY
+            # 库级可见性：白名单外与不存在同样 404（不泄露存在性）
+            and scope.library_hidden(parent_ref.entity_id)
+        ):
+            raise not_found()
         if can_page_movies and parent_ref is not None:
             library = await session.get(Library, parent_ref.entity_id)
             can_page_movies = library is not None and library.kind == "movie"
@@ -336,7 +501,9 @@ async def _query_items(request: Request) -> JSONResponse:
             bundles = await load_bundles(
                 session,
                 page_ids,
+                member_id=scope.member_id,
                 library_id=parent_ref.entity_id,
+                visible_library_ids=scope.visible,
                 dto_options=options,
             )
             page_entries = [
@@ -346,11 +513,12 @@ async def _query_items(request: Request) -> JSONResponse:
             ]
             simple_movie_page = True
         elif ids_raw:
-            entries = await _entries_for_ids(session, ids_raw, options=options)
+            entries = await _entries_for_ids(session, ids_raw, scope, options=options)
         else:
             entries = await _entries_for_parent(
                 session,
                 parent_raw,
+                scope,
                 include_types=include_types,
                 recursive=recursive,
                 has_search=bool(search_term),
@@ -358,12 +526,9 @@ async def _query_items(request: Request) -> JSONResponse:
             )
             if entries is None:
                 # 根级：返回视图列表
-                libraries = await list_libraries(session)
-                stats = await load_library_stats(session)
+                libraries = await list_libraries(session, visible_ids=scope.visible)
                 dtos = [
-                    library_view_dto(
-                        ctx, lib, stats.get(lib.id), await _cover_tag(lib.id)
-                    )
+                    library_view_dto(ctx, lib, await _cover_tag(lib.id))
                     for lib in libraries
                 ]
                 return JSONResponse(query_result(dtos, len(dtos)))
@@ -421,11 +586,19 @@ async def _query_items(request: Request) -> JSONResponse:
 
 
 async def _entries_for_ids(
-    session: AsyncSession, ids_raw: list[str], *, options: DtoOptions
+    session: AsyncSession, ids_raw: list[str], scope: ViewerScope, *, options: DtoOptions
 ) -> list[Entry]:
     refs = [r for r in (decode_guid(i) for i in ids_raw) if r is not None]
     scoped = {r.entity_id for r in refs if r.kind != EntityKind.LIBRARY}
-    bundles = await load_bundles(session, list(scoped), dto_options=options)
+    # 直达 id 也过可见性筛（与浏览口径一致，不给可枚举 GUID 留后门）
+    scoped = {i for i in scoped if await _item_visible(session, i, scope)}
+    bundles = await load_bundles(
+        session,
+        list(scoped),
+        member_id=scope.member_id,
+        visible_library_ids=scope.visible,
+        dto_options=options,
+    )
     entries: list[Entry] = []
     for ref in refs:
         bundle = bundles.get(ref.entity_id)
@@ -445,6 +618,7 @@ async def _entries_for_ids(
 async def _entries_for_parent(
     session: AsyncSession,
     parent_raw: str | None,
+    scope: ViewerScope,
     *,
     include_types: set[str],
     recursive: bool | None,
@@ -454,10 +628,16 @@ async def _entries_for_parent(
     """按 parentId 语义展开候选。返回 None 表示"根级 → 视图列表"。"""
     if not parent_raw or is_empty_guid(parent_raw):
         if has_search or include_types:
-            # 无 parent 的全局搜索/类型查询：跨全部库递归
+            # 无 parent 的全局搜索/类型查询：跨**可见**库递归
             types = include_types or {"Movie", "Series"}
-            ids = await item_ids_with_files(session)
-            bundles = await load_bundles(session, ids, dto_options=options)
+            ids = await item_ids_with_files(session, visible_library_ids=scope.visible)
+            bundles = await load_bundles(
+                session,
+                ids,
+                member_id=scope.member_id,
+                visible_library_ids=scope.visible,
+                dto_options=options,
+            )
             return _build_entries(bundles, types)
         return None
 
@@ -468,6 +648,8 @@ async def _entries_for_parent(
         return None  # 根文件夹 → 视图列表
 
     if ref.kind == EntityKind.LIBRARY:
+        if scope.library_hidden(ref.entity_id):
+            raise not_found()
         library = await session.get(Library, ref.entity_id)
         if library is None:
             raise not_found()
@@ -486,17 +668,38 @@ async def _entries_for_parent(
             types = (include_types & default_types) if include_types else default_types
         ids = await item_ids_with_files(session, library_id=ref.entity_id)
         bundles = await load_bundles(
-            session, ids, library_id=ref.entity_id, dto_options=options
+            session,
+            ids,
+            member_id=scope.member_id,
+            library_id=ref.entity_id,
+            visible_library_ids=scope.visible,
+            dto_options=options,
         )
         return _build_entries(bundles, types)
 
     if ref.kind == EntityKind.ITEM:
-        bundles = await load_bundles(session, [ref.entity_id], dto_options=options)
+        if not await _item_visible(session, ref.entity_id, scope):
+            raise not_found()
+        bundles = await load_bundles(
+            session,
+            [ref.entity_id],
+            member_id=scope.member_id,
+            visible_library_ids=scope.visible,
+            dto_options=options,
+        )
         types = include_types or {"Season"}
         return _build_entries(bundles, types)
 
     if ref.kind == EntityKind.SEASON:
-        bundles = await load_bundles(session, [ref.entity_id], dto_options=options)
+        if not await _item_visible(session, ref.entity_id, scope):
+            raise not_found()
+        bundles = await load_bundles(
+            session,
+            [ref.entity_id],
+            member_id=scope.member_id,
+            visible_library_ids=scope.visible,
+            dto_options=options,
+        )
         return _build_entries(bundles, {"Episode"}, season_scope=ref.season)
 
     raise not_found()
@@ -504,8 +707,12 @@ async def _entries_for_parent(
 
 @router.get("/Items")
 @router.get("/Users/{user_id}/Items")
-async def get_items(request: Request, user_id: str | None = None) -> JSONResponse:
-    return await _query_items(request)
+async def get_items(
+    request: Request,
+    user_id: str | None = None,
+    scope: ViewerScope = Depends(viewer_scope),
+) -> JSONResponse:
+    return await _query_items(request, scope)
 
 
 # ---------------------------------------------------------------------------
@@ -520,6 +727,7 @@ async def items_latest(
     user_id: str | None = None,
     limit: int = Query(default=20),
     groupItems: bool = Query(default=True),  # noqa: N803 —— 对齐协议参数名
+    scope: ViewerScope = Depends(viewer_scope),
 ) -> JSONResponse:
     q = request.query_params
     ctx = await dto_context()
@@ -538,11 +746,17 @@ async def items_latest(
     if is_played is None:
         is_played = False  # HidePlayedInLatest=True 的默认语义
 
+    if library_id is not None and scope.library_hidden(library_id):
+        raise not_found()
     async with get_database().session() as session:
         # 先读每个最新单元的 5 个标量列；只有通过 limit/groupItems 的最终
         # 条目才进入 load_bundles。这样 1200 部电影不会先水合整库 JSON。
         latest_units = await latest_unit_candidates(
-            session, library_id=library_id, is_played=is_played
+            session,
+            member_id=scope.member_id,
+            library_id=library_id,
+            visible_library_ids=scope.visible,
+            is_played=is_played,
         )
         selected_units: list[LatestUnitCandidate] = []
         grouped_series: dict[int, int] = {}
@@ -566,7 +780,9 @@ async def items_latest(
         bundles = await load_bundles(
             session,
             selected_ids,
+            member_id=scope.member_id,
             library_id=library_id,
+            visible_library_ids=scope.visible,
             dto_options=options,
         )
     dtos: list[dict[str, Any]] = []
@@ -600,7 +816,11 @@ async def items_latest(
 
 @router.get("/UserItems/Resume")
 @router.get("/Users/{user_id}/Items/Resume")
-async def items_resume(request: Request, user_id: str | None = None) -> JSONResponse:
+async def items_resume(
+    request: Request,
+    user_id: str | None = None,
+    scope: ViewerScope = Depends(viewer_scope),
+) -> JSONResponse:
     q = request.query_params
     ctx = await dto_context()
     options = dto_options(
@@ -615,14 +835,22 @@ async def items_resume(request: Request, user_id: str | None = None) -> JSONResp
     if not media_types or "Video" in media_types:
         async with get_database().session() as session:
             # 播放状态表通常远小于媒体库；只为有续播点的单元查询 bundle。
-            candidates = await resume_unit_candidates(session)
+            candidates = await resume_unit_candidates(
+                session, member_id=scope.member_id, visible_library_ids=scope.visible
+            )
             page_candidates = (
                 candidates[start_index : start_index + limit]
                 if limit >= 0
                 else candidates[start_index:]
             )
             selected_ids = list(dict.fromkeys(c.media_item_id for c in page_candidates))
-            bundles = await load_bundles(session, selected_ids, dto_options=options)
+            bundles = await load_bundles(
+                session,
+                selected_ids,
+                member_id=scope.member_id,
+                visible_library_ids=scope.visible,
+                dto_options=options,
+            )
     else:
         page_candidates = []
         bundles = {}
@@ -670,38 +898,91 @@ async def items_root(user_id: str | None = None) -> JSONResponse:
 
 
 @router.get("/Items/Counts")
-async def items_counts(request: Request) -> JSONResponse:
+async def items_counts(
+    request: Request, scope: ViewerScope = Depends(viewer_scope)
+) -> JSONResponse:
     """全服统计（LibraryController.cs:453，ItemCounts 的 12 个非可空计数）。
 
-    播放器的服务器/媒体库卡片用它显示"多少部电影、多少部剧"。"""
+    播放器的服务器/媒体库卡片用它显示"多少部电影、多少部剧"。
+    每类型只有一个在用库时直接读扫描/入库写路径维护的快照。
+    同类型多库可能收藏同一作品（例如一部剧的分集跨库），此时才用
+    library_file 的覆盖索引做跨库去重，避免盲目相加快照导致重复计数。"""
     async with get_database().session() as session:
-        movie_ids = await item_ids_with_files(session, kind="movie")
-        tv_ids = await item_ids_with_files(session, kind="tv")
-        episode_count = 0
-        if tv_ids:
+        libraries = await list_libraries(session, visible_ids=scope.visible)
+        movie_libraries = [
+            library
+            for library in libraries
+            if library.kind == "movie" and library.stats_item_count > 0
+        ]
+        tv_libraries = [
+            library
+            for library in libraries
+            if library.kind == "tv" and library.stats_item_count > 0
+        ]
+
+        movie_count = sum(library.stats_item_count for library in movie_libraries)
+        series_count = sum(library.stats_item_count for library in tv_libraries)
+        episode_count = sum(library.stats_episode_count for library in tv_libraries)
+
+        if len(movie_libraries) > 1 or len(tv_libraries) > 1:
+            from sqlalchemy import func
             from sqlalchemy import select as sa_select
 
             from movieclaw_db.models import LibraryFile
 
-            units = (
-                await session.execute(
+            async def distinct_item_count(library_ids: list[int]) -> int:
+                distinct_items = (
+                    sa_select(LibraryFile.media_item_id)
+                    .where(
+                        LibraryFile.library_id.in_(library_ids),
+                        LibraryFile.media_item_id.is_not(None),
+                        LibraryFile.missing_since.is_(None),
+                    )
+                    .distinct()
+                    .subquery()
+                )
+                return int(
+                    (
+                        await session.execute(
+                            sa_select(func.count()).select_from(distinct_items)
+                        )
+                    ).scalar_one()
+                )
+
+            if len(movie_libraries) > 1:
+                movie_count = await distinct_item_count(
+                    [library.id for library in movie_libraries if library.id is not None]
+                )
+            if len(tv_libraries) > 1:
+                tv_library_ids = [
+                    library.id for library in tv_libraries if library.id is not None
+                ]
+                series_count = await distinct_item_count(tv_library_ids)
+                distinct_units = (
                     sa_select(
                         LibraryFile.media_item_id,
                         LibraryFile.season_number,
                         LibraryFile.episode_number,
                     )
                     .where(
-                        LibraryFile.media_item_id.in_(tv_ids),
+                        LibraryFile.library_id.in_(tv_library_ids),
+                        LibraryFile.media_item_id.is_not(None),
                         LibraryFile.missing_since.is_(None),
                     )
                     .distinct()
+                    .subquery()
                 )
-            ).all()
-            episode_count = len(units)
+                episode_count = int(
+                    (
+                        await session.execute(
+                            sa_select(func.count()).select_from(distinct_units)
+                        )
+                    ).scalar_one()
+                )
     return JSONResponse(
         {
-            "MovieCount": len(movie_ids),
-            "SeriesCount": len(tv_ids),
+            "MovieCount": movie_count,
+            "SeriesCount": series_count,
             "EpisodeCount": episode_count,
             "ArtistCount": 0,
             "ProgramCount": 0,
@@ -711,7 +992,7 @@ async def items_counts(request: Request) -> JSONResponse:
             "MusicVideoCount": 0,
             "BoxSetCount": 0,
             "BookCount": 0,
-            "ItemCount": len(movie_ids) + len(tv_ids) + episode_count,
+            "ItemCount": movie_count + series_count + episode_count,
         }
     )
 
@@ -730,9 +1011,71 @@ async def items_filters(request: Request) -> JSONResponse:
 # ---------------------------------------------------------------------------
 
 
+async def _overlay_layered_meta(dto: dict[str, Any], bundle: ItemBundle) -> None:
+    """单条目详情叠加分层元数据（与 Web 详情页同一份读策略，layered_item_meta）。
+
+    列表装配只读库内档案（批量性能不容 NFO 磁盘 IO 与 TMDB 兜底）；点进
+    详情的这一条走完整分层——NFO 里人工维护的简介优先生效，还没刮过的
+    条目当场用 TMDB 兜底填充文本（后台自愈刮削由分层读内部触发）。
+    People 不叠加：人物页要靠关系表里的影人 id，NFO/TMDB 兜底给不出稳定
+    id，缺口由自愈刮削收敛。库内档案来源与 DTO 同源，无需二次装配。
+    """
+    from movieclaw_api.services.library.items import layered_item_meta, resolve_entry_dirs
+    from movieclaw_media.models import MediaKind
+
+    async with get_database().session() as session:
+        rows = (
+            await session.execute(
+                select_files_with_roots(bundle.item.id)  # type: ignore[arg-type]
+            )
+        ).all()
+        if not rows:
+            return
+        files = [f for f, _ in rows]
+        roots: list[Path] = []
+        for _, lib in rows:
+            for p in lib.root_paths:
+                path = Path(p)
+                if path not in roots:
+                    roots.append(path)
+        entry_dirs = resolve_entry_dirs(roots, files)
+        meta = await layered_item_meta(
+            session, bundle.item, entry_dirs, files, MediaKind(bundle.item.kind)
+        )
+    if meta is None or meta.source not in ("nfo", "tmdb"):
+        return
+    if meta.plot:
+        dto["Overview"] = meta.plot
+    if meta.rating:
+        dto["CommunityRating"] = meta.rating
+    if meta.genres:
+        dto["Genres"] = list(meta.genres)
+
+
+def select_files_with_roots(media_item_id: int):
+    """条目的在册文件 + 所属库（取根路径用），单条目详情与图片接口同款联查。"""
+    from sqlalchemy import select as sa_select
+
+    from movieclaw_db.models import LibraryFile
+
+    return (
+        sa_select(LibraryFile, Library)
+        .join(Library, Library.id == LibraryFile.library_id)
+        .where(
+            LibraryFile.media_item_id == media_item_id,
+            LibraryFile.missing_since.is_(None),
+        )
+    )
+
+
 @router.get("/Items/{item_id}")
 @router.get("/Users/{user_id}/Items/{item_id}")
-async def get_item(request: Request, item_id: str, user_id: str | None = None) -> JSONResponse:
+async def get_item(
+    request: Request,
+    item_id: str,
+    user_id: str | None = None,
+    scope: ViewerScope = Depends(viewer_scope),
+) -> JSONResponse:
     ctx = await dto_context()
     if is_empty_guid(item_id):
         return await items_root()
@@ -768,27 +1111,52 @@ async def get_item(request: Request, item_id: str, user_id: str | None = None) -
                 dto["OriginalTitle"] = person.original_name
             return JSONResponse(dto)
         if ref.kind == EntityKind.LIBRARY:
+            if scope.library_hidden(ref.entity_id):
+                raise not_found()
             library = await session.get(Library, ref.entity_id)
             if library is None:
                 raise not_found()
-            stats = await load_library_stats(session)
             return JSONResponse(
-                library_view_dto(
-                    ctx, library, stats.get(library.id), await _cover_tag(library.id)
-                )
+                library_view_dto(ctx, library, await _cover_tag(library.id))
             )
-        # 单条目是全字段语义，People 恒输出
-        bundles = await load_bundles(session, [ref.entity_id], dto_options=options)
+        # 单条目是全字段语义，People 恒输出；可见性先行（GUID 可枚举）
+        if not await _item_visible(session, ref.entity_id, scope):
+            raise not_found()
+        bundles = await load_bundles(
+            session,
+            [ref.entity_id],
+            member_id=scope.member_id,
+            visible_library_ids=scope.visible,
+            dto_options=options,
+        )
 
     bundle = bundles.get(ref.entity_id)
     if bundle is None:
         raise not_found()
+    # 自愈刮削的第二触发条件：档案里有 cast 但影人关系表为空——影人功能
+    # 上线前刮的存量条目，cast 非空证明 TMDB 有数据，补刮一次关系落库后
+    # 条件即不再成立（收敛，不会对"确实没有演职员"的条目反复触发）。
+    # 第一触发条件（档案缺失/从未刮过）由 _overlay_layered_meta 里的分层读
+    # 内部触发（与网页详情完全同一份逻辑），这里不重复。只挂单条目详情、
+    # 不挂列表查询：列表一次装配几十条，逐条自愈会放大成 TMDB 请求风暴。
+    needs_heal = (
+        bundle.metadata is not None
+        and bundle.metadata.scraped_at is not None
+        and not bundle.people
+        and bool(bundle.metadata.cast)
+    )
+    if needs_heal:
+        from movieclaw_api.services.media_scrape import scrape_media_item
+
+        assert bundle.item.id is not None
+        asyncio.get_running_loop().create_task(scrape_media_item(bundle.item.id))
     if ref.kind == EntityKind.ITEM:
         dto = (
             movie_dto(ctx, bundle, options)
             if bundle.item.kind == "movie"
             else series_dto(ctx, bundle, options)
         )
+        await _overlay_layered_meta(dto, bundle)
     elif ref.kind == EntityKind.SEASON:
         dto = season_dto(ctx, bundle, ref.season, options)
     elif ref.kind == EntityKind.EPISODE:
@@ -811,7 +1179,9 @@ async def items_similar(item_id: str) -> JSONResponse:
 
 
 @router.get("/Shows/NextUp")
-async def shows_next_up(request: Request) -> JSONResponse:
+async def shows_next_up(
+    request: Request, scope: ViewerScope = Depends(viewer_scope)
+) -> JSONResponse:
     q = request.query_params
     ctx = await dto_context()
     options = dto_options(
@@ -824,9 +1194,16 @@ async def shows_next_up(request: Request) -> JSONResponse:
     async with get_database().session() as session:
         ids = await next_up_item_ids(
             session,
+            member_id=scope.member_id,
             series_id=series_filter.entity_id if series_filter else None,
         )
-        bundles = await load_bundles(session, ids, dto_options=options)
+        bundles = await load_bundles(
+            session,
+            ids,
+            member_id=scope.member_id,
+            visible_library_ids=scope.visible,
+            dto_options=options,
+        )
 
     candidates: list[tuple[Any, dict[str, Any]]] = []
     for bundle in bundles.values():
@@ -873,7 +1250,9 @@ async def shows_next_up(request: Request) -> JSONResponse:
 
 
 @router.get("/Shows/{series_id}/Seasons")
-async def shows_seasons(request: Request, series_id: str) -> JSONResponse:
+async def shows_seasons(
+    request: Request, series_id: str, scope: ViewerScope = Depends(viewer_scope)
+) -> JSONResponse:
     q = request.query_params
     ctx = await dto_context()
     options = dto_options(
@@ -885,7 +1264,15 @@ async def shows_seasons(request: Request, series_id: str) -> JSONResponse:
     if ref is None or ref.kind != EntityKind.ITEM:
         raise not_found()
     async with get_database().session() as session:
-        bundles = await load_bundles(session, [ref.entity_id], dto_options=options)
+        if not await _item_visible(session, ref.entity_id, scope):
+            raise not_found()
+        bundles = await load_bundles(
+            session,
+            [ref.entity_id],
+            member_id=scope.member_id,
+            visible_library_ids=scope.visible,
+            dto_options=options,
+        )
     bundle = bundles.get(ref.entity_id)
     if bundle is None or bundle.item.kind != "tv":
         raise not_found()
@@ -898,7 +1285,9 @@ async def shows_seasons(request: Request, series_id: str) -> JSONResponse:
 
 
 @router.get("/Shows/{series_id}/Episodes")
-async def shows_episodes(request: Request, series_id: str) -> JSONResponse:
+async def shows_episodes(
+    request: Request, series_id: str, scope: ViewerScope = Depends(viewer_scope)
+) -> JSONResponse:
     q = request.query_params
     ctx = await dto_context()
     options = dto_options(
@@ -925,7 +1314,15 @@ async def shows_episodes(request: Request, series_id: str) -> JSONResponse:
             season_scope = int(season_param)
 
     async with get_database().session() as session:
-        bundles = await load_bundles(session, [target_item_id], dto_options=options)
+        if not await _item_visible(session, target_item_id, scope):
+            raise not_found_message("Series not found")
+        bundles = await load_bundles(
+            session,
+            [target_item_id],
+            member_id=scope.member_id,
+            visible_library_ids=scope.visible,
+            dto_options=options,
+        )
     bundle = bundles.get(target_item_id)
     if bundle is None or bundle.item.kind != "tv":
         raise not_found_message("Series not found")

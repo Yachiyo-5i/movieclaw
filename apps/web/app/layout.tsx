@@ -81,12 +81,12 @@ export const viewport: Viewport = {
  * lib/backdrop.tsx 在每次换图时写入；图片 URL 带版本号且强缓存，恢复是瞬时的）。
  * 只接受站内相对路径，缓存被篡改也注入不了外部地址。
  *
- * 沉浸路由（/runs，Agent 对话页）：首帧绘制前给 <html> 打 immersive-route
+ * 沉浸路由（/sessions/[id]，Agent 对话页）：首帧绘制前给 <html> 打 immersive-route
  * 标记——背景大图的伪元素整个不渲染（也就不会发起图片请求），纯色层免淡入，
  * 强刷时不会闪出背景图。此时也无需恢复背景变量。客户端路由切换后的同步由
  * AppShell 的 effect 负责（见 components/app-shell.tsx）。
  */
-const RESTORE_BACKDROP_SCRIPT = `try{if(location.pathname.indexOf("/runs")===0){document.documentElement.classList.add("immersive-route")}else{var u=localStorage.getItem("movieclaw.backdrop");if(u&&u.charAt(0)==="/")document.documentElement.style.setProperty("--backdrop-image",'url("'+u+'")')}}catch(e){}`;
+const RESTORE_BACKDROP_SCRIPT = `try{if(location.pathname.indexOf("/sessions/")===0){document.documentElement.classList.add("immersive-route")}else{var u=localStorage.getItem("movieclaw.backdrop");if(u&&u.charAt(0)==="/")document.documentElement.style.setProperty("--backdrop-image",'url("'+u+'")')}}catch(e){}`;
 
 export default function RootLayout({
   children,

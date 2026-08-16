@@ -11,7 +11,7 @@
 | 任务形式 | **多任务单模型**：共享编码器 + 三个头 ①token BIO 序列标注（NER）②序列分类 media_type ③序列分类 content_type。均判别式，不用生成式模型 |
 | 基座模型 | `hfl/chinese-lert-small`（15k 数据六模型对决胜出：NER 宏 F1 0.921，片名两轴领先 minirbt 2-3 分；int8 15.6MB / p50 3.3ms)。对决记录：minirbt-h256 0.909/1.7ms、h288 0.918/2.0ms、electra-small 0.895、rbt3 0.905（偏科：集数强片名弱）、roberta-wwm-ext fp32≈0.95 为天花板但 26.8ms 且 **int8 动态量化崩塌**（大基座须量化校准/QAT） |
 | 输入 | 双段编码 `(title, subtitle)`，max_length=256 —— 两段互证是年份消歧的关键 |
-| span 标签 | BIO × {TITLE_ZH, TITLE_EN, YEAR, SEASON, EPISODE, EPISODE_TOTAL} + O，共 13 类，见 [torrent_ner/labels.py](torrent_ner/labels.py) |
+| span 标签 | BIO × {TITLE_ZH, TITLE_EN, YEAR, SEASON, EPISODE, EPISODE_TOTAL, SUBTITLE, AUDIO} + O，共 17 类（v13 起含字幕/音轨声明两轴，设计见 docs/design/subtitle-audio-ner.md），见 [torrent_ner/labels.py](torrent_ner/labels.py) |
 | 整条分类（两条正交轴） | 结构轴 media_type ∈ {movie, series, other}（"电影还是剧集"）；内容轴 content_type ∈ {anime, documentary, variety, music, other}（只标特殊题材，普通真人影视归 other）。两轴独立，"动漫剧场版"=movie+anime、"纯音频专辑"=other+music、"演唱会蓝光"=movie+music，永不塌缩 |
 | 分工原则 | **模型负责理解**（片名边界、当前集 vs 总集数等语义判定），**代码只做机械转换**（span→int、CJK 数字、字符定位）。语义分类靠标签让模型学，不靠下游正则事后猜 |
 | 任务头 | 线性分类头，不加 CRF；BIO 非法序列在解码时确定性修复 |
@@ -94,20 +94,24 @@ ml/
 - `media_type` / `content_type`：整条分类的监督信号，**不是 span**，是对整条
   种子的两个正交判断（结构 / 题材），训练时各喂给一个序列分类头。
 
-### 多头模型（训练时落地）
+### 多头模型（已落地）
 
-一个共享编码器（MiniRBT）+ 三个头：token 分类头出 BIO、两个序列分类头（接
-`[CLS]`/pooled 输出）分别出 media_type、content_type。三头共享同一次前向，两个
-分类近乎零额外推理成本。当前 `train.py`/`export.py` 是单头（NER）骨架，装训练
-环境后改成自定义多头模型（`AutoModel` + 三个 head + 加权损失），ONNX 同时导出
-三个输出。分类标签从第一条标注就已入库，改多头时无需重新标注。
+一个共享编码器（chinese-lert-small）+ 三个头：token 分类头出 BIO、两个序列
+分类头（pooled 输出）分别出 media_type、content_type，损失直接相加不加权
+（实测无需调权），ONNX 同时导出三个输出。见 `torrent_ner/model.py`。
 
 ## 长期迭代守则
 
 - **标注规范 = annotate.py 里的提示词**。改提示词就是改标注标准，旧数据要
   重标或按批次隔离；labels.py 加新字段只能追加在 FIELDS 末尾（保持旧 id 稳定）。
-  当前 `PROMPT_VERSION=3`：v1/v2 的试标数据是旧标签 schema（episode 未拆分），
-  正式全量标注前应清空 labeled/ 重标（试标量小，不值得迁移）。
+  当前 `PROMPT_VERSION=13`（变更史见 annotate.py 头注释）。**规范变更必须走
+  强制迭代流程**：500-1000 条试标 → 双引擎 diff → 裁决 → 增量条款 → 复测，
+  一致率达标才放量（详见 docs/design/subtitle-audio-ner.md「标注方法论」）。
+  语料生产链新增工具：merge_dual（双引擎合并+label_status 溯源）、
+  normalize_labels（规范增量的确定性归一）、resolve_superset（变体超集自动
+  裁决）、adjudicate（LLM 双盲独立双轮批量裁决）、assign_group_splits
+  （内容指纹防泄漏切分）、corpus_report（配比审计门禁）、compare_models
+  （候选 vs 现役对称对比）。
 - **非影视内容（软件/音乐/体育/MV 等）不标任何 span**——负样本教模型对
   域外输入保持沉默，与"绝不返回猜测值"的管线约定一致。
 - **接入新站点后**：sample.py 重抽（新站自动纳入）→ annotate 增量标注（已标

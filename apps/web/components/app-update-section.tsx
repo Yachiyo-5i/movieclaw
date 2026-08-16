@@ -25,7 +25,7 @@ import {
 } from "@/lib/api/app";
 import { getHealth } from "@/lib/api/health";
 import { formatBytes } from "@/lib/format";
-import { formatDateTime } from "@/lib/time";
+import { formatDateTime, formatUnixDateTime } from "@/lib/time";
 
 /**
  * 版本与更新（设置 → 应用）。
@@ -401,6 +401,15 @@ export function AppUpdateSection() {
                 <p className="text-sub text-amber-300/90">
                   版本 {status.bad_versions.map((v) => `v${v}`).join("、")} 曾连续启动失败，
                   已被自动回落保护。可在新版本发布后重新更新。
+                </p>
+              </div>
+            )}
+            {status.last_abnormal_exit && (
+              <div className="px-5 py-3.5">
+                <p className="text-sub text-amber-300/90">
+                  应用曾于 {formatUnixDateTime(status.last_abnormal_exit.at)}{" "}
+                  异常退出并被容器自动恢复：{status.last_abnormal_exit.detail}
+                  （exit={status.last_abnormal_exit.exit_code}）。若频繁出现，请查看容器日志排查。
                 </p>
               </div>
             )}

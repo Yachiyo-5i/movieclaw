@@ -53,6 +53,73 @@ export interface ConfiguredDownloader {
   updated_at: string;
 }
 
+export type DownloadTaskState =
+  | "downloading"
+  | "stalled"
+  | "queued"
+  | "paused"
+  | "checking"
+  | "completed"
+  | "error"
+  | "missing"
+  | "unknown";
+
+export interface DownloadTaskSubscription {
+  id: number;
+  media_item_id: number;
+  media_title: string;
+  media_kind: string;
+  poster_url: string | null;
+  units: { season_number: number; episode_number: number }[];
+}
+
+/** 下载器实时任务；订阅/手动来源由后端按 infohash 关联，不复制下载状态。 */
+export interface DownloadTask {
+  id: string;
+  info_hash: string;
+  name: string | null;
+  downloader_id: number | null;
+  downloader_name: string | null;
+  downloader_type: DownloaderClientType | null;
+  progress: number | null;
+  size_bytes: number | null;
+  dlspeed_bytes: number | null;
+  eta_seconds: number | null;
+  state: DownloadTaskState;
+  source: "subscription" | "manual" | "external";
+  media_item_id: number | null;
+  media_title: string | null;
+  media_kind: string | null;
+  poster_url: string | null;
+  subscriptions: DownloadTaskSubscription[];
+  rescue_state:
+    | "active"
+    | "replacement_pending"
+    | "trial"
+    | "cleanup_pending"
+    | "retained"
+    | "completed"
+    | null;
+  no_progress_seconds: number | null;
+  can_replace: boolean;
+  replacement_due_at: string | null;
+  rescue_message: string | null;
+}
+
+export interface DownloadTaskSource {
+  id: number;
+  name: string;
+  client_type: DownloaderClientType;
+  status: "active" | "disabled" | "unavailable" | "error";
+  message: string | null;
+  task_count: number;
+}
+
+export interface DownloadTaskSnapshot {
+  items: DownloadTask[];
+  sources: DownloadTaskSource[];
+}
+
 /** 新增/更新下载器的请求体（见 schemas.downloader.DownloaderPayload）。 */
 export interface DownloaderPayload {
   name: string;
@@ -68,6 +135,45 @@ export interface DownloaderPayload {
 /** 列出所有已配置的下载器及连接状态。 */
 export function listDownloaders(init?: RequestInit): Promise<ConfiguredDownloader[]> {
   return unwrap(request<ApiEnvelope<ConfiguredDownloader[]>>("/downloaders", init));
+}
+
+/** 任务中心快照：所有下载器的活跃任务、仍待入库任务与来源健康状态。 */
+export function listDownloadTasks(init?: RequestInit): Promise<DownloadTaskSnapshot> {
+  return unwrap(request<ApiEnvelope<DownloadTaskSnapshot>>("/downloaders/tasks", init));
+}
+
+/**
+ * 从指定下载器移除一个种子任务。默认保留数据文件；只有确认弹窗中显式
+ * 选择后才传 deleteFiles=true，避免误删正在下载或做种的数据。
+ */
+export function deleteDownloadTask(
+  downloaderId: number,
+  infoHash: string,
+  deleteFiles = false,
+): Promise<{ downloader_id: number; info_hash: string; delete_files: boolean }> {
+  const query = deleteFiles ? "?delete_files=true" : "";
+  return unwrap(
+    request<
+      ApiEnvelope<{ downloader_id: number; info_hash: string; delete_files: boolean }>
+    >(
+      `/downloaders/${downloaderId}/torrents/${encodeURIComponent(infoHash)}${query}`,
+      { method: "DELETE" },
+    ),
+  );
+}
+
+/** 立即为 15 分钟无进度的订阅任务执行真实跨站换源搜索。 */
+export function replaceDownloadTask(
+  downloaderId: number,
+  infoHash: string,
+): Promise<{ downloader_id: number; info_hash: string; attempt_id: number }> {
+  return unwrap(
+    request<
+      ApiEnvelope<{ downloader_id: number; info_hash: string; attempt_id: number }>
+    >(`/downloaders/${downloaderId}/torrents/${encodeURIComponent(infoHash)}/replace`, {
+      method: "POST",
+    }),
+  );
 }
 
 /** 获取单个下载器详情（用于轮询连接测试进度）。 */
@@ -149,6 +255,55 @@ export interface DownloadSubmitPayload {
   save_path?: string | null;
   /** 指定投递到哪台下载器（配了多台按需分流）；缺省用默认下载器 */
   downloader_id?: number | null;
+  /** 服务端按已确认的 TMDB 身份重新匹配媒体库并选择监听导入目录 */
+  auto_route?: boolean;
+  /** 智能入库的媒体类型，与 tmdb_id 一起构成后端路由输入 */
+  media_kind?: "movie" | "tv";
+  /** 智能入库已确认的 TMDB 条目 ID */
+  tmdb_id?: number;
+}
+
+/** 手动下载识别未收敛时返回的 TMDB 候选（供界面解释为何不自动投递）。 */
+export interface ManualDownloadTargetCandidate {
+  tmdb_id: number;
+  title: string;
+  year: number | null;
+  episode_count: number | null;
+}
+
+/** 手动搜索种子的「识别 → 库路由 → 监听投递目录」预检结果。 */
+export interface ManualDownloadTarget {
+  status: "ready" | "ambiguous" | "not_found";
+  tmdb_id: number | null;
+  candidates: ManualDownloadTargetCandidate[];
+  library_id: number | null;
+  library_name: string | null;
+  mode: "watch" | "inplace" | "downloader_default" | null;
+  path: string | null;
+  staging_path: string | null;
+  route_matched: boolean | null;
+  route_reason: string | null;
+  ok: boolean;
+  warning: string | null;
+}
+
+/** 预演一条搜索结果能否被可靠识别并投递到匹配库的监听目录。 */
+export function resolveManualDownloadTarget(payload: {
+  kind: "movie" | "tv";
+  title: string;
+  year: number;
+  subtitle?: string | null;
+  /** 用这台下载器的路径映射预检；缺省沿用后端默认下载器语义 */
+  downloader_id?: number | null;
+  /** 歧义时由用户确认的、且必须属于本次候选的 TMDB ID */
+  selected_tmdb_id?: number | null;
+}): Promise<ManualDownloadTarget> {
+  return unwrap(
+    request<ApiEnvelope<ManualDownloadTarget>>("/downloaders/resolve-target", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+  );
 }
 
 /** 手动提交下载的结果（见 schemas.downloader.DownloadSubmitView）。 */
@@ -164,8 +319,10 @@ export interface DownloadSubmitResult {
 }
 
 /**
- * 把一条搜索结果种子提交到默认下载器：后端带站点登录态取回 .torrent 再递交，
- * 保存目录用默认下载器配置的默认目录。失败抛 HttpError，message 为可读中文。
+ * 把一条搜索结果种子提交到下载器：后端带站点登录态取回 .torrent 再递交。
+ * 保存目标按 auto_route / save_path / library_id / 下载器默认目录的互斥选择决定；
+ * Web 的智能选项必须先经 resolveManualDownloadTarget 收敛身份并通过预检。
+ * 失败抛 HttpError，message 为可读中文。
  */
 export function submitTorrentDownload(
   payload: DownloadSubmitPayload,

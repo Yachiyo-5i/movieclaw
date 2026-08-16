@@ -52,7 +52,6 @@ export interface AgentDone {
 
 export interface AgentEvent {
   type: AgentEventType;
-  run_id: string;
   /** thinking_delta / text_delta / tool_call_delta 的增量文本 */
   delta?: string;
   /** tool_call_start：仅含 id/name；tool_call：参数完整的调用 */
@@ -98,10 +97,10 @@ export interface AgentTranscriptMessage {
 }
 
 /** 会话详情里的一条消息 entry（信封 + API 格式消息）。 */
-export interface AgentSessionEntry {
-  /** v1 历史文件的行没有 type 字段，缺省即消息行 */
-  type?: "message";
-  uuid: string;
+export interface SessionMessageEntry {
+  type: "message";
+  message_id: string;
+  parent_id?: string;
   timestamp: string;
   message: AgentTranscriptMessage;
   /** 以下仅 assistant 消息携带（运行元数据） */
@@ -111,34 +110,34 @@ export interface AgentSessionEntry {
   finish_reason?: string | null;
 }
 
-/** 会话详情里的一条压缩行（服务端投影已剔除 replacement_history）。 */
-export interface AgentSessionCompactionEntry {
+/** 会话详情里的一条压缩行；replacement_history 是续聊所用的完整替代上下文。 */
+export interface SessionCompactionEntry {
   type: "compaction";
-  uuid: string;
+  compaction_id: string;
+  parent_id?: string;
   timestamp: string;
   summary: string;
   tokens_before?: number;
   tokens_after?: number;
+  replacement_history: AgentTranscriptMessage[];
 }
 
-export type AgentSessionAnyEntry = AgentSessionEntry | AgentSessionCompactionEntry;
+export type SessionAnyEntry = SessionMessageEntry | SessionCompactionEntry;
 
-/** 会话列表项（running 由 active_run_id + 心跳窗派生）。 */
-export interface AgentSessionSummary {
+/** 会话列表项；后台运行编号是服务端实现细节，不进入公开协议。 */
+export interface SessionSummary {
   id: string;
   title: string | null;
   last_prompt: string | null;
   entry_count: number;
   running: boolean;
-  /** running 为 true 时可用它重新挂上 SSE 事件流 */
-  active_run_id: string | null;
   created_at: string;
   updated_at: string;
 }
 
-export interface AgentSessionDetail {
-  session: AgentSessionSummary;
-  entries: AgentSessionAnyEntry[];
+export interface SessionTranscript {
+  session: SessionSummary;
+  entries: SessionAnyEntry[];
 }
 
 interface ApiEnvelope<T> {
@@ -148,85 +147,77 @@ interface ApiEnvelope<T> {
   data: T;
 }
 
-/**
- * 创建后台 Agent 运行；响应只确认已入队，不等待模型开始输出。
- * 传 sessionId 表示在既有服务端会话上续聊（历史由服务端从转录重建）；
- * 留空则新建会话，返回的 session_id 供后续续聊时带回。
- */
-export async function startAgentRun(
-  input: string,
+/** 提交一条用户消息；不传 sessionId 新建会话，传入则继续已有会话。 */
+export async function startSession(
+  content: string,
   sessionId?: string,
-): Promise<{ runId: string; sessionId: string; entryUuid: string }> {
-  const response = await request<
-    ApiEnvelope<{ run_id: string; session_id: string; entry_uuid: string }>
-  >("/agent/start", {
-    method: "POST",
-    body: JSON.stringify(sessionId ? { input, session_id: sessionId } : { input }),
-  });
-  return {
-    runId: response.data.run_id,
-    sessionId: response.data.session_id,
-    entryUuid: response.data.entry_uuid,
-  };
+): Promise<{ sessionId: string; messageId: string }> {
+  const body: { content: string; session_id?: string } = { content };
+  if (sessionId) body.session_id = sessionId;
+  const response = await request<ApiEnvelope<{ session_id: string; message_id: string }>>(
+    "/sessions",
+    {
+      method: "POST",
+      body: JSON.stringify(body),
+    },
+  );
+  return { sessionId: response.data.session_id, messageId: response.data.message_id };
 }
 
 /** 最近会话列表（按最后活跃时间倒序，limit/offset 分页）。 */
-export async function listAgentSessions(
+export async function listSessions(
   params: { limit?: number; offset?: number } = {},
-): Promise<AgentSessionSummary[]> {
+): Promise<SessionSummary[]> {
   const query = new URLSearchParams();
   if (params.limit != null) query.set("limit", String(params.limit));
   if (params.offset) query.set("offset", String(params.offset));
   const suffix = query.size > 0 ? `?${query}` : "";
-  const response = await request<ApiEnvelope<AgentSessionSummary[]>>(
-    `/agent/sessions${suffix}`,
-  );
+  const response = await request<ApiEnvelope<SessionSummary[]>>(`/sessions${suffix}`);
   return response.data;
 }
 
 /** 会话详情（完整消息 entry 回放）。 */
-export async function getAgentSession(sessionId: string): Promise<AgentSessionDetail> {
-  const response = await request<ApiEnvelope<AgentSessionDetail>>(
-    `/agent/sessions/${sessionId}`,
-  );
+export async function getSessionTranscript(sessionId: string): Promise<SessionTranscript> {
+  const response = await request<ApiEnvelope<SessionTranscript>>(`/sessions/${sessionId}`);
   return response.data;
 }
 
 /** 重命名会话（标题只改索引元数据，转录内容不变）。 */
-export async function renameAgentSession(
+export async function renameSession(
   sessionId: string,
   title: string,
 ): Promise<void> {
-  await request<ApiEnvelope<AgentSessionSummary>>(`/agent/sessions/${sessionId}`, {
+  await request<ApiEnvelope<SessionSummary>>(`/sessions/${sessionId}`, {
     method: "PATCH",
     body: JSON.stringify({ title }),
   });
 }
 
-/** 删除会话（转录文件与索引一并删除；运行中的会话会被服务端拒绝）。 */
-/**
- * 从某条用户提问处截断会话：该提问及其之后的全部转录记录被永久删除。
- * 不可逆，调用前必须让用户二次确认（会话页的「改写重问」入口）。
- */
-export async function truncateAgentSession(
+/** 重新提交指定用户消息；content 为空时原文重试，否则用新内容替换。 */
+export async function retrySessionMessage(
   sessionId: string,
-  entryUuid: string,
-): Promise<void> {
-  await request<ApiEnvelope<{ removed_entries: number; entry_count: number }>>(
-    `/agent/sessions/${sessionId}/truncate`,
-    { method: "POST", body: JSON.stringify({ entry_uuid: entryUuid }) },
+  messageId: string,
+  content?: string,
+): Promise<{ sessionId: string; messageId: string }> {
+  const body: { message_id: string; content?: string } = { message_id: messageId };
+  if (content) body.content = content;
+  const response = await request<ApiEnvelope<{ session_id: string; message_id: string }>>(
+    `/sessions/${sessionId}/retry`,
+    { method: "POST", body: JSON.stringify(body) },
   );
+  return { sessionId: response.data.session_id, messageId: response.data.message_id };
 }
 
-export async function deleteAgentSession(sessionId: string): Promise<void> {
-  await request<ApiEnvelope<Record<string, never>>>(`/agent/sessions/${sessionId}`, {
+/** 删除会话（转录文件与索引一并删除；运行中的会话会被服务端拒绝）。 */
+export async function deleteSession(sessionId: string): Promise<void> {
+  await request<ApiEnvelope<Record<string, never>>>(`/sessions/${sessionId}`, {
     method: "DELETE",
   });
 }
 
 /** 幂等请求停止后台运行；真正的终态由 stream 中的 agent_cancelled 确认。 */
-export async function cancelAgentRun(runId: string): Promise<void> {
-  await request<ApiEnvelope<Record<string, never>>>(`/agent/runs/${runId}/cancel`, {
+export async function stopSession(sessionId: string): Promise<void> {
+  await request<ApiEnvelope<Record<string, never>>>(`/sessions/${sessionId}/stop`, {
     method: "POST",
   });
 }
@@ -280,8 +271,8 @@ function waitBeforeRetry(ms: number, signal?: AbortSignal): Promise<void> {
  * 因此只回放缺失部分；HTTP 错误（含运行过期 404）直接交给调用方，只有网络
  * 中断才指数退避重试。函数收到终态事件后返回，不会再次连接已完成的运行。
  */
-export async function streamAgentRun(
-  runId: string,
+export async function streamSession(
+  sessionId: string,
   onEvent: (event: AgentEvent) => void,
   opts?: { signal?: AbortSignal; afterEventId?: number },
 ): Promise<void> {
@@ -293,7 +284,7 @@ export async function streamAgentRun(
     try {
       const headers = new Headers({ Accept: "text/event-stream" });
       if (lastEventId > 0) headers.set("Last-Event-ID", String(lastEventId));
-      response = await fetch(resolveRequestUrl(`/agent/runs/${runId}/stream`), {
+      response = await fetch(resolveRequestUrl(`/sessions/${sessionId}/events`), {
         headers,
         signal: opts?.signal,
       });

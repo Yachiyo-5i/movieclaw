@@ -8,7 +8,7 @@
 
 此前 Agent 完全没有上下文管理：`AgentRunner` 每步全量重发
 `system + 历史 + 工具往返`，工具结果全文入上下文（bash/mclaw 单次可达 50KB）；
-续聊时 `build_history()` 全量重放转录。长会话最终触发供应商的上下文超长错误
+发送后续消息时 `build_history()` 全量重放转录。长会话最终触发供应商的上下文超长错误
 （不可重试、无恢复路径），运行直接失败。
 
 目标：会话可以无限继续，压缩对任务的破坏最小，全过程对用户可见、可解释。
@@ -19,7 +19,7 @@
 |---|---|---|
 | pre-run | 组装完消息、进入循环之前 | 字节启发式（约 4 字节 ≈ 1 token）——冷启动没有服务端数据 |
 | mid-run | 每步的全部工具结果回喂之后 | 服务端上报的 `usage.prompt_tokens + completion_tokens`，仅对尚未发送的新工具结果补估 |
-| 手动 | `POST /agent/sessions/{id}/compact` | 不判水位，无条件执行 |
+| 手动 | `POST /sessions/{id}/compact-context` | 不判水位，无条件执行 |
 
 - 水位线：`context_window × 0.9`（`COMPACT_TRIGGER_RATIO`，codex 同款比例）。
 - 窗口来自模型目录 `ModelInfo.context_window`（预设全有、自定义模型入口强制
@@ -33,7 +33,7 @@
 1. 把交接摘要指令（`COMPACT_PROMPT`）作为一条普通 user 消息追加到**全量现场**
    （system + 用户输入 + assistant 往返 + 工具调用与结果）末尾；
 2. `tools=None` 发起一次普通模型调用——不带工具定义，模型只能输出文本，
-   天然保证这一轮只写摘要；模型、系统提示词、采样参数都沿用会话本身的；
+   天然保证这次调用只写摘要；模型、系统提示词、采样参数都沿用会话本身的；
 3. 取最终 content 作为摘要；任何失败（流错误、异常、空摘要）返回 None。
 
 **降级原则**：压缩是优化路径。自动压缩失败只记日志、跳过本次压缩、运行继续
@@ -73,8 +73,8 @@
   但仍合法，属可接受降级，无需迁移；
 - `seal_pending_tool_calls` 只处理最后一条压缩行之后的消息（更早的往返是死
   上下文，补回执毫无意义）；
-- 会话详情接口的压缩行投影**不含 replacement_history**（重建数据可达几十 KB，
-  不是渲染数据）。
+- `session get-transcript` 返回包括 `replacement_history` 在内的完整压缩轨迹；
+  该命令不分页、不截断，调用方需自行权衡长会话的数据体量。
 
 ## 6. 事件与前端
 
@@ -87,10 +87,10 @@
 
 ## 7. 手动压缩接口
 
-`POST /agent/sessions/{session_id}/compact`（`agent.sessions.compact`）：
+`POST /sessions/{session_id}/compact-context`（`session.compact-context`）：
 404（会话不存在）/ 400（正在运行——运行内自有 mid-run 压缩，并发写转录会破坏
 链尾）→ 与自动压缩共用 `movieclaw_agent.compact()` → 压缩行落盘、刷新索引 →
-返回 `{summary, tokens_before, tokens_after, entry_uuid}`。模型沿用会话最近
+返回 `{summary, tokens_before, tokens_after, compaction_id}`。模型沿用会话最近
 一次运行的模型（转录 assistant 行的 model 元数据），无记录时走默认路由。
 
 ## 8. 已知取舍与后续工作
@@ -102,8 +102,8 @@
   展示与观测；触发决策以服务端 usage 为准。
 - **手动压缩的 TOCTOU 窗口**：`is_running` 检查与执行之间理论上可插入新运行，
   与删除会话相同的已接受取舍。
-- 工具层已有源头截断（bash/mclaw 尾部保留 2000 行 / 50KB，溢出落临时文件），
-  与本机制互补：截断控制单条体量，压缩控制总量。
+- 工具层通常有源头截断（bash/mclaw 尾部保留 2000 行 / 50KB）；
+  `session get-transcript` 明确豁免该限制，确保模型需要时能取得完整轨迹。
 
 ## 9. 测试矩阵
 
@@ -112,5 +112,5 @@
 | 纯函数 | `tests/agent/unit/test_compaction.py` | token 估算、水位边界、重建规则（预算/截断/旧摘要排除） |
 | loop 集成 | `tests/agent/unit/test_runner.py` | mid-run / pre-run 触发、失败降级、无窗口停用、回调载荷 |
 | 存储 | `tests/api/test_agent_sessions.py` | 压缩行链条、build_history 重建、seal 范围、summarize 语义、未知类型容错 |
-| API e2e | `tests/api/test_agent.py` | 手动端点、详情投影不含替换历史、续聊用压缩后上下文 |
+| API e2e | `tests/api/test_agent.py` | 手动端点、完整替换历史投影、后续消息使用压缩后上下文 |
 | 前端 | 无 JS 测试设施 | `pnpm lint + build` + 手工验证卡片（实时 + 回放） |

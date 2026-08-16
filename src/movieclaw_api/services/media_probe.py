@@ -53,6 +53,8 @@ class MediaSpec:
     bit_depth: int | None
     duration_seconds: int | None
     bit_rate: int | None
+    frame_rate: float | None = None
+    color_space: str | None = None
     audio_streams: list[dict] = field(default_factory=list)
     subtitle_streams: list[dict] = field(default_factory=list)
 
@@ -95,10 +97,10 @@ def probe_media(path: str | Path) -> MediaSpec | None:
         payload = json.loads(proc.stdout)
     except json.JSONDecodeError:
         return None
-    return _parse_probe(payload)
+    return _parse_probe(payload, include_mpegts_pids=Path(path).suffix.lower() == ".m2ts")
 
 
-def _parse_probe(payload: dict) -> MediaSpec:
+def _parse_probe(payload: dict, *, include_mpegts_pids: bool = False) -> MediaSpec:
     video = next(
         (s for s in payload.get("streams", []) if s.get("codec_type") == "video"),
         None,
@@ -123,20 +125,31 @@ def _parse_probe(payload: dict) -> MediaSpec:
         bit_depth=bit_depth,
         duration_seconds=_to_int(fmt.get("duration")),
         bit_rate=_to_int(fmt.get("bit_rate")),
+        frame_rate=(
+            _frame_rate(video.get("avg_frame_rate"))
+            or _frame_rate(video.get("r_frame_rate"))
+            if video
+            else None
+        ),
+        color_space=_color_space_label(video) if video else None,
         audio_streams=[
-            _audio_stream_info(s) for s in streams if s.get("codec_type") == "audio"
+            _audio_stream_info(s, include_pid=include_mpegts_pids)
+            for s in streams
+            if s.get("codec_type") == "audio"
         ],
         subtitle_streams=[
-            _subtitle_stream_info(s) for s in streams if s.get("codec_type") == "subtitle"
+            _subtitle_stream_info(s, include_pid=include_mpegts_pids)
+            for s in streams
+            if s.get("codec_type") == "subtitle"
         ],
     )
 
 
-def _audio_stream_info(stream: dict) -> dict:
+def _audio_stream_info(stream: dict, *, include_pid: bool = False) -> dict:
     """音轨的展示要素。``profile`` 比 codec 更接近用户认知（如 DTS-HD MA、
     Dolby TrueHD + Atmos 探不出 Atmos 层，先给基础格式），缺失时前端退回 codec。"""
     tags = stream.get("tags") or {}
-    return {
+    result = {
         "codec": stream.get("codec_name"),
         "profile": stream.get("profile"),
         "channels": _to_int(stream.get("channels")),
@@ -145,19 +158,45 @@ def _audio_stream_info(stream: dict) -> dict:
         "title": tags.get("title"),
         "default": bool((stream.get("disposition") or {}).get("default")),
     }
+    pid = _stream_pid(stream.get("id")) if include_pid else None
+    if pid is not None:
+        # MPEG-TS/BDMV 用 PID 与 CLPI 关联。详情 API 显式投影公开字段，内部键
+        # 只落 JSON 台账，不改变前端契约。
+        result["pid"] = pid
+    return result
 
 
-def _subtitle_stream_info(stream: dict) -> dict:
+def _subtitle_stream_info(stream: dict, *, include_pid: bool = False) -> dict:
     """内封字幕轨的展示要素（外挂字幕文件由媒体库详情层另行发现）。"""
     tags = stream.get("tags") or {}
     disposition = stream.get("disposition") or {}
-    return {
+    result = {
         "codec": stream.get("codec_name"),
         "language": tags.get("language"),
         "title": tags.get("title"),
         "forced": bool(disposition.get("forced")),
         "default": bool(disposition.get("default")),
     }
+    pid = _stream_pid(stream.get("id")) if include_pid else None
+    if pid is not None:
+        result["pid"] = pid
+    return result
+
+
+def _stream_pid(value) -> int | None:
+    """ffprobe 的 MPEG-TS stream.id 通常是 ``0x1200``，也兼容整数/十进制。"""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    if not isinstance(value, str):
+        return None
+    try:
+        stripped = value.strip().lower()
+        parsed = int(stripped, 16 if stripped.startswith("0x") else 10)
+    except ValueError:
+        return None
+    return parsed if parsed >= 0 else None
 
 
 def _resolution_label(width: int | None, height: int | None) -> str | None:
@@ -179,16 +218,72 @@ def _resolution_label(width: int | None, height: int | None) -> str | None:
 
 
 def _hdr_label(video: dict) -> str | None:
-    """从传输特性判定 HDR 基础格式；SDR 返回 None。
+    """识别用户真正关心的 HDR 格式；SDR 返回 None。
 
-    Dolby Vision 的可靠判定需要 side_data/配置记录，各容器差异大，
-    v1 先覆盖 HDR10（PQ）与 HLG 两大类；DV 层探测留待洗版（P6）细化。
+    Dolby Vision 与 HDR10+ 都通过 ffprobe 的 side data/codec tag 判定；若动态
+    元数据不可见，再按 BT.2100 传输特性回退 HDR10（PQ）或 HLG。顺序不能
+    反过来，否则带 PQ 基础层的 Dolby Vision/HDR10+ 会被误标成普通 HDR10。
     """
+    side_data_types = {
+        str(item.get("side_data_type") or "").lower()
+        for item in (video.get("side_data_list") or [])
+        if isinstance(item, dict)
+    }
+    codec_tag = str(video.get("codec_tag_string") or "").lower()
+    if codec_tag in {"dvh1", "dvhe"} or any(
+        "dovi" in value or "dolby vision" in value for value in side_data_types
+    ):
+        return "Dolby Vision"
+    if any(
+        "hdr10+" in value or "smpte2094-40" in value or "smpte 2094-40" in value
+        for value in side_data_types
+    ):
+        return "HDR10+"
     transfer = (video.get("color_transfer") or "").lower()
     if transfer == "smpte2084":
         return "HDR10"
     if transfer == "arib-std-b67":
         return "HLG"
+    return None
+
+
+def _frame_rate(value) -> float | None:
+    """ffprobe 的 ``24000/1001`` 等有理数帧率转成稳定的小数展示值。"""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        if isinstance(value, str) and "/" in value:
+            numerator, denominator = value.split("/", 1)
+            denominator_value = float(denominator)
+            if denominator_value == 0:
+                return None
+            rate = float(numerator) / denominator_value
+        else:
+            rate = float(value)
+    except (TypeError, ValueError):
+        return None
+    if rate <= 0 or rate > 1000:
+        return None
+    return round(rate, 3)
+
+
+def _color_space_label(video: dict) -> str | None:
+    """把 ffprobe 的色彩原色/矩阵值收敛成用户可识别的标准名称。"""
+    primaries = str(video.get("color_primaries") or "").lower()
+    matrix = str(video.get("color_space") or "").lower()
+    # 某些文件的 color_primaries 会写成 unknown，但矩阵仍有有效值；逐项
+    # 尝试，避免一个无意义的非空字符串挡住后备信息。
+    for value in (primaries, matrix):
+        if value.startswith("bt2020"):
+            return "BT.2020"
+        if value == "bt709":
+            return "BT.709"
+        if value == "smpte432":
+            return "Display P3"
+        if value == "smpte431":
+            return "DCI-P3"
+        if value in {"bt470bg", "smpte170m", "smpte240m"}:
+            return "BT.601"
     return None
 
 

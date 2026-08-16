@@ -14,6 +14,7 @@ from movieclaw_downloader.clients.transmission import TransmissionDownloader
 from movieclaw_downloader.exceptions import (
     DownloaderAuthError,
     DownloaderConnectError,
+    DownloaderDeleteError,
 )
 from movieclaw_downloader.models import DownloaderConfig, DownloaderType, DownloadRequest
 from movieclaw_downloader.torrent import compute_info_hash
@@ -39,6 +40,7 @@ class FakeTrClient:
     def __init__(self):
         self.store: dict[str, SimpleNamespace] = {}
         self.add_calls: list[tuple] = []
+        self.remove_calls: list[tuple] = []
 
     def get_torrent(self, torrent_id):
         if torrent_id not in self.store:
@@ -51,6 +53,13 @@ class FakeTrClient:
 
     def get_session(self):
         return SimpleNamespace(version="4.0.5")
+
+    def get_torrents(self):
+        return list(self.store.values())
+
+    def remove_torrent(self, torrent_id, *, delete_data=False):
+        self.remove_calls.append((torrent_id, delete_data))
+        self.store.pop(torrent_id, None)
 
 
 def make_downloader(fake: FakeTrClient) -> TransmissionDownloader:
@@ -157,3 +166,99 @@ class TestConnection:
         )
         with pytest.raises(DownloaderConnectError):
             downloader._client()
+
+
+class TestDeleteTorrent:
+    async def test_delete_keeps_downloaded_files_by_default(self):
+        fake = FakeTrClient()
+
+        await make_downloader(fake).delete_torrent(TORRENT_HASH)
+
+        assert fake.remove_calls == [(TORRENT_HASH, False)]
+
+    async def test_delete_can_remove_downloaded_files(self):
+        fake = FakeTrClient()
+
+        await make_downloader(fake).delete_torrent(TORRENT_HASH, delete_files=True)
+
+        assert fake.remove_calls == [(TORRENT_HASH, True)]
+
+    async def test_delete_error_translated(self):
+        fake = FakeTrClient()
+
+        def raise_error(torrent_id, *, delete_data=False):
+            from transmission_rpc.error import TransmissionError
+
+            raise TransmissionError("boom")
+
+        fake.remove_torrent = raise_error
+
+        with pytest.raises(DownloaderDeleteError, match="删除 Transmission 任务失败"):
+            await make_downloader(fake).delete_torrent(TORRENT_HASH)
+
+
+class TestListTorrents:
+    async def test_list_includes_task_center_progress_snapshot(self):
+        fake = FakeTrClient()
+        fake.store[TORRENT_HASH] = SimpleNamespace(
+            hash_string=TORRENT_HASH,
+            name="Task.Center.Movie",
+            percent_done=0.5,
+            fields={"eta": 60, "sizeWhenDone": 8192, "rateDownload": 2048, "status": 4},
+        )
+
+        rows = await make_downloader(fake).list_torrents()
+
+        assert rows[0].progress == 0.5
+        assert rows[0].size_bytes == 8192
+        assert rows[0].dlspeed_bytes == 2048
+        assert rows[0].eta_seconds == 60
+        assert rows[0].state == "downloading"
+
+
+class TestGetTorrent:
+    async def test_file_snapshot_keeps_completed_bytes_and_selection(self):
+        fake = FakeTrClient()
+        fake.store[TORRENT_HASH] = SimpleNamespace(
+            hash_string=TORRENT_HASH,
+            name="Partial.Show",
+            percent_done=0.5,
+            download_dir="/downloads/tv",
+            fields={
+                "eta": 60,
+                "sizeWhenDone": 300,
+                "rateDownload": 100,
+                "status": 4,
+                "haveValid": 0,
+                "haveUnchecked": 150,
+                "downloadedEver": 80,
+            },
+            get_files=lambda: [
+                SimpleNamespace(
+                    name="Partial.Show/ep1.mkv",
+                    size=100,
+                    completed=100,
+                    selected=True,
+                ),
+                SimpleNamespace(
+                    name="Partial.Show/ep2.mkv",
+                    size=200,
+                    completed=50,
+                    selected=True,
+                ),
+                SimpleNamespace(
+                    name="Partial.Show/sample.mkv",
+                    size=20,
+                    completed=0,
+                    selected=False,
+                ),
+            ],
+        )
+
+        status = await make_downloader(fake).get_torrent(TORRENT_HASH)
+
+        assert status is not None
+        assert status.completed_bytes == 150
+        assert status.downloaded_bytes == 80
+        assert [file.completed_bytes for file in status.files] == [100, 50, 0]
+        assert [file.selected for file in status.files] == [True, True, False]

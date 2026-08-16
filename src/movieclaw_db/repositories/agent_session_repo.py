@@ -74,7 +74,7 @@ class AgentSessionRepository:
         self._session.add(row)
         await self._session.commit()
 
-    async def resync_after_truncate(
+    async def resync_after_discard(
         self,
         session_id: str,
         *,
@@ -82,12 +82,12 @@ class AgentSessionRepository:
         entry_count: int,
         last_prompt: str | None,
     ) -> None:
-        """会话被截断后按文件重新校准索引（行缺失时静默跳过，同 touch_after_append）。
+        """丢弃旧消息后按文件重新校准索引（行缺失时静默跳过，同 touch_after_append）。
 
         与 touch_after_append 的区别在两处「减法」上：``last_prompt`` 允许被
-        置空（最后一轮可能刚被删掉），会话被截成空壳时连标题一并清掉——标题
+        置空（最后一条用户消息可能刚被删掉），会话清空时连标题一并清掉——标题
         本就是首条提问的预览，那条提问已经不在了，留着就是个对不上号的名字，
-        清空后下一条消息会重新给它命名（见 recorder.record_user_input）。
+        清空后下一条消息会重新给它命名（见 recorder.record_user_message）。
         用户自己改过的标题同样会被清掉：会话内容已被清空，沿用旧名反而误导。
         """
         row = await self.get(session_id)

@@ -25,6 +25,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import shutil
 from collections.abc import Callable, Iterable
@@ -37,6 +38,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
 from movieclaw_api.core.config import get_settings
+from movieclaw_api.services import jobs
 from movieclaw_api.services.task_state import TaskState
 from movieclaw_db.engine import get_database
 from movieclaw_db.models import (
@@ -123,7 +125,11 @@ async def scrape_media_item(
 
 async def _scrape(media_item_id: int, *, force: bool, on_phase: PhaseHook = None) -> bool:
     from movieclaw_api.services.media_discover import get_tmdb_client
-    from movieclaw_api.services.subscription import expected_units, recompute_subscription_status
+    from movieclaw_api.services.subscription import (
+        expected_units,
+        recompute_subscription_status,
+        refresh_release_forecasts,
+    )
 
     def _phase(text: str) -> None:
         if on_phase is not None:
@@ -170,6 +176,9 @@ async def _scrape(media_item_id: int, *, force: bool, on_phase: PhaseHook = None
             )
             await _grow_and_sync(session, subscription, item, expected, known_keys)
             await recompute_subscription_status(session, subscription, item)
+            # 新集出现或 air_date 改档后立即重建目标快照。快照内带 target_air_date，
+            # 即使本次刷新中断，读取端也不会使用旧档期的预测。
+            await refresh_release_forecasts(session, media_item_ids={media_item_id})
 
     _phase("下载图片")
     await download_item_assets(media_item_id, force=force)
@@ -310,6 +319,220 @@ async def refresh_library_metadata(library_id: int) -> None:
         logger.exception("媒体库 #%s 整库元数据刷新时发生未知错误", library_id)
     finally:
         _refresh_tasks.finish(library_id)
+
+
+async def enqueue_library_metadata_refresh_job(
+    session: AsyncSession,
+    library_id: int,
+    library_name: str,
+    *,
+    actor_kind: str | None = None,
+    actor_name: str | None = None,
+    actor_id: str | None = None,
+    origin: str = "web",
+) -> jobs.CreateJobResult:
+    """把整库刷新固化成可恢复 Job；目标快照保证更新前后处理口径一致。"""
+    result = await session.execute(
+        select(LibraryFile.media_item_id, MediaItem.title)
+        .join(MediaItem, MediaItem.id == LibraryFile.media_item_id)  # type: ignore[arg-type]
+        .where(LibraryFile.library_id == library_id)
+        .distinct()
+        .order_by(LibraryFile.media_item_id)
+    )
+    targets = [
+        {"media_item_id": item_id, "title": title}
+        for item_id, title in result.all()
+        if item_id is not None
+    ]
+    return await jobs.create_job(
+        session,
+        job_type="library.metadata.refresh",
+        subject=library_name,
+        input_data={"library_id": library_id, "targets": targets},
+        resources=[jobs.ResourceRef("library", library_id)],
+        dedupe_key=f"library.metadata.refresh:{library_id}",
+        conflict_policy="return_existing",
+        handler_revision="library.metadata.refresh.v1",
+        max_attempts=3,
+        actor_kind=actor_kind,
+        actor_name=actor_name,
+        actor_id=actor_id,
+        origin=origin,
+        progress={
+            **jobs.default_progress("等待刷新媒体库元数据"),
+            "total": len(targets),
+            "details": {"failed": 0, "active": []},
+        },
+    )
+
+
+async def enqueue_item_metadata_refresh_job(
+    session: AsyncSession,
+    *,
+    library_id: int,
+    media_item_id: int,
+    title: str,
+    actor_kind: str | None = None,
+    actor_name: str | None = None,
+    actor_id: str | None = None,
+    origin: str = "web",
+) -> jobs.CreateJobResult:
+    """创建单条目刷新 Job；媒体条目资源锁避免与转移或另一刷新并发。"""
+    return await jobs.create_job(
+        session,
+        job_type="media.metadata.refresh",
+        subject=title,
+        input_data={
+            "library_id": library_id,
+            "media_item_id": media_item_id,
+            "title": title,
+        },
+        resources=[
+            jobs.ResourceRef("media_item", media_item_id),
+            # 刮削末段会向媒体目录写 NFO/图片，必须与整理/转移的路径变更
+            # 共用库级资源锁，不能只把 library 当展示容器。
+            jobs.ResourceRef("library", library_id),
+        ],
+        dedupe_key=f"media.metadata.refresh:{media_item_id}",
+        conflict_policy="return_existing",
+        handler_revision="media.metadata.refresh.v1",
+        max_attempts=3,
+        actor_kind=actor_kind,
+        actor_name=actor_name,
+        actor_id=actor_id,
+        origin=origin,
+        progress={
+            **jobs.default_progress("等待刷新条目元数据"),
+            "details": {"media_item_id": media_item_id, "title": title},
+        },
+    )
+
+
+@jobs.register_job_handler("library.metadata.refresh")
+async def _run_library_metadata_refresh_job(
+    context: jobs.JobContext, input_data: dict[str, object]
+) -> dict[str, object]:
+    """整库刷新处理器：每批三个条目落一次检查点，重启最多重复当前批次。
+
+    单条目刮削本身幂等；检查点只在一批完整收口后前移，因此服务更新发生
+    在任意网络请求或图片写入阶段都不会越过尚未完成的条目。
+    """
+    library_id = int(input_data["library_id"])
+    raw_targets = input_data.get("targets")
+    targets = list(raw_targets) if isinstance(raw_targets, list) else []
+    persisted = await context.current_progress()
+    resume_at = min(max(int(persisted.get("current") or 0), 0), len(targets))
+    details = persisted.get("details") if isinstance(persisted.get("details"), dict) else {}
+    failed = int(details.get("failed") or 0)
+    state = RefreshState(total=len(targets), processed=resume_at, failed=failed)
+    if not _refresh_tasks.try_start(library_id, state):
+        raise jobs.JobRetry("该媒体库已有元数据刷新正在收尾", delay_seconds=5)
+
+    try:
+        for start in range(resume_at, len(targets), _REFRESH_CONCURRENCY):
+            await context.raise_if_cancelled()
+            batch = targets[start : start + _REFRESH_CONCURRENCY]
+
+            async def _refresh_one(raw: object) -> bool:
+                if not isinstance(raw, dict):
+                    return False
+                item_id = int(raw["media_item_id"])
+                title = str(raw.get("title") or f"条目 #{item_id}")
+                state.active[item_id] = (title, "排队中")
+                try:
+                    return await scrape_media_item(
+                        item_id,
+                        force=True,
+                        on_phase=lambda phase, _id=item_id, _title=title: state.active.__setitem__(
+                            _id, (_title, phase)
+                        ),
+                    )
+                finally:
+                    state.active.pop(item_id, None)
+
+            outcomes = await asyncio.gather(*(_refresh_one(raw) for raw in batch))
+            failed += sum(not ok for ok in outcomes)
+            state.failed = failed
+            state.processed = start + len(batch)
+            percent = state.processed / len(targets) * 100 if targets else 100.0
+            await context.update_progress(
+                mode="determinate",
+                phase="refreshing",
+                message=f"已刷新 {state.processed} / {len(targets)} 个条目",
+                current=state.processed,
+                total=len(targets),
+                percent=round(percent, 1),
+                details={"failed": failed, "active": []},
+            )
+
+        message = f"元数据刷新完成，共 {len(targets)} 个条目"
+        if failed:
+            message += f"，其中 {failed} 个未完成"
+        logger.info("媒体库 #%s %s", library_id, message)
+        return {
+            "message": message,
+            "library_id": library_id,
+            "processed": len(targets),
+            "total": len(targets),
+            "failed": failed,
+        }
+    finally:
+        _refresh_tasks.finish(library_id)
+
+
+@jobs.register_job_handler("media.metadata.refresh")
+async def _run_item_metadata_refresh_job(
+    context: jobs.JobContext, input_data: dict[str, object]
+) -> dict[str, object]:
+    """单条目刷新处理器；阶段写入公共进度，取消与重启都可安全重跑。"""
+    media_item_id = int(input_data["media_item_id"])
+    title = str(input_data.get("title") or f"条目 #{media_item_id}")
+    if is_scraping(media_item_id):
+        raise jobs.JobRetry(f"《{title}》已有一次刮削正在收尾", delay_seconds=5)
+
+    phase = "准备刷新"
+
+    def _phase(value: str) -> None:
+        nonlocal phase
+        phase = value
+
+    runner = asyncio.create_task(
+        scrape_media_item(media_item_id, force=True, on_phase=_phase),
+        name=f"metadata-refresh-{media_item_id}",
+    )
+    last_phase = ""
+    try:
+        while not runner.done():
+            await context.raise_if_cancelled()
+            if phase != last_phase:
+                await context.update_progress(
+                    mode="indeterminate",
+                    phase="refreshing",
+                    message=phase,
+                    details={"media_item_id": media_item_id, "title": title},
+                )
+                last_phase = phase
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(asyncio.shield(runner), timeout=0.5)
+        if not await runner:
+            raise jobs.JobFailed(
+                f"《{title}》元数据刷新未完成，请检查 TMDB 配置或后端日志",
+                code="METADATA_REFRESH_FAILED",
+                actions=[
+                    {"type": "retry_job", "label": "重试"},
+                    {"type": "open_settings", "label": "检查设置", "target": "metadata"},
+                ],
+            )
+        return {
+            "message": f"《{title}》元数据刷新完成",
+            "library_id": int(input_data["library_id"]),
+            "media_item_id": media_item_id,
+        }
+    finally:
+        if not runner.done():
+            runner.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await runner
 
 
 # ---------------------------------------------------------------------------
@@ -680,12 +903,11 @@ async def _grow_and_sync(
 # 图片资产（事实源：data/metadata/images/{条目 id}/，docs/design/metadata.md 6.1）
 # ---------------------------------------------------------------------------
 
+
 def _asset_sizes() -> tuple[str, str, str]:
     """当前配置的 (海报, 背景, 剧照) 尺寸档位（见 Settings 的注释与取舍）。"""
     settings = get_settings()
     return (settings.tmdb_poster_size, settings.tmdb_backdrop_size, settings.tmdb_still_size)
-
-
 
 
 def assets_root() -> Path:
@@ -813,6 +1035,8 @@ async def download_item_assets(
         item_dir = assets_root() / str(media_item_id)
         base = get_settings().tmdb_image_base_url.rstrip("/")
         poster_size, backdrop_size, still_size = _asset_sizes()
+        sources = await asyncio.to_thread(_load_asset_sources, item_dir)
+        saved_sources = dict(sources)
 
         async with _asset_semaphore:
             meta.poster_file = await _sync_asset(
@@ -822,6 +1046,9 @@ async def download_item_assets(
                 item_dir / "poster.jpg",
                 meta.poster_file,
                 force and (ignore_locks or not meta.poster_locked),
+                sources,
+                "poster",
+                locked=meta.poster_locked and not ignore_locks,
             )
             meta.backdrop_file = await _sync_asset(
                 base,
@@ -830,6 +1057,9 @@ async def download_item_assets(
                 item_dir / "backdrop.jpg",
                 meta.backdrop_file,
                 force and (ignore_locks or not meta.backdrop_locked),
+                sources,
+                "backdrop",
+                locked=meta.backdrop_locked and not ignore_locks,
             )
             session.add(meta)
             for season in seasons:
@@ -840,30 +1070,87 @@ async def download_item_assets(
                     item_dir / f"season-{season.season_number}.jpg",
                     season.poster_file,
                     force,
+                    sources,
+                    f"season-{season.season_number}",
                 )
                 session.add(season)
             if has_files:
                 for episode in episodes:
+                    key = f"s{episode.season_number:02d}e{episode.episode_number:02d}"
                     episode.still_file = await _sync_asset(
                         base,
                         still_size,
                         episode.still_path,
-                        item_dir / f"s{episode.season_number:02d}e{episode.episode_number:02d}.jpg",
+                        item_dir / f"{key}.jpg",
                         episode.still_file,
                         force,
+                        sources,
+                        key,
                     )
                     session.add(episode)
+        if sources != saved_sources:
+            await asyncio.to_thread(_save_asset_sources, item_dir, sources)
         await session.commit()
 
 
+_SOURCES_FILE = "sources.json"
+
+
+def _load_asset_sources(item_dir: Path) -> dict[str, str]:
+    """条目资产目录的溯源记录：资产键 → 下载时的「档位+TMDB 路径」。
+
+    普通刷新据此判断"上游换图了没有"——没有溯源就没法感知 TMDB 换图，
+    资产会永远停在首次下载的那张（docs/design/metadata.md 6.1，2026-08-04
+    完整性决策）。放文件而非数据库：与资产同生共死，且免一次迁移。
+    """
+    try:
+        import json
+
+        return json.loads((item_dir / _SOURCES_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_asset_sources(item_dir: Path, sources: dict[str, str]) -> None:
+    try:
+        import json
+
+        item_dir.mkdir(parents=True, exist_ok=True)
+        (item_dir / _SOURCES_FILE).write_text(
+            json.dumps(sources, ensure_ascii=False, indent=1), encoding="utf-8"
+        )
+    except OSError as exc:
+        logger.warning("资产溯源记录写盘失败（不阻断）：%s（%s）", item_dir, exc)
+
+
 async def _sync_asset(
-    base: str, size: str, tmdb_path: str | None, dest: Path, current: str | None, force: bool
+    base: str,
+    size: str,
+    tmdb_path: str | None,
+    dest: Path,
+    current: str | None,
+    force: bool,
+    sources: dict[str, str],
+    key: str,
+    *,
+    locked: bool = False,
 ) -> str | None:
-    """下载单张图到资产目录，返回落库的相对路径（失败保留现值/None）。"""
+    """下载单张图到资产目录，返回落库的相对路径（失败保留现值/None）。
+
+    跳过条件（普通刷新）：文件在**且溯源与当前来源一致**——TMDB 换图
+    （poster_path 变更）或档位配置调整都会触发重下，资产随刷新保持最新。
+    ``locked``（手动选定）：只要文件还在就不动，上游换图与它无关。
+    """
     if not tmdb_path:
         return current
     rel = str(dest.relative_to(assets_root()))
-    if not force and current == rel and await asyncio.to_thread(dest.is_file):
+    want = f"{size}{tmdb_path}"
+    if (
+        not force
+        and current == rel
+        and (locked or sources.get(key) == want)
+        and await asyncio.to_thread(dest.is_file)
+    ):
         return current
     from movieclaw_api.services.image_proxy import get_image_proxy
 
@@ -877,6 +1164,7 @@ async def _sync_asset(
     except OSError as exc:
         logger.warning("图片资产写盘失败：%s（%s）", dest, exc)
         return current
+    sources[key] = want
     return rel
 
 
@@ -996,12 +1284,10 @@ async def select_artwork(media_item_id: int, *, kind: str, file_path: str | None
 async def mirror_media_dir_assets(media_item_id: int, *, force: bool = False) -> None:
     """把刮削成果镜像写入媒体目录：条目图片 + 完整 NFO + 分集 thumb/NFO。
 
-    铁律：目标文件已存在则跳过（唯一例外：内容为空的最小身份 NFO 且
-    tmdbid 相同，升级为完整 NFO）；绝不删除；写失败只告警。
-
-    ``force``（单条目手动刷新）：**图片**改为覆盖写——用户点强制刷新的
-    语义就是"以 TMDB 最新为准"（Emby「替换现有图片」同款）；NFO 不跟随
-    覆盖（TMM/Emby 的富 NFO 是用户刮削成果，维持只增规则）。
+    铁律（2026-08-04 完整性决策改版，docs/design/metadata.md 6.2）：镜像随
+    库内档案**保持更新**——图片"资产比镜像新才覆盖"（_copy_asset），NFO 每次
+    刷新按 media_metadata 重写（内容比对，无变化不落盘）；**绝不删除**；
+    写失败只告警。``force``（单条目手动刷新）：图片无条件覆盖写。
 
     NFO 只在身份**高置信**时写（人工认领 / 目录 tmdbid 标记 / 既有 NFO /
     入库管线锚定）：扫描的名称收敛（RESOLVED）是机器结论，写成 NFO 会被
@@ -1102,9 +1388,21 @@ async def mirror_media_dir_assets(media_item_id: int, *, force: bool = False) ->
 
 
 def _copy_asset(src: Path, dest: Path, force: bool) -> None:
-    """资产 → 媒体目录的单张复制：默认只补缺失，force 覆盖（源不存在不动）。"""
-    if not src.is_file() or (dest.exists() and not force):
+    """资产 → 媒体目录的单张镜像：**资产比镜像新（或 force）才覆盖**，绝不删除。
+
+    2026-08-04 完整性决策：镜像随资产追新——资产因上游换图/档位调整重下后
+    （mtime 变新），下次镜像即覆盖媒体目录里的旧图；用户手工放进目录的图
+    （mtime 比资产新）不会被冲掉——想让手选图长期生效请走详情页选图锁
+    （锁会覆盖镜像并冻结资产，见 docs/design/metadata.md 6.3）。
+    """
+    if not src.is_file():
         return
+    if dest.exists() and not force:
+        try:
+            if dest.stat().st_mtime >= src.stat().st_mtime:
+                return
+        except OSError:
+            return
     try:
         shutil.copyfile(src, dest)
     except OSError as exc:

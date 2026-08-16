@@ -28,9 +28,20 @@ def resolve_overlaps(spans: list[dict]) -> list[dict]:
 
 
 def build_char_tags(text_len: int, spans: list[dict]) -> list[str]:
-    """把一组不重叠的字符 span 展开成逐字符的 BIO 标签数组。"""
+    """把一组不重叠的字符 span 展开成逐字符的 BIO 标签数组。
+
+    重叠 span 在此**硬报错**而不是静默消解：平面 BIO 无法无损表达重叠，
+    静默裁剪会造成落盘标注/入训标签/评估 gold 三态不一致。重叠记录应在
+    标注定位阶段被打 review 隔离（clean_only 训练不会走到这里），走到这里
+    说明管线上游漏了，必须暴露。"""
+    resolved = resolve_overlaps(spans)
+    if len(resolved) != len(spans):
+        raise ValueError(
+            f"存在重叠 span（{len(spans)} 条消解后剩 {len(resolved)} 条）——"
+            "重叠记录应在上游打 review 隔离，不允许训练时静默裁剪"
+        )
     tags = ["O"] * text_len
-    for span in resolve_overlaps(spans):
+    for span in resolved:
         start, end, field = span["start"], span["end"], span["field"]
         if not (0 <= start < end <= text_len):
             raise ValueError(f"span 越界: {span} (文本长度 {text_len})")

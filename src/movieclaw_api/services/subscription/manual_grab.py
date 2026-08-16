@@ -1,4 +1,4 @@
-"""手动选种：把搜索结果里的一条种子直接投给指定订阅（sub.grab）。
+"""人工选择种子下载：把搜索结果里的一条种子直接投给指定订阅。
 
 自动管线（被动匹配/主动搜索）之外的第三条投递路径——用户在搜索页看到了
 一个合适的种子，不必再等规则组恰好放行：**手动选种即用户对规则的显式覆盖，
@@ -35,7 +35,6 @@ from movieclaw_db.models import (
     SubscriptionStatus,
     WantedItem,
     WantedStatus,
-    utcnow,
 )
 from movieclaw_enrich import enrich
 from movieclaw_enrich.models import TorrentAttrs
@@ -74,7 +73,10 @@ async def grab_manual(
     （与 dl.submit 拿 download_url 的信任模型一致——调用方本就是管理员）。
     """
     from movieclaw_api.services.subscription.dispatch import dispatch
-    from movieclaw_api.services.subscription.matching import covered_units
+    from movieclaw_api.services.subscription.matching import (
+        covered_units,
+        publish_calendar_date,
+    )
 
     subscription = await session.get(Subscription, subscription_id)
     if subscription is None:
@@ -91,6 +93,7 @@ async def grab_manual(
                 select(WantedItem).where(
                     WantedItem.subscription_id == subscription_id,
                     WantedItem.status == WantedStatus.WANTED,
+                    WantedItem.in_scope.is_(True),  # type: ignore[attr-defined]
                 )
             )
         )
@@ -149,7 +152,7 @@ async def grab_manual(
             "可改用「一键下载」手动选择保存目录"
         )
 
-    published = publish_time.date() if publish_time is not None else utcnow().date()
+    published = publish_calendar_date(publish_time)
     covered = covered_units(match, open_wanted, published=published)
     if not covered:
         gap_text = "、".join(

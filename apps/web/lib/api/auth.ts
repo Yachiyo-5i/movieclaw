@@ -12,6 +12,13 @@ async function unwrap<T>(promise: Promise<ApiEnvelope<T>>): Promise<T> {
   return (await promise).data;
 }
 
+/** 能力开关快照：前端据此裁剪入口；安全边界仍在后端 403。 */
+export interface SessionCapabilities {
+  allow_subscribe: boolean;
+  allow_search: boolean;
+  allow_direct_download: boolean;
+}
+
 /** 当前登录会话（见 schemas.auth.SessionView）。 */
 export interface SessionView {
   username: string;
@@ -19,6 +26,10 @@ export interface SessionView {
   nickname: string;
   /** 头像相对 URL（含版本号，换头像后 URL 变化以绕开缓存）；未上传过为空 */
   avatar_url: string | null;
+  /** admin=超级管理员；member=成员（导航与设置分区按此裁剪） */
+  role: "admin" | "member";
+  /** 能力开关快照；管理员恒为全开 */
+  capabilities: SessionCapabilities;
 }
 
 /** 首次初始化状态：未初始化时前端应进 /setup 引导页。 */

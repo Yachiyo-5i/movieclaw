@@ -159,6 +159,8 @@ def _list_load_columns(
         MediaMetadata.genres,
     ]
     if options.enable_images:
+        # TMDB 路径兜底出 tag（资产未落地时）也在列表路径读，短字符串列
+        item_columns.extend([MediaItem.poster_path, MediaItem.backdrop_path])
         metadata_columns.extend(
             [
                 MediaMetadata.poster_file,
@@ -202,6 +204,7 @@ def _list_load_columns(
                 LibraryFile.bit_rate,
                 LibraryFile.audio_streams,
                 LibraryFile.subtitle_streams,
+                LibraryFile.external_subtitles,
             ]
         )
     elif options.has("Path"):
@@ -238,12 +241,21 @@ async def load_bundles(
     session: AsyncSession,
     item_ids: list[int],
     *,
+    member_id: int = 0,
     library_id: int | None = None,
+    visible_library_ids: set[int] | None = None,
     include_people: bool = False,
     include_fileless: bool = False,
     dto_options: DtoOptions | None = None,
 ) -> dict[int, ItemBundle]:
-    """批量装载条目素材。library_id 限定时只装该库的文件行。
+    """批量装载条目素材。库参数限定时只装对应范围内的文件行。
+
+    ``member_id``：观看者（0=超管哨兵）——bundle 里的播放状态只装该
+    成员自己的行，UserData（进度/已看/收藏）随之按人投影。
+
+    ``visible_library_ids``：成员可见库范围。条目可能同时存在于多个库，
+    不能只在进入详情前判断“至少有一份可见”，否则 DTO 会夹带隐藏库的
+    MediaSourceId，播放器选择后又在取流层被 404，形成“能看见但播不了”。
 
     ``include_people`` 只在输出会用到 People 时为 True（fields=People 或
     单条目全字段）：演职员是量最大的关联（条目数 × 十余人的 join +
@@ -292,6 +304,8 @@ async def load_bundles(
     )
     if library_id is not None:
         file_q = file_q.where(LibraryFile.library_id == library_id)
+    if visible_library_ids is not None:
+        file_q = file_q.where(LibraryFile.library_id.in_(visible_library_ids))
     if summary_columns is not None:
         file_q = file_q.options(load_only(*summary_columns[2]))
     for f in (await session.execute(file_q)).scalars():
@@ -314,7 +328,10 @@ async def load_bundles(
 
     for st in (
         await session.execute(
-            select(PlaybackState).where(PlaybackState.media_item_id.in_(item_ids))
+            select(PlaybackState).where(
+                PlaybackState.media_item_id.in_(item_ids),
+                PlaybackState.member_id == member_id,
+            )
         )
     ).scalars():
         b = bundles.get(st.media_item_id)
@@ -350,7 +367,9 @@ async def load_bundles(
 async def latest_unit_candidates(
     session: AsyncSession,
     *,
+    member_id: int = 0,
     library_id: int | None = None,
+    visible_library_ids: set[int] | None = None,
     is_played: bool | None = None,
 ) -> list[LatestUnitCandidate]:
     """只查询 Latest 的排序单元，延后到选页后再装载 bundle。
@@ -378,6 +397,8 @@ async def latest_unit_candidates(
     )
     if library_id is not None:
         q = q.where(LibraryFile.library_id == library_id)
+    if visible_library_ids is not None:
+        q = q.where(LibraryFile.library_id.in_(visible_library_ids))
     if is_played is not None:
         q = q.outerjoin(
             PlaybackState,
@@ -385,6 +406,7 @@ async def latest_unit_candidates(
                 PlaybackState.media_item_id == LibraryFile.media_item_id,
                 PlaybackState.season_number == LibraryFile.season_number,
                 PlaybackState.episode_number == LibraryFile.episode_number,
+                PlaybackState.member_id == member_id,
             ),
         )
         if is_played:
@@ -418,18 +440,22 @@ async def latest_unit_candidates(
     ]
 
 
-async def resume_unit_candidates(session: AsyncSession) -> list[ResumeUnitCandidate]:
-    """查询有续播位置且文件仍在位的单元，不加载未进入结果页的 bundle。"""
-    file_exists = (
-        select(LibraryFile.id)
-        .where(
-            LibraryFile.media_item_id == PlaybackState.media_item_id,
-            LibraryFile.season_number == PlaybackState.season_number,
-            LibraryFile.episode_number == PlaybackState.episode_number,
-            LibraryFile.missing_since.is_(None),
-        )
-        .exists()
-    )
+async def resume_unit_candidates(
+    session: AsyncSession,
+    *,
+    member_id: int = 0,
+    visible_library_ids: set[int] | None = None,
+) -> list[ResumeUnitCandidate]:
+    """查询该成员有续播位置且文件仍在位的单元，不加载未进入结果页的 bundle。"""
+    file_conditions = [
+        LibraryFile.media_item_id == PlaybackState.media_item_id,
+        LibraryFile.season_number == PlaybackState.season_number,
+        LibraryFile.episode_number == PlaybackState.episode_number,
+        LibraryFile.missing_since.is_(None),
+    ]
+    if visible_library_ids is not None:
+        file_conditions.append(LibraryFile.library_id.in_(visible_library_ids))
+    file_exists = select(LibraryFile.id).where(*file_conditions).exists()
     q = (
         select(
             PlaybackState.media_item_id,
@@ -438,6 +464,7 @@ async def resume_unit_candidates(session: AsyncSession) -> list[ResumeUnitCandid
         )
         .join(MediaItem, MediaItem.id == PlaybackState.media_item_id)
         .where(
+            PlaybackState.member_id == member_id,
             PlaybackState.position_ms > 0,
             file_exists,
             or_(
@@ -468,9 +495,9 @@ async def resume_unit_candidates(session: AsyncSession) -> list[ResumeUnitCandid
 
 
 async def next_up_item_ids(
-    session: AsyncSession, *, series_id: int | None = None
+    session: AsyncSession, *, member_id: int = 0, series_id: int | None = None
 ) -> list[int]:
-    """返回有在位文件和播放活动的剧集 id，供 NextUp 延后加载。"""
+    """返回该成员有在位文件和播放活动的剧集 id，供 NextUp 延后加载。"""
     file_exists = (
         select(LibraryFile.id)
         .where(
@@ -486,6 +513,7 @@ async def next_up_item_ids(
         .join(MediaItem, MediaItem.id == PlaybackState.media_item_id)
         .where(
             MediaItem.kind == "tv",
+            PlaybackState.member_id == member_id,
             PlaybackState.season_number != 0,
             or_(PlaybackState.played.is_(True), PlaybackState.position_ms > 0),
             file_exists,
@@ -540,8 +568,10 @@ async def item_ids_with_files(
     *,
     kind: str | None = None,
     library_id: int | None = None,
+    visible_library_ids: set[int] | None = None,
 ) -> list[int]:
-    """有在位文件的条目 id 集合（粗筛）。"""
+    """有在位文件的条目 id 集合（粗筛）。``visible_library_ids`` 限定成员
+    可见库（None=不受限）——跨库递归查询的可见性收口点。"""
     q = (
         select(LibraryFile.media_item_id)
         .where(LibraryFile.media_item_id.is_not(None), LibraryFile.missing_since.is_(None))
@@ -549,6 +579,8 @@ async def item_ids_with_files(
     )
     if library_id is not None:
         q = q.where(LibraryFile.library_id == library_id)
+    if visible_library_ids is not None:
+        q = q.where(LibraryFile.library_id.in_(visible_library_ids))
     ids = [row for row in (await session.execute(q)).scalars()]
     if kind is None or not ids:
         return ids
@@ -560,46 +592,14 @@ async def item_ids_with_files(
     return list(kind_ids)
 
 
-async def list_libraries(session: AsyncSession) -> list[Library]:
-    return list((await session.execute(select(Library))).scalars())
-
-
-@dataclass
-class LibraryStats:
-    """库卡片素材：条目数（播放器的库列表用；封面另走拼贴服务）。"""
-
-    item_count: int = 0  # 顶层条目数（电影部数 / 剧集部数）
-    episode_count: int = 0
-
-
-async def load_library_stats(session: AsyncSession) -> dict[int, LibraryStats]:
-    """一次性算出全部库的条目数（封面见 library.cover 拼贴服务）。"""
-    stats: dict[int, LibraryStats] = {}
-    rows = (
-        await session.execute(
-            select(
-                LibraryFile.library_id,
-                LibraryFile.media_item_id,
-                LibraryFile.season_number,
-                LibraryFile.episode_number,
-            ).where(
-                LibraryFile.media_item_id.is_not(None),
-                LibraryFile.missing_since.is_(None),
-            )
-        )
-    ).all()
-    per_lib_items: dict[int, set[int]] = {}
-    per_lib_units: dict[int, set[tuple[int, int, int]]] = {}
-    for r in rows:
-        per_lib_items.setdefault(r.library_id, set()).add(r.media_item_id)
-        per_lib_units.setdefault(r.library_id, set()).add(
-            (r.media_item_id, r.season_number, r.episode_number)
-        )
-    for lib_id, items in per_lib_items.items():
-        stats[lib_id] = LibraryStats(
-            item_count=len(items), episode_count=len(per_lib_units[lib_id])
-        )
-    return stats
+async def list_libraries(
+    session: AsyncSession, *, visible_ids: set[int] | None = None
+) -> list[Library]:
+    """全部库；``visible_ids`` 限定成员可见库（None=不受限）。"""
+    q = select(Library)
+    if visible_ids is not None:
+        q = q.where(Library.id.in_(visible_ids))
+    return list((await session.execute(q)).scalars())
 
 
 # ---------------------------------------------------------------------------
@@ -771,6 +771,15 @@ def _apply_provider_ids(dto: dict[str, Any], bundle: ItemBundle, options: DtoOpt
     dto["ProviderIds"] = providers
 
 
+def _tmdb_tag(tmdb_path: str | None) -> str | None:
+    """TMDB 图床兜底的图片 tag：资产未落地时也要让客户端来请求图片——
+    没有 ImageTags 播放器根本不会发起图片请求，三层解析的兜底层就永远
+    走不到（图片端点会经图片代理拉取并缓存）。路径变即 tag 变。"""
+    if not tmdb_path:
+        return None
+    return hashlib.md5(f"tmdb:{tmdb_path}".encode()).hexdigest()
+
+
 def _apply_item_images(
     dto: dict[str, Any], ctx: DtoContext, bundle: ItemBundle, options: DtoOptions
 ) -> None:
@@ -778,13 +787,17 @@ def _apply_item_images(
         return
     tags: dict[str, str] = {}
     meta = bundle.metadata
-    poster = _asset_tag(meta.poster_file if meta else None, meta.updated_at if meta else None)
+    # 资产已落地 → 零 IO 派生 tag（issue #88 硬约束）；未落地 → TMDB 路径
+    # 兜底出 tag（a303b8e：图片接口按三层解析，tag 有值客户端才来取图）
+    poster = _asset_tag(
+        meta.poster_file if meta else None, meta.updated_at if meta else None
+    ) or _tmdb_tag(bundle.item.poster_path)
     if poster:
         tags["Primary"] = poster
     dto["ImageTags"] = tags
     backdrop = _asset_tag(
         meta.backdrop_file if meta else None, meta.updated_at if meta else None
-    )
+    ) or _tmdb_tag(bundle.item.backdrop_path)
     dto["BackdropImageTags"] = [backdrop] if backdrop else []
 
 
@@ -1045,7 +1058,6 @@ def episode_dto(
 def library_view_dto(
     ctx: DtoContext,
     library: Library,
-    stats: LibraryStats | None = None,
     cover_tag: str | None = None,
 ) -> dict[str, Any]:
     dto = _common(ctx, library_guid(library.id), library.name, "CollectionFolder", "Unknown")
@@ -1055,12 +1067,15 @@ def library_view_dto(
     dto["ImageTags"] = {"Primary": cover_tag} if cover_tag else {}
     dto["BackdropImageTags"] = []
     dto["ParentId"] = root_guid()
-    if stats is not None:
-        # UserViews 是全字段语义：CollectionFolder 带 ChildCount（库卡片计数）
-        dto["ChildCount"] = stats.item_count
-        dto["RecursiveItemCount"] = (
-            stats.episode_count if library.kind == "tv" else stats.item_count
-        )
+    # UserViews 是全字段语义：CollectionFolder 带 ChildCount（库卡片计数）。
+    # 直接读 library 上由扫描/入库写路径维护的快照，不再为每次
+    # Jellyfin 浏览请求扫描 library_file 全表。
+    dto["ChildCount"] = library.stats_item_count
+    dto["RecursiveItemCount"] = (
+        library.stats_episode_count
+        if library.kind == "tv"
+        else library.stats_item_count
+    )
     # 库视图不做已看聚合（CollectionFolder.SupportsPlayedStatus=false）
     guid = library_guid(library.id)
     dto["UserData"] = {
@@ -1093,10 +1108,15 @@ def _lang_display(code: str | None) -> str | None:
     return _LANG_DISPLAY.get(code.lower(), code.capitalize())
 
 
-def _video_range(hdr: str | None) -> tuple[str, str]:
-    if not hdr:
-        return "SDR", "SDR"
-    normalized = hdr.upper()
+def _video_range(f: LibraryFile) -> tuple[str, str]:
+    if not f.hdr:
+        # hdr 为空有两种含义（media_probe 三态铁律）：探测跑过、确实是 SDR；
+        # 或探测根本没跑（ffprobe 缺失/strm 远程文件）。后者不能妄断 SDR——
+        # Jellyfin 语义里 Unknown 让客户端隐藏画质角标，而非挂错误的 SDR 标。
+        if f.video_codec or f.resolution or f.bit_depth:
+            return "SDR", "SDR"
+        return "Unknown", "Unknown"
+    normalized = f.hdr.upper()
     if "HLG" in normalized:
         return "HDR", "HLG"
     if "DOLBY" in normalized or normalized == "DV" or "DOVI" in normalized:
@@ -1110,13 +1130,17 @@ def _resolution_text(f: LibraryFile) -> str:
     return ""
 
 
-def _video_stream(f: LibraryFile) -> dict[str, Any]:
-    video_range, range_type = _video_range(f.hdr)
+def _video_stream(f: LibraryFile, index: int) -> dict[str, Any]:
+    video_range, range_type = _video_range(f)
     codec = (f.video_codec or "").lower()
-    title_parts = [p for p in (_resolution_text(f), codec.upper(), video_range) if p]
+    title_parts = [
+        p
+        for p in (_resolution_text(f), codec.upper(), video_range)
+        if p and p != "Unknown"
+    ]
     stream: dict[str, Any] = {
         "Type": "Video",
-        "Index": 0,
+        "Index": index,
         "IsDefault": True,
         "IsForced": False,
         "IsExternal": False,
@@ -1203,9 +1227,74 @@ def _subtitle_stream(raw: dict, index: int) -> dict[str, Any]:
     return stream
 
 
+# 外挂字幕格式 → Jellyfin 惯用 codec 名（真 Jellyfin 由 ffprobe 得出，
+# 我们由台账扩展名映射）
+_EXTERNAL_SUB_CODEC = {"srt": "subrip", "vtt": "webvtt", "ass": "ass", "ssa": "ssa"}
+
+
+def _external_subtitle_stream(entry: dict, index: int, media_dir: Path) -> dict[str, Any]:
+    """台账外挂字幕元素 → MediaStream（jellyfin-subtitle.md §4.2）。
+
+    DisplayTitle 照内封拼接规则加 " - External" 尾缀；language 解析不出时
+    用 title 原文顶格（"简中&英文 - SUBRIP - External" 这类中文命名照样
+    可读），两者都有时 title 跟在语言后——AI 生成字幕（title="ai"，
+    subtitle-ai-translate.md §0）要靠 "Chinese - ai - …" 在播放器轨列表里
+    与人工字幕区分开。SupportsExternalStream/IsTextSubtitleStream 恒
+    true——v1 只收文本字幕（SUBTITLE_EXTS 已排除图形格式）。
+    """
+    lang = entry.get("language")
+    fmt = str(entry.get("format") or "").lower()
+    codec = _EXTERNAL_SUB_CODEC.get(fmt, fmt)
+    lang_display = _lang_display(lang)
+    title = entry.get("title")
+    parts = [
+        lang_display or title or "Und",
+        title if (lang_display and title) else None,
+        "Default" if entry.get("default") else None,
+        "Forced" if entry.get("forced") else None,
+        codec.upper() if codec else None,
+        "External",
+    ]
+    filename = entry.get("filename")
+    stream: dict[str, Any] = {
+        "Type": "Subtitle",
+        "Index": index,
+        "IsDefault": bool(entry.get("default")),
+        "IsForced": bool(entry.get("forced")),
+        "IsHearingImpaired": bool(entry.get("sdh")),
+        "IsExternal": True,
+        "SupportsExternalStream": True,
+        "IsTextSubtitleStream": True,
+        "DisplayTitle": " - ".join(p for p in parts if p),
+    }
+    # 真 Jellyfin 在详情 MediaStream.Path 下发服务端绝对路径。客户端不应
+    # 直接访问它，但 VidHub 会据此识别外挂流，不能只给 basename。
+    if filename:
+        stream["Path"] = str(media_dir / filename)
+    if codec:
+        stream["Codec"] = codec
+    if lang:
+        stream["Language"] = lang
+    if entry.get("title"):
+        stream["Title"] = entry["title"]
+    return stream
+
+
 def media_streams_dto(f: LibraryFile) -> list[dict[str, Any]]:
-    streams: list[dict[str, Any]] = [_video_stream(f)]
-    index = 1
+    """合成流编号是 Jellyfin 方言、唯一产地在本层（jellyfin-subtitle.md §4.1）：
+    **外挂字幕置前**（台账数组序），再接 video、audio、内封字幕。此顺序
+    对齐 Jellyfin master；VidHub 会按官方布局识别外挂流，不能假设只要
+    Index 在单次响应内自洽就协议等价。
+    编号↔中性轨引用的换算（subtitle_track_for_index 等）必须与本函数同源。
+    """
+    streams: list[dict[str, Any]] = []
+    index = 0
+    media_dir = Path(f.file_path).parent
+    for entry in f.external_subtitles or []:
+        streams.append(_external_subtitle_stream(entry, index, media_dir))
+        index += 1
+    streams.append(_video_stream(f, index))
+    index += 1
     for raw in f.audio_streams or []:
         streams.append(_audio_stream(raw, index))
         index += 1
@@ -1213,6 +1302,52 @@ def media_streams_dto(f: LibraryFile) -> list[dict[str, Any]]:
         streams.append(_subtitle_stream(raw, index))
         index += 1
     return streams
+
+
+# -- 合成编号 ↔ 中性轨引用（协议层 ↔ 领域层的翻译，§4.1） --------------------
+
+
+def subtitle_track_for_index(f: LibraryFile, index: int) -> str | None:
+    """合成 Index → 字幕的中性轨引用；不在字幕区间返回 None。"""
+    from movieclaw_playback.subtitles import embedded_track, external_track
+
+    externals = f.external_subtitles or []
+    if 0 <= index < len(externals):
+        filename = externals[index].get("filename")
+        return external_track(filename) if filename else None
+    embedded_base = len(externals) + 1 + len(f.audio_streams or [])
+    n_embedded = len(f.subtitle_streams or [])
+    if embedded_base <= index < embedded_base + n_embedded:
+        return embedded_track(index - embedded_base)
+    return None
+
+
+def index_for_subtitle_track(f: LibraryFile, track: str) -> int | None:
+    """中性轨引用 → 合成 Index；引用悬空（轨已不在）返回 None。"""
+    from movieclaw_playback.subtitles import parse_embedded_track, parse_external_track
+
+    externals = f.external_subtitles or []
+    embedded_base = len(externals) + 1 + len(f.audio_streams or [])
+    n_embedded = len(f.subtitle_streams or [])
+    k = parse_embedded_track(track)
+    if k is not None:
+        return embedded_base + k if k < n_embedded else None
+    filename = parse_external_track(track)
+    if filename is not None:
+        for j, entry in enumerate(externals):
+            if entry.get("filename") == filename:
+                return j
+    return None
+
+
+def audio_track_for_index(f: LibraryFile, index: int) -> str | None:
+    """合成 Index → 音轨的中性轨引用；不在音轨区间返回 None。"""
+    from movieclaw_playback.subtitles import embedded_track
+
+    audio_base = len(f.external_subtitles or []) + 1
+    if audio_base <= index < audio_base + len(f.audio_streams or []):
+        return embedded_track(index - audio_base)
+    return None
 
 
 def version_name(f: LibraryFile) -> str:

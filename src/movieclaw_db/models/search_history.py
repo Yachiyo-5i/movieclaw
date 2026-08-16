@@ -27,6 +27,10 @@ class SearchHistory(TimestampMixin, table=True):
     __tablename__ = "search_history"
 
     id: int | None = Field(default=None, primary_key=True)
+    # 搜索者（docs/design/member-management.md P2）：0=超管哨兵，与
+    # playback_state.member_id 同约定（非外键，删除成员时服务层显式清理）。
+    # 搜索历史是隐私性最强的个人数据之一，各人只看/只删自己的。
+    member_id: int = Field(default=0, index=True, description="搜索者；0=超管")
     # 搜索关键词（已去首尾空白）。加索引：record 时按 (keyword, 快照) 查重。
     keyword: str = Field(index=True, description="搜索关键词")
     # 搜索垂直："torrent"=站点资源（种子）/ "media"=影视条目（豆瓣）。

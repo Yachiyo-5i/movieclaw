@@ -17,9 +17,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass, field
+from datetime import date, datetime, timedelta
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from movieclaw_cache import AsyncTTLCache
 from movieclaw_media.models import (
@@ -27,10 +30,13 @@ from movieclaw_media.models import (
     DiscoverRowStub,
     MediaCard,
     MediaCastMember,
+    MediaCollection,
     MediaDetail,
     MediaFacts,
     MediaImage,
     MediaKind,
+    MediaPage,
+    MediaPersonDetail,
     MediaRow,
     MediaSearchItem,
     MediaSource,
@@ -42,6 +48,7 @@ logger = logging.getLogger("movieclaw_media.service")
 _PAGE_TTL = 30 * 60
 _GENRE_TTL = 24 * 60 * 60
 _DETAIL_TTL = 6 * 60 * 60
+_PERSON_TTL = 6 * 60 * 60
 _SEARCH_TTL = 10 * 60
 # Hero 轮播的精选数量
 _HERO_COUNT = 6
@@ -84,17 +91,48 @@ class _RowSpec:
     params: dict[str, Any] = field(default_factory=dict)
     ranked: bool = False
     limit: int = 20
+    paginated: bool = True
 
 
-def _movie_rows(region: str) -> tuple[_RowSpec, ...]:
+def _movie_rows(region: str, today: date | None = None) -> tuple[_RowSpec, ...]:
+    today = today or datetime.now(ZoneInfo("Asia/Shanghai")).date()
     # 行序参考 Netflix 发现页编排：趋势排名行打头，院线时效内容随后，热门与
     # 口碑居中，地区行与类型行垫后。discover 查询统一带 vote_count 下限挡住
     # 冷门残缺条目；类型 ID（878 科幻、28 动作等）是 TMDB 官方文档的稳定常量。
     return (
-        _RowSpec("trending-day", "今日热榜 Top 10", "trending/movie/day", ranked=True, limit=10),
+        _RowSpec(
+            "trending-day", "今日热榜", "trending/movie/day",
+            ranked=True, limit=10,
+        ),
         _RowSpec("now-playing", "正在热映", "movie/now_playing", {"region": region}),
         _RowSpec("upcoming", "即将上映", "movie/upcoming", {"region": region}),
         _RowSpec("popular", "热门电影", "movie/popular"),
+        _RowSpec(
+            "recent-acclaimed", "近两年高口碑", "discover/movie",
+            {
+                "primary_release_date.gte": (today - timedelta(days=730)).isoformat(),
+                "primary_release_date.lte": today.isoformat(),
+                "sort_by": "vote_average.desc",
+                "vote_count.gte": 300,
+            },
+        ),
+        _RowSpec(
+            "this-year", "今年新片", "discover/movie",
+            {
+                "primary_release_year": today.year,
+                "primary_release_date.lte": today.isoformat(),
+                "sort_by": "popularity.desc",
+                "vote_count.gte": 20,
+            },
+        ),
+        _RowSpec(
+            "short-runtime", "90 分钟以内", "discover/movie",
+            {
+                "with_runtime.lte": 90,
+                "sort_by": "popularity.desc",
+                "vote_count.gte": 100,
+            },
+        ),
         _RowSpec("top-rated", "高分经典", "movie/top_rated"),
         _RowSpec(
             "chinese", "华语佳片", "discover/movie",
@@ -144,13 +182,38 @@ def _movie_rows(region: str) -> tuple[_RowSpec, ...]:
     )
 
 
-def _tv_rows() -> tuple[_RowSpec, ...]:
+def _tv_rows(
+    today: date | None = None, timezone: str = "Asia/Shanghai"
+) -> tuple[_RowSpec, ...]:
+    today = today or datetime.now(ZoneInfo(timezone)).date()
     # 剧集侧同理：趋势与在播内容在前，热门/口碑居中，然后是地区行与播出平台
     # 品牌行（Netflix/HBO 是发现页里辨识度最高的两块金字招牌），类型行垫后。
     return (
-        _RowSpec("trending-day", "今日热榜 Top 10", "trending/tv/day", ranked=True, limit=10),
-        _RowSpec("on-the-air", "正在播出", "tv/on_the_air"),
+        _RowSpec(
+            "trending-day", "今日热榜", "trending/tv/day",
+            ranked=True, limit=10,
+        ),
+        _RowSpec("airing-today", "今日更新", "tv/airing_today", {"timezone": timezone}),
+        _RowSpec("on-the-air", "本周更新", "tv/on_the_air", {"timezone": timezone}),
         _RowSpec("popular", "热门剧集", "tv/popular"),
+        _RowSpec(
+            "recent-acclaimed", "近两年高口碑", "discover/tv",
+            {
+                "first_air_date.gte": (today - timedelta(days=730)).isoformat(),
+                "first_air_date.lte": today.isoformat(),
+                "sort_by": "vote_average.desc",
+                "vote_count.gte": 100,
+            },
+        ),
+        _RowSpec(
+            "completed-miniseries", "已完结迷你剧", "discover/tv",
+            {
+                "with_type": 2,
+                "with_status": 3,
+                "sort_by": "vote_average.desc",
+                "vote_count.gte": 50,
+            },
+        ),
         _RowSpec("top-rated", "高分神剧", "tv/top_rated"),
         _RowSpec(
             "chinese", "华语剧集", "discover/tv",
@@ -214,11 +277,13 @@ class MediaDiscoverService:
         image_base_url: str,
         language: str = "zh-CN",
         region: str = "CN",
+        timezone: str = "Asia/Shanghai",
     ) -> None:
         self._client = client
         self._image_base = image_base_url.rstrip("/")
         self._language = language
         self._region = region
+        self._timezone = timezone
         self._cache = AsyncTTLCache()
 
     # ------------------------------------------------------------------
@@ -243,35 +308,154 @@ class MediaDiscoverService:
 
     async def discover_row(self, kind: MediaKind, row_id: str) -> MediaRow | None:
         """拉取布局中的一行；row_id 不在布局里时返回 None（路由层译为 404）。"""
+        page = await self.discover_page(kind, row_id, 1)
+        if page is None:
+            return None
+        items = page.items[: next(s.limit for s in self._row_specs(kind) if s.row_id == row_id)]
+        # 条目太少不值得占一行位置：清空 items，前端按「空行」统一收起。
+        if len(items) < _MIN_ROW_ITEMS:
+            items = []
+        return MediaRow(id=page.id, title=page.title, ranked=page.ranked, items=items)
+
+    async def discover_page(
+        self, kind: MediaKind, row_id: str, page: int = 1
+    ) -> MediaPage | None:
+        """拉取榜单的一页；完整列表页用 TMDB 原生分页持续向后加载。"""
         spec = next((s for s in self._row_specs(kind) if s.row_id == row_id), None)
         if spec is None:
             return None
+        requested_page = page if spec.paginated else 1
         return await self._cache.get_or_set(
-            f"row:{kind.value}:{row_id}", _PAGE_TTL, lambda: self._build_row(kind, spec)
+            f"row-page:{kind.value}:{row_id}:{requested_page}",
+            _PAGE_TTL,
+            lambda: self._build_page(kind, spec, requested_page),
         )
 
     def _row_specs(self, kind: MediaKind) -> tuple[_RowSpec, ...]:
-        return _movie_rows(self._region) if kind is MediaKind.MOVIE else _tv_rows()
+        timezone = self._timezone
+        try:
+            today = datetime.now(ZoneInfo(timezone)).date()
+        except (ZoneInfoNotFoundError, ValueError):
+            logger.warning("发现页时区 %s 无效，已回退到 Asia/Shanghai", self._timezone)
+            timezone = "Asia/Shanghai"
+            today = datetime.now(ZoneInfo(timezone)).date()
+        return (
+            _movie_rows(self._region, today)
+            if kind is MediaKind.MOVIE
+            else _tv_rows(today, timezone)
+        )
 
     async def _build_hero(self, kind: MediaKind) -> list[MediaCard]:
         genre_map = await self._genre_map(kind)
         cards = await self._fetch_cards(f"trending/{kind.value}/week", {}, kind, genre_map)
         return [c for c in cards if c.backdrop_url and c.overview][:_HERO_COUNT]
 
-    async def _build_row(self, kind: MediaKind, spec: _RowSpec) -> MediaRow:
+    async def _build_page(self, kind: MediaKind, spec: _RowSpec, page: int) -> MediaPage:
         genre_map = await self._genre_map(kind)
-        items = (await self._fetch_cards(spec.path, spec.params, kind, genre_map))[: spec.limit]
-        # 条目太少不值得占一行位置：清空 items，前端按「空行」统一收起
-        if len(items) < _MIN_ROW_ITEMS:
-            items = []
-        return MediaRow(id=spec.row_id, title=spec.title, ranked=spec.ranked, items=items)
+        params = {**spec.params, **({"page": page} if spec.paginated else {})}
+        data, items = await self._fetch_page(spec.path, params, kind, genre_map)
+        return MediaPage(
+            id=spec.row_id,
+            title=spec.title,
+            ranked=spec.ranked,
+            items=items,
+            page=max(1, int(data.get("page") or page)),
+            total_pages=max(1, int(data.get("total_pages") or 1)),
+            total_results=max(0, int(data.get("total_results") or len(items))),
+        )
 
     async def _fetch_cards(
         self, path: str, params: dict[str, Any], kind: MediaKind, genre_map: dict[int, str]
     ) -> list[MediaCard]:
+        _, cards = await self._fetch_page(path, params, kind, genre_map)
+        return cards
+
+    async def _fetch_page(
+        self, path: str, params: dict[str, Any], kind: MediaKind, genre_map: dict[int, str]
+    ) -> tuple[dict[str, Any], list[MediaCard]]:
         data = await self._client.get(path, {"language": self._language, **params})
         cards = (self._to_card(raw, kind, genre_map) for raw in data.get("results", []))
-        return [c for c in cards if c is not None]
+        return data, [c for c in cards if c is not None]
+
+    async def discovery_genres(self, kind: MediaKind) -> dict[int, str]:
+        """返回筛选器可用的本地化类型清单。"""
+        return await self._genre_map(kind)
+
+    async def discover_filtered(
+        self,
+        kind: MediaKind,
+        *,
+        genre_ids: list[int] | None = None,
+        origin_country: str | None = None,
+        year: int | None = None,
+        rating_gte: float | None = None,
+        runtime_lte: int | None = None,
+        sort: str = "popular",
+        page: int = 1,
+    ) -> MediaPage:
+        """组合 TMDB discover 参数，提供可分享 URL 对应的六维筛选结果。"""
+        sort_map = {
+            "popular": "popularity.desc",
+            "rating": "vote_average.desc",
+            "newest": (
+                "primary_release_date.desc"
+                if kind is MediaKind.MOVIE
+                else "first_air_date.desc"
+            ),
+            "most-rated": "vote_count.desc",
+        }
+        params: dict[str, Any] = {
+            "include_adult": "false",
+            "sort_by": sort_map.get(sort, sort_map["popular"]),
+            "page": page,
+        }
+        if kind is MediaKind.MOVIE:
+            params["include_video"] = "false"
+            params["region"] = self._region
+        if genre_ids:
+            params["with_genres"] = "|".join(str(value) for value in genre_ids)
+        if origin_country:
+            params["with_origin_country"] = origin_country
+        if year:
+            params[
+                "primary_release_year" if kind is MediaKind.MOVIE else "first_air_date_year"
+            ] = year
+        if rating_gte is not None:
+            params["vote_average.gte"] = rating_gte
+        if runtime_lte is not None:
+            params["with_runtime.lte"] = runtime_lte
+        # 纯按均分排序会被少量投票的偶然满分占满，加入轻量门槛才有发现价值。
+        if sort == "rating":
+            params["vote_count.gte"] = 50
+
+        cache_key = ":".join(
+            [
+                kind.value,
+                ",".join(str(value) for value in genre_ids or []),
+                origin_country or "",
+                str(year or ""),
+                str(rating_gte if rating_gte is not None else ""),
+                str(runtime_lte or ""),
+                sort,
+                str(page),
+            ]
+        )
+
+        async def load() -> MediaPage:
+            genre_map = await self._genre_map(kind)
+            data, items = await self._fetch_page(
+                f"discover/{kind.value}", params, kind, genre_map
+            )
+            return MediaPage(
+                id="filtered",
+                title="筛选结果",
+                items=items,
+                page=max(1, int(data.get("page") or page)),
+                total_pages=max(1, int(data.get("total_pages") or 1)),
+                total_results=max(0, int(data.get("total_results") or len(items))),
+            )
+
+        return await self._cache.get_or_set(f"filtered:{cache_key}", _PAGE_TTL, load)
 
     def _to_card(
         self, raw: dict[str, Any], kind: MediaKind, genre_map: dict[int, str]
@@ -354,6 +538,98 @@ class MediaDiscoverService:
         )
 
     # ------------------------------------------------------------------
+    # 影人作品
+    # ------------------------------------------------------------------
+
+    async def person_detail(self, tmdb_person_id: int) -> MediaPersonDetail:
+        """读取 TMDB 影人档案及完整 combined credits，缓存口径与条目详情一致。"""
+        return await self._cache.get_or_set(
+            f"person:{tmdb_person_id}",
+            _PERSON_TTL,
+            lambda: self._build_person_detail(tmdb_person_id),
+        )
+
+    async def _build_person_detail(self, tmdb_person_id: int) -> MediaPersonDetail:
+        """一次读取影人与全部作品；电影/剧集类型表并发补齐中文类型名。"""
+        data, movie_genres, tv_genres = await asyncio.gather(
+            self._client.get(
+                f"person/{tmdb_person_id}",
+                {
+                    "language": self._language,
+                    "append_to_response": "combined_credits",
+                },
+            ),
+            self._genre_map(MediaKind.MOVIE),
+            self._genre_map(MediaKind.TV),
+        )
+        name = (data.get("name") or "").strip()
+        if not name:
+            raise TmdbError("该影人在 TMDB 中缺少姓名，无法展示")
+
+        # 同一作品可能同时出现在 cast 与 crew，幕后也可能因多个 job 重复；
+        # 人物页回答“有哪些作品”，所以只按媒体类型 + TMDB ID 保留一张海报。
+        credits = data.get("combined_credits") or {}
+        cards: dict[tuple[MediaKind, str], tuple[str, MediaCard]] = {}
+        genre_maps = {MediaKind.MOVIE: movie_genres, MediaKind.TV: tv_genres}
+        for raw in [*(credits.get("cast") or []), *(credits.get("crew") or [])]:
+            mapped = self._person_credit_card(raw, genre_maps)
+            if mapped is None:
+                continue
+            release_date, card = mapped
+            key = (card.type, card.id)
+            existing = cards.get(key)
+            if existing is None or release_date > existing[0]:
+                cards[key] = (release_date, card)
+
+        ordered = [
+            card
+            for _release_date, card in sorted(
+                cards.values(),
+                key=lambda entry: (entry[0], entry[1].rating),
+                reverse=True,
+            )
+        ]
+        profile = data.get("profile_path")
+        return MediaPersonDetail(
+            tmdb_person_id=tmdb_person_id,
+            name=name,
+            avatar_url=f"{self._image_base}/w300{profile}" if profile else None,
+            credits=ordered,
+        )
+
+    def _person_credit_card(
+        self,
+        raw: dict[str, Any],
+        genre_maps: dict[MediaKind, dict[int, str]],
+    ) -> tuple[str, MediaCard] | None:
+        """combined credit → 海报卡；缺海报或日期仍保留，确保履历完整。"""
+        media_type = raw.get("media_type")
+        if media_type not in (MediaKind.MOVIE.value, MediaKind.TV.value):
+            return None
+        external_id = raw.get("id")
+        title = (raw.get("title") or raw.get("name") or "").strip()
+        if not external_id or not title:
+            return None
+
+        kind = MediaKind(media_type)
+        release_date = raw.get("release_date") or raw.get("first_air_date") or ""
+        poster = raw.get("poster_path")
+        backdrop = raw.get("backdrop_path")
+        genre_map = genre_maps[kind]
+        return release_date, MediaCard(
+            id=str(external_id),
+            type=kind,
+            title=title,
+            original_title=raw.get("original_title") or raw.get("original_name") or title,
+            year=int(release_date[:4]) if release_date[:4].isdigit() else 0,
+            rating=round(float(raw.get("vote_average") or 0), 1),
+            genres=[genre_map[g] for g in raw.get("genre_ids") or [] if g in genre_map][:3],
+            overview=(raw.get("overview") or "").strip(),
+            poster_url=f"{self._image_base}/w500{poster}" if poster else "",
+            backdrop_url=f"{self._image_base}/w1280{backdrop}" if backdrop else None,
+        )
+
+    # ------------------------------------------------------------------
     # 条目详情
     # ------------------------------------------------------------------
 
@@ -389,13 +665,56 @@ class MediaDiscoverService:
             for c in (self._to_card(r, kind, genre_map) for r in related_raw)
             if c is not None
         ][:_RELATED_LIMIT]
+        collection = await self._movie_collection(data, kind, genre_map)
         backdrops, posters = self._images(data)
         return MediaDetail(
             card=card,
             facts=self._facts(data, kind),
             backdrops=backdrops,
             posters=posters,
+            collection=collection,
             related=related,
+        )
+
+    async def _movie_collection(
+        self,
+        detail: dict[str, Any],
+        kind: MediaKind,
+        genre_map: dict[int, str],
+    ) -> MediaCollection | None:
+        """按 belongs_to_collection 补齐系列作品，保持官方系列顺序的时间语义。"""
+        if kind is not MediaKind.MOVIE:
+            return None
+        summary = detail.get("belongs_to_collection") or {}
+        collection_id = summary.get("id")
+        if not collection_id:
+            return None
+        try:
+            data = await self._client.get(
+                f"collection/{collection_id}", {"language": self._language}
+            )
+        except TmdbError:
+            # 系列是详情增强信息，偶发失败不应让影片主详情和演职员一起不可用。
+            logger.warning("TMDB 系列电影读取失败，已保留影片主详情", exc_info=True)
+            return None
+        parts = sorted(
+            data.get("parts") or [],
+            key=lambda raw: (raw.get("release_date") or "9999-12-31", raw.get("id") or 0),
+        )
+        cards = [
+            card
+            for card in (
+                self._to_card(raw, MediaKind.MOVIE, genre_map)
+                for raw in parts
+            )
+            if card is not None
+        ]
+        if not cards:
+            return None
+        return MediaCollection(
+            id=str(collection_id),
+            name=data.get("name") or summary.get("name") or "系列电影",
+            items=cards,
         )
 
     def _images(self, data: dict[str, Any]) -> tuple[list[MediaImage], list[MediaImage]]:
@@ -465,13 +784,40 @@ class MediaDiscoverService:
             )
         return members
 
+    def _director_credits(
+        self, data: dict[str, Any], kind: MediaKind
+    ) -> list[MediaCastMember]:
+        """把电影导演或剧集主创转换为结构化人物，供详情页合并进演职员条。"""
+        if kind is MediaKind.MOVIE:
+            people = [
+                person
+                for person in (data.get("credits") or {}).get("crew", [])
+                if person.get("job") == "Director"
+            ]
+        else:
+            people = data.get("created_by") or []
+
+        members: list[MediaCastMember] = []
+        for person in people[:3]:
+            name = (person.get("name") or "").strip()
+            if not name:
+                continue
+            profile = person.get("profile_path")
+            members.append(
+                MediaCastMember(
+                    name=name,
+                    avatar_url=f"{self._image_base}/w185{profile}" if profile else None,
+                    tmdb_person_id=person.get("id"),
+                )
+            )
+        return members
+
     def _facts(self, data: dict[str, Any], kind: MediaKind) -> MediaFacts:
         credits = data.get("credits") or {}
+        director_credits = self._director_credits(data, kind)
         if kind is MediaKind.MOVIE:
-            directors = [c["name"] for c in credits.get("crew", []) if c.get("job") == "Director"]
             country_codes = [c.get("iso_3166_1", "") for c in data.get("production_countries", [])]
         else:
-            directors = [c["name"] for c in data.get("created_by", [])]
             country_codes = data.get("origin_country") or [
                 c.get("iso_3166_1", "") for c in data.get("production_countries", [])
             ]
@@ -479,7 +825,8 @@ class MediaDiscoverService:
         networks = data.get("networks") or []
         original_language = data.get("original_language") or ""
         return MediaFacts(
-            directors=directors[:3],
+            directors=[person.name for person in director_credits],
+            director_credits=director_credits,
             cast=self._cast(credits),
             country=" / ".join(_COUNTRY_NAMES.get(c, c) for c in country_codes if c),
             language=_LANGUAGE_NAMES.get(original_language, original_language),

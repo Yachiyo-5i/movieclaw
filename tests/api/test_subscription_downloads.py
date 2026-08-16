@@ -1,4 +1,4 @@
-"""订阅实时下载进度快照（sub.downloads 的服务层）测试。
+"""订阅实时下载进度快照（subscriptions.list-active-downloads 的服务层）测试。
 
 只测快照的组装语义：在途工单分组、下载器命中/失联两种形态、字段透传。
 下载器查询本身在 tests/downloader 里另测，这里一律打桩。

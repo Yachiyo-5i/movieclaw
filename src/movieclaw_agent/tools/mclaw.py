@@ -7,7 +7,7 @@
   （--help 齐全、错误带 hint），工具层不重复建模；
 - shlex 解析后以 argv 直接执行，不经 shell——无管道/变量展开，注入面为零；
   令牌只注入本工具子进程，bash 环境里拿不到（泄漏面收窄）；
-- handler 硬闸：agent 子命令（递归）与 login/logout（破坏凭证）直接拒绝；
+- handler 硬闸：会话开始/继续/重试/跟随（递归）、login/logout 与 --server 直接拒绝；
 - 退出码语义标注：结果尾部按退出码契约附一行中文解读，模型从工具结果
   本身就能学会正确的下一步（运行时教学，不占 description）。
 """
@@ -39,24 +39,27 @@ _EXIT_CODE_NOTES = {
 
 # 硬闸：这些子命令在工具里没有任何合法用途
 _BLOCKED = {
-    "agent": "不能在工具里调用 mclaw agent——那是你自己的运行入口（禁止递归）。"
-    "请直接在当前会话完成任务。",
     "login": "授权已自动配置，不需要也不允许执行 login/logout（会破坏凭证状态）。",
     "logout": "授权已自动配置，不需要也不允许执行 login/logout（会破坏凭证状态）。",
 }
 
 _PROTOCOL = """\
-movieclaw 的官方命令行工具。对本产品的一切操作——搜索资源、订阅、媒体库、下载、\
-站点/下载器/规则等全部设置——都用本工具完成（不要通过 bash 调用，bash 环境没有授权）。\
-授权已自动配置，永远不需要 login。
+movieclaw 的官方命令行工具。用于从 TMDB 和豆瓣发现实时热点、最新、热映/在播、热门和\
+高分电影/剧集，搜索并下载 PT 资源，持续订阅追更并自动整理入库，管理本地媒体库；也可\
+查看任务进度，以及配置资源站点、下载器、规则、消息渠道、AI 模型、网络和应用更新。查询\
+或变更 movieclaw 产品状态都用本工具完成（不要通过 bash 调用，bash 环境没有授权）。授权\
+已自动配置，永远不需要 login。
 
 {service_map}
 
 使用协议：
+- 常用链路：search titles 找片/找剧 → subscriptions create 订阅；search torrents 搜 PT 种子 → \
+download 投递；search library-items 查已有库存，discover 浏览榜单，library 管理已入库内容；\
+订阅会持续追踪，并在出现符合规则的新资源后自动搜索、下载和整理入库。
 - 输出即数据：stdout 是 JSON（默认），stderr 是过程提示与错误原因。
 - 参数拿不准就先 --help（域级与命令级都有，含示例），不要凭记忆猜参数或取值。
 - 列表默认有条数上限、长字段有截断；下结论前确认数据没有被截断（--limit 可调）。
-- 带 ⚠ 的命令需要 --yes 确认。其中 lib items delete 会删除磁盘上的媒体文件：\
+- 带 ⚠ 的命令需要 --yes 确认。其中 library items delete 会删除磁盘上的媒体文件：\
 必须先用只读命令查清将删除的具体条目、向用户复述并取得本轮明确同意后才能执行；\
 用户泛泛说「清理/整理」不构成删除文件的同意。其余 ⚠ 命令（删配置、清记录）在用户\
 任务明确要求时可直接 --yes。
@@ -89,9 +92,26 @@ def make_mclaw_tool(
         except ValueError as exc:
             raise ValueError(f"参数串无法解析（引号不配对？）：{exc}") from None
         if not argv:
-            raise ValueError('args 不能为空；例如 args="sub list" 或 args="--help"')
-        if note := _BLOCKED.get(argv[0]):
+            raise ValueError('args 不能为空；例如 args="subscriptions list" 或 args="--help"')
+        blocked_action = next((arg for arg in argv if arg in _BLOCKED), None)
+        if note := _BLOCKED.get(blocked_action or ""):
             raise ValueError(note)
+        if any(arg == "--server" or arg.startswith("--server=") for arg in argv):
+            raise ValueError("不允许覆盖服务器地址；mclaw 已绑定当前 movieclaw 实例")
+        session_action = next(
+            (
+                argv[index + 1]
+                for index, arg in enumerate(argv[:-1])
+                if arg == "session"
+            ),
+            None,
+        )
+        if session_action in {"start", "retry", "follow"}:
+            raise ValueError(
+                f"不能在工具里调用 session {session_action}（禁止递归或嵌套跟随）；"
+                "请直接在当前会话完成任务"
+            )
+        full_transcript = session_action == "get-transcript"
 
         # 与当前解释器同环境的 CLI 入口（同 venv/镜像内必然可用，无需依赖 PATH）
         proc = await asyncio.create_subprocess_exec(
@@ -118,7 +138,7 @@ def make_mclaw_tool(
         stdout = stdout_b.decode(errors="replace")
         stderr = stderr_b.decode(errors="replace")
         if stdout.strip():
-            sections.append(_truncate_tail(stdout, label="stdout"))
+            sections.append(stdout if full_transcript else _truncate_tail(stdout, label="stdout"))
         if stderr.strip():
             sections.append("[stderr]\n" + _truncate_tail(stderr, label="stderr"))
         code = proc.returncode or 0
@@ -137,7 +157,9 @@ def make_mclaw_tool(
                     "args": {
                         "type": "string",
                         "description": "mclaw 后面的完整参数串（不含 mclaw 本身），"
-                        '如 "sub list" 或 "search \\"沙丘2\\" --resolution 2160p"',
+                        "如 'discover list-collections --media-type movie --provider tmdb'、"
+                        "'subscriptions list' 或 "
+                        "'search torrents \"沙丘2\" --resolution 2160p'",
                     },
                     "timeout": {
                         "type": "number",

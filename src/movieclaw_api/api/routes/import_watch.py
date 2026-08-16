@@ -12,9 +12,10 @@ from pathlib import PurePosixPath
 from typing import Literal
 
 from fastapi import APIRouter, Depends
-from pydantic import BaseModel, Field
+from pydantic import Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from movieclaw_api.schemas.base import BaseModel
 from movieclaw_api.schemas.response import ApiResponse, ok
 from movieclaw_api.services.import_watch_config import ImportWatchConfigService
 from movieclaw_api.services.library import ingest
@@ -250,7 +251,7 @@ class IngestEntriesView(BaseModel):
 
 
 class ClaimPayload(BaseModel):
-    """人工认领请求：把条目钉到指定 TMDB 条目并立即入库。"""
+    """人工认领请求：把条目钉到指定 TMDB 条目并恢复后台入库作业。"""
 
     tmdb_id: int = Field(description="TMDB 条目 id（类型按规则先验：库类型或规则声明）")
 
@@ -308,7 +309,7 @@ async def restore_entry(
 @router.post(
     "/entries/{entry_id}/claim",
     response_model=ApiResponse[IngestEntryView],
-    summary="认领条目：钉到指定 TMDB 身份并立即入库",
+    summary="认领条目：钉到指定 TMDB 身份并恢复后台入库作业",
     operation_id="watch.entries.claim",
 )
 async def claim_entry(
@@ -320,5 +321,5 @@ async def claim_entry(
     view = IngestEntryView.from_model(row)
     if row.status == IngestStatus.IMPORTED:
         return ok(view, message=row.message or "已入库")
-    # 认领本身成功但处理未完成（探测失败/搬运出错等）：结论如实带回
-    return ok(view, message=row.message or "已认领，处理未完成")
+    # 认领只持久化身份并唤醒原 Job；入库进度与故障继续由任务中心呈现。
+    return ok(view, message=row.message or "已认领，等待后台整理入库")
