@@ -31,10 +31,10 @@ import { formatRelativeTime } from "@/lib/time";
 
 const POLL_MS = 30_000;
 
-/** 严重度圆点颜色：error 用全站危险色，warning 用琥珀 */
+/** 严重度圆点颜色：直接取全站状态色，不另立色值 */
 const DOT_COLOR: Record<string, string> = {
   error: "var(--danger)",
-  warning: "#f5a623",
+  warning: "var(--warn)",
 };
 
 export function NoticeCenter({ collapsed }: { collapsed: boolean }) {

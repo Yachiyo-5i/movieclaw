@@ -419,7 +419,7 @@ function EndpointRow({
       ? { label: "未投递过", color: "#c0c4cc" }
       : last.ok
         ? { label: `投递成功 · ${formatRelativeTime(last.at)}`, color: "var(--ok)" }
-        : { label: `投递失败 · ${formatRelativeTime(last.at)}`, color: "#ff6b6b" };
+        : { label: `投递失败 · ${formatRelativeTime(last.at)}`, color: "var(--danger)" };
 
   return (
     <div className="flex flex-wrap items-center gap-x-3.5 gap-y-2 p-4">
@@ -488,7 +488,7 @@ function DeliveryList({ records }: { records: WebhookDelivery[] }) {
         >
           <span
             className="size-1.5 shrink-0 rounded-full"
-            style={{ background: r.ok ? "var(--ok)" : "#ff6b6b" }}
+            style={{ background: r.ok ? "var(--ok)" : "var(--danger)" }}
           />
           <span className="w-44 shrink-0 truncate font-mono">{r.event}</span>
           <span className="shrink-0">

@@ -852,7 +852,7 @@ function ProgressStrip({
       </div>
       <div className="tnum mt-2 flex flex-wrap items-center gap-x-4 gap-y-1.5 text-caption text-white/45">
         <ProgressLegend color="var(--ok)" label={`已入库 ${imported}`} />
-        <ProgressLegend color="#6aa7ff" label={`下载中 ${inPipeline}`} />
+        <ProgressLegend color="var(--info)" label={`下载中 ${inPipeline}`} />
         <ProgressLegend color="rgba(255,255,255,0.2)" label={`缺失 ${wanted}`} />
       </div>
     </div>
@@ -912,12 +912,12 @@ function activityColor(type: SubscriptionActivity["type"]): string {
     case "match_rejected":
     case "dispatch_failed":
     case "import_failed":
-      return "#f87171";
+      return "var(--danger)";
     case "paused":
     case "download_stalled":
       return "var(--warn)";
     default:
-      return "#6aa7ff";
+      return "var(--info)";
   }
 }
 
@@ -945,7 +945,7 @@ function ActivityTimeline({ activities }: { activities: SubscriptionActivity[] }
               <div className="flex flex-col items-center">
                 <span
                   className="mt-[7px] size-2 shrink-0 rounded-full"
-                  style={{ backgroundColor: color, boxShadow: `0 0 8px ${color}55` }}
+                  style={{ backgroundColor: color, boxShadow: `0 0 8px color-mix(in oklab, ${color} 33%, transparent)` }}
                 />
                 {!last && <span className="mt-1.5 w-px flex-1 bg-white/[0.08]" />}
               </div>
@@ -1055,7 +1055,7 @@ function WantedRow({
         </span>
         <span
           className="shrink-0 rounded-full px-2 py-0.5 text-micro font-semibold"
-          style={{ backgroundColor: `${color}22`, color }}
+          style={{ backgroundColor: `color-mix(in oklab, ${color} 13%, transparent)`, color }}
         >
           {label}
         </span>
@@ -1201,7 +1201,7 @@ function wantedPresentation(w: WantedItem): { label: string; color: string; note
   if (due <= new Date()) {
     return {
       label: "排队搜索",
-      color: "#6aa7ff",
+      color: "var(--info)",
       note: w.last_search_at
         ? `上次搜索 ${formatRelativeTime(w.last_search_at)}`
         : "等待搜索任务执行",
@@ -1209,7 +1209,7 @@ function wantedPresentation(w: WantedItem): { label: string; color: string; note
   }
   return {
     label: "冷却中",
-    color: "#6aa7ff",
+    color: "var(--info)",
     note: `暂无合适资源，${formatDateTime(w.next_search_at)} 再试`,
   };
 }

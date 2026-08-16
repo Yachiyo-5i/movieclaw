@@ -29,9 +29,9 @@ import { LiquidGlassButton } from "@/vendor/liquid-glass";
 /** 连接状态 → 展示文案与颜色（与站点配置同语言） */
 const STATUS_META: Record<DownloaderStatus, { label: string; color: string }> = {
   active: { label: "已连接", color: "var(--ok)" },
-  verifying: { label: "测试中", color: "#6aa7ff" },
+  verifying: { label: "测试中", color: "var(--info)" },
   pending: { label: "待测试", color: "#c0c4cc" },
-  failed: { label: "连接失败", color: "#ff6b6b" },
+  failed: { label: "连接失败", color: "var(--danger)" },
 };
 
 /** 下载器类型 → 展示名 */
@@ -286,7 +286,7 @@ function DownloaderCard({
             )}
             <span
               className="flex shrink-0 items-center gap-1.5 rounded-full px-2 py-0.5 text-caption font-medium"
-              style={{ background: `${meta.color}1f`, color: meta.color }}
+              style={{ background: `color-mix(in oklab, ${meta.color} 12%, transparent)`, color: meta.color }}
             >
               <span className="size-1.5 rounded-full" style={{ background: meta.color }} />
               {meta.label}

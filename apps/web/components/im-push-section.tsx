@@ -290,7 +290,7 @@ function ChannelAccountRowView({
 }) {
   const meta =
     row.status === "stale"
-      ? { label: "需重新绑定", color: "#ff6b6b" }
+      ? { label: "需重新绑定", color: "var(--danger)" }
       : row.running
         ? { label: "运行中", color: "var(--ok)" }
         : { label: "未运行", color: "#c0c4cc" };
@@ -309,7 +309,7 @@ function ChannelAccountRowView({
           </p>
           <span
             className="flex shrink-0 items-center gap-1.5 rounded-full px-2 py-0.5 text-caption font-medium"
-            style={{ background: `${meta.color}1f`, color: meta.color }}
+            style={{ background: `color-mix(in oklab, ${meta.color} 12%, transparent)`, color: meta.color }}
           >
             <span className="size-1.5 rounded-full" style={{ background: meta.color }} />
             {meta.label}
