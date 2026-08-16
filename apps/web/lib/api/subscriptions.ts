@@ -92,15 +92,20 @@ export interface Subscription {
   updated_at: string;
 }
 
-/** 订阅首页的一行“今日可能入库”单集摘要。 */
+/** 订阅首页的一行待入库摘要（今天，或今天没有安排时窗口内最近的一天）。 */
 export interface TodaySubscriptionArrival {
   subscription_id: number;
   wanted_id: number;
   media_title: string;
+  media_kind: "movie" | "tv";
   season_number: number;
   episode_number: number;
   status: Extract<WantedStatus, "wanted" | "grabbed" | "downloaded">;
   air_date: string | null;
+  /** 预计入库/播出的站点日历日（YYYY-MM-DD），用于展示日期。 */
+  expected_day: string;
+  /** expected_day 距今天几天（0=今天）。站点日历口径由后端算好，前端不复制时区规则。 */
+  days_ahead: number;
   release_forecast: ReleaseForecast | null;
   /** 后端按站点游标和礼貌间隔计算的下一次有效预测探测时间。 */
   next_probe_at: string | null;
@@ -393,7 +398,10 @@ export function listSubscriptions(
   return unwrap(request<ApiEnvelope<Subscription[]>>(`/subscriptions${query}`, init));
 }
 
-/** 今天待播或仍在下载/整理中的剧集；预计耗时已按各订阅历史校准。 */
+/**
+ * 最近一次可能入库的订阅内容；预计耗时已按各订阅历史校准。
+ * 今天没有安排时后端自动回退到一周内最近的那一天（``days_ahead`` > 0）。
+ */
 export function listTodaySubscriptionArrivals(
   init?: RequestInit,
 ): Promise<TodaySubscriptionArrival[]> {

@@ -70,6 +70,12 @@ FUTURE_GRACE = timedelta(hours=48)
 _DEFAULT_RELEASE_TO_IMPORT_MINUTES = 60
 _DEFAULT_DOWNLOAD_TO_IMPORT_MINUTES = 10
 
+# 首页预告的前瞻窗口：订阅少的用户今天往往什么都不更新，只看今天会得到一个
+# 没有信息量的空栏目。窗口放宽到一周，配合“今天优先”收敛（见 today_arrivals），
+# 保证首页永远能回答“下一次是什么时候”。
+# 改这个值时记得同步 Web 空态文案里的“接下来 7 天”（subscriptions-view.tsx）。
+_UPCOMING_WINDOW_DAYS = 7
+
 # 剧集完结类 status：期望集合不再生长的判定输入之一
 _ENDED_STATUSES = frozenset({"Ended", "Canceled"})
 
@@ -98,7 +104,7 @@ class ExpectedUnit:
 
 @dataclass(frozen=True)
 class TodayArrivalCandidate:
-    """订阅首页的一行待入库剧集，以及由本剧历史得出的耗时基线。"""
+    """订阅首页的一行待入库内容，以及由本订阅历史得出的耗时基线。"""
 
     subscription: Subscription
     media: MediaItem
@@ -106,6 +112,33 @@ class TodayArrivalCandidate:
     next_probe_at: datetime | None
     release_to_import_minutes: int
     download_to_import_minutes: int
+    #: 该行预计入库/播出的站点日历日；today_arrivals 收敛后同一批候选共享同一天
+    expected_day: date
+    #: 距今天几天（0=今天）。站点日历与浏览器时区可能不同，判断“是不是今天”
+    #: 由服务端一次算好，前端不复制这套时区规则。
+    days_ahead: int
+
+
+def _expected_arrival_day(candidates: tuple[date | None, ...], today: date) -> date | None:
+    """从若干候选日历日里取今天或之后最早的一个；全部落在过去时返回 None。
+
+    早该播出却迟迟没抓到的旧集不算“待播预告”——它属于订阅详情页的缺口清单，
+    首页硬塞进来只会把过期日期当成未来安排展示。
+    """
+    upcoming = [day for day in candidates if day is not None and day >= today]
+    return min(upcoming) if upcoming else None
+
+
+def _focus_day_rows(
+    rows: list[TodayArrivalCandidate], today: date
+) -> list[TodayArrivalCandidate]:
+    """今天优先：今天有安排就只留今天，否则只留最近一个有安排的日子。"""
+    focus = (
+        today
+        if any(row.expected_day == today for row in rows)
+        else min((row.expected_day for row in rows), default=None)
+    )
+    return [row for row in rows if row.expected_day == focus]
 
 
 def _median_pipeline_minutes(
@@ -870,13 +903,24 @@ class SubscriptionService:
         return rows
 
     async def today_arrivals(self, *, member_id: int | None = None) -> list[TodayArrivalCandidate]:
-        """聚合今天待播或仍在下载/整理中的可见剧集，不查询外部下载器。
+        """聚合最近一次可能入库的可见内容，不查询外部下载器。
 
         资源预测只负责给出“何时可能出种”。首页把本订阅过往的
         ``投递→入库`` 中位耗时叠加上去，得到面向用户的预计入库时间；
         下载中的实时 ETA 由 Web 已有的全局下载快照进一步覆盖。
+
+        **今天优先**：候选先按 ``today .. today + _UPCOMING_WINDOW_DAYS`` 收集，
+        再**按媒体类型各自**收敛到一个焦点日——今天有安排就只回今天，否则只回
+        窗口内最近一个有安排的日子。首页因此永远只讲“下一次是什么时候”，既不会
+        在订阅少时空着，也不会退化成一张七天流水账。按类型分开收敛是因为首页的
+        分区切换就是按类型分的：混在一起收敛会让“电影今天在下载”顶掉“剧集三天后
+        更新”，切到剧集分区就只剩一句并不成立的“接下来一周没有更新”。
+
+        **电影只在管道内纳入**：电影没有播出日，未投递时给不出可信的预告时间，
+        常年在找资源的电影会天天占据首页；已投递/已下载的电影则和剧集一样，
+        “下载中 / 整理中”对用户完全成立。
         """
-        visible = await self.list_with_progress(kind=MediaKind.TV.value, member_id=member_id)
+        visible = await self.list_with_progress(member_id=member_id)
         subscriptions = {
             sub.id: (sub, media) for sub, media, _counts in visible if sub.id is not None
         }
@@ -890,6 +934,7 @@ class SubscriptionService:
             by_subscription.setdefault(wanted.subscription_id, []).append(wanted)
 
         today = publish_calendar_date(utcnow())
+        horizon = today + timedelta(days=_UPCOMING_WINDOW_DAYS)
         candidates: list[TodayArrivalCandidate] = []
         for subscription_id, (subscription, media) in subscriptions.items():
             rows = by_subscription.get(subscription_id, [])
@@ -916,8 +961,13 @@ class SubscriptionService:
                     # 模拟投递没有后续下载/入库链路，不应伪装成首页的“下载中”。
                     if wanted.info_hash is None:
                         continue
+                    # 已经在下载/整理链路里的内容随时可能落地，一律归入今天。
+                    expected_day = today
                 elif wanted.status == WantedStatus.WANTED:
                     if subscription.status != SubscriptionStatus.ACTIVE:
+                        continue
+                    # 电影没有播出日，还在找资源时给不出可信的预告时间。
+                    if media.kind == MediaKind.MOVIE.value:
                         continue
                     predicted = _forecast_predicted_at(wanted)
                     predicted_import_day = (
@@ -925,8 +975,10 @@ class SubscriptionService:
                         if predicted is not None
                         else None
                     )
-                    if wanted.air_date != today and predicted_import_day != today:
+                    day = _expected_arrival_day((wanted.air_date, predicted_import_day), today)
+                    if day is None or day > horizon:
                         continue
+                    expected_day = day
                 else:
                     continue
 
@@ -938,8 +990,21 @@ class SubscriptionService:
                         next_probe_at=next_probe_by_wanted.get(wanted.id or -1),
                         release_to_import_minutes=release_to_import,
                         download_to_import_minutes=download_to_import,
+                        expected_day=expected_day,
+                        days_ahead=(expected_day - today).days,
                     )
                 )
+
+        # 今天优先收敛：只留焦点日，避免首页把一周的安排一次性倒给用户。
+        # 按媒体类型各算一次——首页的分区切换正是按类型分的，混在一起收敛会让
+        # “电影今天在下载”顶掉“剧集三天后更新”，用户切到剧集分区就会看到一句
+        # 并不成立的“接下来一周没有更新”。前端过滤完当前分区后再收敛到最近一天。
+        by_kind: dict[str, list[TodayArrivalCandidate]] = {}
+        for row in candidates:
+            by_kind.setdefault(row.media.kind, []).append(row)
+        candidates = [
+            row for rows_of_kind in by_kind.values() for row in _focus_day_rows(rows_of_kind, today)
+        ]
 
         status_order = {
             WantedStatus.DOWNLOADED: 0,

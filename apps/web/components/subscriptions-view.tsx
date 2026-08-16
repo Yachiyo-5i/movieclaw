@@ -6,7 +6,12 @@ import type { Route } from "next";
 import Link from "next/link";
 
 import { ContentEmptyState } from "@/components/content-empty-state";
-import { ChevronRightIcon, ClockIcon, CompassIcon } from "@/components/icons";
+import {
+  CalendarIcon,
+  ChevronRightIcon,
+  ClockIcon,
+  CompassIcon,
+} from "@/components/icons";
 import { PosterCardVisual, type PosterVisualItem } from "@/components/poster-card";
 import { useSubscribeEntry } from "@/components/subscribe-entry";
 import type { DownloadTask } from "@/lib/api/downloaders";
@@ -135,10 +140,8 @@ export function SubscriptionsView() {
     reload();
   }, [reload]);
 
-  const todayArrivalsEnabled =
-    mediaType !== "movie" &&
-    subscriptions !== null &&
-    subscriptions.some((sub) => sub.media.kind === "tv");
+  // 只要有订阅就取预告：电影在下载/整理阶段同样进这块，切到电影分区也要有内容。
+  const todayArrivalsEnabled = subscriptions !== null && subscriptions.length > 0;
   const refreshTodayArrivals = useCallback(() => {
     if (!todayArrivalsEnabled) return;
     const requestId = ++todayArrivalsRequestRef.current;
@@ -160,8 +163,8 @@ export function SubscriptionsView() {
       });
   }, [todayArrivalsEnabled]);
 
-  // 今日区域属于“全部”和“剧集”视图。首次进入与订阅清单变化时立即读取，
-  // 停留期间每 10 秒静默同步；后台标签页暂停，恢复可见时补一次。已有快照
+  // 首次进入与订阅清单变化时立即读取，停留期间每 10 秒静默同步；
+  // 后台标签页暂停，恢复可见时补一次。已有快照
   // 遇到瞬时请求失败继续保留，避免时间轨道闪成错误态或重新出现加载文案。
   useEffect(() => {
     if (!todayArrivalsEnabled) {
@@ -296,17 +299,18 @@ export function SubscriptionsView() {
         </Link>
       )}
 
-      {mediaType !== "movie" &&
-        subscriptions !== null &&
-        !failed &&
-        tvSubscriptions.length > 0 && (
-          <TodayArrivalsSection
-            arrivals={todayArrivals}
-            failed={todayArrivalsFailed}
-            downloadTasks={downloadTasks}
-            canOpenTasks={isAdmin}
-          />
-        )}
+      {subscriptions !== null && !failed && visible.length > 0 && (
+        <TodayArrivalsSection
+          arrivals={todayArrivals}
+          failed={todayArrivalsFailed}
+          downloadTasks={downloadTasks}
+          canOpenTasks={isAdmin}
+          mediaType={mediaType}
+          trackingCount={visible.filter((sub) => sub.status === "active").length}
+          hasTvInView={visible.some((sub) => sub.media.kind === "tv")}
+          canSubscribe={canSubscribe}
+        />
+      )}
 
       {subscriptions === null && !failed && (
         <div className="mt-16 flex items-center justify-center gap-2.5 text-ui text-[var(--text-muted)]">
@@ -478,19 +482,33 @@ function SubscriptionSection({
 }
 
 /**
- * 首页首屏的今日待入库摘要。这里刻意不放海报与下载百分比：标题负责识别，
+ * 首页首屏的待入库摘要。这里刻意不放海报与下载百分比：标题负责识别，
  * “下载中”深链到任务中心查看完整下载细节，避免和下方订阅海报墙重复。
+ *
+ * 这块的目标是回答一个问题：“我下一次能看到新东西是什么时候”。因此它永远
+ * 有话说——今天有安排讲今天，没有就讲后端回退给出的最近一天（``daysAhead`` > 0），
+ * 一周内都没有则说明订阅仍在追踪。空着不说话会让用户以为功能坏了。
  */
 function TodayArrivalsSection({
   arrivals,
   failed,
   downloadTasks,
   canOpenTasks,
+  mediaType,
+  trackingCount,
+  hasTvInView,
+  canSubscribe,
 }: {
   arrivals: TodaySubscriptionArrival[] | null;
   failed: boolean;
   downloadTasks: DownloadTask[];
   canOpenTasks: boolean;
+  mediaType: SubscriptionFilter;
+  /** 当前分区里仍在追踪的订阅数，用于空态说明“系统还在盯着”。 */
+  trackingCount: number;
+  /** 当前分区里有没有剧集：没有就别用“定档”这种剧集语汇跟纯电影用户说话。 */
+  hasTvInView: boolean;
+  canSubscribe: boolean;
 }) {
   const [now, setNow] = useState(() => new Date());
   useEffect(() => {
@@ -503,7 +521,9 @@ function TodayArrivalsSection({
     [downloadTasks],
   );
   const rows = useMemo(() => {
+    // 预告跟随当前分区：切到电影就只看电影，避免和下方海报墙讲不同的事。
     const presented = (arrivals ?? [])
+      .filter((arrival) => mediaType === "all" || arrival.media_kind === mediaType)
       .map((arrival) => {
         const task = arrival.info_hash
           ? taskByHash.get(arrival.info_hash.toLowerCase())
@@ -513,13 +533,21 @@ function TodayArrivalsSection({
           presentation: todayArrivalPresentation(arrival, task, now),
         };
       });
-    return groupTodayArrivals(presented).toSorted((left, right) => {
+    const groups = groupTodayArrivals(presented).toSorted((left, right) => {
       const leftTime = left.presentation.estimatedAt ?? Number.MAX_SAFE_INTEGER;
       const rightTime = right.presentation.estimatedAt ?? Number.MAX_SAFE_INTEGER;
       if (leftTime !== rightTime) return leftTime - rightTime;
       return left.firstWantedId - right.firstWantedId;
     });
-  }, [arrivals, now, taskByHash]);
+    // 后端按媒体类型各自给了焦点日，“全部”分区可能同时拿到两类的不同日子；
+    // 这里再收敛一次到最近的那一天，保证卡片始终只讲一件事。
+    const nearest = Math.min(...groups.map((group) => group.daysAhead));
+    return groups.filter((group) => group.daysAhead === nearest);
+  }, [arrivals, mediaType, now, taskByHash]);
+
+  const daysAhead = rows[0]?.daysAhead ?? 0;
+  const isUpcoming = rows.length > 0 && daysAhead > 0;
+  const episodeCount = rows.reduce((total, row) => total + row.episodeCount, 0);
 
   return (
     <section
@@ -537,39 +565,82 @@ function TodayArrivalsSection({
         />
         <header className="relative flex items-center justify-between gap-4 border-b border-white/[0.065] px-5 py-4 max-md:px-4 max-md:py-3.5">
           <div className="flex min-w-0 items-center gap-3">
-            <span className="grid size-9 shrink-0 place-items-center rounded-xl border border-white/[0.09] bg-white/[0.055] text-violet-200 shadow-[inset_0_1px_0_rgba(255,255,255,0.055)] max-md:size-8 max-md:rounded-lg">
-              <ClockIcon className="size-[18px] max-md:size-4" />
+            {/* 图标跟着模式走：今天是“以小时计”的时钟，预告是“以天计”的日历。
+                预告态收成中性灰——紫/青/琥珀/绿在这张卡里都已经是状态色，
+                给“还没到”再占一个色相只会稀释状态语义，压暗才是它该有的分量。 */}
+            <span
+              className={`grid size-9 shrink-0 place-items-center rounded-xl border border-white/[0.09] bg-white/[0.055] shadow-[inset_0_1px_0_rgba(255,255,255,0.055)] transition-colors duration-300 max-md:size-8 max-md:rounded-lg ${
+                isUpcoming ? "text-white/55" : "text-violet-200"
+              }`}
+            >
+              {isUpcoming ? (
+                <CalendarIcon className="size-[18px] max-md:size-4" />
+              ) : (
+                <ClockIcon className="size-[18px] max-md:size-4" />
+              )}
             </span>
             <div className="min-w-0">
               <h3 id="today-arrivals-title" className="text-ui font-semibold text-white/92">
-                今日可能入库
+                {isUpcoming ? "即将入库" : "今日可能入库"}
               </h3>
               <p className="mt-0.5 truncate text-caption text-white/38">
-                播出、出种与下载状态动态估算
+                {isUpcoming
+                  ? "今天没有更新，这是最近的一次"
+                  : "播出、出种与下载状态动态估算"}
               </p>
             </div>
           </div>
-          {arrivals !== null && !failed && (
+          {/* 空态不显示“0 部 · 0 集”——那看着像报错，而不是“今天没安排”。 */}
+          {arrivals !== null && !failed && rows.length > 0 && (
             <span className="tnum shrink-0 rounded-full border border-white/[0.075] bg-white/[0.045] px-2.5 py-1 text-caption text-white/48 shadow-[inset_0_1px_0_rgba(255,255,255,0.035)]">
-              {rows.length} 部 · {rows.reduce((total, row) => total + row.episodeCount, 0)} 集
+              {isUpcoming
+                ? `${daysAhead === 1 ? "明天" : `${daysAhead} 天后`} · ${rows.length} 部`
+                : `${rows.length} 部 · ${episodeCount} 集`}
             </span>
           )}
         </header>
 
         {arrivals === null && !failed && (
           <p className="relative px-5 py-5 text-sub text-[var(--text-muted)] max-md:px-4">
-            正在计算今日入库时间…
+            正在计算预计入库时间…
           </p>
         )}
         {failed && (
           <p className="relative px-5 py-5 text-sub text-amber-100/70 max-md:px-4">
-            今日入库信息暂时不可用
+            入库预告暂时不可用
           </p>
         )}
+        {/* 一周内确实无事可预告时，也要交代清楚系统的状态和用户的下一步，
+            不能只留一句“暂无”让人怀疑追踪停了。主句说结论，次句说依据。 */}
         {!failed && arrivals !== null && rows.length === 0 && (
-          <p className="relative px-5 py-5 text-sub text-[var(--text-muted)] max-md:px-4">
-            今天暂无可能入库的剧集
-          </p>
+          <div className="relative px-5 py-5 max-md:px-4">
+            <p className="text-sub text-white/68">
+              {trackingCount === 0
+                ? "订阅都已收齐或暂停了"
+                : hasTvInView
+                  ? "接下来 7 天没有已定档的更新"
+                  : "当前没有正在下载或整理的电影"}
+            </p>
+            <p className="mt-1 text-caption text-white/38">
+              {trackingCount > 0 ? (
+                <>
+                  <span className="tnum">{trackingCount}</span> 部订阅仍在追踪
+                  {hasTvInView
+                    ? "，定档或出种后会自动开抓"
+                    : "，找到合适资源就会自动开抓"}
+                </>
+              ) : canSubscribe ? (
+                <Link
+                  href={`/discover/${mediaType === "movie" ? "movie" : "tv"}` as Route}
+                  className="text-violet-200/85 underline-offset-4 transition-colors hover:text-violet-100 hover:underline"
+                >
+                  去发现页添加新的追踪目标 →
+                </Link>
+              ) : (
+                "有新的追踪目标时，这里会提前预告"
+              )}
+            </p>
+          </div>
         )}
         {!failed && rows.length > 0 && (
           <div className="relative space-y-1 p-3">
@@ -594,9 +665,12 @@ function TodayArrivalsSection({
                       className="absolute top-1 size-3 animate-ping rounded-full bg-cyan-300/25"
                     />
                   )}
+                  {/* 预告是“几天后”，节点压暗一档；发光的实心点留给马上要落地的内容。 */}
                   <span
                     aria-hidden="true"
-                    className={`relative z-10 size-2.5 rounded-full border-2 ${style.node}`}
+                    className={`relative z-10 size-2.5 rounded-full border-2 ${style.node}${
+                      isUpcoming ? " opacity-65" : ""
+                    }`}
                   />
                 </span>
                 <div className="min-w-0 self-center">

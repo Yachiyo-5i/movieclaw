@@ -147,10 +147,13 @@ function todayArrival(overrides = {}) {
     subscription_id: 1,
     wanted_id: 10,
     media_title: "测试剧集",
+    media_kind: "tv",
     season_number: 2,
     episode_number: 5,
     status: "wanted",
     air_date: "2030-01-01",
+    expected_day: "2030-01-01",
+    days_ahead: 0,
     release_forecast: null,
     next_probe_at: null,
     info_hash: null,
@@ -290,4 +293,70 @@ test("合并行使用尚未完成且预计最晚的一集作为整体状态", ()
 
   assert.equal(groups[0].presentation.statusLabel, "等待资源");
   assert.equal(groups[0].presentation.timeLabel, "时间待更新");
+});
+
+test("给不出入库时刻时优先报下次探测时刻，让用户看到系统在动", () => {
+  const result = todayArrivalPresentation(
+    todayArrival({
+      release_forecast: {
+        predicted_at: "2030-01-01T12:00:00Z",
+        window_end: "2030-01-01T14:00:00Z",
+        confidence: "volatile",
+      },
+      next_probe_at: "2030-01-01T13:30:00Z",
+    }),
+    undefined,
+    new Date("2030-01-01T10:00:00Z"),
+  );
+  const expectedClock = new Intl.DateTimeFormat("zh-CN", {
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).format(new Date("2030-01-01T13:30:00Z"));
+
+  assert.equal(result.estimatedAt, null);
+  assert.equal(result.timeLabel, `${expectedClock} 探测`);
+});
+
+test("未来预告没有可用时刻时退到播出日期，而不是一句时间待更新", () => {
+  const result = todayArrivalPresentation(
+    todayArrival({ expected_day: "2030-01-04", days_ahead: 3 }),
+    undefined,
+    new Date("2030-01-01T10:00:00Z"),
+  );
+
+  assert.equal(result.statusLabel, "预计入库");
+  assert.equal(result.timeLabel, "1月4日 播出");
+});
+
+test("几天后的预告不写只有时分的探测时刻，避免被当成今天", () => {
+  const result = todayArrivalPresentation(
+    todayArrival({
+      expected_day: "2030-01-04",
+      days_ahead: 3,
+      next_probe_at: "2030-01-04T13:30:00Z",
+    }),
+    undefined,
+    new Date("2030-01-01T10:00:00Z"),
+  );
+
+  assert.equal(result.timeLabel, "1月4日 播出");
+});
+
+test("电影不展示 S00E00 哨兵季集号", () => {
+  const groups = groupTodayArrivals([
+    presented(
+      todayArrival({
+        media_kind: "movie",
+        media_title: "测试电影",
+        season_number: 0,
+        episode_number: 0,
+        status: "grabbed",
+      }),
+      { statusLabel: "下载中", timeLabel: "约 20:00", estimatedAt: 200 },
+    ),
+  ]);
+
+  assert.equal(groups[0].episodeLabel, "电影");
+  assert.equal(groups[0].daysAhead, 0);
 });
