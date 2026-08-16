@@ -25,6 +25,7 @@ from movieclaw_db.models import (
     ConfigStatus,
     DownloadAttemptStatus,
     DownloaderClient,
+    FileState,
     LibraryFile,
     ManualDownloadIntent,
     MediaItem,
@@ -283,7 +284,7 @@ def _inventory_covers_torrent(
         for row in inventory
         if row.library_id == manual["library_id"]
         and row.media_item_id == manual["media_item_id"]
-        and row.missing_since is None
+        and row.state == FileState.IN_PLACE
     ]
     unused = set(range(len(relevant)))
     for expected_path, expected_size in expected:
@@ -333,7 +334,7 @@ async def _reconcile_completed_manual_intents(
                 select(LibraryFile).where(
                     LibraryFile.media_item_id.in_(media_ids),  # type: ignore[union-attr]
                     LibraryFile.library_id.in_(library_ids),  # type: ignore[union-attr]
-                    LibraryFile.missing_since.is_(None),  # type: ignore[union-attr]
+                    LibraryFile.in_place(),
                 )
             )
         )

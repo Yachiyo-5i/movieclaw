@@ -51,7 +51,7 @@ from movieclaw_api.services.library.layout import entry_dir_of
 from movieclaw_api.services.library.organize import _prune_emptied_dirs
 from movieclaw_api.services.task_state import TaskState
 from movieclaw_db.engine import get_database
-from movieclaw_db.models import Library, LibraryFile, MediaItem, Subscription, utcnow
+from movieclaw_db.models import FileState, Library, LibraryFile, MediaItem, Subscription, utcnow
 from movieclaw_db.repositories.library_file_repo import LibraryFileRepository
 from movieclaw_db.repositories.library_repo import LibraryRepository
 
@@ -214,7 +214,7 @@ def _build_plan_sync(
 
     for row in files:
         path = Path(row.file_path)
-        if row.missing_since is not None:
+        if row.state != FileState.IN_PLACE:
             # 磁盘上没有实体，无从搬运——只做逻辑随迁（下面统一处理）
             assert row.id is not None
             plan.missing_file_ids.append(row.id)

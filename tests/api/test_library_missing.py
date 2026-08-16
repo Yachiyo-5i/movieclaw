@@ -10,7 +10,7 @@ from movieclaw_api.core.config import get_settings
 from movieclaw_api.schemas.library import MissingClearPayload
 from movieclaw_db.engine import dispose_db, get_database, init_db
 from movieclaw_db.migrations import run_migrations
-from movieclaw_db.models import FileSource, LibraryFile, MediaItem, utcnow
+from movieclaw_db.models import FileState, FileSource, LibraryFile, MediaItem, utcnow
 from movieclaw_db.repositories.library_repo import LibraryRepository
 
 
@@ -46,6 +46,7 @@ async def _seed(session) -> tuple[int, int, int]:
                 size_bytes=1,
                 source=FileSource.SCANNED,
                 missing_since=now,
+                state=FileState.MISSING,
             ),
             LibraryFile(
                 library_id=library.id,
@@ -65,6 +66,7 @@ async def _seed(session) -> tuple[int, int, int]:
                 size_bytes=1,
                 source=FileSource.SCANNED,
                 missing_since=now,
+                state=FileState.MISSING,
             ),
             LibraryFile(
                 library_id=library.id,
@@ -75,6 +77,7 @@ async def _seed(session) -> tuple[int, int, int]:
                 size_bytes=1,
                 source=FileSource.SCANNED,
                 missing_since=now,
+                state=FileState.MISSING,
             ),
         ]
     )

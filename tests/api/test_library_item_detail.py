@@ -37,7 +37,7 @@ from movieclaw_api.services.library.scan import scan_library
 from movieclaw_api.services.media_probe import MediaSpec, _parse_probe
 from movieclaw_db.engine import dispose_db, get_database, init_db
 from movieclaw_db.migrations import run_migrations
-from movieclaw_db.models import LibraryFile, MediaItem
+from movieclaw_db.models import FileState, LibraryFile, MediaItem
 from movieclaw_db.models.library_file import IdentitySource
 from movieclaw_db.repositories.library_repo import LibraryRepository
 
@@ -1174,6 +1174,7 @@ async def test_delete_single_file_missing_row_clears_ledger_only(db, tmp_path) -
                     size_bytes=1,
                     source="scanned",
                     missing_since=datetime(2024, 1, 1),
+                    state=FileState.MISSING,
                 ),
             ]
         )

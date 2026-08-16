@@ -14,7 +14,7 @@ from movieclaw_api.core.config import get_settings
 from movieclaw_api.services.discover_library import DiscoverLibraryProjectionService
 from movieclaw_db.engine import dispose_db, get_database, init_db
 from movieclaw_db.migrations import run_migrations
-from movieclaw_db.models import FileSource, Library, LibraryFile, MediaItem, utcnow
+from movieclaw_db.models import FileState, FileSource, Library, LibraryFile, MediaItem, utcnow
 from movieclaw_media.models import (
     DiscoverLayout,
     DiscoverRowStub,
@@ -165,6 +165,7 @@ async def _seed_library_status(db) -> dict[str, int]:
                     file_path="/media/priority/missing.mkv",
                     source=FileSource.SCANNED,
                     missing_since=utcnow(),
+                    state=FileState.MISSING,
                 ),
                 LibraryFile(
                     library_id=priority.id,

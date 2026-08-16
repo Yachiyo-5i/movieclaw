@@ -128,6 +128,7 @@ def test_subscriptions_exposes_only_user_intent_commands() -> None:
         "subscriptions.search-missing-resources",
         "subscriptions.set-follow-future",
         "subscriptions.set-tracking-state",
+        "subscriptions.upgrade-run",
         "subscriptions.unsubscribe",
         "subscriptions.update",
     }

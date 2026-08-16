@@ -8,7 +8,7 @@ from sqlmodel import select
 
 from movieclaw_db.models.base import utcnow
 from movieclaw_db.models.library import Library
-from movieclaw_db.models.library_file import LibraryFile
+from movieclaw_db.models.library_file import FileState, LibraryFile
 
 
 class LibraryRepository:
@@ -71,7 +71,7 @@ class LibraryRepository:
         if not ids:
             return
 
-        present = LibraryFile.missing_since.is_(None)  # type: ignore[union-attr]
+        present = LibraryFile.in_place()  # type: ignore[union-attr]
         identified_item = case(
             (
                 and_(
@@ -106,7 +106,7 @@ class LibraryRepository:
                     ).label("unidentified_count"),
                     func.sum(
                         case(
-                            (LibraryFile.missing_since.is_not(None), 1),  # type: ignore[union-attr]
+                            (LibraryFile.state == FileState.MISSING, 1),
                             else_=0,
                         )
                     ).label("missing_count"),

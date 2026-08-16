@@ -141,6 +141,7 @@ from movieclaw_api.services.title_discovery import parse_title_ref
 from movieclaw_db.engine import get_database, get_session
 from movieclaw_db.models import (
     ACTIVE_JOB_STATUSES,
+    FileState,
     Job,
     JobStatus,
     LibraryFile,
@@ -1696,7 +1697,7 @@ def _file_view(row: LibraryFile, external_subs: list[str]) -> LibraryFileView:
         source=row.source,
         season_number=row.season_number,
         episode_number=row.episode_number,
-        missing=row.missing_since is not None,
+        missing=row.state == FileState.MISSING,
         audio_streams=(
             None
             if row.audio_streams is None

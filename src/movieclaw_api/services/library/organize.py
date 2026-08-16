@@ -57,7 +57,7 @@ from movieclaw_api.services.library.fsops import rename_no_replace
 from movieclaw_api.services.library.layout import SCAN_VIDEO_EXTS, entry_base_name
 from movieclaw_api.services.task_state import TaskState
 from movieclaw_db.engine import get_database
-from movieclaw_db.models import Library, LibraryFile, MediaItem, utcnow
+from movieclaw_db.models import FileState, Library, LibraryFile, MediaItem, utcnow
 from movieclaw_db.repositories.library_file_repo import LibraryFileRepository
 from movieclaw_media.models import MediaKind
 
@@ -168,7 +168,7 @@ def _build_plan_sync(
     plan = OrganizePlan(library_id=library_id)
     candidates: list[RenameAction] = []
     for row, item in rows:
-        if row.missing_since is not None:
+        if row.state != FileState.IN_PLACE:
             continue  # 缺失文件不计入总数也不展示——它不在磁盘上，无从整理
         plan.total += 1
         src = Path(row.file_path)
@@ -229,7 +229,7 @@ def _build_plan_sync(
     in_place_item: dict[str, int] = {
         row.file_path: item.id
         for row, item in rows
-        if item is not None and item.id is not None and row.missing_since is None
+        if item is not None and item.id is not None and row.state == FileState.IN_PLACE
     }
     by_target: dict[str, list[RenameAction]] = {}
     for action in candidates:

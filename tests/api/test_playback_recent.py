@@ -11,6 +11,7 @@ from movieclaw_api.services.playback_recent import recent_watch_items
 from movieclaw_db.engine import dispose_db, get_database, init_db
 from movieclaw_db.migrations import run_migrations
 from movieclaw_db.models import (
+    FileState,
     FileSource,
     LibraryFile,
     MediaEpisode,
@@ -53,6 +54,7 @@ def _file(
         source=FileSource.SCANNED,
         duration_seconds=duration_seconds,
         missing_since=datetime(2026, 8, 1) if missing else None,
+        state=FileState.MISSING if missing else FileState.IN_PLACE,
         created_at=added_at,
         updated_at=added_at,
     )

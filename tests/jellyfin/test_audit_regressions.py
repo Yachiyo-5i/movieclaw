@@ -617,7 +617,7 @@ def test_browse_index_covers_latest_and_movie_library_page(
         FROM library_file
         JOIN media_item ON media_item.id = library_file.media_item_id
         WHERE library_file.media_item_id IS NOT NULL
-          AND library_file.missing_since IS NULL
+          AND library_file.state = 'in_place'
           AND library_file.library_id = ?
         GROUP BY
             library_file.media_item_id,
@@ -643,7 +643,7 @@ def test_browse_index_covers_latest_and_movie_library_page(
                 AND library_file.media_item_id = media_item.id
                 AND library_file.season_number = 0
                 AND library_file.episode_number = 0
-                AND library_file.missing_since IS NULL
+                AND library_file.state = 'in_place'
           )
     """
     with sqlite3.connect(db_path) as conn:
@@ -881,7 +881,7 @@ def test_mark_played_survives_missing_files(client: TestClient, seeded: dict) ->
     db_path = os.environ["DATABASE_URL"].split("///", 1)[1]
     with sqlite3.connect(db_path) as conn:
         conn.execute(
-            "UPDATE library_file SET missing_since = '2026-08-07 00:00:00' "
+            "UPDATE library_file SET missing_since = '2026-08-07 00:00:00', state = 'missing' "
             "WHERE media_item_id = ?",
             (seeded["show"],),
         )

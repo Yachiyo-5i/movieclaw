@@ -177,6 +177,7 @@ subscriptions set-follow-future
 subscriptions set-tracking-state
 subscriptions unsubscribe
 subscriptions update
+subscriptions upgrade-run
 ui prefs show
 ui prefs update
 watch create

@@ -133,7 +133,7 @@ async def _item_layer_fallbacks(
             .join(Library, Library.id == LibraryFile.library_id)
             .where(
                 LibraryFile.media_item_id == media_item_id,
-                LibraryFile.missing_since.is_(None),
+                LibraryFile.in_place(),
             )
         )
     ).all()

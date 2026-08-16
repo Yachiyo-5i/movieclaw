@@ -133,7 +133,7 @@ async def fill_snapshots(
             await session.execute(
                 select(LibraryFile).where(
                     LibraryFile.media_item_id == media_item_id,
-                    LibraryFile.missing_since.is_(None),  # type: ignore[union-attr]
+                    LibraryFile.in_place(),
                 )
             )
         )
@@ -214,7 +214,7 @@ async def materialize_owned_wanted(
         await session.execute(
             select(LibraryFile).where(
                 LibraryFile.media_item_id == subscription.media_item_id,
-                LibraryFile.missing_since.is_(None),  # type: ignore[union-attr]
+                LibraryFile.in_place(),
             )
         )
     ).scalars():
@@ -492,85 +492,6 @@ def _provably_below(snapshot, spec) -> bool:
 # 入库验证：实测说了算（quality-upgrade.md §6.3）
 # ---------------------------------------------------------------------------
 
-# 回收站目录名：放在**媒体库根目录内**（与文件同一文件系统，重命名即完成，
-# 避免跨盘搬 40GB 文件）；保留期满由回填 tick 顺带清理
-_TRASH_DIR_NAME = ".movieclaw-trash"
-_TRASH_RETENTION_DAYS = 7
-
-
-def _trash_root_for(file: LibraryFile, root_paths: list[str]) -> Path:
-    """选文件所属的库根作为回收站落点（前缀匹配）；都不匹配时用文件父目录。"""
-    file_path = Path(file.file_path)
-    for root in root_paths:
-        try:
-            file_path.relative_to(root)
-        except ValueError:
-            continue
-        return Path(root) / _TRASH_DIR_NAME
-    return file_path.parent / _TRASH_DIR_NAME
-
-
-def _move_file_to_trash(file: LibraryFile, root_paths: list[str]) -> tuple[bool, str | None]:
-    """把库文件移入回收站；返回 (可安全移除台账行, 回收站内路径)。
-
-    - 源文件已不存在 → (True, None)：行可删（现实里文件早没了）；
-    - 移动成功 → (True, 路径)；
-    - 移动失败/做种保护 → **(False, None)**：行必须保留——删了行而文件还在，
-      库扫描会把它当新文件重新收编，证伪文件甚至可能借文件名"重生"。
-    同名冲突加时间戳前缀。同文件系统内是 rename，瞬时完成。
-
-    **做种保护（唯一硬链接绝不改名）**：推荐的硬链入库流程里，库文件与
-    下载器做种的原始文件是同一 inode 的两个目录项，改名库内这份不影响
-    做种（st_nlink ≥ 2）。但原地下载（直下库根）或复制导入的库文件是
-    唯一副本（st_nlink == 1）——它可能正是下载器做种的原始文件，改名会
-    立刻打断做种（PT 站 H&R 风险），一律保留原位：下载器侧任务交给旧任务
-    的证据链清理，库内这份可在库详情手动删除。
-    """
-    import shutil
-
-    src = Path(file.file_path)
-    if not src.exists():
-        return True, None
-    try:
-        if src.stat().st_nlink <= 1:
-            logger.info(
-                "旧版本文件保留原位（唯一硬链接，可能是下载器做种的原始文件）：%s", src
-            )
-            return False, None
-    except OSError:
-        logger.warning("读取旧版本文件硬链接数失败，按保守策略保留原位：%s", src)
-        return False, None
-    trash_dir = _trash_root_for(file, root_paths)
-    try:
-        trash_dir.mkdir(parents=True, exist_ok=True)
-        target = trash_dir / src.name
-        if target.exists():
-            target = trash_dir / f"{utcnow().strftime('%Y%m%d%H%M%S')}-{src.name}"
-        shutil.move(str(src), str(target))
-        return True, str(target)
-    except OSError:
-        logger.exception("洗版旧版本移入回收站失败：%s", src)
-        return False, None
-
-
-def cleanup_trash_dirs(root_paths: list[str]) -> int:
-    """清理回收站中超过保留期的文件，返回清理数（同步，调用方放线程池可选）。"""
-    removed = 0
-    horizon = utcnow().timestamp() - _TRASH_RETENTION_DAYS * 86400
-    for root in root_paths:
-        trash_dir = Path(root) / _TRASH_DIR_NAME
-        if not trash_dir.is_dir():
-            continue
-        for entry in trash_dir.iterdir():
-            try:
-                if entry.stat().st_mtime < horizon:
-                    entry.unlink() if entry.is_file() else __import__("shutil").rmtree(entry)
-                    removed += 1
-            except OSError:
-                logger.warning("清理回收站条目失败：%s", entry, exc_info=True)
-    return removed
-
-
 def _file_from_attempt(file: LibraryFile, attempt: SubscriptionDownloadAttempt) -> bool:
     """该库文件是否来自这次洗版投递。
 
@@ -610,7 +531,6 @@ async def _verify_upgrades_locked(session: AsyncSession, media_item_id: int) -> 
         MediaItem,
         SubscriptionActivity,
     )
-    from movieclaw_db.models.library import Library
     from movieclaw_db.models.subscription_activity import ActivityType
     from movieclaw_db.repositories import SubscriptionRepository
     from movieclaw_matcher import quality_label
@@ -667,7 +587,7 @@ async def _verify_upgrades_locked(session: AsyncSession, media_item_id: int) -> 
             await session.execute(
                 select(LibraryFile).where(
                     LibraryFile.media_item_id == media_item_id,
-                    LibraryFile.missing_since.is_(None),  # type: ignore[union-attr]
+                    LibraryFile.in_place(),
                 )
             )
         ).scalars()
@@ -695,19 +615,19 @@ async def _verify_upgrades_locked(session: AsyncSession, media_item_id: int) -> 
         if a.site_id and a.torrent_id
     }
 
+    from movieclaw_api.services.library.recycle import recycle_file
     from movieclaw_matcher import QualitySnapshot
 
     item = await session.get(MediaItem, media_item_id)
     repo = SubscriptionRepository(session)
-    root_paths_cache: dict[int, list[str]] = {}
 
-    async def _roots(library_id: int | None) -> list[str]:
-        if library_id is None:
-            return []
-        if library_id not in root_paths_cache:
-            row = await session.get(Library, library_id)
-            root_paths_cache[library_id] = list(row.root_paths) if row else []
-        return root_paths_cache[library_id]
+    def _recycle_trigger(w: WantedItem) -> dict:
+        """回收审计快照（library-file-recycle.md §4）：存展示用快照不外键。"""
+        return {
+            "kind": "subscription",
+            "id": w.subscription_id,
+            "label": f"《{item.title}》订阅洗版" if item is not None else "订阅洗版",
+        }
 
     for wanted in rows:
         unit = (wanted.season_number, wanted.episode_number)
@@ -722,10 +642,14 @@ async def _verify_upgrades_locked(session: AsyncSession, media_item_id: int) -> 
         ]
         if quarantine and len(quarantine) < len(unit_files):
             for file in quarantine:
-                removable, _trashed = _move_file_to_trash(
-                    file, await _roots(file.library_id)
+                outcome = await recycle_file(
+                    session,
+                    file,
+                    reason="upgrade_refuted",
+                    trigger=_recycle_trigger(wanted),
+                    note="洗版证伪残留隔离：来自已证伪来源的文件不参与版本裁决",
                 )
-                if removable:
+                if outcome == "already_gone":
                     await session.delete(file)
             await session.commit()
             unit_files = [f for f in unit_files if f not in quarantine]
@@ -873,15 +797,19 @@ async def _verify_upgrades_locked(session: AsyncSession, media_item_id: int) -> 
             for file in unit_files:
                 if file.id == best_file.id:
                     continue
-                removable, trashed = _move_file_to_trash(file, await _roots(file.library_id))
-                if trashed:
-                    trash_paths.append(trashed)
-                if removable:
-                    await session.delete(file)
+                outcome = await recycle_file(
+                    session,
+                    file,
+                    reason="upgrade_replaced",
+                    trigger=_recycle_trigger(wanted),
+                    note=f"洗版替换：{old_label} → {new_label}",
+                )
+                if outcome == "already_gone":
+                    await session.delete(file)  # 文件早没了：行删掉与磁盘一致
+                elif outcome == "moved_to_trash":
+                    trash_paths.append(file.file_path)
                 else:
-                    # 移动失败/做种保护时保留台账行：行删了而文件还在，
-                    # 扫描会把它当新文件重新收编（台账必须与磁盘一致）
-                    kept_in_place += 1
+                    kept_in_place += 1  # 做种保护：原地待回收
             await session.commit()
             await repo.add_activity(
                 SubscriptionActivity(
@@ -892,8 +820,8 @@ async def _verify_upgrades_locked(session: AsyncSession, media_item_id: int) -> 
                         f"{_unit_text(wanted)}已洗版：{old_label} → {new_label}"
                         + ("，旧版本已移入回收站（保留 7 天）" if trash_paths else "")
                         + (
-                            "；旧版本文件可能仍在做种，已保留原位——"
-                            "旧任务安全清理后可在库详情删除"
+                            "；旧版本文件可能仍在做种，已原地转入待回收——"
+                            "可在库详情恢复或清理"
                             if kept_in_place
                             else ""
                         )
@@ -967,13 +895,17 @@ async def _verify_upgrades_locked(session: AsyncSession, media_item_id: int) -> 
             # 也绝不把单元清空）
             if others:
                 for file in from_attempt:
-                    removable, trashed = _move_file_to_trash(
-                        file, await _roots(file.library_id)
+                    outcome = await recycle_file(
+                        session,
+                        file,
+                        reason="upgrade_refuted",
+                        trigger=_recycle_trigger(wanted),
+                        note="洗版证伪：实测档位不高于当前版本",
                     )
-                    if trashed:
-                        trash_paths.append(trashed)
-                    if removable:
+                    if outcome == "already_gone":
                         await session.delete(file)
+                    elif outcome == "moved_to_trash":
+                        trash_paths.append(file.file_path)
             # 资源是否诚实：投递文件的实测快照没有低于其声称档位 → 资源没
             # 撒谎，只是基线在下载期间被更优版本（如手工入库）抢先刷高。
             # 诚实资源不计熔断、不进排除清单、不写证伪活动——错误的惩罚会
@@ -1385,15 +1317,3 @@ async def backfill_upgrade_snapshots() -> None:
                 await session.commit()
                 logger.info("洗版排期补挂：%d 个已有快照的单元进入洗版排期", armed_late)
 
-        # 顺带清理各库回收站中超保留期的旧版本文件
-        from movieclaw_db.models.library import Library
-
-        roots: list[str] = []
-        for row in (await session.execute(select(Library))).scalars():
-            roots.extend(row.root_paths or [])
-        if roots:
-            removed = cleanup_trash_dirs(roots)
-            if removed:
-                logger.info(
-                    "回收站清理：移除 %d 个超过 %d 天的旧版本文件", removed, _TRASH_RETENTION_DAYS
-                )

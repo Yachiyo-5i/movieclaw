@@ -90,7 +90,7 @@ async def recent_watch_items(
             LibraryFile.episode_number.label("episode_number"),
             func.min(LibraryFile.created_at).label("first_added_at"),
             func.max(
-                case((LibraryFile.missing_since.is_(None), 1), else_=0)  # type: ignore[union-attr]
+                case((LibraryFile.in_place(), 1), else_=0)  # type: ignore[union-attr]
             ).label("available"),
         )
         .where(LibraryFile.media_item_id.is_not(None))  # type: ignore[union-attr]
@@ -139,7 +139,7 @@ async def recent_watch_items(
                 LibraryFile.media_item_id == PlaybackState.media_item_id,
                 LibraryFile.season_number == PlaybackState.season_number,
                 LibraryFile.episode_number == PlaybackState.episode_number,
-                LibraryFile.missing_since.is_(None),  # type: ignore[union-attr]
+                LibraryFile.in_place(),
             ),
         )
         .join(Library, Library.id == LibraryFile.library_id)
