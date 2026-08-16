@@ -19,7 +19,7 @@ from movieclaw_api.services.library.organize import build_organize_plan, organiz
 from movieclaw_api.services.library.scan import scan_library
 from movieclaw_db.engine import dispose_db, get_database, init_db
 from movieclaw_db.migrations import run_migrations
-from movieclaw_db.models import FileState, FileSource, Library, LibraryFile, MediaItem, utcnow
+from movieclaw_db.models import FileSource, FileState, Library, LibraryFile, MediaItem, utcnow
 from movieclaw_db.repositories.library_repo import LibraryRepository
 from movieclaw_media.models import MediaKind
 
