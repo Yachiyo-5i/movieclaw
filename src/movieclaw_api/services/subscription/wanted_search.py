@@ -148,7 +148,9 @@ async def _due_media_groups(session: AsyncSession) -> list[int]:
             WantedItem.in_scope.is_(True),  # type: ignore[attr-defined]
             WantedItem.next_search_at.isnot(None),  # type: ignore[union-attr]
             WantedItem.next_search_at <= now,  # type: ignore[operator]
-            Subscription.status == SubscriptionStatus.ACTIVE,
+            # != PAUSED 而非 == ACTIVE：洗版单元挂在已收齐（completed）的
+            # 订阅上；缺口行的订阅必然 active，对它语义不变
+            Subscription.status != SubscriptionStatus.PAUSED,  # type: ignore[arg-type]
         )
         .order_by(WantedItem.priority.desc(), WantedItem.next_search_at)  # type: ignore[attr-defined]
     )

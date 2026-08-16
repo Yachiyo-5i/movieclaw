@@ -457,3 +457,180 @@ async def test_honest_resource_superseded_is_cancelled_not_refuted(db, tmp_path)
             ).scalars()
         )
         assert acts == []  # 没有错误的证伪指控
+
+
+@pytest.mark.asyncio
+async def test_pack_confirm_retains_extra_old_attempts(db, tmp_path):
+    """整季包一次替换多个来源不同的旧单集：replaces 指针只能指一个，
+    其余旧 attempt 保守 RETAINED（绝不悬空 CLEANUP_PENDING 等不到清理）。"""
+    library, item_id, sub_id, _w1, root, _old1 = await _seed(db, tmp_path)
+    # 第二个单元 E02：独立旧文件 + 独立旧 attempt（old2）
+    old_file2 = root / "Testshow.S01E02.1080p.WEB-DL.mkv"
+    old_file2.write_bytes(b"old2")
+    async with db.session() as session:
+        session.add(
+            WantedItem(
+                subscription_id=sub_id,
+                media_item_id=item_id,
+                season_number=1,
+                episode_number=2,
+                status=WantedStatus.IMPORTED,
+                quality=_WEBDL,
+                info_hash="old2",
+                imported_at=utcnow(),
+            )
+        )
+        session.add(
+            LibraryFile(
+                library_id=library.id,
+                media_item_id=item_id,
+                season_number=1,
+                episode_number=2,
+                file_path=str(old_file2),
+                size_bytes=4,
+                source=FileSource.IMPORTED,
+                resolution="1080p",
+                media_source="WEB-DL",
+                bit_rate=5_000_000,
+            )
+        )
+        session.add(
+            SubscriptionDownloadAttempt(
+                subscription_id=sub_id,
+                info_hash="old2",
+                units=[[1, 2]],
+                quality=_WEBDL,
+                status=DownloadAttemptStatus.COMPLETED,
+                last_progress_at=utcnow(),
+            )
+        )
+        # 整季包洗版 attempt 覆盖 E01+E02，两个新文件已入库
+        session.add(
+            SubscriptionDownloadAttempt(
+                subscription_id=sub_id,
+                info_hash="packhash",
+                site_id="site-a",
+                torrent_id="pack1",
+                units=[[1, 1], [1, 2]],
+                quality={"resolution": "1080p", "media_source": "Blu-ray", "remux": True},
+                purpose="upgrade",
+                status=DownloadAttemptStatus.COMPLETED,
+                last_progress_at=utcnow(),
+            )
+        )
+        for episode in (1, 2):
+            new_file = root / f"Testshow.S01E0{episode}.REMUX.mkv"
+            new_file.write_bytes(b"remux")
+            session.add(
+                LibraryFile(
+                    library_id=library.id,
+                    media_item_id=item_id,
+                    season_number=1,
+                    episode_number=episode,
+                    file_path=str(new_file),
+                    size_bytes=5,
+                    source=FileSource.IMPORTED,
+                    site_id="site-a",
+                    torrent_id="pack1",
+                    resolution="1080p",
+                    bit_rate=30_000_000,
+                )
+            )
+        await session.commit()
+        await close_fulfilled_wanted(session, item_id)
+        old1 = (
+            await session.execute(
+                select(SubscriptionDownloadAttempt).where(
+                    SubscriptionDownloadAttempt.info_hash == "old1"
+                )
+            )
+        ).scalar_one()
+        old2 = (
+            await session.execute(
+                select(SubscriptionDownloadAttempt).where(
+                    SubscriptionDownloadAttempt.info_hash == "old2"
+                )
+            )
+        ).scalar_one()
+        statuses = {old1.status, old2.status}
+        # 一个走清理通道（被 replaces 指针指到），另一个保守保留
+        assert DownloadAttemptStatus.CLEANUP_PENDING in statuses
+        assert DownloadAttemptStatus.RETAINED in statuses
+
+
+@pytest.mark.asyncio
+async def test_trash_failure_keeps_ledger_row(db, tmp_path, monkeypatch):
+    """回收站移动失败：台账行必须保留（行删了文件还在，扫描会把它当新
+    文件重新收编，台账必须与磁盘一致）。"""
+    import shutil as _shutil
+
+    library, item_id, sub_id, wanted_id, root, old_file = await _seed(db, tmp_path)
+    await _add_upgrade_delivery(
+        db, sub_id, item_id, library.id, root,
+        claimed_quality={"resolution": "1080p", "media_source": "Blu-ray", "remux": True},
+        probed={"resolution": "1080p", "bit_rate": 30_000_000},
+    )
+
+    def broken_move(*args, **kwargs):
+        raise OSError("模拟移动失败")
+
+    monkeypatch.setattr(_shutil, "move", broken_move)
+    async with db.session() as session:
+        await close_fulfilled_wanted(session, item_id)
+        wanted = await session.get(WantedItem, wanted_id)
+        assert wanted.quality["remux"] is True  # 升级本身确认
+        assert old_file.exists()  # 移动失败，文件在原位
+        rows = list(
+            (
+                await session.execute(
+                    select(LibraryFile).where(LibraryFile.media_item_id == item_id)
+                )
+            ).scalars()
+        )
+        # 旧文件的台账行保留（与磁盘一致），新文件行在位
+        assert {r.file_path for r in rows} >= {str(old_file)}
+
+
+@pytest.mark.asyncio
+async def test_refuted_residue_file_quarantined_not_reborn(db, tmp_path):
+    """证伪残留文件（FAILED attempt 的来源）重新出现在台账时：隔离清理，
+    绝不参与最优选择——否则会借文件名解析"重生"为手工升级。"""
+    library, item_id, sub_id, wanted_id, root, old_file = await _seed(db, tmp_path)
+    residue = root / "Testshow.S01E01.FAKE.REMUX.mkv"
+    residue.write_bytes(b"fake")
+    async with db.session() as session:
+        session.add(
+            SubscriptionDownloadAttempt(
+                subscription_id=sub_id,
+                info_hash="fakehash",
+                site_id="site-a",
+                torrent_id="fake1",
+                units=[[1, 1]],
+                quality={"resolution": "2160p", "media_source": "WEB-DL"},
+                purpose="upgrade",
+                status=DownloadAttemptStatus.FAILED,
+                last_progress_at=utcnow(),
+            )
+        )
+        session.add(
+            LibraryFile(
+                library_id=library.id,
+                media_item_id=item_id,
+                season_number=1,
+                episode_number=1,
+                file_path=str(residue),
+                size_bytes=4,
+                source=FileSource.IMPORTED,
+                site_id="site-a",
+                torrent_id="fake1",
+                resolution="1080p",
+                media_source="Blu-ray",  # 文件名/来源声称高档——不能被采信
+                bit_rate=6_000_000,
+            )
+        )
+        await session.commit()
+        await close_fulfilled_wanted(session, item_id)
+        wanted = await session.get(WantedItem, wanted_id)
+        assert wanted.quality == _WEBDL  # 基线纹丝不动
+        assert not residue.exists()  # 残留文件被隔离进回收站
+        assert old_file.exists()

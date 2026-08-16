@@ -223,16 +223,20 @@ def _trash_root_for(file: LibraryFile, root_paths: list[str]) -> Path:
     return file_path.parent / _TRASH_DIR_NAME
 
 
-def _move_file_to_trash(file: LibraryFile, root_paths: list[str]) -> str | None:
-    """把库文件移入回收站；返回回收站内路径，源文件不存在/失败返回 None。
+def _move_file_to_trash(file: LibraryFile, root_paths: list[str]) -> tuple[bool, str | None]:
+    """把库文件移入回收站；返回 (可安全移除台账行, 回收站内路径)。
 
+    - 源文件已不存在 → (True, None)：行可删（现实里文件早没了）；
+    - 移动成功 → (True, 路径)；
+    - 移动失败 → **(False, None)**：行必须保留——删了行而文件还在，
+      库扫描会把它当新文件重新收编，证伪文件甚至可能借文件名"重生"。
     同名冲突加时间戳前缀。同文件系统内是 rename，瞬时完成。
     """
     import shutil
 
     src = Path(file.file_path)
     if not src.exists():
-        return None
+        return True, None
     trash_dir = _trash_root_for(file, root_paths)
     try:
         trash_dir.mkdir(parents=True, exist_ok=True)
@@ -240,10 +244,10 @@ def _move_file_to_trash(file: LibraryFile, root_paths: list[str]) -> str | None:
         if target.exists():
             target = trash_dir / f"{utcnow().strftime('%Y%m%d%H%M%S')}-{src.name}"
         shutil.move(str(src), str(target))
-        return str(target)
+        return True, str(target)
     except OSError:
         logger.exception("洗版旧版本移入回收站失败：%s", src)
-        return None
+        return False, None
 
 
 def cleanup_trash_dirs(root_paths: list[str]) -> int:
@@ -364,6 +368,25 @@ async def verify_upgrades(session: AsyncSession, media_item_id: int) -> None:
     for file in files:
         files_by_unit.setdefault((file.season_number, file.episode_number), []).append(file)
 
+    # 已证伪 attempt 的来源集合：它们的文件（回收站失败残留 / 意外重复入库）
+    # 必须隔离清理，绝不参与最优选择——否则证伪文件会借文件名解析
+    # "重生"为一次手工升级
+    failed_sources: set[tuple[int, str, str]] = {
+        (a.subscription_id, a.site_id, a.torrent_id)
+        for a in (
+            await session.execute(
+                select(SubscriptionDownloadAttempt).where(
+                    SubscriptionDownloadAttempt.subscription_id.in_(  # type: ignore[union-attr]
+                        {w.subscription_id for w in rows}
+                    ),
+                    SubscriptionDownloadAttempt.purpose == "upgrade",
+                    SubscriptionDownloadAttempt.status == DownloadAttemptStatus.FAILED,
+                )
+            )
+        ).scalars()
+        if a.site_id and a.torrent_id
+    }
+
     from movieclaw_matcher import QualitySnapshot
 
     item = await session.get(MediaItem, media_item_id)
@@ -383,6 +406,21 @@ async def verify_upgrades(session: AsyncSession, media_item_id: int) -> None:
         unit_files = files_by_unit.get(unit) or []
         if len(unit_files) < 2 and (wanted.subscription_id, unit) not in attempts_by_unit:
             continue  # 单版本且无在途洗版：没有可裁决的事
+        quarantine = [
+            f
+            for f in unit_files
+            if f.site_id
+            and (wanted.subscription_id, f.site_id, f.torrent_id) in failed_sources
+        ]
+        if quarantine and len(quarantine) < len(unit_files):
+            for file in quarantine:
+                removable, _trashed = _move_file_to_trash(
+                    file, await _roots(file.library_id)
+                )
+                if removable:
+                    await session.delete(file)
+            await session.commit()
+            unit_files = [f for f in unit_files if f not in quarantine]
         baseline = QualitySnapshot.model_validate(wanted.quality)
         spec = specs.get(wanted.subscription_id)
         # 同一单元可能同时挂着旧洗版源（等替换）与试用源两个 attempt：优先
@@ -484,17 +522,32 @@ async def verify_upgrades(session: AsyncSession, media_item_id: int) -> None:
                         DownloadAttemptStatus.RETAINED,
                         DownloadAttemptStatus.CANCELLED,
                     ):
-                        attempt.replaces_attempt_id = old_attempt.id
-                        old_attempt.status = DownloadAttemptStatus.CLEANUP_PENDING
+                        if attempt.replaces_attempt_id in (None, old_attempt.id):
+                            attempt.replaces_attempt_id = old_attempt.id
+                            old_attempt.status = DownloadAttemptStatus.CLEANUP_PENDING
+                        else:
+                            # 整季包一次替换多个来源不同的旧单集时，replaces
+                            # 指针只能指向一个旧 attempt——清理巡检靠这个指针
+                            # 找"新源"读取证据，指不到的旧 attempt 挂进
+                            # CLEANUP_PENDING 只会永远等不到清理。其余旧任务
+                            # 保守保留做种（与"证据不足不删数据"的换源铁律一致）
+                            old_attempt.status = DownloadAttemptStatus.RETAINED
+                            old_attempt.cleanup_note = (
+                                "洗版整季替换：多个旧任务无法自动比对文件重叠，"
+                                "保留做种，可在任务中心手动清理"
+                            )
                         old_attempt.updated_at = now
             # 旧版本文件进回收站、台账行移除（quality-upgrade.md §7.1）
             for file in unit_files:
                 if file.id == best_file.id:
                     continue
-                trashed = _move_file_to_trash(file, await _roots(file.library_id))
+                removable, trashed = _move_file_to_trash(file, await _roots(file.library_id))
                 if trashed:
                     trash_paths.append(trashed)
-                await session.delete(file)
+                if removable:
+                    await session.delete(file)
+                # 移动失败时保留台账行：行删了而文件还在，扫描会把它当新
+                # 文件重新收编（台账必须与磁盘一致）
             await session.commit()
             await repo.add_activity(
                 SubscriptionActivity(
@@ -543,10 +596,13 @@ async def verify_upgrades(session: AsyncSession, media_item_id: int) -> None:
             # 也绝不把单元清空）
             if others:
                 for file in from_attempt:
-                    trashed = _move_file_to_trash(file, await _roots(file.library_id))
+                    removable, trashed = _move_file_to_trash(
+                        file, await _roots(file.library_id)
+                    )
                     if trashed:
                         trash_paths.append(trashed)
-                    await session.delete(file)
+                    if removable:
+                        await session.delete(file)
             # 资源是否诚实：投递文件的实测快照没有低于其声称档位 → 资源没
             # 撒谎，只是基线在下载期间被更优版本（如手工入库）抢先刷高。
             # 诚实资源不计熔断、不进排除清单、不写证伪活动——错误的惩罚会
@@ -731,7 +787,11 @@ async def reset_upgrade_search_now(session: AsyncSession, subscription_id: int) 
     只碰"当下确实可洗"的单元（到顶/不可比/熔断冷却中的不碰）。
     只改内存行、不 commit（跟随调用方事务）。返回重置数。
     """
-    from movieclaw_api.services.subscription.matching import UPGRADE_PRIORITY, upgrade_ready
+    from movieclaw_api.services.subscription.matching import (
+        UPGRADE_FUSE_LIMIT,
+        UPGRADE_PRIORITY,
+    )
+    from movieclaw_matcher import provably_below_cutoff
 
     specs = await _specs_for_subscriptions(session, {subscription_id})
     spec = specs.get(subscription_id)
@@ -752,8 +812,23 @@ async def reset_upgrade_search_now(session: AsyncSession, subscription_id: int) 
     now = utcnow()
     reset = 0
     for wanted in rows:
-        if not upgrade_ready(wanted, spec, now=now):
+        if not wanted.quality:
             continue
+        if not provably_below_cutoff(QualitySnapshot.model_validate(wanted.quality), spec):
+            continue
+        if wanted.upgrade_verify_failures >= UPGRADE_FUSE_LIMIT:
+            # 「立即搜索」正是熔断提示（system_notice）要求的人工介入：
+            # 解除熔断、清零计数重新观察，并熄灭对应提示
+            from movieclaw_api.services.system_notice import resolve_notices
+
+            wanted.upgrade_verify_failures = 0
+            await resolve_notices(
+                session,
+                prefix=(
+                    f"subscription.upgrade:{subscription_id}:"
+                    f"{wanted.season_number}:{wanted.episode_number}"
+                ),
+            )
         wanted.priority = UPGRADE_PRIORITY
         wanted.next_search_at = now
         wanted.updated_at = now

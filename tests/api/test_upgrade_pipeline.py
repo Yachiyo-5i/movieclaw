@@ -430,3 +430,49 @@ async def test_import_clears_stale_gap_schedule(db):
         # 旧排期已清；随后 arm 只对可洗单元重挂（本例 Blu-ray 未到 Remux，
         # 规则组开了洗版 → 被重新排期为洗版搜索，语义正确）
         assert wanted.quality["media_source"] == "Blu-ray"
+
+
+@pytest.mark.asyncio
+async def test_completed_subscription_still_upgrades(db):
+    """洗版的主场景是"已收齐"（completed）订阅：上下文加载与搜索队列都
+    不得把它排除（paused 才停，quality-upgrade.md §6.3）。"""
+    from movieclaw_api.services.subscription.wanted_search import _due_media_groups
+
+    item_id, sub_id, (wanted_id,) = await _seed(db, quality=_WEBDL)
+    async with db.session() as session:
+        sub = await session.get(Subscription, sub_id)
+        sub.status = "completed"
+        wanted = await session.get(WantedItem, wanted_id)
+        wanted.next_search_at = utcnow()  # 已排期到期
+        await session.commit()
+        contexts = await load_match_context(session)
+        assert item_id in contexts and (1, 1) in contexts[item_id].upgrade_wanted
+        assert item_id in await _due_media_groups(session)
+
+        # 暂停则真正停
+        sub = await session.get(Subscription, sub_id)
+        sub.status = "paused"
+        await session.commit()
+        assert item_id not in await load_match_context(session)
+        assert item_id not in await _due_media_groups(session)
+
+
+@pytest.mark.asyncio
+async def test_search_now_defuses_fused_unit(db):
+    """「立即搜索」是熔断提示要求的人工介入：解除熔断、清零计数、立即排期。"""
+    from movieclaw_api.services.subscription.upgrade import reset_upgrade_search_now
+
+    _item, sub_id, (wanted_id,) = await _seed(db, quality=_WEBDL)
+    async with db.session() as session:
+        from datetime import timedelta
+
+        wanted = await session.get(WantedItem, wanted_id)
+        wanted.upgrade_verify_failures = 3
+        wanted.next_search_at = utcnow() + timedelta(days=20)  # 冷却中
+        await session.commit()
+        reset = await reset_upgrade_search_now(session, sub_id)
+        await session.commit()
+        assert reset == 1
+        wanted = await session.get(WantedItem, wanted_id)
+        assert wanted.upgrade_verify_failures == 0
+        assert (utcnow() - wanted.next_search_at).total_seconds() < 5

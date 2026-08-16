@@ -266,7 +266,9 @@ async def load_match_context(session: AsyncSession) -> dict[int, MediaContext]:
             .where(
                 WantedItem.status == WantedStatus.IMPORTED,
                 WantedItem.in_scope.is_(True),  # type: ignore[attr-defined]
-                Subscription.status == SubscriptionStatus.ACTIVE,
+                # 洗版的主场景恰恰是"已收齐"（completed）的订阅——只有
+                # 用户显式暂停才停（quality-upgrade.md §6.3）
+                Subscription.status != SubscriptionStatus.PAUSED,  # type: ignore[arg-type]
                 Subscription.rule_set_id.in_(upgrade_rule_ids),  # type: ignore[union-attr]
             )
         )

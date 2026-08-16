@@ -280,7 +280,8 @@ async def run_replacement_search(attempt_id: int, *, force: bool = False) -> boo
             if await _has_trial(session, attempt.id):
                 return False
             subscription = await session.get(Subscription, attempt.subscription_id)
-            if subscription is None or subscription.status != SubscriptionStatus.ACTIVE:
+            # paused 才拦：洗版源换源发生在已收齐（completed）的订阅上
+            if subscription is None or subscription.status == SubscriptionStatus.PAUSED:
                 return False
             item = await session.get(MediaItem, subscription.media_item_id)
             if item is None:
@@ -428,7 +429,8 @@ async def _try_candidates(
 ) -> bool:
     """评估一批候选并投递首个实际不同的同品质试用源。"""
     subscription = await session.get(Subscription, attempt.subscription_id)
-    if subscription is None or subscription.status != SubscriptionStatus.ACTIVE:
+    # paused 才拦：洗版源换源发生在已收齐（completed）的订阅上
+    if subscription is None or subscription.status == SubscriptionStatus.PAUSED:
         return False
     item = await session.get(MediaItem, subscription.media_item_id)
     rule = await session.get(RuleSet, subscription.rule_set_id)
