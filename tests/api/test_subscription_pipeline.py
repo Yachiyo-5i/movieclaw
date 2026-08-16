@@ -82,6 +82,31 @@ _TV_ROUTES = {
 }
 
 
+_MOVIE_ROUTES = {
+    # 电影上映感知调度夹具：未上映（30 天后）与未定档（制作中）
+    "/3/movie/101": {
+        "id": 101,
+        "title": "未上映电影",
+        "original_title": "Upcoming Movie",
+        "release_date": (_TODAY + timedelta(days=30)).isoformat(),
+        "status": "Post Production",
+        "external_ids": {},
+        "alternative_titles": {"titles": []},
+        "translations": {"translations": []},
+    },
+    "/3/movie/103": {
+        "id": 103,
+        "title": "未定档电影",
+        "original_title": "Undated Movie",
+        "release_date": "",
+        "status": "In Production",
+        "external_ids": {},
+        "alternative_titles": {"titles": []},
+        "translations": {"translations": []},
+    },
+}
+
+
 def _fake_tmdb(routes: dict) -> TmdbClient:
     def handler(request: httpx.Request) -> httpx.Response:
         payload = routes.get(request.url.path)
@@ -107,7 +132,9 @@ async def db(tmp_path, monkeypatch):
 
 
 def _service(session) -> SubscriptionService:
-    return SubscriptionService(session, MediaLibraryService(session, _fake_tmdb(_TV_ROUTES)))
+    return SubscriptionService(
+        session, MediaLibraryService(session, _fake_tmdb({**_TV_ROUTES, **_MOVIE_ROUTES}))
+    )
 
 
 async def _insert_torrent(session, torrent_id: str, title: str, attrs: dict, **kw) -> SiteTorrent:
@@ -755,6 +782,43 @@ async def test_search_hit_persists_and_dispatches(db, monkeypatch) -> None:
         assert "投递覆盖 2 个单元" in searched[0].message
 
 
+async def test_movie_forced_search_restores_release_schedule(db, monkeypatch) -> None:
+    """强制搜索未上映电影无果后，退避地板把调度恢复到"上映 + 宽限"，
+    不落进 15 分钟起步的退避曲线在明知没资源的窗口里反复空搜。"""
+    from movieclaw_api.services.subscription import MOVIE_RELEASE_GRACE
+    from movieclaw_api.services.subscription.wanted_search import search_wanted
+
+    _fake_search(monkeypatch, sites_ok=2, hits=[])
+    async with db.session() as session:
+        service = _service(session)
+        sub = await service.create(MediaKind.MOVIE, 101)
+        await service.search_now(sub.id)  # 用户强制：未上映也搜一次
+
+    await search_wanted()
+    async with db.session() as session:
+        w = list((await _wanted_map(session, sub.id)).values())[0]
+        assert w.search_attempts == 1  # 强制的这次真实搜索照常记账
+        assert w.next_search_at is not None
+        assert w.next_search_at.date() == _TODAY + timedelta(days=30) + MOVIE_RELEASE_GRACE
+
+
+async def test_movie_forced_search_on_undated_returns_to_unschedulable(db, monkeypatch) -> None:
+    """未定档电影强制搜索无果后回到不可调度（NULL），等定档回填，不进退避循环。"""
+    from movieclaw_api.services.subscription.wanted_search import search_wanted
+
+    _fake_search(monkeypatch, sites_ok=2, hits=[])
+    async with db.session() as session:
+        service = _service(session)
+        sub = await service.create(MediaKind.MOVIE, 103)
+        await service.search_now(sub.id)
+
+    await search_wanted()
+    async with db.session() as session:
+        w = list((await _wanted_map(session, sub.id)).values())[0]
+        assert w.search_attempts == 1
+        assert w.next_search_at is None
+
+
 # ---------------------------------------------------------------------------
 # F3 元数据刷新：新集生长 + 定档回填
 # ---------------------------------------------------------------------------
@@ -807,3 +871,58 @@ async def test_refresh_grows_new_episode_and_schedules_dated(db, monkeypatch) ->
             await session.execute(select(MediaItem).where(MediaItem.tmdb_id == 200))
         ).scalar_one()
         assert item.next_refresh_at is not None  # 分档排期已写回
+
+
+async def test_refresh_backfills_movie_release_schedule(db, monkeypatch) -> None:
+    """电影的定档回填：未定档订阅（NULL 不可调度）在 TMDB 档期出现后，
+    刷新把哨兵工单调度对齐到"上映 + 宽限"，并落一条可读活动。"""
+    from movieclaw_api.services import media_discover, media_refresh
+    from movieclaw_api.services.subscription import MOVIE_RELEASE_GRACE
+
+    async with db.session() as session:
+        sub = await _service(session).create(MediaKind.MOVIE, 103)
+        w = list((await _wanted_map(session, sub.id)).values())[0]
+        assert w.next_search_at is None  # 未定档：不可调度
+
+    release = _TODAY + timedelta(days=20)
+    updated_routes = {
+        **_TV_ROUTES,
+        **_MOVIE_ROUTES,
+        "/3/movie/103": {
+            **_MOVIE_ROUTES["/3/movie/103"],
+            "release_date": release.isoformat(),
+            "status": "Post Production",
+        },
+    }
+    monkeypatch.setattr(media_discover, "get_tmdb_client", lambda: _fake_tmdb(updated_routes))
+
+    await media_refresh.refresh_media_metadata()
+    async with db.session() as session:
+        w = list((await _wanted_map(session, sub.id)).values())[0]
+        assert w.next_search_at is not None  # 定档回填调度
+        assert w.next_search_at.date() == release + MOVIE_RELEASE_GRACE
+        assert w.priority > 0
+
+        adjusted = [a for a in await _activities(session, sub.id) if a.type == "adjusted"]
+        assert any("档期更新" in a.message for a in adjusted)
+
+
+async def test_refresh_keeps_user_forced_search_pending(db, monkeypatch) -> None:
+    """定档回填不得回撤用户已触发、尚未执行的强制搜索：next<=now 是等待
+    搜索管线消费的排队信号，刷新往未来/NULL 改写会把强制悄悄吞掉。"""
+    from movieclaw_api.services import media_discover, media_refresh
+
+    async with db.session() as session:
+        service = _service(session)
+        sub = await service.create(MediaKind.MOVIE, 101)  # 未上映：排在上映+宽限
+        await service.search_now(sub.id)  # 用户强制：next 清零到当下
+        forced_at = list((await _wanted_map(session, sub.id)).values())[0].next_search_at
+        assert forced_at is not None and forced_at <= utcnow()
+
+    monkeypatch.setattr(
+        media_discover, "get_tmdb_client", lambda: _fake_tmdb({**_TV_ROUTES, **_MOVIE_ROUTES})
+    )
+    await media_refresh.refresh_media_metadata()
+    async with db.session() as session:
+        w = list((await _wanted_map(session, sub.id)).values())[0]
+        assert w.next_search_at == forced_at  # 强制仍在排队，未被改回未来档期
