@@ -335,6 +335,14 @@ async def list_subscriptions(
             for season in seasons_by_item.get(item_id, [])
         ]
         views.append(SubscriptionView.from_model(sub, item, counts, collection))
+    # 「洗版中」批量派生（与详情页同口径）：海报墙据此给完结剧亮青点
+    from movieclaw_api.services.subscription import upgrading_counts
+
+    upgrading = await upgrading_counts(
+        session, [sub.id for sub, _item, _counts in rows if sub.id is not None]
+    )
+    for view in views:
+        view.progress.upgrading = upgrading.get(view.id, 0)
     return ok(views)
 
 

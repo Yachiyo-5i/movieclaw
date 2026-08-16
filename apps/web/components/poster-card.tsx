@@ -89,8 +89,9 @@ export interface PosterVisualItem {
   ribbonVariant?: "compact-left";
   /** 斜标的语义色：已入库为绿色，已订阅为蓝色。 */
   ribbonTone?: "owned" | "subscribed";
-  /** 海报底部常显的一行左右信息；订阅墙用来承载剧集范围与收录进度。 */
-  posterFooter?: { label: string; value: string; tracking?: boolean };
+  /** 海报底部常显的一行左右信息；订阅墙用来承载剧集范围与收录进度。
+   *  tracking=追更中绿点；upgrading=洗版中青点（绿点优先，同槽位只亮一个）。 */
+  posterFooter?: { label: string; value: string; tracking?: boolean; upgrading?: boolean };
   /** 悬浮层的一行紧凑元信息；长内容截断，完整值保留在 title 中。 */
   overlayMeta?: string;
   /** 悬浮层的两行紧凑上下文；不占用海报下方的常显元信息。 */
@@ -232,7 +233,10 @@ export function PosterCardVisual({
   if (href) {
     const accessibilityDetails = [
       resolveRibbon(item)?.label,
-      item.posterFooter ? `${item.posterFooter.label}，收录 ${item.posterFooter.value}` : undefined,
+      item.posterFooter
+        ? `${item.posterFooter.label}，收录 ${item.posterFooter.value}` +
+          (item.posterFooter.upgrading ? "，洗版中" : "")
+        : undefined,
       item.overlayDetails?.primary,
       item.overlayDetails?.secondary,
       item.genres?.join("、"),
@@ -340,12 +344,17 @@ function PosterCardContent({
             <p className="flex items-center justify-between gap-2 text-caption text-white/80">
               <span className="truncate">{item.posterFooter.label}</span>
               <span className="tnum flex shrink-0 items-center gap-1.5 font-semibold text-white">
-                {item.posterFooter.tracking && (
+                {item.posterFooter.tracking ? (
                   <span
                     aria-hidden="true"
                     className="size-1.5 rounded-full bg-[var(--ok)] shadow-[0_0_7px_rgba(74,222,128,0.55)]"
                   />
-                )}
+                ) : item.posterFooter.upgrading ? (
+                  <span
+                    aria-hidden="true"
+                    className="size-1.5 rounded-full bg-[#2dd4bf] shadow-[0_0_7px_rgba(45,212,191,0.55)]"
+                  />
+                ) : null}
                 {item.posterFooter.value}
               </span>
             </p>

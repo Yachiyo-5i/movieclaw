@@ -60,6 +60,7 @@ from movieclaw_api.services.subscription.replacement import (
 from movieclaw_api.services.subscription.upgrade import (
     run_upgrade_round,
     upgrade_attempt_wanted_rows,
+    upgrading_counts,
 )
 from movieclaw_api.services.subscription.wanted_fulfillment import close_fulfilled_wanted
 from movieclaw_api.services.subscription.wanted_search import kick_search_soon, search_wanted
@@ -90,6 +91,7 @@ __all__ = [
     "quality_not_lower",
     "reconcile_pending_cleanup",
     "run_upgrade_round",
+    "upgrading_counts",
     "upgrade_attempt_wanted_rows",
     "upgrade_ready",
     "replacement_backoff",

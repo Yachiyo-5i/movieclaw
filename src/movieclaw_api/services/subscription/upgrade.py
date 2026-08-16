@@ -1087,6 +1087,44 @@ async def _specs_for_subscriptions(
     return result
 
 
+async def upgrading_counts(
+    session: AsyncSession, subscription_ids: list[int]
+) -> dict[int, int]:
+    """批量派生每个订阅「洗版中」的单元数（订阅列表/海报墙用）。
+
+    与详情页的 ``upgrade_ready`` 完全同口径（可证明低于目标且未熔断），
+    否则海报墙亮着青点、点进详情却说没在洗。只扫配了洗版目标的订阅的
+    已入库单元，规模与洗版启用面成正比，列表接口可以承受。
+    """
+    from movieclaw_api.services.subscription.matching import upgrade_ready
+
+    specs = await _specs_for_subscriptions(session, set(subscription_ids))
+    enabled = {
+        sid
+        for sid, spec in specs.items()
+        if spec is not None and spec.upgrade_source is not None
+    }
+    if not enabled:
+        return {}
+    now = utcnow()
+    counts: dict[int, int] = {}
+    for w in (
+        await session.execute(
+            select(WantedItem).where(
+                WantedItem.subscription_id.in_(enabled),  # type: ignore[attr-defined]
+                WantedItem.status == WantedStatus.IMPORTED,
+                WantedItem.in_scope.is_(True),  # type: ignore[attr-defined]
+                WantedItem.quality.isnot(None),  # type: ignore[union-attr]
+            )
+        )
+    ).scalars():
+        spec = specs[w.subscription_id]
+        assert spec is not None  # enabled 集合已保证
+        if upgrade_ready(w, spec, now=now):
+            counts[w.subscription_id] = counts.get(w.subscription_id, 0) + 1
+    return counts
+
+
 async def arm_upgrade_candidates(session: AsyncSession, wanted_rows: list[WantedItem]) -> int:
     """给可洗版的 imported 单元排洗版搜索（首搜在 24h 内错峰）。
 

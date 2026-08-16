@@ -74,7 +74,7 @@ export interface SubscriptionProgress {
   downloaded: number;
   /** 已整理入库（终态） */
   imported: number;
-  /** 已入库但仍在洗版中的单元数（详情接口计算；列表接口恒为 0） */
+  /** 已入库但仍在洗版中的单元数（详情与列表接口同口径计算；海报墙青点据此显示） */
   upgrading: number;
 }
 

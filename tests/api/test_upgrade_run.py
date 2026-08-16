@@ -13,6 +13,7 @@ from movieclaw_api.exceptions import BadRequestException
 from movieclaw_api.services.subscription.upgrade import (
     materialize_owned_wanted,
     run_upgrade_round,
+    upgrading_counts,
 )
 from movieclaw_db.engine import dispose_db, get_database, init_db
 from movieclaw_db.migrations import run_migrations
@@ -62,15 +63,19 @@ async def _seed(
     spec=None,
     episodes=((1, 1), (1, 2), (1, 3)),
     status=SubscriptionStatus.COMPLETED,
+    tmdb_id=300,
 ):
     """库/条目（含集数据）/订阅 的最小闭包；集全部已播出。"""
     async with db.session() as session:
         library = await LibraryRepository(session).create(
-            name="剧集库", kind="tv", root_paths=["/media/tv"]
+            name=f"剧集库-{tmdb_id}", kind="tv", root_paths=["/media/tv"]
         )
-        item = MediaItem(kind="tv", tmdb_id=300, title="存量剧", original_title="Stock", year=2020)
+        item = MediaItem(
+            kind="tv", tmdb_id=tmdb_id, title="存量剧", original_title="Stock", year=2020
+        )
         rule_set = RuleSet(
-            name="洗版组", spec={"upgrade_source": "remux"} if spec is None else spec
+            name=f"洗版组-{tmdb_id}",
+            spec={"upgrade_source": "remux"} if spec is None else spec,
         )
         session.add_all([item, rule_set])
         await session.commit()
@@ -359,3 +364,26 @@ async def test_run_defuses_fused_unit(db, kicked):
         assert row.upgrade_verify_failures == 0
         assert row.next_search_at <= utcnow()
         assert kicked
+
+
+@pytest.mark.asyncio
+async def test_upgrading_counts_matches_detail_semantics(db):
+    """列表视图的批量「洗版中」计数与详情页 upgrade_ready 同口径：
+    低于目标的计入，到顶/无法确认（{} 哨兵与片源未知）的不计。"""
+    _lib, item_id, sub_id, _rs = await _seed(db, episodes=((1, 1), (1, 2), (1, 3)))
+    async with db.session() as session:
+        await _add_wanted(session, sub_id, item_id, 1, 1, quality=_WEBDL)  # 低于目标
+        await _add_wanted(session, sub_id, item_id, 1, 2, quality=_REMUX)  # 到顶
+        await _add_wanted(session, sub_id, item_id, 1, 3, quality={})  # 无法确认
+        assert await upgrading_counts(session, [sub_id]) == {sub_id: 1}
+
+    # 未配洗版目标的订阅：直接跳过，不扫工单
+    _lib2, item2, sub2, _rs2 = await _seed_plain(db)
+    async with db.session() as session:
+        await _add_wanted(session, sub2, item2, 1, 1, quality=_WEBDL)
+        assert await upgrading_counts(session, [sub2]) == {}
+
+
+async def _seed_plain(db):
+    """无洗版目标的对照订阅（tmdb_id 错开避免唯一约束）。"""
+    return await _seed(db, spec={}, episodes=((1, 1),), tmdb_id=301)
