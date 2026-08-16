@@ -872,6 +872,12 @@ export interface LibraryItemFile {
   episode_number: number;
   /** 文件当前不在磁盘（missing 标记） */
   missing: boolean;
+  /** 生命周期：in_place 在位 / missing 缺失 / trashed 待回收 */
+  state: "in_place" | "missing" | "trashed";
+  /** 待回收的预计自动清理时间；null 且 trashed = 做种保护，不自动删 */
+  purge_after: string | null;
+  /** 待回收原因（中文整句，含触发方） */
+  trash_note: string | null;
   /** 音轨列表；null=尚未探测（ffprobe 缺失或文件不可达） */
   audio_streams: AudioStream[] | null;
   /** 字幕列表：内封轨 + 外挂文件 */
@@ -1052,6 +1058,34 @@ export function deleteLibraryItem(
  * 洗掉一个、删某集重下的出口。同样会真删磁盘，调用前必须明确二次确认；
  * 该文件是条目在本库的最后一个文件时会升级为整条目删除（确认界面须告知）。
  */
+/** 恢复待回收的文件为在位版本（原路径被占用时后端报可读错误）。 */
+export function restoreLibraryFile(
+  libraryId: number,
+  mediaItemId: number,
+  fileId: number,
+): Promise<Record<string, never>> {
+  return unwrap(
+    request<ApiEnvelope<Record<string, never>>>(
+      `/libraries/${libraryId}/items/${mediaItemId}/files/${fileId}/restore`,
+      { method: "POST" },
+    ),
+  );
+}
+
+/** 立即清理待回收的文件（真删磁盘；做种保护形态需先向用户确认断种风险）。 */
+export function purgeLibraryFile(
+  libraryId: number,
+  mediaItemId: number,
+  fileId: number,
+): Promise<Record<string, never>> {
+  return unwrap(
+    request<ApiEnvelope<Record<string, never>>>(
+      `/libraries/${libraryId}/items/${mediaItemId}/files/${fileId}/purge`,
+      { method: "POST" },
+    ),
+  );
+}
+
 export function deleteLibraryFile(
   libraryId: number,
   mediaItemId: number,

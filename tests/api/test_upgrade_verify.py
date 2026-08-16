@@ -16,6 +16,7 @@ from movieclaw_db.migrations import run_migrations
 from movieclaw_db.models import (
     DownloadAttemptStatus,
     FileSource,
+    FileState,
     LibraryFile,
     MediaItem,
     RuleSet,
@@ -56,7 +57,7 @@ async def db(tmp_path, monkeypatch):
     get_settings.cache_clear()
 
 
-async def _seed(db, tmp_path, *, quality=_WEBDL, old_hash="old1"):
+async def _seed(db, tmp_path, *, quality=_WEBDL, old_hash="old1", rule_spec=None):
     """库(真实 tmp 根)/条目/订阅/imported 工单 + 旧版本物理文件。"""
     root = tmp_path / "tv"
     root.mkdir(exist_ok=True)
@@ -70,7 +71,7 @@ async def _seed(db, tmp_path, *, quality=_WEBDL, old_hash="old1"):
             kind="tv", tmdb_id=200, title="测试剧集", original_title="Testshow", year=2024,
             aliases=["Testshow"],
         )
-        rule_set = RuleSet(name="默认", spec={"upgrade_source": "remux"})
+        rule_set = RuleSet(name="默认", spec=rule_spec or {"upgrade_source": "remux"})
         session.add_all([item, rule_set])
         await session.commit()
         await session.refresh(item)
@@ -764,3 +765,47 @@ async def test_confirm_keeps_single_link_old_file_in_place(db, tmp_path):
         )
         assert any(a.payload.get("kept_in_place") == 1 for a in activities)
     assert old_file.exists()  # 文件原位未动，做种不受影响
+
+
+@pytest.mark.asyncio
+async def test_confirm_keep_old_coexists(db, tmp_path):
+    """「保留共存」（upgrade_keep_old，收藏家模式）：升级照常确认，
+    旧版本既不进回收站也不转待回收——两个在位版本并存。"""
+    library, item_id, sub_id, wanted_id, root, old_file = await _seed(
+        db, tmp_path, rule_spec={"upgrade_source": "remux", "upgrade_keep_old": True}
+    )
+    await _add_upgrade_delivery(
+        db,
+        sub_id,
+        item_id,
+        library.id,
+        root,
+        claimed_quality={"resolution": "1080p", "media_source": "Blu-ray", "remux": True},
+        probed={"resolution": "1080p", "bit_rate": 30_000_000},
+    )
+    async with db.session() as session:
+        from movieclaw_api.services.subscription.upgrade import verify_upgrades
+
+        await verify_upgrades(session, item_id)
+        wanted = await session.get(WantedItem, wanted_id)
+        assert wanted.info_hash == "new1"  # 升级本身照常确认
+        rows = list(
+            (
+                await session.execute(
+                    select(LibraryFile).where(LibraryFile.media_item_id == item_id)
+                )
+            ).scalars()
+        )
+        assert len(rows) == 2
+        assert all(r.state == FileState.IN_PLACE for r in rows)  # 都在位，无待回收
+        activities = list(
+            (
+                await session.execute(
+                    select(SubscriptionActivity).where(
+                        SubscriptionActivity.subscription_id == sub_id
+                    )
+                )
+            ).scalars()
+        )
+        assert any(a.payload.get("kept_coexisting") for a in activities)
+    assert old_file.exists()

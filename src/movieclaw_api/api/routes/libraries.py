@@ -1625,6 +1625,18 @@ async def list_library_item_index(
 # ---------------------------------------------------------------------------
 
 
+def _trash_note(row: LibraryFile) -> str | None:
+    """待回收行的展示句：审计快照的 note + 触发方 label（都是快照，免 join）。"""
+    if row.state != FileState.TRASHED or not row.trash_context:
+        return None
+    note = str(row.trash_context.get("note") or "")
+    trigger = row.trash_context.get("trigger") or {}
+    label = str(trigger.get("label") or "")
+    if note and label:
+        return f"{note}（{label}）"
+    return note or label or None
+
+
 async def _item_rows(
     session: AsyncSession, library_id: int, media_item_id: int
 ) -> tuple[MediaItem, list[LibraryFile]]:
@@ -1698,6 +1710,9 @@ def _file_view(row: LibraryFile, external_subs: list[str]) -> LibraryFileView:
         season_number=row.season_number,
         episode_number=row.episode_number,
         missing=row.state == FileState.MISSING,
+        state=row.state,
+        purge_after=row.purge_after,
+        trash_note=_trash_note(row),
         audio_streams=(
             None
             if row.audio_streams is None
@@ -2080,6 +2095,67 @@ async def delete_library_file(
     else:
         message = f"「{file_name}」已从磁盘删除"
     return ok(view, message=message)
+
+
+@router.post(
+    "/{library_id}/items/{media_item_id}/files/{file_id}/restore",
+    response_model=ApiResponse[dict],
+    summary="把待回收的文件恢复为在位版本",
+    operation_id="library.items.restore-file",
+    dependencies=[Depends(require_admin)],
+)
+async def restore_library_file(
+    library_id: int,
+    media_item_id: int,
+    file_id: int,
+    session: AsyncSession = Depends(get_session),
+) -> ApiResponse[dict]:
+    """回收机制的「恢复」（library-file-recycle.md §7）：文件移回原路径、
+    状态复位在位；原路径已被占用（如新版本同名）时恢复失败并保持待回收。"""
+    from movieclaw_api.services.library.recycle import restore_file
+
+    item, rows = await _item_rows(session, library_id, media_item_id)
+    row = next((r for r in rows if r.id == file_id), None)
+    if row is None:
+        raise NotFoundException(f"台账文件不存在或不属于「{item.title}」：id={file_id}")
+    if row.state != FileState.TRASHED:
+        raise BadRequestException("该文件不在待回收状态，无需恢复")
+    if not await restore_file(session, row):
+        raise ConflictException("恢复失败：原路径已有同名文件，或文件已不存在——可稍后清理该记录")
+    await session.commit()
+    return ok({}, message=f"「{PurePath(row.file_path).name}」已恢复为在位版本")
+
+
+@router.post(
+    "/{library_id}/items/{media_item_id}/files/{file_id}/purge",
+    response_model=ApiResponse[dict],
+    summary="立即清理一个待回收的文件（真删磁盘）",
+    operation_id="library.items.purge-file",
+    dependencies=[Depends(require_admin)],
+    openapi_extra={"x-cli-dangerous": "destructive"},
+)
+async def purge_library_file(
+    library_id: int,
+    media_item_id: int,
+    file_id: int,
+    session: AsyncSession = Depends(get_session),
+) -> ApiResponse[dict]:
+    """回收机制的「立即清理」：不等保留期，删物理文件 + 删台账行。
+    做种保护形态（原地待回收）的清理可能中断做种——确认弹窗由前端负责，
+    调用方必须先向用户明确确认。"""
+    from movieclaw_api.services.library.recycle import purge_file
+
+    item, rows = await _item_rows(session, library_id, media_item_id)
+    row = next((r for r in rows if r.id == file_id), None)
+    if row is None:
+        raise NotFoundException(f"台账文件不存在或不属于「{item.title}」：id={file_id}")
+    if row.state != FileState.TRASHED:
+        raise BadRequestException("该文件不在待回收状态；删除在位文件请用「删除文件」")
+    file_name = PurePath(row.file_path).name
+    if not await purge_file(session, row):
+        raise ConflictException(f"清理「{file_name}」失败，请检查文件权限后重试")
+    await session.commit()
+    return ok({}, message=f"「{file_name}」已清理")
 
 
 @router.post(

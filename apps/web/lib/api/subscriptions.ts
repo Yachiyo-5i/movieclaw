@@ -230,6 +230,8 @@ export interface RuleSetSpec {
   upgrade_source?: "web-dl" | "blu-ray" | "remux" | null;
   /** 洗版目标分辨率；缺省=分辨率偏好首选（都缺省则 1080p），须在 resolutions 内 */
   cutoff_resolution?: string | null;
+  /** 洗到新版本后保留旧版本（多版本共存，收藏家模式）；缺省=旧版本进回收站 */
+  upgrade_keep_old?: boolean;
   /** [预留] 站点白名单；空=全部启用站点 */
   sites?: string[];
 }

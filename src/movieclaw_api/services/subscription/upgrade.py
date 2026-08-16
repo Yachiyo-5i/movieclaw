@@ -791,25 +791,28 @@ async def _verify_upgrades_locked(session: AsyncSession, media_item_id: int) -> 
                                 "保留做种，可在任务中心手动清理"
                             )
                         old_attempt.updated_at = now
-            # 旧版本文件进回收站、台账行移除（quality-upgrade.md §7.1）；
-            # 唯一硬链接的文件受做种保护，保留原位（台账行同步保留）
+            # 旧版本文件进回收站（quality-upgrade.md §7.1 / library-file-recycle.md）；
+            # 唯一硬链接的文件受做种保护，原地转入待回收。
+            # 「保留共存」（upgrade_keep_old，收藏家模式）：旧版本不进回收站，
+            # 多版本并存——升级本身（基线/关联/活动）照常
             kept_in_place = 0
-            for file in unit_files:
-                if file.id == best_file.id:
-                    continue
-                outcome = await recycle_file(
-                    session,
-                    file,
-                    reason="upgrade_replaced",
-                    trigger=_recycle_trigger(wanted),
-                    note=f"洗版替换：{old_label} → {new_label}",
-                )
-                if outcome == "already_gone":
-                    await session.delete(file)  # 文件早没了：行删掉与磁盘一致
-                elif outcome == "moved_to_trash":
-                    trash_paths.append(file.file_path)
-                else:
-                    kept_in_place += 1  # 做种保护：原地待回收
+            if not spec.upgrade_keep_old:
+                for file in unit_files:
+                    if file.id == best_file.id:
+                        continue
+                    outcome = await recycle_file(
+                        session,
+                        file,
+                        reason="upgrade_replaced",
+                        trigger=_recycle_trigger(wanted),
+                        note=f"洗版替换：{old_label} → {new_label}",
+                    )
+                    if outcome == "already_gone":
+                        await session.delete(file)  # 文件早没了：行删掉与磁盘一致
+                    elif outcome == "moved_to_trash":
+                        trash_paths.append(file.file_path)
+                    else:
+                        kept_in_place += 1  # 做种保护：原地待回收
             await session.commit()
             await repo.add_activity(
                 SubscriptionActivity(
@@ -825,12 +828,14 @@ async def _verify_upgrades_locked(session: AsyncSession, media_item_id: int) -> 
                             if kept_in_place
                             else ""
                         )
+                        + ("；旧版本按规则保留共存" if spec.upgrade_keep_old else "")
                     ),
                     payload={
                         "from": old_label,
                         "to": new_label,
                         "trash_paths": trash_paths,
                         "kept_in_place": kept_in_place,
+                        "kept_coexisting": spec.upgrade_keep_old,
                         "units": [[wanted.season_number, wanted.episode_number]],
                     },
                 )
