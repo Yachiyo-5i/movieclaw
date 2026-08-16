@@ -99,6 +99,7 @@ async def _relations(
         unit = {
             "season_number": wanted.season_number,
             "episode_number": wanted.episode_number,
+            "imported": False,
         }
         grouped_units[key].append(unit)
         scoped_units_by_subscription[subscription.id].add(
@@ -179,7 +180,13 @@ async def _relations(
             continue
         if key not in subscription_meta:
             grouped_units[key] = [
-                {"season_number": season, "episode_number": episode}
+                {
+                    "season_number": season,
+                    "episode_number": episode,
+                    # 洗版任务覆盖的单元本就已在库（旧版本），如实标注
+                    "imported": (season, episode)
+                    in imported_units_by_subscription[subscription.id],
+                }
                 for season, episode in sorted(relevant_units)
             ]
         # 纯洗版订阅可能没有任何缺口在途行，base_meta 里没有它——用 attempt
@@ -210,6 +217,38 @@ async def _relations(
                 DownloadAttemptStatus.COMPLETED,
             ),
         }
+
+    # 季包边下边入库时，已入库的集已不是在途工单，但任务还在下载/做种，
+    # 用户需要知道包里哪些集完成了入库：按（infohash, 订阅）把 IMPORTED
+    # 单元补回覆盖列表。只补已存在的任务键——全部入库的种子没有在途单元，
+    # 不能借这条查询重新出现在任务中心。
+    active_hashes = {info_hash for info_hash, _subscription_id in grouped_units}
+    if active_hashes:
+        imported_rows = (
+            await session.execute(
+                select(WantedItem).where(
+                    WantedItem.status == WantedStatus.IMPORTED,
+                    WantedItem.in_scope.is_(True),  # type: ignore[attr-defined]
+                    WantedItem.info_hash.in_(active_hashes),  # type: ignore[union-attr]
+                )
+            )
+        ).scalars()
+        for wanted in imported_rows:
+            assert wanted.info_hash is not None
+            key = (wanted.info_hash.lower(), wanted.subscription_id)
+            units = grouped_units.get(key)
+            if units is None:
+                continue
+            spot = (wanted.season_number, wanted.episode_number)
+            if any((unit["season_number"], unit["episode_number"]) == spot for unit in units):
+                continue
+            units.append(
+                {
+                    "season_number": wanted.season_number,
+                    "episode_number": wanted.episode_number,
+                    "imported": True,
+                }
+            )
 
     subscriptions: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for key, meta in subscription_meta.items():

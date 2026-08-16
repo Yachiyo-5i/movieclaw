@@ -70,7 +70,8 @@ export interface DownloadTaskSubscription {
   media_title: string;
   media_kind: string;
   poster_url: string | null;
-  units: { season_number: number; episode_number: number }[];
+  /** imported=true 表示该集已完成入库（季包边下边入库时逐集翻真） */
+  units: { season_number: number; episode_number: number; imported: boolean }[];
 }
 
 /** 下载器实时任务；订阅/手动来源由后端按 infohash 关联，不复制下载状态。 */

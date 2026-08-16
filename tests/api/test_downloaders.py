@@ -290,6 +290,16 @@ def test_task_center_aggregates_live_downloads_and_subscription_context(client) 
                         status=WantedStatus.GRABBED,
                         info_hash=missing_hash,
                     ),
+                    # 季包边下边入库：同一 hash 的已入库集要以 imported 标注
+                    # 补回覆盖列表，让前端标绿
+                    WantedItem(
+                        subscription_id=subscription.id,
+                        media_item_id=media.id,
+                        season_number=1,
+                        episode_number=3,
+                        status=WantedStatus.IMPORTED,
+                        info_hash=linked_hash,
+                    ),
                 ]
             )
             session.add(
@@ -337,7 +347,8 @@ def test_task_center_aggregates_live_downloads_and_subscription_context(client) 
         by_hash[linked_hash]["subscriptions"][0]["poster_url"] == by_hash[linked_hash]["poster_url"]
     )
     assert by_hash[linked_hash]["subscriptions"][0]["units"] == [
-        {"season_number": 1, "episode_number": 1}
+        {"season_number": 1, "episode_number": 1, "imported": False},
+        {"season_number": 1, "episode_number": 3, "imported": True},
     ]
     assert by_hash[external_hash]["source"] == "external"
     assert by_hash[external_hash]["progress"] == 0.42

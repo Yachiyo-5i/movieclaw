@@ -1163,7 +1163,9 @@ function DownloadTaskFeedItem({
   const title = grouped
     ? task.name || task.media_title || task.info_hash
     : task.media_title || task.name || task.info_hash;
-  const note = downloadTaskNote(task, ingestJob);
+  // 有关联入库 Job 时不再单独出一行文字说明：入库阶段与解释由底部生命
+  // 周期承担，覆盖集标签会标注已入库进度，feed 行只保留下载态/换源提示
+  const note = ingestJob != null ? null : downloadTaskNote(task, null);
   const showReplace = shouldOfferInlineReplacement(task);
   const firstSubscription = task.subscriptions[0];
   // 种子名前用站点徽标回答"这个资源从哪来"；画面规格与片源紧随其后，
@@ -1251,9 +1253,6 @@ function DownloadTaskFeedItem({
       )}
       {firstSubscription && (
         <div className="mt-2 flex flex-wrap items-center gap-x-2 gap-y-1 text-caption">
-          <span className="text-white/30">
-            {firstSubscription.media_kind === "tv" ? "覆盖剧集" : "下载内容"}
-          </span>
           <EpisodeUnitsLabel units={firstSubscription.units} />
         </div>
       )}
@@ -1474,9 +1473,6 @@ function DownloadTaskCard({
         )}
         {firstSubscription && (
           <div className="mt-2.5 flex flex-wrap items-start gap-x-2 gap-y-1.5 text-caption">
-            <span className="shrink-0 py-1 text-white/35">
-              {firstSubscription.media_kind === "tv" ? "覆盖剧集" : "下载内容"}
-            </span>
             <EpisodeUnitsLabel units={firstSubscription.units} />
           </div>
         )}
@@ -1781,8 +1777,9 @@ function downloadTaskNote(
 }
 
 /**
- * 多集资源默认显示连续区间，点击后按季查看完整集号。原生 details 保留了
- * 键盘与读屏交互，也不会为了这块纯展示状态引入额外 React 状态。
+ * 多集资源默认显示连续区间，同一标签内并列入库进度；点击后按季查看完整
+ * 集号，已入库的集标绿。原生 details 保留了键盘与读屏交互，也不会为了
+ * 这块纯展示状态引入额外 React 状态。
  */
 function EpisodeUnitsLabel({
   units,
@@ -1791,14 +1788,29 @@ function EpisodeUnitsLabel({
 }) {
   const summary = summarizeEpisodeUnits(units);
   if (!summary) return null;
+  const importedKeys = new Set(
+    units
+      .filter((unit) => unit.imported)
+      .map((unit) => `${unit.season_number}:${unit.episode_number}`),
+  );
+  const importedCount = importedKeys.size;
   if (summary.kind === "movie" || summary.episodeCount <= 1) {
-    return <span className="tnum">{summary.label}</span>;
+    return (
+      <span className="tnum">
+        {summary.label}
+        {summary.kind === "episodes" && importedCount > 0 && (
+          <span className="text-[var(--ok)]"> · 已入库</span>
+        )}
+      </span>
+    );
   }
 
   return (
     <details className="group min-w-0 max-w-full open:basis-full open:w-full">
       <summary
-        aria-label={`覆盖 ${summary.episodeCount} 集：${summary.fullLabel}。展开查看全部集号`}
+        aria-label={`覆盖 ${summary.episodeCount} 集：${summary.fullLabel}。${
+          importedCount > 0 ? `其中 ${importedCount} 集已入库。` : ""
+        }展开查看全部集号`}
         className="flex w-fit max-w-full cursor-pointer list-none items-center gap-1.5 rounded-md border border-[var(--info)]/20 bg-[var(--info)]/[0.07] px-2 py-1 text-[var(--info)] transition-colors hover:bg-[var(--info)]/[0.11] [&::-webkit-details-marker]:hidden"
       >
         <OverflowText
@@ -1811,6 +1823,11 @@ function EpisodeUnitsLabel({
         >
           {summary.label}
         </OverflowText>
+        {importedCount > 0 && (
+          <span className="tnum shrink-0 text-[var(--ok)]">
+            · 已入库 {importedCount}/{summary.episodeCount}
+          </span>
+        )}
         <ChevronRightIcon className="size-3 shrink-0 rotate-90 transition-transform group-open:-rotate-90" />
       </summary>
       <div className="mt-2 max-w-xl space-y-2.5 rounded-xl border border-white/[0.07] bg-white/[0.035] px-3 py-2.5">
@@ -1821,14 +1838,22 @@ function EpisodeUnitsLabel({
               <span className="font-normal text-white/35">共 {season.episodes.length} 集</span>
             </div>
             <div className="flex flex-wrap gap-1.5">
-              {season.episodes.map((episode) => (
-                <span
-                  key={episode}
-                  className="tnum rounded-md bg-white/[0.055] px-1.5 py-0.5 text-micro text-white/60"
-                >
-                  E{String(episode).padStart(2, "0")}
-                </span>
-              ))}
+              {season.episodes.map((episode) => {
+                const imported = importedKeys.has(`${season.seasonNumber}:${episode}`);
+                return (
+                  <span
+                    key={episode}
+                    title={imported ? "已入库" : undefined}
+                    className={`tnum rounded-md px-1.5 py-0.5 text-micro ${
+                      imported
+                        ? "bg-[var(--ok)]/[0.16] text-[var(--ok)]"
+                        : "bg-white/[0.055] text-white/60"
+                    }`}
+                  >
+                    E{String(episode).padStart(2, "0")}
+                  </span>
+                );
+              })}
             </div>
           </div>
         ))}

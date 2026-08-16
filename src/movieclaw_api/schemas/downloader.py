@@ -91,6 +91,8 @@ class DownloadTaskUnitView(BaseModel):
 
     season_number: int
     episode_number: int
+    # 该集是否已完成入库：季包边下边入库时逐集翻真，前端据此标绿
+    imported: bool = False
 
 
 class DownloadTaskSubscriptionView(BaseModel):
