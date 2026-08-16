@@ -1802,7 +1802,7 @@ function EpisodeUnitsLabel({
       <span className="tnum">
         {summary.label}
         {summary.kind === "episodes" && importedCount > 0 && (
-          <span className="text-[var(--ok)]"> · 已入库</span>
+          <span className="text-[var(--ok)]">（已入库）</span>
         )}
       </span>
     );
@@ -1828,7 +1828,7 @@ function EpisodeUnitsLabel({
         </OverflowText>
         {importedCount > 0 && (
           <span className="tnum shrink-0 text-[var(--ok)]">
-            · 已入库 {importedCount}/{summary.episodeCount}
+            （有 {importedCount} 集已入库）
           </span>
         )}
         <ChevronRightIcon className="size-3 shrink-0 rotate-90 transition-transform group-open:-rotate-90" />
