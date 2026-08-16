@@ -272,10 +272,12 @@ class WantedItem(TimestampMixin, table=True):
     # 满足该单元的当前版本质量快照（QualitySnapshot schema，movieclaw_matcher）。
     # 洗版比较的唯一基线：只在"确认升级"时刷新（基线单调），实测维度以
     # ffprobe 为准、出处维度采信名称解析。NULL=未满足或无法识别（不参与洗版）。
+    # none_as_null：Python None ↔ SQL NULL（同 library_file 的三态 JSON 约定），
+    # 否则 None 会被存成 JSON 'null' 字符串，回填任务的 IS NULL 查询失效
     quality: dict | None = Field(
         default=None,
-        sa_column=Column(JSON, nullable=True),
-        description="当前版本质量快照（洗版基线）；NULL=未满足或无法识别",
+        sa_column=Column(JSON(none_as_null=True), nullable=True),
+        description="当前版本质量快照（洗版基线）；NULL=未回填；{}=已回填但无法识别",
     )
     # 洗版证伪熔断计数：连续证伪达到阈值后该单元洗版转入长冷却并提示人工介入，
     # 防连环造假资源烧流量烧 ratio；确认升级成功时清零。

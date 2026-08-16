@@ -60,6 +60,11 @@ async def close_fulfilled_wanted(session: AsyncSession, media_item_id: int) -> i
         wanted.imported_at = now
         wanted.updated_at = now
         by_subscription.setdefault(wanted.subscription_id, []).append(wanted)
+    # 洗版基线：入库即落质量快照（与规则组是否开洗版无关——数据此刻最热，
+    # 规则组日后开洗版时立即可用，见 services/subscription/upgrade.py）
+    from movieclaw_api.services.subscription.upgrade import fill_snapshots
+
+    await fill_snapshots(session, media_item_id, fulfilled)
     await session.commit()
 
     # 时间线与派生状态：逐订阅补记（对账可能一次关闭多个订阅的工单）

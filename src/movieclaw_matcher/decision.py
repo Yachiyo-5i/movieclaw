@@ -104,7 +104,7 @@ def _resolution_ladder(spec: RuleSetSpec) -> list[str]:
     return [r.casefold() for r in ladder]
 
 
-def _resolution_rank(resolution: str | None, spec: RuleSetSpec) -> int | None:
+def resolution_rank(resolution: str | None, spec: RuleSetSpec) -> int | None:
     """分辨率位次，越大越优；未知/不在偏好序中返回 None。"""
     if not resolution:
         return None
@@ -150,11 +150,11 @@ def provably_below_cutoff(snapshot: QualitySnapshot | None, spec: RuleSetSpec) -
     """
     if spec.upgrade_source is None or snapshot is None:
         return False
-    cur_res = _resolution_rank(snapshot.resolution, spec)
+    cur_res = resolution_rank(snapshot.resolution, spec)
     if cur_res is None:
         return False
     target_resolution, target_tier = _target(spec)
-    tgt_res = _resolution_rank(target_resolution, spec)
+    tgt_res = resolution_rank(target_resolution, spec)
     if tgt_res is None:  # 目标分辨率不在偏好序（配置矛盾，校验器已拦，防御处理）
         return False
     if cur_res < tgt_res:
@@ -179,7 +179,7 @@ def compare_upgrade(
     current_label = quality_label(snapshot)
     candidate_label = quality_label(candidate.attrs)
 
-    cur_res = _resolution_rank(snapshot.resolution, spec)
+    cur_res = resolution_rank(snapshot.resolution, spec)
     if cur_res is None:
         return _upgrade_reject(
             "upgrade_not_comparable",
@@ -187,7 +187,7 @@ def compare_upgrade(
             current_label,
             candidate_label,
         )
-    cand_res = _resolution_rank(candidate.attrs.resolution, spec)
+    cand_res = resolution_rank(candidate.attrs.resolution, spec)
     if cand_res is None:
         return _upgrade_reject(
             "upgrade_not_comparable",
@@ -198,7 +198,7 @@ def compare_upgrade(
 
     # 停止线：当前版本已达洗版目标（分辨率位次更高，或同位次且片源档达标）
     target_resolution, target_tier = _target(spec)
-    tgt_res = _resolution_rank(target_resolution, spec)
+    tgt_res = resolution_rank(target_resolution, spec)
     cur_tier = source_tier(snapshot.media_source, snapshot.remux)
     if tgt_res is not None and (
         cur_res > tgt_res

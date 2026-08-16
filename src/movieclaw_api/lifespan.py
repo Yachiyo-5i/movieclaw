@@ -144,6 +144,9 @@ def build_lifespan(settings: Settings):
             from movieclaw_api.services.subscription import (  # noqa: F401  缺口搜索任务注册
                 wanted_search,
             )
+            from movieclaw_api.services.subscription import (  # noqa: F401  洗版基线回填任务注册
+                upgrade as subscription_upgrade,
+            )
 
             init_scheduler(
                 SchedulerConfig(

@@ -21,6 +21,7 @@ from movieclaw_matcher.decision import (
     pick_best,
     provably_below_cutoff,
     quality_label,
+    resolution_rank,
     source_tier,
     upgrade_target_label,
 )
@@ -60,6 +61,7 @@ __all__ = [
     "compare_upgrade",
     "provably_below_cutoff",
     "quality_label",
+    "resolution_rank",
     "source_tier",
     "upgrade_target_label",
 ]
