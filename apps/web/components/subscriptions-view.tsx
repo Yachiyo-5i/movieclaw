@@ -53,33 +53,41 @@ const rememberedVisibleCounts: Record<SubscriptionKind, number> = {
   tv: SUBSCRIPTION_BATCH_SIZE,
 };
 
-/** 今日时间轨道的状态色：只承担进度语义，不与下方海报墙争夺视觉焦点。 */
+/**
+ * 今日时间轨道的状态色：只承担进度语义，不与下方海报墙争夺视觉焦点。
+ *
+ * 颜色按「事情有没有真的发生」升级：预计入库还没开始，走中性灰不发光；
+ * 到点没拿到资源转 --warn，真正在下载转 --info，收尾转 --ok。这样一屏里
+ * 亮起来的点就是此刻真有进展的那几行，而不是满屏紫点。
+ */
 const todayArrivalStyle: Record<
   TodayArrivalPresentation["statusLabel"],
   { node: string; status: string; time: string; pulse: boolean }
 > = {
   预计入库: {
-    node: "border-violet-300/70 bg-violet-400 shadow-[0_0_12px_rgba(167,139,250,0.38)]",
-    status: "border-violet-300/15 bg-violet-400/10 text-violet-200/90",
-    time: "text-violet-100/90",
+    // 这是最常见的一行，节点压到刚好看得见即可——否则「什么都还没发生」
+    // 会成为整屏最亮的东西，把真正有进展的几行盖过去。
+    node: "border-white/35 bg-white/55",
+    status: "border-white/[0.12] bg-white/[0.06] text-white/70",
+    time: "text-white/82",
     pulse: false,
   },
   等待资源: {
-    node: "border-amber-200/70 bg-amber-300 shadow-[0_0_12px_rgba(252,211,77,0.3)]",
-    status: "border-amber-200/15 bg-amber-300/10 text-amber-100/85",
-    time: "text-amber-50/85",
+    node: "border-[var(--warn)]/70 bg-[var(--warn)] shadow-[0_0_12px_rgba(245,196,81,0.32)]",
+    status: "border-[var(--warn)]/20 bg-[var(--warn)]/10 text-[var(--warn)]",
+    time: "text-[var(--warn)]",
     pulse: false,
   },
   下载中: {
-    node: "border-cyan-200/75 bg-cyan-300 shadow-[0_0_14px_rgba(103,232,249,0.42)]",
-    status: "border-cyan-200/20 bg-cyan-300/10 text-cyan-100",
-    time: "text-cyan-50/90",
+    node: "border-[var(--info)]/75 bg-[var(--info)] shadow-[0_0_14px_rgba(127,176,255,0.42)]",
+    status: "border-[var(--info)]/25 bg-[var(--info)]/12 text-[var(--info)]",
+    time: "text-[var(--info)]",
     pulse: true,
   },
   整理中: {
-    node: "border-emerald-200/70 bg-emerald-300 shadow-[0_0_13px_rgba(110,231,183,0.38)]",
-    status: "border-emerald-200/15 bg-emerald-300/10 text-emerald-100/90",
-    time: "text-emerald-50/90",
+    node: "border-[var(--ok)]/70 bg-[var(--ok)] shadow-[0_0_13px_rgba(95,211,154,0.38)]",
+    status: "border-[var(--ok)]/20 bg-[var(--ok)]/10 text-[var(--ok)]",
+    time: "text-[var(--ok)]",
     pulse: false,
   },
 };
@@ -653,10 +661,11 @@ function TodayArrivalsSection({
                       className="absolute left-1/2 top-4 -bottom-5 w-px -translate-x-1/2 bg-gradient-to-b from-white/16 via-white/10 to-white/[0.035]"
                     />
                   )}
+                  {/* pulse 只对「下载中」为真，颜色跟着它的 --info 走 */}
                   {style.pulse && (
                     <span
                       aria-hidden="true"
-                      className="absolute top-1 size-3 animate-ping rounded-full bg-cyan-300/25"
+                      className="absolute top-1 size-3 animate-ping rounded-full bg-[var(--info)]/25"
                     />
                   )}
                   {/* 预告是“几天后”，节点压暗一档；发光的实心点留给马上要落地的内容。 */}

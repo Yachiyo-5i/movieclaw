@@ -741,13 +741,16 @@ export function LibraryDetailView({ libraryId }: { libraryId: number }) {
                 {missing.length} 个条目缺失
               </button>
             )}
+            {/* 待识别与待复核都是「识别环节没搞定、等人工看一眼」，同属 --warn。
+                两者的区别由文案承担：紫色曾经暗示它们是两类不同的东西，而紫在
+                订阅首页表示「等着就行」，同一个色在两页说反话。 */}
             {unidentified.length > 0 && (
               <button
                 type="button"
                 onClick={() => setIssueTab("unidentified")}
-                className="flex items-center gap-1.5 rounded-full border border-[#f5c451]/35 bg-[#f5c451]/[0.12] px-3 py-1 text-sub font-semibold text-[#f5c451] transition hover:bg-[#f5c451]/[0.22]"
+                className="flex items-center gap-1.5 rounded-full border border-[var(--warn)]/35 bg-[var(--warn)]/[0.12] px-3 py-1 text-sub font-semibold text-[var(--warn)] transition hover:bg-[var(--warn)]/[0.22]"
               >
-                <span className="size-1.5 rounded-full bg-[#f5c451]" />
+                <span className="size-1.5 rounded-full bg-[var(--warn)]" />
                 {unidentifiedFiles} 个文件待识别
                 {unidentified.length > 1 ? ` · ${unidentified.length} 组` : ""}
               </button>
@@ -756,9 +759,9 @@ export function LibraryDetailView({ libraryId }: { libraryId: number }) {
               <button
                 type="button"
                 onClick={() => setIssueTab("review")}
-                className="flex items-center gap-1.5 rounded-full border border-[#c4b5fd]/35 bg-[#c4b5fd]/[0.12] px-3 py-1 text-sub font-semibold text-[#c4b5fd] transition hover:bg-[#c4b5fd]/[0.22]"
+                className="flex items-center gap-1.5 rounded-full border border-[var(--warn)]/35 bg-[var(--warn)]/[0.12] px-3 py-1 text-sub font-semibold text-[var(--warn)] transition hover:bg-[var(--warn)]/[0.22]"
               >
-                <span className="size-1.5 rounded-full bg-[#c4b5fd]" />
+                <span className="size-1.5 rounded-full bg-[var(--warn)]" />
                 {review.length} 个条目待复核身份
               </button>
             )}
