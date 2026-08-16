@@ -22,6 +22,7 @@ from movieclaw_media.models import (
     MediaLibraryLink,
     MediaLibraryStatus,
     MediaSource,
+    MediaVideo,
 )
 
 
@@ -190,10 +191,14 @@ class DiscoveredTitleCollectionView(BaseModel):
 
 
 class DiscoveredTitleDetailsView(BaseModel):
-    """影视条目的完整资料、图片、相关推荐与本地媒体库入口。"""
+    """影视条目的完整资料、预告片、图片、相关推荐与本地媒体库入口。"""
 
     title: DiscoveredTitleView
     metadata: DiscoveredTitleMetadata
+    videos: list[MediaVideo] = Field(
+        default_factory=list,
+        description="预告片与花絮（正式预告在前）；来源未提供时为空数组",
+    )
     backdrops: list[MediaImage] = Field(default_factory=list)
     posters: list[MediaImage] = Field(default_factory=list)
     collection: DiscoveredTitleCollectionView | None = None
