@@ -224,7 +224,10 @@ class LibraryFileRepository:
         existing.audio_streams = row.audio_streams
         existing.subtitle_streams = row.subtitle_streams
         existing.external_subtitles = row.external_subtitles
-        existing.media_source = row.media_source
+        # 人工标注的片源不被自动解析覆盖（docs/design/media-source-annotation.md
+        # §3.2）；扫描/入库构造的 row 永远非人工，标记位无需从 row 继承
+        if not existing.media_source_manual:
+            existing.media_source = row.media_source
         existing.release_group = row.release_group
         existing.source = row.source
         existing.site_id = row.site_id

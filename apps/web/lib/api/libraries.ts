@@ -766,6 +766,53 @@ export function ignoreAllUnidentifiedLibraryFiles(
   );
 }
 
+/** 片源标注预览的一行：将被标注的文件（片源未知或此前人工标注）。 */
+export interface MediaSourceAnnotationCandidate {
+  file_id: number;
+  file_name: string;
+  episode_number: number;
+  size_bytes: number;
+  media_source: string | null;
+  media_source_manual: boolean;
+}
+
+/** 列出整季片源标注将影响的文件（弹窗预览用）。 */
+export function listMediaSourceAnnotationCandidates(
+  mediaItemId: number,
+  seasonNumber: number,
+): Promise<MediaSourceAnnotationCandidate[]> {
+  const params = new URLSearchParams({
+    media_item_id: String(mediaItemId),
+    season_number: String(seasonNumber),
+  });
+  return unwrap(
+    request<ApiEnvelope<MediaSourceAnnotationCandidate[]>>(
+      `/libraries/media-source-annotations/candidates?${params}`,
+    ),
+  );
+}
+
+/** 整季人工标注片源（docs/design/media-source-annotation.md）；电影季号传 0。 */
+export function annotateMediaSource(
+  mediaItemId: number,
+  seasonNumber: number,
+  mediaSource: string,
+): Promise<{ files: number; snapshots: number }> {
+  return unwrap(
+    request<ApiEnvelope<{ files: number; snapshots: number }>>(
+      `/libraries/media-source-annotations`,
+      {
+        method: "POST",
+        body: JSON.stringify({
+          media_item_id: mediaItemId,
+          season_number: seasonNumber,
+          media_source: mediaSource,
+        }),
+      },
+    ),
+  );
+}
+
 /** 缺失清单里的一个文件。 */
 export interface MissingFile {
   id: number;
@@ -865,6 +912,8 @@ export interface LibraryItemFile {
   frame_rate: number | null;
   color_space: string | null;
   media_source: string | null;
+  /** 片源为人工标注（含 user-lowest 哨兵），自动解析不会覆盖 */
+  media_source_manual: boolean;
   release_group: string | null;
   /** imported（入库管线）/ scanned（存量扫描） */
   source: string;

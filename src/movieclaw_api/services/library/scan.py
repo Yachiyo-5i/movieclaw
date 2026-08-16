@@ -1988,6 +1988,10 @@ async def _merge_same_file_rows(
     ):
         if getattr(survivor, field_name) is None:
             setattr(survivor, field_name, getattr(duplicate, field_name))
+    # 人工标注的片源优先于自动解析值（对齐上方"人工身份优先"的原则）
+    if duplicate.media_source_manual and not survivor.media_source_manual:
+        survivor.media_source = duplicate.media_source
+        survivor.media_source_manual = True
     if survivor.source == FileSource.SCANNED and duplicate.source == FileSource.IMPORTED:
         survivor.source = duplicate.source
     if survivor.ignored_at is None:

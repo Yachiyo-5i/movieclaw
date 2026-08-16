@@ -51,10 +51,18 @@ def pick_best(entries: list[Entry]) -> Entry | None:
 # Remux 是封装方式不是片源，单独用 remux 布尔判定为最高档 T5
 _REMUX_TIER = 5
 
+# 人工标注「不确定，按最低档」的哨兵值（docs/design/media-source-annotation.md
+# §2.2）。只有片源标注 API 能写入——enrich 词表永远解析不出它，因此
+# 「系统未知（None，不可比）」与「用户判定最低（T0，可比）」严格分离。
+USER_LOWEST_SOURCE = "user-lowest"
+
 # 片源 → 档位。键为 casefold 后的归一值；不在表中/None = 片源未知（不可比）。
 # 与换源 replacement._SOURCE_RANK 相比补全了 BDRip/HDRip/DVD 等档
 # （Phase 7 会把换源迁移到本表，消除两套片源序）。
 _SOURCE_TIER: dict[str, int] = {
+    # T5：人工标注的 Remux 存为 media_source 值（library_file 无 remux 布尔列，
+    # 快照出处维度由 file.media_source 覆盖，走值比走布尔位更省一列）
+    "remux": _REMUX_TIER,
     # T4 光盘重编码
     "uhd blu-ray": 4,
     "blu-ray": 4,
@@ -71,6 +79,8 @@ _SOURCE_TIER: dict[str, int] = {
     "hdtvrip": 1,
     "tvrip": 1,
     "dvd": 1,
+    # T0 用户判定最低档：低于一切已知档，可证明低于任何洗版目标
+    USER_LOWEST_SOURCE: 0,
 }
 
 # 未配置 resolutions 时的内置默认偏好序（高清优先），与 rules.py 的
@@ -131,6 +141,8 @@ def quality_label(snapshot: QualitySnapshot | TorrentAttrs) -> str:
     resolution = snapshot.resolution or "分辨率未知"
     if snapshot.remux:
         return f"{resolution} Remux"
+    if (snapshot.media_source or "").casefold() == USER_LOWEST_SOURCE:
+        return f"{resolution} 最低档（人工标注）"
     return f"{resolution} {snapshot.media_source or '片源未知'}"
 
 
