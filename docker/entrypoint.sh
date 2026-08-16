@@ -108,7 +108,7 @@ overlay_version_if_valid() {
     for f in "$manifest" "$dir/backend/src/movieclaw_api/main.py" \
              "$dir/backend/alembic.ini" "$dir/web/apps/web/server.js"; do
         if [ ! -f "$f" ]; then
-            echo "[entrypoint] overlay $dir 缺少 $f，忽略该版本" >&2
+            echo "[entrypoint] overlay $dir 缺少 ${f}，忽略该版本" >&2
             return 0
         fi
     done
@@ -120,7 +120,7 @@ overlay_version_if_valid() {
         return 0
     fi
     if [ "$requires" != "$RUNTIME_VERSION" ]; then
-        echo "[entrypoint] overlay v$version 需要 runtime=$requires，镜像为 runtime=$RUNTIME_VERSION，忽略（需升级 Docker 镜像）" >&2
+        echo "[entrypoint] overlay v$version 需要 runtime=${requires}，镜像为 runtime=${RUNTIME_VERSION}，忽略（需升级 Docker 镜像）" >&2
         return 0
     fi
     if [ -f "$STATE_DIR/bad-$(sanitize "$version")" ]; then
@@ -242,6 +242,7 @@ except Exception:
 start_placeholder() {
     "$PYTHON_BIN" -c '
 import json
+import socketserver
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PAGE = """<!doctype html>
@@ -308,7 +309,20 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
 
-ThreadingHTTPServer(("0.0.0.0", 3000), Handler).serve_forever()
+class PlaceholderServer(ThreadingHTTPServer):
+    """跳过 HTTPServer.server_bind 里的 socket.getfqdn() 反向解析。
+
+    占位页的全部价值在于「启动瞬间就顶住 3000」；而 getfqdn 在 DNS 不可达
+    的部署环境里会阻塞数十秒，反而让占位页错过它要覆盖的那段窗口，用户照
+    样看到连接被拒。server_name 只用于生成默认错误页，这里用不到。
+    """
+
+    def server_bind(self):
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
+
+
+PlaceholderServer(("0.0.0.0", 3000), Handler).serve_forever()
 ' &
     PLACEHOLDER_PID=$!
 }
@@ -446,7 +460,7 @@ start_health_watchdog() {
             else
                 segment="后端直连亦失败，疑似后端故障"
             fi
-            echo "[entrypoint] 完整健康链路检查失败（$failures/${HEALTHCHECK_FAILURE_THRESHOLD}）：$WEB_HEALTH_URL（原因：$reason；$segment）" >&2
+            echo "[entrypoint] 完整健康链路检查失败（$failures/${HEALTHCHECK_FAILURE_THRESHOLD}）：${WEB_HEALTH_URL}（原因：${reason}；${segment}）" >&2
             if [ "$failures" -ge "$HEALTHCHECK_FAILURE_THRESHOLD" ]; then
                 echo "[entrypoint] 完整健康链路连续失败，停止容器以触发 Docker 重启。" >&2
                 exit "$HEALTH_WATCHDOG_EXIT_CODE"

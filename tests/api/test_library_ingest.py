@@ -1102,7 +1102,7 @@ async def test_upgrade_retries_legacy_partial_import_through_job(db, tmp_path, m
 
     async with db.session() as session:
         job = (await session.execute(select(Job))).scalar_one()
-    assert job.handler_revision == ingest_mod._INGEST_HANDLER_REVISION
+    assert job.handler_revision == ingest_mod._ingest_handler_revision()
     await jobs.init_job_dispatcher(max_parallel=1)
     await _wait_job_status(job.id, JobStatus.SUCCEEDED)
 
@@ -1516,7 +1516,7 @@ async def test_upgrade_unblocks_old_revision_parser_gap_job(db, tmp_path, monkey
         unchanged = await session.get(Job, job.id)
         assert unchanged is not None
         assert unchanged.status == JobStatus.BLOCKED
-        assert unchanged.handler_revision == ingest_mod._INGEST_HANDLER_REVISION
+        assert unchanged.handler_revision == ingest_mod._ingest_handler_revision()
 
     # 模拟解析能力升级：旧 revision 的 blocked Job 应原地恢复；同一 revision
     # 后续再扫只会短路，避免每次启动都重新跑一遍。
