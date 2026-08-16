@@ -177,3 +177,37 @@ async def test_dispatch_filters_units_with_in_flight_upgrade(db):
         await session.refresh(other)
         remaining = await _filter_upgrade_in_flight(session, sub, [other])
         assert [r.id for r in remaining] == [other.id]
+
+
+@pytest.mark.asyncio
+async def test_task_center_relations_associate_upgrade_attempt(db):
+    """任务中心的下载任务关联：洗版 attempt 按「attempt 单元 ∩ 已入库工单」
+    关联到订阅——否则洗版种子被当成外部任务，不按影片分组（真实教训）。"""
+    from movieclaw_api.services.download_tasks import _relations
+
+    sub_id, _attempt_id, _wanted_id = await _seed(db)
+    async with db.session() as session:
+        subscriptions, _manual = await _relations(session)
+        assert "newhash" in subscriptions  # 洗版 attempt 的 hash 关联成功
+        entry = subscriptions["newhash"][0]
+        assert entry["id"] == sub_id
+        assert entry["media_item_id"] is not None  # 有影片身份 → 前端可分组
+        assert entry["units"] == [{"season_number": 1, "episode_number": 1}]
+
+
+@pytest.mark.asyncio
+async def test_task_center_relations_skip_completed_download_attempt(db):
+    """守护既有边界：普通缺口下载的 COMPLETED attempt（单元已入库、做种中）
+    不得借「已入库单元」关联复活成业务任务——否则每个做种种子永远挂在
+    任务中心。已入库单元关联只对 purpose=upgrade 开放。"""
+    from movieclaw_api.services.download_tasks import _relations
+
+    sub_id, attempt_id, _wanted_id = await _seed(db)
+    async with db.session() as session:
+        attempt = await session.get(SubscriptionDownloadAttempt, attempt_id)
+        attempt.purpose = "download"
+        attempt.status = DownloadAttemptStatus.COMPLETED
+        await session.commit()
+    async with db.session() as session:
+        subscriptions, _manual = await _relations(session)
+        assert "newhash" not in subscriptions

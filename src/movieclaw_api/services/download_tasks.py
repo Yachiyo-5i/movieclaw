@@ -120,7 +120,31 @@ async def _relations(
             )
         )
     ).all()
-    for attempt, subscription, _media in attempt_rows:
+    # 洗版 attempt 的关联走升级语义（quality-upgrade.md §6.2）：工单不重开、
+    # info_hash 指向旧版本，缺口语义（在途工单 ∩ attempt 单元）对它恒为空——
+    # 必须按「attempt 单元 ∩ 已入库 in_scope 工单」关联，否则洗版种子会被
+    # 当成外部任务：无影片身份、任务中心不按影片分组（真实教训）
+    upgrade_subscription_ids = {
+        attempt.subscription_id
+        for attempt, _subscription, _media in attempt_rows
+        if attempt.purpose == "upgrade"
+    }
+    imported_units_by_subscription: dict[int, set[tuple[int, int]]] = defaultdict(set)
+    if upgrade_subscription_ids:
+        for w in (
+            await session.execute(
+                select(WantedItem).where(
+                    WantedItem.subscription_id.in_(upgrade_subscription_ids),  # type: ignore[attr-defined]
+                    WantedItem.status == WantedStatus.IMPORTED,
+                    WantedItem.in_scope.is_(True),  # type: ignore[attr-defined]
+                )
+            )
+        ).scalars():
+            imported_units_by_subscription[w.subscription_id].add(
+                (w.season_number, w.episode_number)
+            )
+
+    for attempt, subscription, media in attempt_rows:
         assert subscription.id is not None
         info_hash = attempt.info_hash.lower()
         key = (info_hash, subscription.id)
@@ -130,8 +154,11 @@ async def _relations(
             if isinstance(unit, list) and len(unit) == 2
         }
         relevant_units = attempt_units & scoped_units_by_subscription[subscription.id]
+        if attempt.purpose == "upgrade":
+            relevant_units |= attempt_units & imported_units_by_subscription[subscription.id]
         # 尝试台账只是历史/救援状态，不能单独制造业务任务。主源直接按 hash
-        # 关联；试用源和待清理旧源按覆盖单元关联，但都必须仍有入域在途目标。
+        # 关联；试用源和待清理旧源按覆盖单元关联，但都必须仍有入域在途目标
+        # （洗版语义下"目标"即它照看的已入库单元）。
         if key not in subscription_meta and not relevant_units:
             continue
         if key not in subscription_meta:
@@ -139,8 +166,17 @@ async def _relations(
                 {"season_number": season, "episode_number": episode}
                 for season, episode in sorted(relevant_units)
             ]
+        # 纯洗版订阅可能没有任何缺口在途行，base_meta 里没有它——用 attempt
+        # 查询自带的订阅/条目现场构造
+        base_meta = base_meta_by_subscription.get(subscription.id) or {
+            "id": subscription.id,
+            "media_item_id": media.id,
+            "media_title": media.title,
+            "media_kind": media.kind,
+            "poster_url": _poster_url(media),
+        }
         subscription_meta[key] = {
-            **base_meta_by_subscription[subscription.id],
+            **base_meta,
             "_attempt_status": attempt.status,
             "_attempt_downloader_id": attempt.downloader_id,
             "_last_progress_at": attempt.last_progress_at,
