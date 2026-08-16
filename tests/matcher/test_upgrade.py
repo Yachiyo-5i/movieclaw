@@ -15,6 +15,7 @@ from movieclaw_matcher import (
     TorrentCandidate,
     build_snapshot,
     compare_upgrade,
+    provably_at_cutoff,
     provably_below_cutoff,
     quality_label,
     upgrade_target_label,
@@ -239,6 +240,37 @@ def test_provably_below_cutoff(snap_kw, spec_kw, expected) -> None:
 
 def test_below_cutoff_none_snapshot() -> None:
     assert provably_below_cutoff(None, _spec(upgrade_source="remux")) is False
+
+
+AT_CUTOFF_CASES = [
+    # (快照, spec kwargs, 期望)——与 provably_below 成对但不互补：
+    # 两者都 False 的是第三态"无法确认"（体检报告口径）
+    # 已是 Remux → 可证明达标
+    (
+        dict(resolution="1080p", media_source="Blu-ray", remux=True),
+        dict(upgrade_source="remux"),
+        True,
+    ),
+    # 分辨率已超目标 → 达标（片源档不再比较）
+    (
+        dict(resolution="2160p", media_source="WEB-DL"),
+        dict(upgrade_source="remux", resolutions=["2160p", "1080p"], cutoff_resolution="1080p"),
+        True,
+    ),
+    # WEB-DL 低于 remux 目标 → 未达标
+    (dict(resolution="1080p", media_source="WEB-DL"), dict(upgrade_source="remux"), False),
+    # 同分辨率片源未知 → 证明不了达标（第三态，below 同样证明不了）
+    (dict(resolution="1080p"), dict(upgrade_source="remux"), False),
+    # 分辨率未知 → 证明不了
+    (dict(media_source="Blu-ray", remux=True), dict(upgrade_source="remux"), False),
+    # 未配置洗版 → 无目标可达
+    (dict(resolution="1080p", media_source="Blu-ray", remux=True), dict(), False),
+]
+
+
+@pytest.mark.parametrize("snap_kw, spec_kw, expected", AT_CUTOFF_CASES)
+def test_provably_at_cutoff(snap_kw, spec_kw, expected) -> None:
+    assert provably_at_cutoff(_snap(**snap_kw), _spec(**spec_kw)) is expected
 
 
 # ---------------------------------------------------------------------------

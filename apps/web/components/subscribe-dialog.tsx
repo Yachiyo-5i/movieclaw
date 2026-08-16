@@ -118,9 +118,13 @@ export function SubscribeDialog({
       setError(null);
       setUpgradeReport(null);
       try {
+        // 洗版变体成员也要选「洗到哪一档」（换组由 upgrade-runs 按订阅归属
+        // 者权限执行，与后端口径一致），故规则列表不再只对管理员拉取
         const [result, rules] = await Promise.all([
           previewSubscriptionTitle({ title_ref: t.titleRef }),
-          canManageSubscriptions ? listRuleSets() : Promise.resolve([]),
+          canManageSubscriptions || t.upgradeIntent
+            ? listRuleSets()
+            : Promise.resolve([]),
         ]);
         // 豆瓣条目可能没有可靠的前端类型；媒体库和投递路由必须以后端
         // 收敛后的 canonical kind 为准，避免电影/剧集选到错误的库。
@@ -212,9 +216,13 @@ export function SubscribeDialog({
       onChanged?.();
       if (upgradeMode) {
         // 洗版变体：创建成功即自动接一轮洗版，弹层切到体检报告段（§13.3）。
+        // 规则组显式带给 upgrade-runs：管理员创建时已选中（后端跳过同组切换），
+        // 成员创建时后端忽略选组、订阅落在默认组，靠这里的归属者换组生效。
         // 触发失败时订阅已建好——报错留在弹层里，用户可去订阅详情重试
         try {
-          setUpgradeReport(await runSubscriptionUpgradeRound(created.id));
+          setUpgradeReport(
+            await runSubscriptionUpgradeRound(created.id, ruleSetId ?? undefined),
+          );
         } catch (e) {
           setError(
             `订阅已创建，但触发洗版失败：${
@@ -259,8 +267,8 @@ export function SubscribeDialog({
   const canSubmit = useMemo(() => {
     if (!prepared?.media || busy) return false;
     // 洗版变体必须选中一个带洗版目标的组，否则触发一轮洗版会被后端拒绝
-    if (upgradeMode && canManageSubscriptions) {
-      if (!selectableRules.some((r) => r.id === ruleSetId)) return false;
+    if (upgradeMode && !selectableRules.some((r) => r.id === ruleSetId)) {
+      return false;
     }
     if (prepared.media.kind === "movie") return true;
     return selectedSeasons.size > 0 || followFuture;
@@ -270,7 +278,6 @@ export function SubscribeDialog({
     selectedSeasons,
     followFuture,
     upgradeMode,
-    canManageSubscriptions,
     selectableRules,
     ruleSetId,
   ]);
@@ -408,7 +415,9 @@ export function SubscribeDialog({
               {prepared.movie_owned && (
                 <p className="flex items-center gap-2 rounded-xl border border-[#4ade80]/25 bg-[#4ade80]/10 px-3.5 py-2.5 text-sub text-[#4ade80]">
                   <CheckIcon className="size-4 shrink-0" />
-                  媒体库里已有这部电影，订阅后不会重复下载
+                  {upgradeMode
+                    ? "媒体库里已有这部电影，将体检现有版本并按需洗版"
+                    : "媒体库里已有这部电影，订阅后不会重复下载"}
                 </p>
               )}
               {prepared.media?.kind === "tv" && (
@@ -449,7 +458,7 @@ export function SubscribeDialog({
                 </section>
               )}
 
-              {canManageSubscriptions && (upgradeMode || ruleSets.length > 0) && (
+              {(upgradeMode || (canManageSubscriptions && ruleSets.length > 0)) && (
                 <section>
                   <div className="mb-2 flex items-center justify-between">
                     <h3 className="text-ui font-semibold text-white/85">
@@ -460,18 +469,21 @@ export function SubscribeDialog({
                         </span>
                       )}
                     </h3>
-                    <button
-                      type="button"
-                      onClick={() => setCreatingRuleSet(true)}
-                      className="text-sub font-medium text-[var(--accent)] hover:underline"
-                    >
-                      + 新建规则组
-                    </button>
+                    {canManageSubscriptions && (
+                      <button
+                        type="button"
+                        onClick={() => setCreatingRuleSet(true)}
+                        className="text-sub font-medium text-[var(--accent)] hover:underline"
+                      >
+                        + 新建规则组
+                      </button>
+                    )}
                   </div>
                   {upgradeMode && selectableRules.length === 0 ? (
                     <p className="rounded-xl border border-white/[0.08] bg-white/[0.03] px-4 py-3 text-sub leading-6 text-[var(--text-muted)]">
-                      还没有配置洗版目标的规则组——点右上角「+
-                      新建规则组」，在编辑器里选择「洗到哪一档」即可。
+                      {canManageSubscriptions
+                        ? "还没有配置洗版目标的规则组——点右上角「+ 新建规则组」，在编辑器里选择「洗到哪一档」即可。"
+                        : "还没有配置洗版目标的规则组，请联系管理员在「设置 → 订阅 → 规则组」中配置「洗到哪一档」。"}
                     </p>
                   ) : (
                   <select

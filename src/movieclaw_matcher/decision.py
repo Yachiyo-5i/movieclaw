@@ -165,6 +165,28 @@ def provably_below_cutoff(snapshot: QualitySnapshot | None, spec: RuleSetSpec) -
     return cur_tier is not None and cur_tier < target_tier
 
 
+def provably_at_cutoff(snapshot: QualitySnapshot | None, spec: RuleSetSpec) -> bool:
+    """该单元是否**可证明**已达（或超过）洗版目标（体检报告口径，§13.2）。
+
+    与 provably_below_cutoff 成对但不互补：两者都证明不了的第三态
+    （分辨率位次未知、同分辨率但片源未知）体检报告要如实展示为
+    「无法确认」，不能冒充"已达目标"。
+    """
+    if spec.upgrade_source is None or snapshot is None:
+        return False
+    cur_res = resolution_rank(snapshot.resolution, spec)
+    if cur_res is None:
+        return False
+    target_resolution, target_tier = _target(spec)
+    tgt_res = resolution_rank(target_resolution, spec)
+    if tgt_res is None:
+        return False
+    if cur_res != tgt_res:
+        return cur_res > tgt_res
+    cur_tier = source_tier(snapshot.media_source, snapshot.remux)
+    return cur_tier is not None and cur_tier >= target_tier
+
+
 def compare_upgrade(
     candidate: TorrentCandidate, snapshot: QualitySnapshot, spec: RuleSetSpec
 ) -> UpgradeVerdict:

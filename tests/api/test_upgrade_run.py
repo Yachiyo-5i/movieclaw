@@ -210,21 +210,22 @@ async def test_run_rejects_rule_set_without_upgrade_target(db, kicked):
 
 @pytest.mark.asyncio
 async def test_run_switches_rule_set_and_classifies_units(db, kicked):
-    """换组 + 逐集体检：可洗/到顶/无法识别/缺失 各归各位；可洗单元
+    """换组 + 逐集体检：可洗/到顶/无法确认/缺失 各归各位；可洗单元
     priority=0 且立即到期；缺失单元不动（照常走缺口逻辑）。"""
     library_id, item_id, sub_id, _rs = await _seed(
-        db, spec={}, episodes=((1, 1), (1, 2), (1, 3), (1, 4))
+        db, spec={}, episodes=((1, 1), (1, 2), (1, 3), (1, 4), (1, 5))
     )
     async with db.session() as session:
         upgrade_rs = RuleSet(name="换入洗版组", spec={"upgrade_source": "remux"})
         session.add(upgrade_rs)
-        # 体检要看快照，给三个已入库单元配文件（物化不会重建已有行，但
+        # 体检要看快照，给已入库单元配文件（物化不会重建已有行，但
         # E4 缺失、无文件）
         session.add_all(
             [
                 _file(library_id, item_id, 1, 1),
                 _file(library_id, item_id, 1, 2),
                 _file(library_id, item_id, 1, 3),
+                _file(library_id, item_id, 1, 5),
             ]
         )
         await session.commit()
@@ -235,6 +236,9 @@ async def test_run_switches_rule_set_and_classifies_units(db, kicked):
         w4 = await _add_wanted(
             session, sub_id, item_id, 1, 4, status=WantedStatus.WANTED
         )
+        # 第三态：同分辨率但片源未知——证明不了低于目标也证明不了达标，
+        # 必须报"无法确认"而不是冒充"已达目标"
+        await _add_wanted(session, sub_id, item_id, 1, 5, quality={"resolution": "1080p"})
 
         before = utcnow()
         report = await run_upgrade_round(session, sub_id, rule_set_id=upgrade_rs.id)
@@ -244,7 +248,7 @@ async def test_run_switches_rule_set_and_classifies_units(db, kicked):
             "upgradable": 1,
             "at_cutoff": 1,
             "in_flight": 0,
-            "not_comparable": 1,
+            "not_comparable": 2,
             "missing": 1,
         }
         states = {
@@ -255,6 +259,7 @@ async def test_run_switches_rule_set_and_classifies_units(db, kicked):
             (1, 2): "at_cutoff",
             (1, 3): "not_comparable",
             (1, 4): "missing",
+            (1, 5): "not_comparable",
         }
         assert report["target_label"]
         assert "可洗版" in report["summary"]

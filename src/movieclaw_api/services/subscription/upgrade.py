@@ -312,7 +312,7 @@ async def run_upgrade_round(
         SubscriptionActivity,
     )
     from movieclaw_db.repositories import SubscriptionRepository
-    from movieclaw_matcher import quality_label, upgrade_target_label
+    from movieclaw_matcher import provably_at_cutoff, quality_label, upgrade_target_label
 
     subscription = await session.get(Subscription, subscription_id)
     if subscription is None:
@@ -426,8 +426,12 @@ async def run_upgrade_round(
                 wanted.next_search_at = now
                 wanted.updated_at = now
                 state = "upgradable"
-            else:
+            elif provably_at_cutoff(snapshot, spec):
                 state = "at_cutoff"
+            else:
+                # 第三态：证明不了低于目标也证明不了已达标（如分辨率位次
+                # 未知、同分辨率但片源未知）——如实报"无法确认"，不冒充达标
+                state = "not_comparable"
         counts[state] += 1
         units.append(
             {
@@ -447,7 +451,7 @@ async def run_upgrade_round(
     if counts["at_cutoff"]:
         summary_parts.append(f"{counts['at_cutoff']} 个已达目标")
     if counts["not_comparable"]:
-        summary_parts.append(f"{counts['not_comparable']} 个无法识别当前版本")
+        summary_parts.append(f"{counts['not_comparable']} 个无法确认当前版本档位")
     if counts["missing"]:
         summary_parts.append(f"{counts['missing']} 个缺失将照常下载")
     summary = "；".join(summary_parts) if summary_parts else "没有可处理的单元"
