@@ -1207,9 +1207,11 @@ function wantedPresentation(w: WantedItem): { label: string; color: string; note
         : "等待搜索任务执行",
     };
   }
-  // 从未搜索过却排在未来 = 档期未到（电影上映+宽限、剧集播出+宽限），
-  // 不是"搜过没结果"的冷却——文案分开，别让用户误以为已经白搜过
-  if (!w.last_search_at) {
+  // 从未搜索过却排在远处 = 档期未到（电影上映+宽限、剧集播出+宽限），
+  // 不是"搜过没结果"的冷却——文案分开，别让用户误以为已经白搜过。
+  // 1 小时门槛用来排除"搜索本身失败"的短重试（15 分钟顺延不记 last_search_at），
+  // 那种情况维持原本的冷却展示
+  if (!w.last_search_at && due.getTime() - now.getTime() > 60 * 60 * 1000) {
     return {
       label: "待搜索",
       color: "#f5c451",

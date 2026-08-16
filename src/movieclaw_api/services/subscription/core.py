@@ -749,6 +749,24 @@ class SubscriptionService:
             subscription = await self.create(
                 kind, item.tmdb_id, selected_seasons=seasons, library_id=library_id
             )
+            assert subscription.id is not None
+            # 重新下载与「立即搜索」同为用户强制：文件曾经存在，资源显然可得。
+            # 电影可能被"未上映/未定档缓搜"排到未来或不可调度（TMDB 档期与
+            # 现实不符时），这里把缺失单元改回立即排队，不能让用户点了却没动静
+            forced = 0
+            now = utcnow()
+            for row in await self._repo.list_wanted(subscription.id):
+                if (
+                    (row.season_number, row.episode_number) in units
+                    and row.status == WantedStatus.WANTED
+                    and (row.next_search_at is None or row.next_search_at > now)
+                ):
+                    row.next_search_at = now
+                    self._session.add(row)
+                    forced += 1
+            if forced:
+                await self._session.commit()
+                self._kick_search()
             return subscription, len(units)
 
         subscription = existing
@@ -774,7 +792,14 @@ class SubscriptionService:
                 requeued += 1
                 continue
             if row.status == WantedStatus.WANTED:
-                continue  # 本来就在队列里，别清人家的搜索退避
+                # 排在未来/不可调度的（电影未上映缓搜、未定档、退避冷却中）
+                # 清零到当下重新排队——重新下载与「立即搜索」同为用户强制，
+                # 文件曾经存在说明资源可得；search_attempts 保留，不清退避阶梯
+                if row.next_search_at is None or row.next_search_at > now:
+                    row.next_search_at = now
+                    self._session.add(row)
+                    requeued += 1
+                continue
             row.status = WantedStatus.WANTED
             row.info_hash = None
             row.grabbed_at = None

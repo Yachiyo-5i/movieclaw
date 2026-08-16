@@ -915,8 +915,10 @@ async def _sync_movie_schedule(
     改写规则：
     - 未定档 → 定档/上映：任何时候都回填——用户强制搜过（attempts>0）也不能
       让工单永远卡在不可调度；
-    - 已排期 → 档期变化：仅未搜过（attempts==0）且新旧至少一方在未来时改写。
-      两边都已到期属于"立即可搜"，没有可同步的档期；退避中的不打扰。
+    - 已到期（next_search_at<=now，含用户「立即搜索/重新下载」强制的 now）：
+      绝不回撤——那是等待搜索管线消费的排队信号，刷新往未来/NULL 改写会把
+      用户的强制悄悄吞掉；
+    - 已排期在未来 → 档期变化：仅未搜过（attempts==0）时改写；退避中的不打扰。
     """
     from movieclaw_api.services.subscription import movie_schedule
 
@@ -930,14 +932,12 @@ async def _sync_movie_schedule(
     now = utcnow()
     if row.next_search_at is None:
         changed = next_search is not None
+    elif row.next_search_at <= now:
+        changed = False  # 已到期/用户强制：让搜索管线消费，刷新不回撤
     elif next_search is None:
         changed = row.search_attempts == 0  # 撤档：真没档期就别到点空搜
     else:
-        changed = (
-            row.search_attempts == 0
-            and next_search != row.next_search_at
-            and (next_search > now or row.next_search_at > now)
-        )
+        changed = row.search_attempts == 0 and next_search != row.next_search_at
     if not changed:
         return
     row.next_search_at = next_search

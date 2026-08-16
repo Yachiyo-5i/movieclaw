@@ -905,3 +905,24 @@ async def test_refresh_backfills_movie_release_schedule(db, monkeypatch) -> None
 
         adjusted = [a for a in await _activities(session, sub.id) if a.type == "adjusted"]
         assert any("档期更新" in a.message for a in adjusted)
+
+
+async def test_refresh_keeps_user_forced_search_pending(db, monkeypatch) -> None:
+    """定档回填不得回撤用户已触发、尚未执行的强制搜索：next<=now 是等待
+    搜索管线消费的排队信号，刷新往未来/NULL 改写会把强制悄悄吞掉。"""
+    from movieclaw_api.services import media_discover, media_refresh
+
+    async with db.session() as session:
+        service = _service(session)
+        sub = await service.create(MediaKind.MOVIE, 101)  # 未上映：排在上映+宽限
+        await service.search_now(sub.id)  # 用户强制：next 清零到当下
+        forced_at = list((await _wanted_map(session, sub.id)).values())[0].next_search_at
+        assert forced_at is not None and forced_at <= utcnow()
+
+    monkeypatch.setattr(
+        media_discover, "get_tmdb_client", lambda: _fake_tmdb({**_TV_ROUTES, **_MOVIE_ROUTES})
+    )
+    await media_refresh.refresh_media_metadata()
+    async with db.session() as session:
+        w = list((await _wanted_map(session, sub.id)).values())[0]
+        assert w.next_search_at == forced_at  # 强制仍在排队，未被改回未来档期

@@ -713,6 +713,31 @@ async def test_redownload_missing_units_creates_and_resets(db) -> None:
         assert requeued3 == 0
 
 
+async def test_redownload_forces_movie_past_release_deferral(db) -> None:
+    """重新下载与「立即搜索」同为用户强制：文件曾经存在说明资源可得，
+    电影的"未上映/未定档缓搜"在这条路径上必须让位、立即排队。"""
+    async with db.session() as session:
+        service = _service(session)
+
+        # 无订阅 → 按缺失单元新建：未上映电影不能被缓搜排到未来
+        item, _, _ = await service.prepare(MediaKind.MOVIE, 101)
+        sub, _ = await service.redownload_missing_units(MediaKind.MOVIE, item, {(0, 0)})
+        w = (await _wanted_of(session, sub.id))[0]
+        assert w.next_search_at is not None
+        assert w.next_search_at <= utcnow()
+
+        # 已有订阅、工单未定档（NULL 不可调度）→ 重下同样强制排队
+        undated = await service.create(MediaKind.MOVIE, 103)
+        w = (await _wanted_of(session, undated.id))[0]
+        assert w.next_search_at is None
+        item, _, _ = await service.prepare(MediaKind.MOVIE, 103)
+        _, requeued = await service.redownload_missing_units(MediaKind.MOVIE, item, {(0, 0)})
+        assert requeued == 1
+        w = (await _wanted_of(session, undated.id))[0]
+        assert w.next_search_at is not None
+        assert w.next_search_at <= utcnow()
+
+
 # ---------------------------------------------------------------------------
 # 即时搜索触发收口在 service 层（任何入口共用，不依赖路由自觉）
 # ---------------------------------------------------------------------------
