@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import pytest
 import pytest_asyncio
-from sqlmodel import select
 
 import movieclaw_api.services.download_progress as progress_mod
 from movieclaw_api.core.config import get_settings

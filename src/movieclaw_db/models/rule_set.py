@@ -10,7 +10,8 @@ class RuleSet(TimestampMixin, table=True):
     """规则组——"什么样的载体可接受"的可复用参数包。
 
     职责边界（docs/design/subscription-plan.md 数据模型汇总）：
-    - 回答"候选可不可接受"（硬过滤）与"谁更好"（偏好排序），洗版目标见 spec 的 upgrade_source/cutoff_resolution；
+    - 回答"候选可不可接受"（硬过滤）与"谁更好"（偏好排序），
+      洗版目标见 spec 的 upgrade_source/cutoff_resolution；
     - **纯参数**：判断逻辑全在 movieclaw_matcher，本表一行不含行为；
     - 订阅只持引用、不做 per-订阅 override——想微调就复制一个规则组；
     - 被订阅引用时禁删（服务层保证）；修改只影响之后的评估，不追溯已 grabbed。

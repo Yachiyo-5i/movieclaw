@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import pytest
+
 from movieclaw_enrich.models import TorrentAttrs
 from movieclaw_matcher import (
     QualitySnapshot,
@@ -261,7 +262,9 @@ def test_snapshot_probe_overrides_name_resolution() -> None:
 def test_snapshot_probe_hdr_normalized_to_vocab() -> None:
     """probe 的 "Dolby Vision" 归一为词表值 "DV"，两侧命名空间在此消化。"""
     name = TorrentAttrs(resolution="2160p", media_source="Blu-ray", remux=True, hdr=["HDR10"])
-    snap = build_snapshot(name, probed=True, probe_resolution="2160p", probe_hdr_label="Dolby Vision")
+    snap = build_snapshot(
+        name, probed=True, probe_resolution="2160p", probe_hdr_label="Dolby Vision"
+    )
     assert snap.hdr == ["DV"]
     assert snap.remux is True
 

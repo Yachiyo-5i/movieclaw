@@ -476,6 +476,37 @@ class ResourceTimingView(BaseModel):
         )
 
 
+class UpgradeRunPayload(BaseModel):
+    """「一轮洗版」请求（docs/design/quality-upgrade.md §13.2）。"""
+
+    rule_set_id: int | None = Field(
+        default=None,
+        description="可选：先换用该规则组再触发（组必须已配置洗版目标）；缺省用当前组",
+    )
+
+
+class UpgradeRunUnitView(BaseModel):
+    """一轮洗版的逐集体检结果。"""
+
+    season_number: int
+    episode_number: int
+    state: Literal["upgradable", "at_cutoff", "in_flight", "not_comparable", "missing"] = Field(
+        description="可洗已排期 / 已达目标 / 洗版在途 / 无法识别当前版本 / 缺失走补缺"
+    )
+    current_label: str | None = Field(description="当前版本档位标签；未入库/无法识别为 null")
+    target_label: str = Field(description="洗版目标档位标签")
+
+
+class UpgradeRunView(BaseModel):
+    """一轮洗版的体检报告（同步返回的一次性快照，不落库）。"""
+
+    target_label: str
+    rule_set_id: int = Field(description="本轮实际生效的规则组（换组后为新组）")
+    summary: str = Field(description="中文摘要句，前端直接展示")
+    counts: dict[str, int]
+    units: list[UpgradeRunUnitView]
+
+
 class WantedUpgradeView(BaseModel):
     """单元的洗版派生状态（docs/design/quality-upgrade.md §8.3/§9）。
 

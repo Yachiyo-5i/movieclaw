@@ -39,6 +39,8 @@ from movieclaw_api.schemas.subscription import (
     SubscriptionUpdatePayload,
     SubscriptionView,
     TodayArrivalView,
+    UpgradeRunPayload,
+    UpgradeRunView,
 )
 from movieclaw_api.services.auth import Principal
 from movieclaw_api.services.media_discover import get_tmdb_client
@@ -466,6 +468,32 @@ async def update_subscription(
         SubscriptionDetailView.from_detail(sub, item, wanted, resource_timings),
         message="订阅已调整",
     )
+
+
+@router.post(
+    "/{subscription_id}/upgrade-runs",
+    response_model=ApiResponse[UpgradeRunView],
+    summary="触发一轮洗版：逐集体检并把可洗单元排入立即搜索",
+    operation_id="subscriptions.upgrade-run",
+)
+async def run_subscription_upgrade(
+    subscription_id: int,
+    payload: UpgradeRunPayload,
+    principal: Principal = Depends(require_subscribe_capability),
+    session: AsyncSession = Depends(get_session),
+) -> ApiResponse[UpgradeRunView]:
+    """「一轮洗版」（quality-upgrade.md §13.2）：可选换组 → 物化存量单元 →
+    补快照 → 逐集体检 → 可洗单元立即排期 → 踢搜索。同步返回体检报告。"""
+    from movieclaw_api.services.subscription import run_upgrade_round
+
+    service = _service(session)
+    await service.assert_can_manage(
+        subscription_id, None if principal.is_admin else principal.member_id
+    )
+    report = await run_upgrade_round(
+        session, subscription_id, rule_set_id=payload.rule_set_id
+    )
+    return ok(UpgradeRunView.model_validate(report), message=report["summary"])
 
 
 @router.post(

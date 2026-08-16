@@ -141,11 +141,11 @@ def build_lifespan(settings: Settings):
                 ingest as library_ingest,
             )
             from movieclaw_api.services.library import scan as library_scan  # noqa: F401
-            from movieclaw_api.services.subscription import (  # noqa: F401  缺口搜索任务注册
-                wanted_search,
-            )
             from movieclaw_api.services.subscription import (  # noqa: F401  洗版基线回填任务注册
                 upgrade as subscription_upgrade,
+            )
+            from movieclaw_api.services.subscription import (  # noqa: F401  缺口搜索任务注册
+                wanted_search,
             )
 
             init_scheduler(

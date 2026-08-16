@@ -37,6 +37,7 @@ from movieclaw_db.models import (
     WantedStatus,
     utcnow,
 )
+from movieclaw_db.models.scheduled_task import TriggerType
 from movieclaw_enrich import enrich
 from movieclaw_matcher import (
     QualitySnapshot,
@@ -46,7 +47,6 @@ from movieclaw_matcher import (
     source_tier,
 )
 from movieclaw_scheduler.registry import register_task
-from movieclaw_db.models.scheduled_task import TriggerType
 
 logger = logging.getLogger("movieclaw_api.subscription.upgrade")
 
@@ -171,6 +171,88 @@ async def fill_snapshots(
 
 
 # ---------------------------------------------------------------------------
+# 工单物化：给存量内容一个洗版基线的载体（quality-upgrade.md §13.1）
+# ---------------------------------------------------------------------------
+
+
+async def materialize_owned_wanted(
+    session: AsyncSession, subscription: Subscription
+) -> list[WantedItem]:
+    """为期望集合 E 中**库里已有但没有工单**的单元补建 imported 工单行。
+
+    订阅创建会跳过库里已有的单元（"无需重复下载"）——但洗版的全部状态
+    （基线快照、证伪计数、搜索排期）都住在工单行上，存量内容没有行就
+    没有洗版。物化幂等：唯一约束 ``uq_wanted_sub_season_episode`` 天然防重，
+    已有行（含 in_scope=False 的历史行）一律不动。
+    只改内存行 + flush、不 commit（跟随调用方事务）。返回新建的行。
+    """
+    from movieclaw_api.services.subscription.core import expected_units
+    from movieclaw_db.repositories.library_file_repo import LibraryFileRepository
+    from movieclaw_db.repositories.media_repo import MediaItemRepository
+    from movieclaw_media.models import MediaKind
+
+    assert subscription.id is not None
+    episodes = await MediaItemRepository(session).list_episodes(subscription.media_item_id)
+    units = expected_units(
+        MediaKind(subscription.kind),
+        episodes,
+        list(subscription.selected_seasons),
+        subscription.follow_future,
+    )
+    owned = await LibraryFileRepository(session).owned_units(subscription.media_item_id)
+    existing = {
+        (row.season_number, row.episode_number)
+        for row in (
+            await session.execute(
+                select(WantedItem).where(WantedItem.subscription_id == subscription.id)
+            )
+        ).scalars()
+    }
+    # imported_at 取该单元最早文件的入库时间（真实历史），查一次全条目文件
+    file_added: dict[tuple[int, int], object] = {}
+    for file in (
+        await session.execute(
+            select(LibraryFile).where(
+                LibraryFile.media_item_id == subscription.media_item_id,
+                LibraryFile.missing_since.is_(None),  # type: ignore[union-attr]
+            )
+        )
+    ).scalars():
+        key = (file.season_number, file.episode_number)
+        if file.created_at is not None and (
+            key not in file_added or file.created_at < file_added[key]  # type: ignore[operator]
+        ):
+            file_added[key] = file.created_at
+
+    created: list[WantedItem] = []
+    now = utcnow()
+    for unit in units:
+        key = (unit.season_number, unit.episode_number)
+        if key not in owned or key in existing:
+            continue
+        row = WantedItem(
+            subscription_id=subscription.id,
+            media_item_id=subscription.media_item_id,
+            season_number=unit.season_number,
+            episode_number=unit.episode_number,
+            status=WantedStatus.IMPORTED,
+            in_scope=True,
+            air_date=unit.air_date,
+            imported_at=file_added.get(key, now),
+        )
+        session.add(row)
+        created.append(row)
+    if created:
+        await session.flush()
+        logger.info(
+            "洗版物化：订阅 #%s 为 %d 个存量单元补建了工单行",
+            subscription.id,
+            len(created),
+        )
+    return created
+
+
+# ---------------------------------------------------------------------------
 # 洗版 attempt 的工单解析（状态机的关键差异点）
 # ---------------------------------------------------------------------------
 
@@ -204,6 +286,202 @@ async def upgrade_attempt_wanted_rows(
         conditions.append(WantedItem.in_scope.is_(True))  # type: ignore[attr-defined]
     rows = list((await session.execute(select(WantedItem).where(*conditions))).scalars())
     return [r for r in rows if (r.season_number, r.episode_number) in units]
+
+
+# ---------------------------------------------------------------------------
+# 一轮洗版（quality-upgrade.md §13.2）：手动触发的同步组合动作
+# ---------------------------------------------------------------------------
+
+
+async def run_upgrade_round(
+    session: AsyncSession, subscription_id: int, *, rule_set_id: int | None = None
+) -> dict:
+    """「一轮洗版」：可选换组 → 物化 → 补快照 → 逐集体检 → 排期 → 踢搜索。
+
+    同步执行、幂等（重复触发对已排期/在途单元无副作用）。返回体检报告
+    （直接可渲染的结构，标签由后端生成）。中文错误全部走 BadRequest。
+    """
+    from movieclaw_api.exceptions import BadRequestException, NotFoundException
+    from movieclaw_api.services.subscription.matching import (
+        UPGRADE_FUSE_LIMIT,
+        upgrade_ready,
+    )
+    from movieclaw_db.models import (
+        ActivityType,
+        DownloadAttemptStatus,
+        SubscriptionActivity,
+    )
+    from movieclaw_db.repositories import SubscriptionRepository
+    from movieclaw_matcher import quality_label, upgrade_target_label
+
+    subscription = await session.get(Subscription, subscription_id)
+    if subscription is None:
+        raise NotFoundException(f"订阅不存在：#{subscription_id}")
+    if subscription.status == "paused":
+        raise BadRequestException("订阅已暂停，请先恢复追踪再触发洗版")
+
+    # （可选）换组：目标组必须配置洗版目标——"选规则 + 触发"合成一步
+    if rule_set_id is not None and rule_set_id != subscription.rule_set_id:
+        rule_set = await session.get(RuleSet, rule_set_id)
+        if rule_set is None:
+            raise NotFoundException(f"规则组不存在：#{rule_set_id}")
+        try:
+            new_spec = RuleSetSpec.model_validate(rule_set.spec or {})
+        except ValueError as exc:
+            raise BadRequestException(f"规则组「{rule_set.name}」的参数无法解析：{exc}") from exc
+        if new_spec.upgrade_source is None:
+            raise BadRequestException(
+                f"规则组「{rule_set.name}」未配置洗版目标，请先在规则组编辑器中选择「洗到哪一档」"
+            )
+        subscription.rule_set_id = rule_set_id
+        subscription.updated_at = utcnow()
+
+    specs = await _specs_for_subscriptions(session, {subscription_id})
+    spec = specs.get(subscription_id)
+    if spec is None:
+        raise BadRequestException("当前规则组的参数无法解析，请在规则组页面重新保存修正")
+    if spec.upgrade_source is None:
+        raise BadRequestException(
+            "当前规则组未配置洗版目标；在请求中带上一个已配置洗版目标的规则组，"
+            "或先到「设置 → 订阅 → 规则组」配置"
+        )
+
+    # 物化存量单元 + 当场补快照（不等回填 tick——体检要看到每一集）
+    await materialize_owned_wanted(session, subscription)
+    rows = list(
+        (
+            await session.execute(
+                select(WantedItem).where(
+                    WantedItem.subscription_id == subscription_id,
+                    WantedItem.in_scope.is_(True),  # type: ignore[attr-defined]
+                )
+            )
+        ).scalars()
+    )
+    pending_snapshot = [
+        w for w in rows if w.status == WantedStatus.IMPORTED and w.quality is None
+    ]
+    if pending_snapshot:
+        await fill_snapshots(session, subscription.media_item_id, pending_snapshot)
+
+    # 在途洗版单元集合（体检里如实展示"已在洗"）
+    in_flight: set[tuple[int, int]] = set()
+    for attempt in (
+        await session.execute(
+            select(SubscriptionDownloadAttempt).where(
+                SubscriptionDownloadAttempt.subscription_id == subscription_id,
+                SubscriptionDownloadAttempt.purpose == "upgrade",
+                SubscriptionDownloadAttempt.status.in_(  # type: ignore[attr-defined]
+                    (
+                        DownloadAttemptStatus.ACTIVE,
+                        DownloadAttemptStatus.REPLACEMENT_PENDING,
+                        DownloadAttemptStatus.TRIAL,
+                        DownloadAttemptStatus.CLEANUP_PENDING,
+                        DownloadAttemptStatus.COMPLETED,
+                    )
+                ),
+            )
+        )
+    ).scalars():
+        in_flight.update(
+            (int(u[0]), int(u[1]))
+            for u in attempt.units
+            if isinstance(u, list) and len(u) == 2
+        )
+
+    # 逐集体检 + 可洗单元排期（用户显式触发 = 补旧级 priority 0，立即到期；
+    # 熔断中的视为人工介入解除，与「立即搜索」同语义）
+    now = utcnow()
+    target_label = upgrade_target_label(spec) or ""
+    units: list[dict] = []
+    counts = {"upgradable": 0, "at_cutoff": 0, "in_flight": 0, "not_comparable": 0, "missing": 0}
+    for wanted in sorted(rows, key=lambda w: (w.season_number, w.episode_number)):
+        unit = (wanted.season_number, wanted.episode_number)
+        current_label: str | None = None
+        if wanted.status != WantedStatus.IMPORTED:
+            state = "missing"
+        elif not wanted.quality:
+            state = "not_comparable"
+        else:
+            snapshot = QualitySnapshot.model_validate(wanted.quality)
+            current_label = quality_label(snapshot)
+            if unit in in_flight:
+                state = "in_flight"
+            elif upgrade_ready(wanted, spec, now=now) or (
+                wanted.upgrade_verify_failures >= UPGRADE_FUSE_LIMIT
+                and _provably_below(snapshot, spec)
+            ):
+                if wanted.upgrade_verify_failures >= UPGRADE_FUSE_LIMIT:
+                    from movieclaw_api.services.system_notice import resolve_notices
+
+                    wanted.upgrade_verify_failures = 0
+                    await resolve_notices(
+                        session,
+                        prefix=(
+                            f"subscription.upgrade:{subscription_id}:"
+                            f"{wanted.season_number}:{wanted.episode_number}"
+                        ),
+                    )
+                wanted.priority = 0
+                wanted.next_search_at = now
+                wanted.updated_at = now
+                state = "upgradable"
+            else:
+                state = "at_cutoff"
+        counts[state] += 1
+        units.append(
+            {
+                "season_number": wanted.season_number,
+                "episode_number": wanted.episode_number,
+                "state": state,
+                "current_label": current_label,
+                "target_label": target_label,
+            }
+        )
+
+    summary_parts = []
+    if counts["upgradable"]:
+        summary_parts.append(f"{counts['upgradable']} 个单元可洗版，已排入立即搜索")
+    if counts["in_flight"]:
+        summary_parts.append(f"{counts['in_flight']} 个已在洗版中")
+    if counts["at_cutoff"]:
+        summary_parts.append(f"{counts['at_cutoff']} 个已达目标")
+    if counts["not_comparable"]:
+        summary_parts.append(f"{counts['not_comparable']} 个无法识别当前版本")
+    if counts["missing"]:
+        summary_parts.append(f"{counts['missing']} 个缺失将照常下载")
+    summary = "；".join(summary_parts) if summary_parts else "没有可处理的单元"
+
+    await session.commit()
+    await SubscriptionRepository(session).add_activity(
+        SubscriptionActivity(
+            subscription_id=subscription_id,
+            type=ActivityType.ADJUSTED,
+            message=f"用户触发一轮洗版（目标 {target_label}）：{summary}",
+            payload={
+                "reason": "upgrade_run",
+                "counts": counts,
+                "rule_set_id": subscription.rule_set_id,
+            },
+        )
+    )
+    if counts["upgradable"] or counts["missing"]:
+        from movieclaw_api.services.subscription.wanted_search import kick_search_soon
+
+        kick_search_soon()
+    return {
+        "target_label": target_label,
+        "rule_set_id": subscription.rule_set_id,
+        "summary": summary,
+        "counts": counts,
+        "units": units,
+    }
+
+
+def _provably_below(snapshot, spec) -> bool:
+    from movieclaw_matcher import provably_below_cutoff
+
+    return provably_below_cutoff(snapshot, spec)
 
 
 # ---------------------------------------------------------------------------
@@ -693,9 +971,8 @@ async def _verify_upgrades_locked(session: AsyncSession, media_item_id: int) -> 
                 )
             )
             if fused:
-                from movieclaw_db.models.system_notice import NoticeSeverity
-
                 from movieclaw_api.services.system_notice import upsert_notice
+                from movieclaw_db.models.system_notice import NoticeSeverity
 
                 await upsert_notice(
                     session,
@@ -1018,4 +1295,6 @@ async def backfill_upgrade_snapshots() -> None:
         if roots:
             removed = cleanup_trash_dirs(roots)
             if removed:
-                logger.info("回收站清理：移除 %d 个超过 %d 天的旧版本文件", removed, _TRASH_RETENTION_DAYS)
+                logger.info(
+                    "回收站清理：移除 %d 个超过 %d 天的旧版本文件", removed, _TRASH_RETENTION_DAYS
+                )

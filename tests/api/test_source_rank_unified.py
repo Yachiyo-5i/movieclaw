@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import pytest
+
 from movieclaw_api.services.subscription.replacement import (
     _SOURCE_RANK,
     _source_rank,

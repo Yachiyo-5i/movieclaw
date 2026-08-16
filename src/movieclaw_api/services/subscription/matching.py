@@ -38,6 +38,7 @@ from movieclaw_enrich.models import TorrentAttrs
 from movieclaw_matcher import (
     IdentityMatch,
     MediaIdentity,
+    QualitySnapshot,
     RuleSetSpec,
     RuleVerdict,
     TorrentCandidate,
@@ -123,7 +124,7 @@ class MediaContext:
     spec: RuleSetSpec
     open_wanted: dict[tuple[int, int], WantedItem]
     upgrade_wanted: dict[tuple[int, int], WantedItem] = field(default_factory=dict)
-    upgrade_snapshots: dict[tuple[int, int], "QualitySnapshot"] = field(default_factory=dict)
+    upgrade_snapshots: dict[tuple[int, int], QualitySnapshot] = field(default_factory=dict)
     upgrade_excluded: frozenset[tuple[str, str]] = frozenset()
     # 已入库但**不可洗**的单元（到顶/快照不可比/熔断冷却/洗版在途）：
     # 整季包铁律的另一半——包覆盖到任何一个这样的单元就整体放弃洗版维度，
@@ -207,20 +208,19 @@ def upgrade_ready(wanted: WantedItem, spec: RuleSetSpec, *, now: datetime) -> bo
       冷却到期即恢复（计数由 postpone_upgrade_wanted 在恢复后清零重新观察）；
       next_search_at 为 None 不算熔断中——排期缺失不能变成永久停摆。
     """
-    from movieclaw_matcher import QualitySnapshot, provably_below_cutoff
+    from movieclaw_matcher import provably_below_cutoff
 
     if not wanted.quality:  # NULL 未回填 / {} 无法识别哨兵
         return False
     snapshot = QualitySnapshot.model_validate(wanted.quality)
     if not provably_below_cutoff(snapshot, spec):
         return False
-    if (
+    fused = (  # 熔断冷却中
         wanted.upgrade_verify_failures >= UPGRADE_FUSE_LIMIT
         and wanted.next_search_at is not None
         and wanted.next_search_at > now
-    ):
-        return False  # 熔断冷却中
-    return True
+    )
+    return not fused
 
 
 async def load_match_context(session: AsyncSession) -> dict[int, MediaContext]:
