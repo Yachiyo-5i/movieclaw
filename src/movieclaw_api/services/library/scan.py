@@ -63,6 +63,7 @@ from movieclaw_api.services.library.layout import (
     SCAN_VIDEO_EXTS,
     STRM_EXT,
     entry_dirs,
+    is_disc_dir,
     season_from_dir,
     trailing_index_episode,
 )
@@ -86,6 +87,7 @@ from movieclaw_db.engine import get_database
 from movieclaw_db.models import (
     DownloadHint,
     FileSource,
+    FileState,
     Job,
     JobResource,
     JobStatus,
@@ -885,7 +887,7 @@ async def _scan(
             # 「已忽略」清单里可一键恢复（消失又回来的顺手清 missing 标记，
             # 忽略状态原样保留）
             if existing is not None and existing.ignored_at is not None:
-                if existing.missing_since is not None:
+                if existing.state == FileState.MISSING:
                     assert existing.id is not None
                     await repo.clear_missing_flag(existing.id)
                 summary.skipped_ignored += 1
@@ -896,7 +898,7 @@ async def _scan(
             # 不必先忽略再扫）；行原地更新，不产生新台账
             if (
                 existing is not None
-                and existing.missing_since is None
+                and existing.state != FileState.MISSING  # 在位或待回收的已识别行都秒过
                 and existing.media_item_id is not None
             ):
                 # 身份对账：识别器升级后（版本戳落后）重走识别链复核——
@@ -1015,14 +1017,33 @@ async def _scan(
         # upsert_by_path 会自动清除标记。判定须读行上的当前路径而非快照
         # 的旧 key：改名归并（_try_relink）会把行迁到本轮刚遍历过的新路径
         prefixes = [f"{r.rstrip('/')}/" for r in scanned_roots]
+        # 原盘内部的行（存量嵌套/手动放入）：_walk_videos 不进原盘目录，
+        # seen 恒不含它们，按 seen 判会误标缺失且永不自愈——这类行改按
+        # 物理存在性对账（docs/design/disc-version-layout.md §4）。正常库
+        # 这类行为零，逐行 stat 成本可忽略
+        disc_prefixes = [
+            f"{row.file_path.rstrip('/')}/"
+            for row in known.values()
+            if row.container in ("bluray", "dvd")
+        ]
         now = utcnow()
         for row in known.values():
             path_str = row.file_path
-            if row.missing_since is not None or path_str in seen_paths:
+            if path_str in seen_paths:
                 continue
             if not any(path_str.startswith(prefix) for prefix in prefixes):
                 continue
             assert row.id is not None
+            if any(path_str.startswith(dp) for dp in disc_prefixes):
+                exists = Path(path_str).exists()
+                if row.state == FileState.IN_PLACE and not exists:
+                    await repo.mark_missing(row.id, since=now)
+                    summary.marked_missing += 1
+                elif row.state == FileState.MISSING and exists:
+                    await repo.clear_missing_flag(row.id)
+                continue
+            if row.state != FileState.IN_PLACE:
+                continue
             await repo.mark_missing(row.id, since=now)
             summary.marked_missing += 1
 
@@ -1265,7 +1286,7 @@ async def _auto_clear_missing(
         for row in known
         if row.id is not None
         and row.library_id == library.id
-        and row.missing_since is not None
+        and row.state == FileState.MISSING
         and any(row.file_path.startswith(prefix) for prefix in prefixes)
     ]
     if not doomed:
@@ -1448,7 +1469,7 @@ async def _reconcile_removed_root_ledger_rows(
     warned_accessible_roots: set[str] = set()
 
     for old in list(known.values()):
-        if old.missing_since is not None:
+        if old.state != FileState.IN_PLACE:
             continue
         old_root = next(
             (root for root in removed_roots if _row_under_root(old, root) is not None), None
@@ -1526,7 +1547,7 @@ async def _reconcile_removed_root_ledger_rows(
 
         # 无新文件，或新行无法确认身份时，旧容器路径已不可用，不应继续被详情
         # 页、缩略图刷新等业务当作在位文件。只标台账缺失，磁盘从不触碰。
-        old.missing_since = now
+        old.mark_missing(now)
         old.updated_at = now
         summary.marked_missing += 1
         summary.removed_root_marked_missing += 1
@@ -1599,7 +1620,7 @@ async def preview_root_path_reconcile(
         new_root=str(new_root_path),
     )
     for old in rows:
-        if old.missing_since is not None:
+        if old.state != FileState.IN_PLACE:
             continue
         relative = _row_under_root(old, old_root_path)
         if relative is None:
@@ -1621,11 +1642,6 @@ async def preview_root_path_reconcile(
             preview.marked_missing += 1
             preview.unconfirmed.append(f"{old.file_path} ↔ {candidate}")
     return preview
-
-
-def _is_disc_dir(directory: Path) -> bool:
-    """原盘目录判定：蓝光（BDMV）或 DVD（VIDEO_TS）结构。"""
-    return (directory / "BDMV").is_dir() or (directory / "VIDEO_TS").is_dir()
 
 
 def unit_name(file: Path, is_disc: bool) -> str:
@@ -1696,7 +1712,7 @@ def _walk_videos(
             if entry.is_dir():
                 if name.startswith(".") or name.lower() in _IGNORE_DIRS:
                     continue
-                if _is_disc_dir(entry):
+                if is_disc_dir(entry):
                     yield entry, True
                     continue
                 stack.append(entry)
@@ -1753,7 +1769,7 @@ async def _relink_legacy_root_paths(
     # 不足以证明同一实体（两个独立根也可能恰好有同名、同大小的文件）。
     candidates_by_path: dict[str, list[tuple[LibraryFile, Path]]] = {}
     for row in known.values():
-        if row.missing_since is not None:
+        if row.state != FileState.IN_PLACE:
             continue
         old_path = Path(row.file_path)
         for old_root in old_roots:
@@ -1921,7 +1937,7 @@ def _can_merge_same_file_rows(old: LibraryFile, current: LibraryFile) -> bool:
 def _relocate_root_ledger_row(row: LibraryFile, file_path: str) -> None:
     """原地改写台账路径，保留主键及全部既有识别、规格与来源信息。"""
     row.file_path = file_path
-    row.missing_since = None
+    row.revive()
     row.updated_at = utcnow()
 
 
@@ -1991,7 +2007,7 @@ async def _merge_same_file_rows(
     await session.delete(duplicate)
     await session.flush()
     survivor.file_path = file_path
-    survivor.missing_since = None
+    survivor.revive()
     survivor.updated_at = utcnow()
 
 
@@ -2114,7 +2130,7 @@ async def _ingest_file(
 ) -> None:
     """把一个文件识别并写入台账。``existing`` 是该路径已有的台账行：
     在位但待识别 → 本次是识别重试；标记过 missing → 文件回归。"""
-    if existing is None or existing.missing_since is not None:
+    if existing is None or existing.state == FileState.MISSING:
         summary.scanned += 1  # 新文件 / 回归的 missing 文件
     else:
         summary.retried += 1  # 在位但待识别：识别重试，不算新入账
@@ -2380,7 +2396,7 @@ async def _probe_backfill(
                         LibraryFile.audio_streams.is_(None),  # type: ignore[union-attr]
                         LibraryFile.container == "bluray",
                     ),
-                    LibraryFile.missing_since.is_(None),  # type: ignore[union-attr]
+                    LibraryFile.in_place(),
                     LibraryFile.ignored_at.is_(None),  # type: ignore[union-attr]
                 )
             )
@@ -2473,7 +2489,7 @@ async def _collect_and_prefetch(
         # 与主循环的跳过条件对齐：已忽略、以及已识别且在位的行都不会建档
         if existing is not None and (
             existing.ignored_at is not None
-            or (existing.missing_since is None and existing.media_item_id is not None)
+            or (existing.state != FileState.MISSING and existing.media_item_id is not None)
         ):
             continue
         nfo = _entry_nfo(kind, root_path, file)
@@ -2533,7 +2549,9 @@ async def _try_relink(
     for row in await repo.find_by_size(library.id, size_bytes):
         if row.file_path == path_str:
             continue
-        if row.missing_since is None and await asyncio.to_thread(Path(row.file_path).exists):
+        if row.state == FileState.TRASHED:
+            continue  # 待回收行不参与改名归并——归并会复活它
+        if row.state == FileState.IN_PLACE and await asyncio.to_thread(Path(row.file_path).exists):
             continue
         if (
             duration_seconds
@@ -3182,7 +3200,7 @@ async def preview_reidentify(
     grouped: dict[tuple[str, object], ReidentifyGroup] = {}
 
     for row in rows:
-        if row.missing_since is not None:
+        if row.state != FileState.IN_PLACE:
             preview.skipped_missing += 1
             continue
         file = Path(row.file_path)
@@ -3339,7 +3357,7 @@ async def _reidentify(
         new_ids: set[int] = set()
         for done, row in enumerate(rows, start=1):
             state.processed = done
-            if row.missing_since is not None:
+            if row.state != FileState.IN_PLACE:
                 summary.skipped_missing += 1
                 continue
             summary.total += 1

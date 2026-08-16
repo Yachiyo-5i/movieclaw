@@ -262,7 +262,7 @@ async def test_backfill_leaves_missing_and_ignored_rows_alone(db, tmp_path, monk
         # 文件真的从磁盘删掉，否则重扫会把它当"文件回归"重新入账（那条路径
         # 本来就会探测，测不出补探阶段的取舍）
         Path(missing.file_path).unlink()
-        missing.missing_since = utcnow()
+        missing.mark_missing()
         ignored.ignored_at = utcnow()
         await session.commit()
 

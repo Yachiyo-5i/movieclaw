@@ -16,6 +16,7 @@ from movieclaw_api.core.config import get_settings
 from movieclaw_api.schemas.playback import RecentWatchItemView
 from movieclaw_api.services.media_scrape import asset_version
 from movieclaw_db.models import (
+    FileState,
     Library,
     LibraryFile,
     MediaEpisode,
@@ -122,7 +123,7 @@ async def recent_watch_items(
         .where(
             unit_file.library_id == Library.id,
             unit_file.media_item_id == PlaybackState.media_item_id,
-            unit_file.missing_since.is_(None),  # type: ignore[union-attr]
+            unit_file.state == FileState.IN_PLACE,  # 在位口径：缺失/待回收都不算可看
             # 季集按字典序严格大于卡片锚点：补齐的旧季、洗版的老集都排在锚点
             # 之前，不会被当成“可以接着看”的内容。
             or_(
@@ -162,7 +163,7 @@ async def recent_watch_items(
                 LibraryFile.media_item_id == PlaybackState.media_item_id,
                 LibraryFile.season_number == PlaybackState.season_number,
                 LibraryFile.episode_number == PlaybackState.episode_number,
-                LibraryFile.missing_since.is_(None),  # type: ignore[union-attr]
+                LibraryFile.in_place(),
             ),
         )
         .join(Library, Library.id == LibraryFile.library_id)

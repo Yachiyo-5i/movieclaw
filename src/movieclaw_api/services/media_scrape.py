@@ -1389,7 +1389,7 @@ async def mirror_media_dir_assets(media_item_id: int, *, force: bool = False) ->
                     .join(Library, Library.id == LibraryFile.library_id)  # type: ignore[arg-type]
                     .where(
                         LibraryFile.media_item_id == media_item_id,
-                        LibraryFile.missing_since.is_(None),  # type: ignore[union-attr]
+                        LibraryFile.in_place(),
                     )
                 )
             ).all()

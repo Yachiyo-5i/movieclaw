@@ -94,7 +94,7 @@ async def _run_batch(library_id: int) -> None:
                         select(LibraryFile).where(
                             LibraryFile.library_id == library_id,
                             LibraryFile.media_item_id.is_not(None),
-                            LibraryFile.missing_since.is_(None),
+                            LibraryFile.in_place(),
                         )
                     )
                 ).scalars()

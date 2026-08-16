@@ -51,7 +51,7 @@ from movieclaw_api.services.library.layout import entry_dir_of
 from movieclaw_api.services.library.organize import _prune_emptied_dirs
 from movieclaw_api.services.task_state import TaskState
 from movieclaw_db.engine import get_database
-from movieclaw_db.models import Library, LibraryFile, MediaItem, Subscription, utcnow
+from movieclaw_db.models import FileState, Library, LibraryFile, MediaItem, Subscription, utcnow
 from movieclaw_db.repositories.library_file_repo import LibraryFileRepository
 from movieclaw_db.repositories.library_repo import LibraryRepository
 
@@ -214,8 +214,15 @@ def _build_plan_sync(
 
     for row in files:
         path = Path(row.file_path)
-        if row.missing_since is not None:
-            # 磁盘上没有实体，无从搬运——只做逻辑随迁（下面统一处理）
+        if row.state == FileState.MISSING or (
+            row.state == FileState.TRASHED and row.trash_original_path is not None
+        ):
+            # 缺失行没有磁盘实体；移入回收站形态的待回收行实体在源库
+            # .movieclaw-trash 里、不跟条目目录走——都只做逻辑随迁。
+            # **原地待回收行（做种保护形态）不在此列**：它的实体就在条目
+            # 目录里，必须随目录物理搬运并改写路径，否则搬运后行路径陈旧、
+            # 清理任务删行收敛，新库里的无台账文件会被扫描重新收编——
+            # 证伪版本借转移复活（relocate 的 revive 守卫保证状态保持待回收）
             assert row.id is not None
             plan.missing_file_ids.append(row.id)
             continue

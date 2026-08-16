@@ -75,7 +75,7 @@ async def _item_visible(session: AsyncSession, item_id: int, scope: ViewerScope)
             sa_select(LibraryFile.id)
             .where(
                 LibraryFile.media_item_id == item_id,
-                LibraryFile.missing_since.is_(None),
+                LibraryFile.in_place(),
                 LibraryFile.library_id.in_(scope.visible),
             )
             .limit(1)
@@ -936,7 +936,7 @@ async def items_counts(
                     .where(
                         LibraryFile.library_id.in_(library_ids),
                         LibraryFile.media_item_id.is_not(None),
-                        LibraryFile.missing_since.is_(None),
+                        LibraryFile.in_place(),
                     )
                     .distinct()
                     .subquery()
@@ -967,7 +967,7 @@ async def items_counts(
                     .where(
                         LibraryFile.library_id.in_(tv_library_ids),
                         LibraryFile.media_item_id.is_not(None),
-                        LibraryFile.missing_since.is_(None),
+                        LibraryFile.in_place(),
                     )
                     .distinct()
                     .subquery()
@@ -1063,7 +1063,7 @@ def select_files_with_roots(media_item_id: int):
         .join(Library, Library.id == LibraryFile.library_id)
         .where(
             LibraryFile.media_item_id == media_item_id,
-            LibraryFile.missing_since.is_(None),
+            LibraryFile.in_place(),
         )
     )
 

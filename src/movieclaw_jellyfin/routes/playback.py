@@ -74,7 +74,7 @@ async def _files_for_ref(ref, member_id: int = 0) -> list[LibraryFile]:
         visible = await member_visible_ids(session, member_id)
         q = select(LibraryFile).where(
             LibraryFile.media_item_id == ref.entity_id,
-            LibraryFile.missing_since.is_(None),
+            LibraryFile.in_place(),
         )
         if visible is not None:
             q = q.where(LibraryFile.library_id.in_(visible))

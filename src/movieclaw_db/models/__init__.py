@@ -28,7 +28,7 @@ from movieclaw_db.models.job import (
     JobStatus,
 )
 from movieclaw_db.models.library import Library
-from movieclaw_db.models.library_file import FileSource, LibraryFile
+from movieclaw_db.models.library_file import FileSource, FileState, LibraryFile
 from movieclaw_db.models.llm_provider import LlmProvider
 from movieclaw_db.models.manual_download_intent import ManualDownloadIntent
 from movieclaw_db.models.media_item import MediaItem, MediaSeason
@@ -84,6 +84,7 @@ __all__ = [
     "DownloadHint",
     "DownloaderClient",
     "FileSource",
+    "FileState",
     "ImportWatch",
     "IngestEntry",
     "IngestStatus",

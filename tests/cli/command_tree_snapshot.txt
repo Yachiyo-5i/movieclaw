@@ -91,8 +91,10 @@ library items list
 library items list-episodes
 library items preview-reidentification
 library items preview-transfer
+library items purge-file
 library items refresh-metadata
 library items reidentify
+library items restore-file
 library items transfer
 library list
 library list-routing-options
@@ -177,6 +179,7 @@ subscriptions set-follow-future
 subscriptions set-tracking-state
 subscriptions unsubscribe
 subscriptions update
+subscriptions upgrade-run
 ui prefs show
 ui prefs update
 watch create

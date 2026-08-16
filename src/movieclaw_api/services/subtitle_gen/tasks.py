@@ -26,7 +26,7 @@ from movieclaw_api.services import jobs
 from movieclaw_api.services.library.subtitles import discover_external_subtitles
 from movieclaw_api.services.subtitle_gen import extract, pgs, source, sync, translate, validate
 from movieclaw_db.engine import get_database
-from movieclaw_db.models import LibraryFile, MediaItem, MediaMetadata, utcnow
+from movieclaw_db.models import FileState, LibraryFile, MediaItem, MediaMetadata, utcnow
 
 logger = logging.getLogger("movieclaw_api.subtitle_gen")
 
@@ -171,7 +171,7 @@ async def _load_row(session: AsyncSession, file_id: int) -> LibraryFile:
     row = (
         await session.execute(select(LibraryFile).where(LibraryFile.id == file_id))
     ).scalar_one_or_none()
-    if row is None or row.missing_since is not None:
+    if row is None or row.state != FileState.IN_PLACE:
         raise NotFoundException(f"文件不存在或已丢失：id={file_id}")
     return row
 

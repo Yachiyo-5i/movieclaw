@@ -52,6 +52,8 @@ export interface SubscriptionCollectionMeta {
   value: string;
   /** 启用中的未完结追更：海报在收录集数前显示静态绿点。 */
   tracking: boolean;
+  /** 有单元在洗版：无绿点时以青点呈现（洗版专属色，与详情页同源）。 */
+  upgrading?: boolean;
 }
 
 /**
@@ -61,10 +63,13 @@ export interface SubscriptionCollectionMeta {
 export function subscriptionCollectionMeta(
   sub: Pick<
     Subscription,
-    "follow_future" | "media" | "season_collection" | "selected_seasons" | "status"
+    "follow_future" | "media" | "progress" | "season_collection" | "selected_seasons" | "status"
   >,
 ): SubscriptionCollectionMeta | undefined {
   if (sub.media.kind !== "tv") return undefined;
+  // 洗版中（低密度呈现）：不加文字，只在页脚点位上表达——完结剧本来没有
+  // 绿点，青点占的是空槽位；暂停中的订阅洗版也停着，不亮
+  const upgrading = sub.status !== "paused" && (sub.progress.upgrading ?? 0) > 0;
 
   const allSeasons = sub.season_collection
     .filter((season) => season.season_number > 0)
@@ -102,6 +107,7 @@ export function subscriptionCollectionMeta(
           ? "待播出"
           : `${latest.owned_count} / ${total}`,
       tracking: sub.status === "active",
+      upgrading,
     };
   }
 
@@ -112,6 +118,7 @@ export function subscriptionCollectionMeta(
     label: scoped.length === 1 ? `第 ${scoped[0].season_number} 季` : `共 ${scoped.length} 季`,
     value: owned >= total ? `${total} 集全` : `${owned} / ${total}`,
     tracking: false,
+    upgrading,
   };
 }
 

@@ -130,6 +130,11 @@ class RuleSetSpec(BaseModel):
         description="洗版目标分辨率；None=取 resolutions 首选（都缺省则 1080p，"
         "保守缺省避免把用户意外带进 4K 的磁盘占用）",
     )
+    upgrade_keep_old: bool = Field(
+        default=False,
+        description="洗到新版本后保留旧版本（多版本共存，收藏家模式）；"
+        "缺省 False=旧版本进回收站（library-file-recycle.md §9）",
+    )
 
     # -- 预留（本期不消费，字段先占位保证 spec 向前兼容）--------------------
     sites: list[str] = Field(

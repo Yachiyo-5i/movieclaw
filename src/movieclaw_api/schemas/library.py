@@ -410,6 +410,19 @@ class LibraryFileView(BaseModel):
     season_number: int
     episode_number: int
     missing: bool = Field(description="文件当前不在磁盘（missing 标记）")
+    # -- 生命周期第三态（docs/design/library-file-recycle.md §7）--------------
+    state: str = Field(
+        default="in_place",
+        description="生命周期：in_place 在位 / missing 缺失 / trashed 待回收",
+    )
+    purge_after: datetime | None = Field(
+        default=None,
+        description="待回收的预计自动清理时间；null 且 trashed = 做种保护，不自动删",
+    )
+    trash_note: str | None = Field(
+        default=None,
+        description="待回收原因（中文整句，含触发方），文件区直接展示",
+    )
     audio_streams: list[AudioStreamView] | None = Field(
         default=None, description="音轨列表；null=尚未探测（ffprobe 缺失或文件不可达）"
     )
@@ -420,6 +433,14 @@ class LibraryFileView(BaseModel):
 
     @field_serializer("added_at")
     def _serialize_utc(self, value: datetime) -> str:
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=UTC)
+        return value.isoformat()
+
+    @field_serializer("purge_after")
+    def _serialize_purge_after(self, value: datetime | None) -> str | None:
+        if value is None:
+            return None
         if value.tzinfo is None:
             value = value.replace(tzinfo=UTC)
         return value.isoformat()

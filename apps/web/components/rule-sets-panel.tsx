@@ -280,7 +280,9 @@ export function specSummary(spec: RuleSetSpec): string[] {
   const chips: string[] = [];
   if (spec.resolutions?.length) chips.push(spec.resolutions.join(" > "));
   const upgradeTarget = upgradeTargetLabel(spec);
-  if (upgradeTarget) chips.push(`洗到 ${upgradeTarget}`);
+  if (upgradeTarget) {
+    chips.push(`洗到 ${upgradeTarget}${spec.upgrade_keep_old ? "（保留旧版）" : ""}`);
+  }
   if (spec.video_codecs?.length) {
     const rest = new Set(spec.video_codecs);
     const labels: string[] = [];
@@ -375,6 +377,7 @@ export function RuleSetEditorDialog({
   const [groupsBlock, setGroupsBlock] = useState((spec.release_groups_block ?? []).join(", "));
   // 洗版目标：""=不洗版（唯一的洗版配置点，docs/design/quality-upgrade.md §8.2）
   const [upgradeSource, setUpgradeSource] = useState<string>(spec.upgrade_source ?? "");
+  const [upgradeKeepOld, setUpgradeKeepOld] = useState<boolean>(spec.upgrade_keep_old ?? false);
   const [cutoffResolution, setCutoffResolution] = useState<string>(
     spec.cutoff_resolution ?? "",
   );
@@ -455,6 +458,7 @@ export function RuleSetEditorDialog({
         }
         next.cutoff_resolution = cutoffResolution;
       }
+      if (upgradeKeepOld) next.upgrade_keep_old = true;
     }
     // API 写入的预留字段（站点白名单）编辑时原样保留，不因 UI 保存而丢失
     if (spec.sites?.length) next.sites = spec.sites;
@@ -576,6 +580,24 @@ export function RuleSetEditorDialog({
                     ? "缺省跟随上方分辨率偏好的第一位"
                     : "未限定分辨率时缺省洗到 1080p（避免意外进入 4K 的磁盘占用）"}
                 </p>
+                {/* 旧版本处置（library-file-recycle.md §9）：配置洗版的那一刻
+                    就是询问旧版去留的合适时机；保留共存服务收藏家场景 */}
+                <label className="mt-2.5 flex cursor-pointer items-center justify-between gap-3 border-t border-white/[0.06] pt-2.5">
+                  <span>
+                    <span className="block text-sub text-[var(--text-muted)]">
+                      洗到新版本后保留旧版本
+                    </span>
+                    <span className="mt-0.5 block text-caption text-[var(--text-faint)]">
+                      多版本共存（收藏家模式）；关闭 = 旧版本进回收站保留 7 天
+                    </span>
+                  </span>
+                  <input
+                    type="checkbox"
+                    checked={upgradeKeepOld}
+                    onChange={(e) => setUpgradeKeepOld(e.target.checked)}
+                    className="size-4 accent-[var(--accent-2)]"
+                  />
+                </label>
               </div>
             )}
           </Field>

@@ -128,6 +128,7 @@ def test_subscriptions_exposes_only_user_intent_commands() -> None:
         "subscriptions.search-missing-resources",
         "subscriptions.set-follow-future",
         "subscriptions.set-tracking-state",
+        "subscriptions.upgrade-run",
         "subscriptions.unsubscribe",
         "subscriptions.update",
     }
@@ -179,6 +180,8 @@ def test_library_exposes_only_semantic_domain_commands() -> None:
         "library.identification.restore-files",
         "library.items.delete",
         "library.items.delete-file",
+        "library.items.purge-file",
+        "library.items.restore-file",
         "library.items.get",
         "library.items.get-transfer-status",
         "library.items.list",

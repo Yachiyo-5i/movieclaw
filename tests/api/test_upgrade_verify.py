@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import os
+
 import pytest
 import pytest_asyncio
 from sqlmodel import select
@@ -14,6 +16,7 @@ from movieclaw_db.migrations import run_migrations
 from movieclaw_db.models import (
     DownloadAttemptStatus,
     FileSource,
+    FileState,
     LibraryFile,
     MediaItem,
     RuleSet,
@@ -26,6 +29,19 @@ from movieclaw_db.models import (
     utcnow,
 )
 from movieclaw_db.repositories.library_repo import LibraryRepository
+
+
+def _write_seeded(path, data: bytes) -> None:
+    """写测试文件并挂一个硬链接副本，模拟推荐的硬链入库形态（st_nlink ≥ 2）。
+
+    做种保护上线后（§7.1：唯一硬链接绝不改名），回收站相关断言都以
+    硬链形态为前提；单链接（原地下载/复制导入）的行为由专门用例覆盖。
+    """
+    path.write_bytes(data)
+    seed_dir = path.parent / ".seed-copies"
+    seed_dir.mkdir(exist_ok=True)
+    os.link(path, seed_dir / f"{len(list(seed_dir.iterdir()))}-{path.name}")
+
 
 _WEBDL = {"resolution": "1080p", "media_source": "WEB-DL"}
 
@@ -41,12 +57,12 @@ async def db(tmp_path, monkeypatch):
     get_settings.cache_clear()
 
 
-async def _seed(db, tmp_path, *, quality=_WEBDL, old_hash="old1"):
+async def _seed(db, tmp_path, *, quality=_WEBDL, old_hash="old1", rule_spec=None):
     """库(真实 tmp 根)/条目/订阅/imported 工单 + 旧版本物理文件。"""
     root = tmp_path / "tv"
     root.mkdir(exist_ok=True)
     old_file = root / "Testshow.S01E01.1080p.WEB-DL.mkv"
-    old_file.write_bytes(b"old")
+    _write_seeded(old_file, b"old")
     async with db.session() as session:
         library = await LibraryRepository(session).create(
             name="剧集库", kind="tv", root_paths=[str(root)]
@@ -55,7 +71,7 @@ async def _seed(db, tmp_path, *, quality=_WEBDL, old_hash="old1"):
             kind="tv", tmdb_id=200, title="测试剧集", original_title="Testshow", year=2024,
             aliases=["Testshow"],
         )
-        rule_set = RuleSet(name="默认", spec={"upgrade_source": "remux"})
+        rule_set = RuleSet(name="默认", spec=rule_spec or {"upgrade_source": "remux"})
         session.add_all([item, rule_set])
         await session.commit()
         await session.refresh(item)
@@ -112,7 +128,7 @@ async def _add_upgrade_delivery(
 ):
     """模拟洗版 attempt + 其下载文件入库：新 library_file 行 + attempt。"""
     new_file = root / "Testshow.S01E01.1080p.REMUX.mkv"
-    new_file.write_bytes(b"new-version")
+    _write_seeded(new_file, b"new-version")
     async with db.session() as session:
         session.add(
             SubscriptionDownloadAttempt(
@@ -274,7 +290,7 @@ async def test_manual_better_file_confirms_without_attempt(db, tmp_path):
     进回收站、info_hash 保持（没有新种子可关联）。"""
     library, item_id, sub_id, wanted_id, root, old_file = await _seed(db, tmp_path)
     manual = root / "Testshow.S01E01.2160p.WEB-DL.mkv"
-    manual.write_bytes(b"manual-4k")
+    _write_seeded(manual, b"manual-4k")
     async with db.session() as session:
         session.add(
             LibraryFile(
@@ -303,7 +319,7 @@ async def test_equal_manual_file_only_collected(db, tmp_path):
     """手工塞入同档文件：仅收编为多版本，不动快照、不触发任何洗版活动。"""
     library, item_id, _sub, wanted_id, root, old_file = await _seed(db, tmp_path)
     dup = root / "Testshow.S01E01.1080p.WEB-DL.DUP.mkv"
-    dup.write_bytes(b"dup")
+    _write_seeded(dup, b"dup")
     async with db.session() as session:
         session.add(
             LibraryFile(
@@ -346,7 +362,7 @@ async def test_no_upgrade_rule_never_touches_files(db, tmp_path):
         rule_set.spec = {}  # 关掉洗版
         await session.commit()
     better = root / "Testshow.S01E01.2160p.WEB-DL.mkv"
-    better.write_bytes(b"manual-4k")
+    _write_seeded(better, b"manual-4k")
     async with db.session() as session:
         session.add(
             LibraryFile(
@@ -464,7 +480,7 @@ async def test_pack_confirm_retains_extra_old_attempts(db, tmp_path):
     library, item_id, sub_id, _w1, root, _old1 = await _seed(db, tmp_path)
     # 第二个单元 E02：独立旧文件 + 独立旧 attempt（old2）
     old_file2 = root / "Testshow.S01E02.1080p.WEB-DL.mkv"
-    old_file2.write_bytes(b"old2")
+    _write_seeded(old_file2, b"old2")
     async with db.session() as session:
         session.add(
             WantedItem(
@@ -518,7 +534,7 @@ async def test_pack_confirm_retains_extra_old_attempts(db, tmp_path):
         )
         for episode in (1, 2):
             new_file = root / f"Testshow.S01E0{episode}.REMUX.mkv"
-            new_file.write_bytes(b"remux")
+            _write_seeded(new_file, b"remux")
             session.add(
                 LibraryFile(
                     library_id=library.id,
@@ -595,7 +611,7 @@ async def test_refuted_residue_file_quarantined_not_reborn(db, tmp_path):
     绝不参与最优选择——否则会借文件名解析"重生"为手工升级。"""
     library, item_id, sub_id, wanted_id, root, old_file = await _seed(db, tmp_path)
     residue = root / "Testshow.S01E01.FAKE.REMUX.mkv"
-    residue.write_bytes(b"fake")
+    _write_seeded(residue, b"fake")
     async with db.session() as session:
         session.add(
             SubscriptionDownloadAttempt(
@@ -641,7 +657,7 @@ async def test_old_pack_attempt_kept_while_serving_other_units(db, tmp_path):
     library, item_id, sub_id, _w1, root, _old1 = await _seed(db, tmp_path, old_hash="packold")
     # E02 也来自同一个旧整季包（info_hash 同为 packold），不参与本次洗版
     old_file2 = root / "Testshow.S01E02.1080p.WEB-DL.mkv"
-    old_file2.write_bytes(b"old2")
+    _write_seeded(old_file2, b"old2")
     async with db.session() as session:
         session.add(
             WantedItem(
@@ -701,3 +717,95 @@ async def test_old_pack_attempt_kept_while_serving_other_units(db, tmp_path):
         ).scalar_one()
         # E02 仍指着旧包 → 旧包保持原状态，不进清理通道
         assert old_pack.status == DownloadAttemptStatus.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_confirm_keeps_single_link_old_file_in_place(db, tmp_path):
+    """做种保护（§7.1）：唯一硬链接的旧文件（原地下载/复制导入形态）不移入
+    回收站——它可能正是下载器做种的原始文件，改名会打断做种。升级照常
+    确认，台账行同步保留（与磁盘一致），活动如实说明。"""
+    library, item_id, sub_id, wanted_id, root, old_file = await _seed(db, tmp_path)
+    # 拆掉硬链接副本，模拟原地下载：old_file 变成唯一副本（st_nlink == 1）
+    for entry in (root / ".seed-copies").iterdir():
+        if entry.name.endswith(old_file.name):
+            entry.unlink()
+    assert old_file.stat().st_nlink == 1
+    await _add_upgrade_delivery(
+        db,
+        sub_id,
+        item_id,
+        library.id,
+        root,
+        claimed_quality={"resolution": "1080p", "media_source": "Blu-ray", "remux": True},
+        probed={"resolution": "1080p", "bit_rate": 30_000_000},
+    )
+    async with db.session() as session:
+        from movieclaw_api.services.subscription.upgrade import verify_upgrades
+
+        await verify_upgrades(session, item_id)
+        wanted = await session.get(WantedItem, wanted_id)
+        assert wanted.info_hash == "new1"  # 升级本身照常确认
+        assert wanted.quality["remux"] is True
+        files = list(
+            (
+                await session.execute(
+                    select(LibraryFile).where(LibraryFile.media_item_id == item_id)
+                )
+            ).scalars()
+        )
+        assert len(files) == 2  # 旧行保留：删了行而文件还在，扫描会重新收编
+        activities = list(
+            (
+                await session.execute(
+                    select(SubscriptionActivity).where(
+                        SubscriptionActivity.subscription_id == sub_id
+                    )
+                )
+            ).scalars()
+        )
+        assert any(a.payload.get("kept_in_place") == 1 for a in activities)
+    assert old_file.exists()  # 文件原位未动，做种不受影响
+
+
+@pytest.mark.asyncio
+async def test_confirm_keep_old_coexists(db, tmp_path):
+    """「保留共存」（upgrade_keep_old，收藏家模式）：升级照常确认，
+    旧版本既不进回收站也不转待回收——两个在位版本并存。"""
+    library, item_id, sub_id, wanted_id, root, old_file = await _seed(
+        db, tmp_path, rule_spec={"upgrade_source": "remux", "upgrade_keep_old": True}
+    )
+    await _add_upgrade_delivery(
+        db,
+        sub_id,
+        item_id,
+        library.id,
+        root,
+        claimed_quality={"resolution": "1080p", "media_source": "Blu-ray", "remux": True},
+        probed={"resolution": "1080p", "bit_rate": 30_000_000},
+    )
+    async with db.session() as session:
+        from movieclaw_api.services.subscription.upgrade import verify_upgrades
+
+        await verify_upgrades(session, item_id)
+        wanted = await session.get(WantedItem, wanted_id)
+        assert wanted.info_hash == "new1"  # 升级本身照常确认
+        rows = list(
+            (
+                await session.execute(
+                    select(LibraryFile).where(LibraryFile.media_item_id == item_id)
+                )
+            ).scalars()
+        )
+        assert len(rows) == 2
+        assert all(r.state == FileState.IN_PLACE for r in rows)  # 都在位，无待回收
+        activities = list(
+            (
+                await session.execute(
+                    select(SubscriptionActivity).where(
+                        SubscriptionActivity.subscription_id == sub_id
+                    )
+                )
+            ).scalars()
+        )
+        assert any(a.payload.get("kept_coexisting") for a in activities)
+    assert old_file.exists()

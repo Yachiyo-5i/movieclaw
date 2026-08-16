@@ -106,7 +106,7 @@ class DiscoverLibraryProjectionService:
                 )
                 .where(
                     LibraryFile.media_item_id.is_not(None),  # type: ignore[union-attr]
-                    LibraryFile.missing_since.is_(None),  # type: ignore[union-attr]
+                    LibraryFile.in_place(),
                     or_(*identity_filters),
                     *(
                         [LibraryFile.library_id.in_(self._visible_library_ids)]
@@ -147,7 +147,7 @@ class DiscoverLibraryProjectionService:
                 .where(
                     LibraryFile.media_item_id == media_item_id,
                     LibraryFile.media_item_id.is_not(None),  # type: ignore[union-attr]
-                    LibraryFile.missing_since.is_(None),  # type: ignore[union-attr]
+                    LibraryFile.in_place(),
                     *(
                         [LibraryFile.library_id.in_(self._visible_library_ids)]
                         if self._visible_library_ids is not None

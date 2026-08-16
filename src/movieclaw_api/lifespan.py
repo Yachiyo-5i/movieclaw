@@ -140,6 +140,9 @@ def build_lifespan(settings: Settings):
             from movieclaw_api.services.library import (  # noqa: F401  监听导入与对账任务注册
                 ingest as library_ingest,
             )
+            from movieclaw_api.services.library import (  # noqa: F401  回收站到期清理与孤儿清扫任务注册
+                recycle as library_recycle,
+            )
             from movieclaw_api.services.library import scan as library_scan  # noqa: F401
             from movieclaw_api.services.subscription import (  # noqa: F401  洗版基线回填任务注册
                 upgrade as subscription_upgrade,

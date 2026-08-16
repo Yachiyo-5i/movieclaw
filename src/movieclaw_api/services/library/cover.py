@@ -68,7 +68,7 @@ async def select_cover_posters(library_id: int) -> list[Path]:
                 )
                 .where(
                     LibraryFile.library_id == library_id,
-                    LibraryFile.missing_since.is_(None),
+                    LibraryFile.in_place(),
                     MediaMetadata.poster_file.is_not(None),
                 )
                 .group_by(MediaMetadata.media_item_id, MediaMetadata.poster_file)

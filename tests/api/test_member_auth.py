@@ -543,6 +543,8 @@ _MEMBER_ALLOWLIST = {
     ("PATCH", "/api/v1/subscriptions/{subscription_id}/tracking-state"),
     ("PATCH", "/api/v1/subscriptions/{subscription_id}/follow-future"),
     ("POST", "/api/v1/subscriptions/{subscription_id}/missing-resource-searches"),
+    # 一轮洗版与「立即搜索」同口径：订阅能力 + 归属校验（路由内 assert_can_manage）
+    ("POST", "/api/v1/subscriptions/{subscription_id}/upgrade-runs"),
 }
 
 # 路径参数哑值（与 test_auth.py 的匿名守护测试保持一致）

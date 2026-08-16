@@ -86,7 +86,7 @@ async def _resolve_units(ref: EntityRef) -> list[playback_state.Unit]:
     async with get_database().session() as session:
         q = select(LibraryFile.season_number, LibraryFile.episode_number).where(
             LibraryFile.media_item_id == ref.entity_id,
-            LibraryFile.missing_since.is_(None),
+            LibraryFile.in_place(),
         )
         rows = list((await session.execute(q)).all())
         if not rows and ref.kind in (EntityKind.ITEM, EntityKind.SEASON):
@@ -117,7 +117,7 @@ async def _unit_runtime_ms(unit: playback_state.Unit) -> int | None:
                         LibraryFile.media_item_id == item_id,
                         LibraryFile.season_number == season,
                         LibraryFile.episode_number == episode,
-                        LibraryFile.missing_since.is_(None),
+                        LibraryFile.in_place(),
                     )
                 )
             ).scalars()

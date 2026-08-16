@@ -27,6 +27,21 @@ class FileSource(StrEnum):
     SCANNED = "scanned"  # 存量扫描发现（部署前就在库根路径下的文件）
 
 
+class FileState(StrEnum):
+    """library_file.state 的取值——文件生命周期的**唯一判别式**
+    （docs/design/library-file-recycle.md §2）。
+
+    在此之前"在位/缺失"靠 ``missing_since`` 判空推导，每个消费方各自手写
+    条件；状态显式化后查询一律看 ``state``，时间戳降级为状态附属属性。
+    状态迁移只允许经三个写路径：扫描对账（in_place ⇄ missing）、回收服务
+    （in_place ⇄ trashed）、清理任务（trashed → 删行）。
+    """
+
+    IN_PLACE = "in_place"  # 在位：文件在 file_path 上，正常参与一切口径
+    MISSING = "missing"  # 缺失：对账发现文件意外消失（missing_since 记时间）
+    TRASHED = "trashed"  # 待回收：主动移除，等待清理/恢复（trashed_at 记时间）
+
+
 class UnidentifiedCode(StrEnum):
     """识别失败的**分类**（``unidentified_reason`` 是给人看的整句，这是给
     机器用的分类）。
@@ -90,7 +105,7 @@ class LibraryFile(TimestampMixin, table=True):
         Index(
             "ix_library_file_browse_unit",
             "library_id",
-            "missing_since",
+            "state",
             "media_item_id",
             "season_number",
             "episode_number",
@@ -102,6 +117,14 @@ class LibraryFile(TimestampMixin, table=True):
     )
 
     id: int | None = Field(default=None, primary_key=True)
+
+    @classmethod
+    def in_place(cls):
+        """库存默认口径（library-file-recycle.md §6）：只算在位文件。
+
+        全站共享的唯一判别——将来再加状态，所有消费方零改动。
+        """
+        return cls.state == FileState.IN_PLACE
 
     library_id: int = Field(
         sa_column=Column(
@@ -190,9 +213,52 @@ class LibraryFile(TimestampMixin, table=True):
         description="首次入账批次；NULL=旧数据或旧版本写入",
     )
 
-    missing_since: datetime | None = Field(
-        default=None, description="对账发现文件消失的时间；NULL=在位"
+    # -- 生命周期（docs/design/library-file-recycle.md）----------------------
+    # state 是唯一判别式；missing_since / trashed_at 是状态附属时间戳，
+    # 只在对应状态下有意义。file_path 恒为**当前物理位置**（全站不变量：
+    # 缺失检测、ETag、播放都依赖它）——移入回收站时 file_path 更新为回收站
+    # 内路径，原路径存 trash_original_path 供恢复。
+    state: str = Field(
+        default=FileState.IN_PLACE,
+        index=True,
+        description="生命周期：in_place 在位 / missing 缺失 / trashed 待回收",
     )
+    missing_since: datetime | None = Field(
+        default=None, description="对账发现文件消失的时间；仅 state=missing 时有意义"
+    )
+    trashed_at: datetime | None = Field(
+        default=None, description="进入待回收的时间；仅 state=trashed 时有意义"
+    )
+    # NULL 且 state=trashed = 做种保护形态：文件仍在原位（file_path 未变）
+    trash_original_path: str | None = Field(
+        default=None,
+        sa_column=Column(Text, nullable=True),
+        description="移入回收站前的原路径（恢复用）；NULL=文件未被移动（原地待回收）",
+    )
+    purge_after: datetime | None = Field(
+        default=None, description="预计自动删除时间；NULL=不自动删（做种保护/等联动）"
+    )
+    trash_context: dict | None = Field(
+        default=None,
+        sa_column=Column(_NullableJson, nullable=True),
+        description="待回收审计快照：{reason, trigger:{kind,id,label}, note}",
+    )
+
+    def mark_missing(self, since: datetime | None = None) -> None:
+        """对账标缺失：只作用于在位行——待回收行的文件去留由清理任务收敛，
+        缺失检测不得覆盖待回收状态（复活防线）。"""
+        from movieclaw_db.models.base import utcnow
+
+        if self.state == FileState.IN_PLACE:
+            self.state = FileState.MISSING
+            self.missing_since = since or utcnow()
+
+    def revive(self) -> None:
+        """对账发现文件回来了：只把缺失行复位为在位——待回收行保持待回收
+        （扫描按路径命中它时只更新探测属性，不复活状态）。"""
+        if self.state == FileState.MISSING:
+            self.state = FileState.IN_PLACE
+            self.missing_since = None
 
     # 用户在待识别清单点过「忽略」的时间；NULL=没忽略过。
     # 语义是**永久**的"别再问我这个文件"：花絮/预告/自录内容在 TMDB 本就

@@ -311,7 +311,8 @@ class ProgressView(BaseModel):
     grabbed: int
     downloaded: int
     imported: int
-    # 已入库但仍在洗版中的单元数（详情视图计算；列表视图恒为 0，前端不消费）
+    # 已入库但仍在洗版中的单元数。详情视图随 _wanted_upgrades 计算；
+    # 列表路由用 upgrading_counts 批量补算（海报墙青点），两处同口径
     upgrading: int = 0
 
 

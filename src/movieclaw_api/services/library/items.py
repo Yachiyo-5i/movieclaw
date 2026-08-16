@@ -58,7 +58,7 @@ from movieclaw_api.services.library.nfo import (
 from movieclaw_api.services.library.sort_key import title_initial, title_sort_key
 from movieclaw_api.services.media_probe import probe_media
 from movieclaw_api.services.media_scrape import asset_version, file_version
-from movieclaw_db.models import Library, LibraryFile, MediaItem, MediaSeason, utcnow
+from movieclaw_db.models import FileState, Library, LibraryFile, MediaItem, MediaSeason, utcnow
 from movieclaw_db.repositories.library_repo import LibraryRepository
 from movieclaw_media.models import MediaKind
 
@@ -158,7 +158,7 @@ class _FileFacts(NamedTuple):
     episode_number: int
     size_bytes: int
     resolution: str | None
-    missing_since: datetime | None
+    state: str
     created_at: datetime
     added_batch_id: str | None
     # 尚未探出介质规格（audio_streams IS NULL 在 SQL 里算好，不取 JSON 本体）
@@ -318,7 +318,7 @@ async def _wall_page_ids(
                     LibraryFile.library_id == library_id,
                     LibraryFile.media_item_id.is_not(None),  # type: ignore[union-attr]
                     LibraryFile.audio_streams.is_(None),  # type: ignore[union-attr]
-                    LibraryFile.missing_since.is_(None),  # type: ignore[union-attr]
+                    LibraryFile.in_place(),
                     LibraryFile.file_path.not_like(f"%{STRM_EXT}"),  # type: ignore[union-attr]
                 )
                 .distinct()
@@ -390,7 +390,7 @@ async def _aggregate_wall_views(
                 LibraryFile.episode_number,
                 LibraryFile.size_bytes,
                 LibraryFile.resolution,
-                LibraryFile.missing_since,
+                LibraryFile.state,
                 LibraryFile.created_at,
                 LibraryFile.added_batch_id,
                 # strm 占位文件永远探不出规格，不算「待补探」
@@ -460,7 +460,7 @@ async def _aggregate_wall_views(
         season_episode_counts = season_episode_counts_by_item.get(item.id, {})  # type: ignore[arg-type]
         units = {(f.season_number, f.episode_number) for f in files}
         available_units = {
-            (f.season_number, f.episode_number) for f in files if f.missing_since is None
+            (f.season_number, f.episode_number) for f in files if f.state == FileState.IN_PLACE
         }
         latest_file = max(files, key=lambda file: file.created_at)
         recent_addition: LibraryRecentAdditionView | None = None
@@ -525,7 +525,7 @@ async def _aggregate_wall_views(
             seasons=sorted({s for s, _ in units if item.kind == "tv"}),
             episode_count=len(units) if item.kind == "tv" else 0,
             resolutions=sorted({f.resolution for f in files if f.resolution}, reverse=True),
-            missing_count=sum(1 for f in files if f.missing_since is not None),
+            missing_count=sum(1 for f in files if f.state == FileState.MISSING),
             air_status=derive_air_status(item.status) if item.kind == "tv" else None,
             missing_episode_count=missing_episodes,
             added_at=latest_file.created_at,
@@ -536,7 +536,9 @@ async def _aggregate_wall_views(
                 else None
             ),
             # 缺失文件不算「待补探」：文件都不在了，探不是「还没轮到」而是「探不了」
-            probe_pending_count=sum(1 for f in files if f.unprobed and f.missing_since is None),
+            probe_pending_count=sum(
+                1 for f in files if f.unprobed and f.state == FileState.IN_PLACE
+            ),
         )
     # 顺序以调用方给定的 ordered_ids 为准，不在这里二次排序
     return [by_id[i] for i in ordered_ids if i in by_id]
@@ -672,7 +674,7 @@ async def build_item_detail(
 
     external: dict[int, list[str]] = {}
     for row in files:
-        if row.missing_since is not None or row.container in ("bluray", "dvd"):
+        if row.state != FileState.IN_PLACE or row.container in ("bluray", "dvd"):
             continue
         assert row.id is not None
         external[row.id] = await asyncio.to_thread(_external_subtitles, Path(row.file_path))
@@ -792,7 +794,7 @@ async def build_season_episodes(
             name=(meta.name if meta else "").strip() or None,
             overview=meta.overview if meta else None,
             air_date=meta.air_date.isoformat() if meta and meta.air_date else None,
-            owned=any(row.missing_since is None for row in rows),
+            owned=any(row.state == FileState.IN_PLACE for row in rows),
             file_ids=[row.id for row in rows if row.id is not None],
         )
         # 剧照：本地资产 → TMDB 图床（经前端缓存代理）
@@ -809,7 +811,7 @@ async def build_season_episodes(
                 info.still_url = f"{image_base}/w300{meta.still_path}"
         # 本地优先：分集 NFO 的标题/简介、同名 -thumb 缩略图（取首个在位文件）
         for row in rows:
-            if row.missing_since is not None:
+            if row.state != FileState.IN_PLACE:
                 continue
             video = Path(row.file_path)
             nfo = await asyncio.to_thread(read_episode_metadata, video.with_suffix(".nfo"))
@@ -1069,7 +1071,7 @@ async def backfill_streams(
             row.audio_streams is not None
             and not needs_clpi
             and not needs_visual_details
-        ) or row.missing_since is not None:
+        ) or row.state != FileState.IN_PLACE:
             if not await keep_going():
                 break
             continue
@@ -1173,6 +1175,14 @@ async def delete_item_files(
 
     for row in files:
         path = Path(row.file_path)
+        if row.state == FileState.MISSING:
+            continue  # 无磁盘实体，最后统一清账
+        if row.state == FileState.TRASHED:
+            # 待回收行按单文件清理：moved 形态的路径在 .movieclaw-trash 里，
+            # 绝不能让回收站目录被当作条目目录整删（会卷走其他条目的回收文件）
+            assert row.id is not None
+            files_to_remove[row.id] = path
+            continue
         entry = entry_dir_of(roots, path)
         if entry is None and row.container in ("bluray", "dvd"):
             entry = path  # 直接躺在根下的原盘目录：目录本身就是条目
@@ -1209,9 +1219,10 @@ async def delete_item_files(
             deleted_row_ids.add(row_id)
             result.freed_bytes += row.size_bytes
 
-    # missing 行没有磁盘实体，账直接清
+    # 缺失行没有磁盘实体，账直接清（待回收行不在此列——它有实体，
+    # 删除失败必须保留行，否则"账没了文件还在"，扫描会重新收编）
     for row in files:
-        if row.missing_since is not None:
+        if row.state == FileState.MISSING:
             assert row.id is not None
             deleted_row_ids.add(row.id)
 
@@ -1260,7 +1271,7 @@ async def delete_single_file(
         )
 
     result = DeleteResult()
-    if row.missing_since is not None:
+    if row.state == FileState.MISSING:
         await session.delete(row)
         result.rows_deleted = 1
         await session.commit()
@@ -1273,6 +1284,19 @@ async def delete_single_file(
     if not _safe_inside_roots(path, roots):
         result.errors.append(f"「{path}」不在库根路径之内，已跳过（不删库外文件）")
         return result
+
+    # 原盘目录形态整树删除前查台账：监听导入按站点原始目录结构落盘，
+    # 新版本文件可能就在旧原盘目录里面——rmtree 会把它一起炸掉
+    if path.is_dir():
+        prefix = str(path).rstrip("/") + "/"
+        if any(
+            other.id != row.id and other.file_path.startswith(prefix)
+            for other in all_library_files
+        ):
+            result.errors.append(
+                f"「{path}」目录内还有其他在案文件（可能是新入库的版本），已跳过整目录删除"
+            )
+            return result
 
     ok = await asyncio.to_thread(_remove_file_with_sidecars, path, result)
     if ok:

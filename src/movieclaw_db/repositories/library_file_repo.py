@@ -8,7 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
 from movieclaw_db.models.base import utcnow
-from movieclaw_db.models.library_file import IdentitySource, LibraryFile
+from movieclaw_db.models.library_file import FileState, IdentitySource, LibraryFile
 
 logger = logging.getLogger("movieclaw_db.library_file")
 
@@ -75,7 +75,7 @@ class LibraryFileRepository:
         """缺失清单：文件已不在磁盘（missing_since 非空）的台账行。"""
         stmt = select(LibraryFile).where(
             LibraryFile.library_id == library_id,
-            LibraryFile.missing_since.is_not(None),  # type: ignore[union-attr]
+            LibraryFile.state == FileState.MISSING,
         )
         if media_item_id is not None:
             stmt = stmt.where(LibraryFile.media_item_id == media_item_id)
@@ -130,7 +130,7 @@ class LibraryFileRepository:
             select(LibraryFile.season_number, LibraryFile.episode_number)
             .where(
                 LibraryFile.media_item_id == media_item_id,
-                LibraryFile.missing_since.is_(None),  # type: ignore[union-attr]
+                LibraryFile.in_place(),
             )
             .distinct()
         )
@@ -156,7 +156,7 @@ class LibraryFileRepository:
             )
             .where(
                 LibraryFile.media_item_id.in_(media_item_ids),  # type: ignore[attr-defined]
-                LibraryFile.missing_since.is_(None),  # type: ignore[union-attr]
+                LibraryFile.in_place(),
             )
             .distinct()
         )
@@ -235,7 +235,7 @@ class LibraryFileRepository:
         existing.identity_source = row.identity_source
         existing.resolved_version = row.resolved_version
         existing.review_suggestion = row.review_suggestion
-        existing.missing_since = None  # 再次发现即在位
+        existing.revive()  # 再次发现即在位；待回收行不复活，只更新探测属性
         existing.updated_at = utcnow()
         await self._session.commit()
         return existing
@@ -247,7 +247,7 @@ class LibraryFileRepository:
             return
         row.file_path = file_path
         row.container = container
-        row.missing_since = None
+        row.revive()
         row.updated_at = utcnow()
         await self._session.commit()
 
@@ -274,7 +274,7 @@ class LibraryFileRepository:
         row.library_id = library_id
         row.file_path = file_path
         if not keep_missing:
-            row.missing_since = None
+            row.revive()
         row.updated_at = utcnow()
         await self._session.commit()
 
@@ -348,7 +348,7 @@ class LibraryFileRepository:
         row = await self._session.get(LibraryFile, file_id)
         if row is None:
             return
-        row.missing_since = since or utcnow()
+        row.mark_missing(since)  # 待回收行不受缺失检测覆盖（复活防线）
         row.updated_at = utcnow()
         await self._session.commit()
 
@@ -388,8 +388,8 @@ class LibraryFileRepository:
     async def clear_missing_flag(self, file_id: int) -> None:
         """清除 missing 标记（已忽略的文件回归时用：忽略状态原样保留）。"""
         row = await self._session.get(LibraryFile, file_id)
-        if row is None or row.missing_since is None:
+        if row is None or row.state != FileState.MISSING:
             return
-        row.missing_since = None
+        row.revive()
         row.updated_at = utcnow()
         await self._session.commit()

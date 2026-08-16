@@ -6,7 +6,7 @@
     Season  = media_season（以 library_file 存在的季为准）
     Episode = media_episode ⋈ library_file（(item, season, episode) 数字对）
 
-只输出"有文件"的内容：missing_since 非空或未识别（media_item_id NULL）的
+只输出"有文件"的内容：非在位（state != in_place）或未识别（media_item_id NULL）的
 文件行不进任何列表。复杂 Jellyfin 筛选/排序仍在内存完成；首页高频的
 电影列表、Latest 与播放状态查询先在 SQL 取轻量候选，最后才水合 bundle。
 这样在不牺牲兼容性的前提下避免读取整库详情 JSON。
@@ -300,7 +300,7 @@ async def load_bundles(
 
     file_q = select(LibraryFile).where(
         LibraryFile.media_item_id.in_(item_ids),
-        LibraryFile.missing_since.is_(None),
+        LibraryFile.in_place(),
     )
     if library_id is not None:
         file_q = file_q.where(LibraryFile.library_id == library_id)
@@ -392,7 +392,7 @@ async def latest_unit_candidates(
         .join(MediaItem, MediaItem.id == LibraryFile.media_item_id)
         .where(
             LibraryFile.media_item_id.is_not(None),
-            LibraryFile.missing_since.is_(None),
+            LibraryFile.in_place(),
         )
     )
     if library_id is not None:
@@ -451,7 +451,7 @@ async def resume_unit_candidates(
         LibraryFile.media_item_id == PlaybackState.media_item_id,
         LibraryFile.season_number == PlaybackState.season_number,
         LibraryFile.episode_number == PlaybackState.episode_number,
-        LibraryFile.missing_since.is_(None),
+        LibraryFile.in_place(),
     ]
     if visible_library_ids is not None:
         file_conditions.append(LibraryFile.library_id.in_(visible_library_ids))
@@ -504,7 +504,7 @@ async def next_up_item_ids(
             LibraryFile.media_item_id == PlaybackState.media_item_id,
             LibraryFile.season_number == PlaybackState.season_number,
             LibraryFile.episode_number == PlaybackState.episode_number,
-            LibraryFile.missing_since.is_(None),
+            LibraryFile.in_place(),
         )
         .exists()
     )
@@ -541,7 +541,7 @@ async def movie_library_page(
             LibraryFile.media_item_id == MediaItem.id,
             LibraryFile.season_number == 0,
             LibraryFile.episode_number == 0,
-            LibraryFile.missing_since.is_(None),
+            LibraryFile.in_place(),
         )
         .exists()
     )
@@ -574,7 +574,7 @@ async def item_ids_with_files(
     可见库（None=不受限）——跨库递归查询的可见性收口点。"""
     q = (
         select(LibraryFile.media_item_id)
-        .where(LibraryFile.media_item_id.is_not(None), LibraryFile.missing_since.is_(None))
+        .where(LibraryFile.media_item_id.is_not(None), LibraryFile.in_place())
         .distinct()
     )
     if library_id is not None:

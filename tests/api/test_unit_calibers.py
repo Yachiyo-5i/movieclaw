@@ -14,7 +14,7 @@ import pytest_asyncio
 from movieclaw_api.core.config import get_settings
 from movieclaw_db.engine import dispose_db, get_database, init_db
 from movieclaw_db.migrations import run_migrations
-from movieclaw_db.models import LibraryFile, MediaItem, MediaSeason
+from movieclaw_db.models import FileState, LibraryFile, MediaItem, MediaSeason
 from movieclaw_db.models.base import utcnow
 from movieclaw_db.models.media_metadata import MediaEpisode
 from movieclaw_db.repositories.library_file_repo import LibraryFileRepository
@@ -101,6 +101,7 @@ async def test_aired_and_owned_calibers(db) -> None:
                     season_number=1,
                     episode_number=4,
                     missing_since=utcnow(),
+                    state=FileState.MISSING,
                 ),
             ]
         )

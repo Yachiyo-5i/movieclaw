@@ -2986,3 +2986,90 @@ async def test_unidentified_code_classifies_failures(db, tmp_path, monkeypatch) 
         rows = list((await session.execute(select(LibraryFile))).scalars().all())
     fresh = next(r for r in rows if r.file_path.endswith("S01E02.mkv"))
     assert fresh.unidentified_code == "tmdb_unreachable"
+
+
+async def test_scan_reconciles_rows_inside_disc_dir_by_stat(db, tmp_path) -> None:
+    """原盘内部的存量行（落点避让上线前的嵌套/手动放入）按物理存在性对账：
+    在盘不误标缺失、真消失标缺失、回归自动复活——扫描不进原盘目录，
+    seen 集合恒不含这类行，按 seen 判会误标且永不自愈
+    （docs/design/disc-version-layout.md §4）。"""
+    from movieclaw_db.models import FileSource, FileState
+
+    root = tmp_path / "movies"
+    disc = root / "某电影 (2020)"
+    (disc / "BDMV" / "STREAM").mkdir(parents=True)
+    (disc / "BDMV" / "STREAM" / "00000.m2ts").write_bytes(b"disc")
+    inner = disc / "某电影 (2020).mkv"
+    inner.write_bytes(b"inner")
+    async with db.session() as session:
+        library = await LibraryRepository(session).create(
+            name="电影库", kind="movie", root_paths=[str(root)]
+        )
+
+    await scan_library(library.id)  # 原盘按目录整体收编
+    async with db.session() as session:
+        rows = list((await session.execute(select(LibraryFile))).scalars().all())
+        assert [r.file_path for r in rows] == [str(disc)]  # 扫描不进原盘内部
+        session.add(
+            LibraryFile(
+                library_id=library.id,
+                media_item_id=rows[0].media_item_id,
+                file_path=str(inner),
+                size_bytes=5,
+                source=FileSource.IMPORTED,
+            )
+        )
+        await session.commit()
+
+    await scan_library(library.id)  # 在盘：不因缺席 seen 集合被误标缺失
+    async with db.session() as session:
+        row = (
+            await session.execute(select(LibraryFile).where(LibraryFile.file_path == str(inner)))
+        ).scalar_one()
+        assert row.state == FileState.IN_PLACE
+
+    inner.unlink()
+    await scan_library(library.id)  # 真消失：标缺失
+    async with db.session() as session:
+        row = (
+            await session.execute(select(LibraryFile).where(LibraryFile.file_path == str(inner)))
+        ).scalar_one()
+        assert row.state == FileState.MISSING
+
+    inner.write_bytes(b"inner")
+    await scan_library(library.id)  # 回归：自动复活（upsert 看不见它，靠对账）
+    async with db.session() as session:
+        row = (
+            await session.execute(select(LibraryFile).where(LibraryFile.file_path == str(inner)))
+        ).scalar_one()
+        assert row.state == FileState.IN_PLACE
+
+
+async def test_scan_merges_sibling_version_dirs_into_one_item(db, tmp_path) -> None:
+    """同级版本目录规范（docs/design/disc-version-layout.md §2）：
+    ``标题 (年份) - 标签`` 版本目录（含原盘版本目录）与条目目录识别归并
+    到同一条目——版本共存的单位是条目行集合，与目录无关。"""
+    root = tmp_path / "movies"
+    (root / "某电影 (2020)").mkdir(parents=True)
+    (root / "某电影 (2020)" / "某电影 (2020).mkv").write_bytes(b"a")
+    version = root / "某电影 (2020) - 2160p"
+    version.mkdir()
+    (version / "某电影 (2020).mkv").write_bytes(b"b")
+    disc_version = root / "某电影 (2020) - 4K原盘"
+    (disc_version / "BDMV" / "STREAM").mkdir(parents=True)
+    (disc_version / "BDMV" / "STREAM" / "00000.m2ts").write_bytes(b"c")
+    async with db.session() as session:
+        library = await LibraryRepository(session).create(
+            name="电影库", kind="movie", root_paths=[str(root)]
+        )
+
+    await scan_library(library.id)
+    async with db.session() as session:
+        rows = list((await session.execute(select(LibraryFile))).scalars().all())
+        items = list((await session.execute(select(MediaItem))).scalars().all())
+    assert len(rows) == 3
+    assert all(r.media_item_id is not None for r in rows), [
+        (r.file_path, r.unidentified_reason) for r in rows
+    ]
+    assert len({r.media_item_id for r in rows}) == 1  # 三个版本归并同一条目
+    assert [i.tmdb_id for i in items] == [300]

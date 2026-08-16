@@ -19,7 +19,7 @@ import {
   MoreIcon,
   TrashIcon,
 } from "@/components/icons";
-import { useConfirm } from "@/components/feedback";
+import { useConfirm, useToast } from "@/components/feedback";
 import { Modal } from "@/components/modal";
 import { PosterImage } from "@/components/poster-image";
 import { ReidentifyDialog } from "@/components/reidentify-dialog";
@@ -43,7 +43,9 @@ import {
   getLibraryItemTransferStatus,
   listLibraries,
   previewItemTransfer,
+  purgeLibraryFile,
   refreshItemMetadata,
+  restoreLibraryFile,
   transferLibraryItem,
 } from "@/lib/api/libraries";
 import { useSubscribeEntry } from "@/components/subscribe-entry";
@@ -107,6 +109,7 @@ export function LibraryItemDetailView({
   const router = useRouter();
   const discoveryReturnPath = getDiscoveryReturnPath(returnTo);
   const confirm = useConfirm();
+  const toast = useToast();
   const [detail, setDetail] = useState<LibraryItemDetail | null>(null);
   const [library, setLibrary] = useState<MediaLibrary | null>(null);
   const [failed, setFailed] = useState(false);
@@ -164,6 +167,44 @@ export function LibraryItemDetailView({
     setSelectedTrackFileId(null);
     reload();
   }, [reload]);
+
+  // 待回收行的恢复 / 立即清理（library-file-recycle.md §7）。
+  // 恢复是可逆动作直接执行；清理真删磁盘，做种保护形态额外讲清断种风险
+  const restoreTrashedFile = useCallback(
+    async (file: LibraryItemFile) => {
+      try {
+        await restoreLibraryFile(libraryId, mediaItemId, file.id);
+        toast.success(`「${file.file_name}」已恢复为在位版本`);
+        reload();
+      } catch (e) {
+        toast.error(e instanceof Error ? e.message : "恢复失败，请稍后重试");
+      }
+    },
+    [libraryId, mediaItemId, reload, toast],
+  );
+  const purgeTrashedFile = useCallback(
+    async (file: LibraryItemFile) => {
+      const seeding = !file.purge_after;
+      const ok = await confirm({
+        title: `立即清理「${file.file_name}」？`,
+        description: seeding
+          ? "该文件处于做种保护，可能仍被下载器做种。清理会从磁盘删除文件并可能中断做种任务（PT 站请留意保种要求），此操作不可恢复。"
+          : "将立即从回收站删除该文件，不再等待保留期，此操作不可恢复。",
+        confirmLabel: "立即清理",
+        cancelLabel: "先不",
+        tone: "danger",
+      });
+      if (!ok) return;
+      try {
+        await purgeLibraryFile(libraryId, mediaItemId, file.id);
+        toast.success(`「${file.file_name}」已清理`);
+        reload();
+      } catch (e) {
+        toast.error(e instanceof Error ? e.message : "清理失败，请稍后重试");
+      }
+    },
+    [confirm, libraryId, mediaItemId, reload, toast],
+  );
 
   usePageTitle(detail?.title);
   // 与发现详情页保持同一外链行为：移动端优先唤起豆瓣 App，桌面回落网页。
@@ -240,7 +281,8 @@ export function LibraryItemDetailView({
   const trackFiles = isMovie
     ? detail.files
     : (selectedSeriesEpisode?.files ?? []);
-  const availableTrackFiles = trackFiles.filter((file) => !file.missing);
+  // 音轨/规格只认在位文件：缺失与待回收的版本都不该被当作可播内容展示
+  const availableTrackFiles = trackFiles.filter((file) => file.state === "in_place");
   const selectedTrackFile =
     availableTrackFiles.find((file) => file.id === selectedTrackFileId) ??
     availableTrackFiles[0] ??
@@ -249,7 +291,7 @@ export function LibraryItemDetailView({
   // 帧率、编码、文件大小等技术细节留在文件区。电影概览全部在位版本，
   // 剧集只显示当前集当前文件的画面规格，并随文件选择器同步变化。
   const resolutionSources = isMovie
-    ? detail.files.filter((file) => !file.missing)
+    ? detail.files.filter((file) => file.state === "in_place")
     : selectedTrackFile
       ? [selectedTrackFile]
       : [];
@@ -517,6 +559,8 @@ export function LibraryItemDetailView({
               files={files}
               title="文件"
               onDeleteFile={canManageLibraries ? setDeleteFileTarget : undefined}
+              onRestoreFile={canManageLibraries ? restoreTrashedFile : undefined}
+              onPurgeFile={canManageLibraries ? purgeTrashedFile : undefined}
             />
           );
         })()}
@@ -1027,7 +1071,8 @@ function MediaTrackRows({
   onSelectedFileIdChange: (fileId: number) => void;
   onChanged?: () => void;
 }) {
-  const availableFiles = files.filter((file) => !file.missing);
+  // 只认在位文件：缺失与待回收的版本都不该出现在音轨/字幕选择器里
+  const availableFiles = files.filter((file) => file.state === "in_place");
   const [previewTarget, setPreviewTarget] = useState<{
     file: LibraryItemFile;
     stream: SubtitleStream;
@@ -1536,10 +1581,15 @@ function FileSection({
   files,
   title,
   onDeleteFile,
+  onRestoreFile,
+  onPurgeFile,
 }: {
   files: LibraryItemFile[];
   title: string;
   onDeleteFile?: (file: LibraryItemFile) => void;
+  /** 待回收行的恢复/立即清理（library-file-recycle.md §7）；未传则只读展示 */
+  onRestoreFile?: (file: LibraryItemFile) => void;
+  onPurgeFile?: (file: LibraryItemFile) => void;
 }) {
   return (
     <section>
@@ -1555,6 +1605,8 @@ function FileSection({
             key={file.id}
             file={file}
             onDelete={onDeleteFile ? () => onDeleteFile(file) : undefined}
+            onRestore={onRestoreFile ? () => onRestoreFile(file) : undefined}
+            onPurge={onPurgeFile ? () => onPurgeFile(file) : undefined}
           />
         ))}
       </div>
@@ -1562,12 +1614,28 @@ function FileSection({
   );
 }
 
+/** 待回收行的倒计时文案：直读 purge_after，展示精度与清理周期无关。 */
+function purgeCountdown(purgeAfter: string | null): string {
+  if (!purgeAfter) return "做种保护中，不自动清理";
+  const ms = new Date(purgeAfter).getTime() - Date.now();
+  if (ms <= 0) return "即将自动清理";
+  const days = Math.floor(ms / 86_400_000);
+  const hours = Math.floor((ms % 86_400_000) / 3_600_000);
+  if (days > 0) return `预计 ${days} 天 ${hours} 小时后自动清理`;
+  if (hours > 0) return `预计 ${hours} 小时后自动清理`;
+  return "预计 1 小时内自动清理";
+}
+
 function FileRow({
   file,
   onDelete,
+  onRestore,
+  onPurge,
 }: {
   file: LibraryItemFile;
   onDelete?: () => void;
+  onRestore?: () => void;
+  onPurge?: () => void;
 }) {
   // 每个物理文件独立展开，多版本无需再维护额外的版本切换状态。
   const [expanded, setExpanded] = useState(false);
@@ -1605,7 +1673,13 @@ function FileRow({
             }
             maxWidth={520}
           >
-            <span className="min-w-0 truncate text-sub">{file.file_name}</span>
+            <span
+              className={`min-w-0 truncate text-sub ${
+                file.state === "trashed" ? "text-[var(--text-faint)] line-through" : ""
+              }`}
+            >
+              {file.file_name}
+            </span>
           </Tooltip>
         </button>
         {file.missing && (
@@ -1613,7 +1687,30 @@ function FileRow({
             文件缺失
           </span>
         )}
-        {onDelete && (
+        {file.state === "trashed" && (
+          <span className="shrink-0 rounded border border-white/15 px-1.5 py-px text-micro text-[var(--text-faint)]">
+            待回收
+          </span>
+        )}
+        {file.state === "trashed" && onRestore && (
+          <button
+            type="button"
+            onClick={onRestore}
+            className="shrink-0 rounded-md px-2 py-1 text-caption font-medium text-[var(--text-muted)] transition hover:bg-white/[0.06] hover:text-white"
+          >
+            恢复
+          </button>
+        )}
+        {file.state === "trashed" && onPurge && (
+          <button
+            type="button"
+            onClick={onPurge}
+            className="shrink-0 rounded-md px-2 py-1 text-caption font-medium text-[var(--text-faint)] transition hover:bg-white/[0.06] hover:text-[#ff9f9f]"
+          >
+            立即清理
+          </button>
+        )}
+        {file.state !== "trashed" && onDelete && (
           <button
             type="button"
             aria-label="删除此文件"
@@ -1625,6 +1722,12 @@ function FileRow({
           </button>
         )}
       </div>
+      {file.state === "trashed" && (
+        <p className="-mt-1 px-10 pb-2 text-caption leading-5 text-[var(--text-faint)] max-md:px-4">
+          {purgeCountdown(file.purge_after)}
+          {file.trash_note ? ` · ${file.trash_note}` : ""}
+        </p>
+      )}
       {expanded && (
         <div
           id={detailsId}
