@@ -129,6 +129,18 @@ def _expected_arrival_day(candidates: tuple[date | None, ...], today: date) -> d
     return min(upcoming) if upcoming else None
 
 
+def _focus_day_rows(
+    rows: list[TodayArrivalCandidate], today: date
+) -> list[TodayArrivalCandidate]:
+    """今天优先：今天有安排就只留今天，否则只留最近一个有安排的日子。"""
+    focus = (
+        today
+        if any(row.expected_day == today for row in rows)
+        else min((row.expected_day for row in rows), default=None)
+    )
+    return [row for row in rows if row.expected_day == focus]
+
+
 def _median_pipeline_minutes(
     rows: list[WantedItem],
     *,
@@ -898,9 +910,11 @@ class SubscriptionService:
         下载中的实时 ETA 由 Web 已有的全局下载快照进一步覆盖。
 
         **今天优先**：候选先按 ``today .. today + _UPCOMING_WINDOW_DAYS`` 收集，
-        今天有安排就只回今天，否则只回窗口内最近一个有安排的日子。首页因此
-        永远只讲“下一次是什么时候”，既不会在订阅少时空着，也不会退化成一张
-        七天流水账；返回值天然共享同一个 ``expected_day``。
+        再**按媒体类型各自**收敛到一个焦点日——今天有安排就只回今天，否则只回
+        窗口内最近一个有安排的日子。首页因此永远只讲“下一次是什么时候”，既不会
+        在订阅少时空着，也不会退化成一张七天流水账。按类型分开收敛是因为首页的
+        分区切换就是按类型分的：混在一起收敛会让“电影今天在下载”顶掉“剧集三天后
+        更新”，切到剧集分区就只剩一句并不成立的“接下来一周没有更新”。
 
         **电影只在管道内纳入**：电影没有播出日，未投递时给不出可信的预告时间，
         常年在找资源的电影会天天占据首页；已投递/已下载的电影则和剧集一样，
@@ -981,13 +995,16 @@ class SubscriptionService:
                     )
                 )
 
-        # 今天优先收敛：只留下焦点日，避免首页把一周的安排一次性倒给用户。
-        focus_day = (
-            today
-            if any(row.expected_day == today for row in candidates)
-            else min((row.expected_day for row in candidates), default=None)
-        )
-        candidates = [row for row in candidates if row.expected_day == focus_day]
+        # 今天优先收敛：只留焦点日，避免首页把一周的安排一次性倒给用户。
+        # 按媒体类型各算一次——首页的分区切换正是按类型分的，混在一起收敛会让
+        # “电影今天在下载”顶掉“剧集三天后更新”，用户切到剧集分区就会看到一句
+        # 并不成立的“接下来一周没有更新”。前端过滤完当前分区后再收敛到最近一天。
+        by_kind: dict[str, list[TodayArrivalCandidate]] = {}
+        for row in candidates:
+            by_kind.setdefault(row.media.kind, []).append(row)
+        candidates = [
+            row for rows_of_kind in by_kind.values() for row in _focus_day_rows(rows_of_kind, today)
+        ]
 
         status_order = {
             WantedStatus.DOWNLOADED: 0,

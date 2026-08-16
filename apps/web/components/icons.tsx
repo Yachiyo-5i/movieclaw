@@ -88,6 +88,13 @@ export const ClockIcon = (p: IconProps) => (
   </Base>
 );
 
+export const CalendarIcon = (p: IconProps) => (
+  <Base {...p}>
+    <rect x="3.5" y="5" width="17" height="15" rx="2" />
+    <path d="M3.5 10h17M8 3.5V6M16 3.5V6" />
+  </Base>
+);
+
 export const CompassIcon = (p: IconProps) => (
   <Base {...p}>
     <circle cx="12" cy="12" r="8.5" />

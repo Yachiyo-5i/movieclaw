@@ -329,6 +329,20 @@ test("未来预告没有可用时刻时退到播出日期，而不是一句时�
   assert.equal(result.timeLabel, "1月4日 播出");
 });
 
+test("几天后的预告不写只有时分的探测时刻，避免被当成今天", () => {
+  const result = todayArrivalPresentation(
+    todayArrival({
+      expected_day: "2030-01-04",
+      days_ahead: 3,
+      next_probe_at: "2030-01-04T13:30:00Z",
+    }),
+    undefined,
+    new Date("2030-01-01T10:00:00Z"),
+  );
+
+  assert.equal(result.timeLabel, "1月4日 播出");
+});
+
 test("电影不展示 S00E00 哨兵季集号", () => {
   const groups = groupTodayArrivals([
     presented(

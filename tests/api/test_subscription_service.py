@@ -735,6 +735,27 @@ async def test_today_arrivals_includes_movie_only_inside_pipeline(db) -> None:
     assert arrivals[0].days_ahead == 0  # 管道内的内容随时可能落地，归入今天
 
 
+async def test_today_arrivals_keeps_focus_day_per_media_kind(db) -> None:
+    """电影今天在下载，不能顶掉剧集三天后的更新——首页分区是按类型切的。
+
+    回归背景：焦点日曾经跨类型只算一次，用户切到剧集分区会看到一句并不成立的
+    "接下来一周没有更新"，而实际上三天后就有。
+    """
+    async with db.session() as session:
+        service = _service(session)
+        movie = await service.create(MediaKind.MOVIE, 100)
+        await service.create(MediaKind.TV, 202, selected_seasons=[1])
+
+        wanted = (await _wanted_of(session, movie.id))[0]
+        wanted.info_hash = "b" * 40
+        await _mark(session, wanted, WantedStatus.GRABBED)
+
+        arrivals = await service.today_arrivals()
+
+    by_title = {row.media.title: row.days_ahead for row in arrivals}
+    assert by_title == {"测试电影": 0, "本周更新剧集": 3}
+
+
 async def test_today_arrivals_ignores_overdue_episodes(db) -> None:
     """早该播出却没抓到的旧集属于详情页的缺口清单，不该当成未来安排预告。"""
     async with db.session() as session:

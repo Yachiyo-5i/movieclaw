@@ -321,15 +321,18 @@ export function todayArrivalPresentation(
 }
 
 /**
- * 还给不出入库时刻时的兜底文案，按信息量从高到低退：
- * 下次探测时刻（让用户看到系统在动）→ 播出日期（未来预告至少有个日子）→ 待更新。
+ * 还给不出入库时刻时的兜底文案，尽量比一句“时间待更新”多说一点。
+ *
+ * 隔天的预告只到“日”这个粒度：探测时刻只有时分，写在几天后的行上会被当成
+ * 今天的时刻误读，所以未来行先给日期；今天的行才用探测时刻，让用户看到
+ * 系统仍在按计划轮询，而不是停了。
  */
 function pendingTimeLabel(arrival: TodaySubscriptionArrival): string {
-  const nextProbeAt = parsedTime(arrival.next_probe_at);
-  if (nextProbeAt != null) return `${formatClock(new Date(nextProbeAt))} 探测`;
   if (arrival.days_ahead > 0) {
     const day = formatCalendarDay(arrival.expected_day);
     if (day) return `${day} 播出`;
   }
+  const nextProbeAt = parsedTime(arrival.next_probe_at);
+  if (nextProbeAt != null) return `${formatClock(new Date(nextProbeAt))} 探测`;
   return "时间待更新";
 }
