@@ -72,6 +72,10 @@ async def dispatch(
     )
 
     upgrade_rows = upgrade_rows or []
+    if upgrade_rows:
+        # 洗版没有工单认领这道 DB 防线（不改 status），用投递前复查兜住
+        # 被动匹配与搜索 worker 的并发窗口：单元已有在途洗版 attempt 即剔除
+        upgrade_rows = await _filter_upgrade_in_flight(session, subscription, upgrade_rows)
     claimed = await _claim(session, wanted_rows)
     if not claimed and not upgrade_rows:
         return False  # 全部被另一条路径抢先，本候选无事可做
@@ -495,6 +499,41 @@ async def preview_dispatch_route(
         "ok": ok,
         "warning": warning,
     }
+
+
+async def _filter_upgrade_in_flight(
+    session: AsyncSession,
+    subscription: Subscription,
+    upgrade_rows: list[WantedItem],
+) -> list[WantedItem]:
+    """剔除已有在途洗版 attempt 的单元（洗版投递的并发防线）。"""
+    in_flight: set[tuple[int, int]] = set()
+    attempts = (
+        await session.execute(
+            select(SubscriptionDownloadAttempt).where(
+                SubscriptionDownloadAttempt.subscription_id == subscription.id,
+                SubscriptionDownloadAttempt.purpose == "upgrade",
+                SubscriptionDownloadAttempt.status.in_(  # type: ignore[attr-defined]
+                    (
+                        DownloadAttemptStatus.ACTIVE,
+                        DownloadAttemptStatus.REPLACEMENT_PENDING,
+                        DownloadAttemptStatus.TRIAL,
+                        DownloadAttemptStatus.CLEANUP_PENDING,
+                        DownloadAttemptStatus.COMPLETED,
+                    )
+                ),
+            )
+        )
+    ).scalars()
+    for attempt in attempts:
+        in_flight.update(
+            (int(u[0]), int(u[1]))
+            for u in attempt.units
+            if isinstance(u, list) and len(u) == 2
+        )
+    return [
+        w for w in upgrade_rows if (w.season_number, w.episode_number) not in in_flight
+    ]
 
 
 async def _claim(session: AsyncSession, wanted_rows: list[WantedItem]) -> list[WantedItem]:

@@ -351,6 +351,25 @@ async def _observe_attempt(
 
                 await fail_trial(session, attempt, reason="原订阅工单已由入库或其他流程满足")
                 return False
+        elif attempt.purpose == "upgrade":
+            # 洗版 attempt 的目标单元本来就是 imported（工单不重开），下方
+            # 缺口语义的"工单已闭合→退出观察"判据对它恒真，会在首个巡检
+            # tick 把刚投递的洗版任务错误完结。洗版的完成/证伪由入库验证
+            # 裁决（verify_upgrades 置 IMPORTED/FAILED）；这里只做两件事：
+            # 单元全部退出范围时止损取消，否则继续心跳观察与死种换源
+            from movieclaw_api.services.subscription import upgrade_attempt_wanted_rows
+
+            tracked = await upgrade_attempt_wanted_rows(session, attempt, in_scope_only=False)
+            if tracked and not any(row.in_scope for row in tracked):
+                attempt.status = DownloadAttemptStatus.CANCELLED
+                attempt.next_search_at = None
+                attempt.cleanup_note = (
+                    "关联单元已退出当前订阅范围；保留下载器任务，不再观察或换源"
+                )
+                attempt.updated_at = utcnow()
+                session.add(attempt)
+                await session.commit()
+                return False
         elif not await _attempt_wanted_rows(session, attempt):
             if await _cancel_attempt_if_out_of_scope(session, attempt):
                 return False
@@ -696,6 +715,19 @@ async def _trial_has_open_target(
         for unit in trial.units
         if isinstance(unit, list) and len(unit) == 2
     }
+    if old.purpose == "upgrade":
+        # 洗版换源的目标判定走洗版语义：单元仍 imported 且在范围内、
+        # 且尚未被验证收口（旧源仍处等待替代的活跃态）即为开放
+        from movieclaw_api.services.subscription import upgrade_attempt_wanted_rows
+
+        if old.status not in (
+            DownloadAttemptStatus.ACTIVE,
+            DownloadAttemptStatus.REPLACEMENT_PENDING,
+            DownloadAttemptStatus.COMPLETED,
+        ):
+            return False
+        rows = await upgrade_attempt_wanted_rows(session, old)
+        return any((row.season_number, row.episode_number) in allowed for row in rows)
     rows = await _attempt_wanted_rows(session, old)
     return any((row.season_number, row.episode_number) in allowed for row in rows)
 

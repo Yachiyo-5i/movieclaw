@@ -414,3 +414,46 @@ async def test_mixed_attempt_gap_unit_not_refuted(db, tmp_path):
         ).scalar_one()
         assert wanted.upgrade_verify_failures == 0  # 没有被误证伪
         assert attempt.status == DownloadAttemptStatus.COMPLETED  # 未被打成 FAILED
+
+
+@pytest.mark.asyncio
+async def test_honest_resource_superseded_is_cancelled_not_refuted(db, tmp_path):
+    """诚实资源被抢先 ≠ 证伪：下载期间基线被手工入库的更优版本刷高，
+    洗版结果落地时已不再需要——attempt 收口为 CANCELLED，不计熔断、
+    不进排除清单、不写证伪活动。"""
+    library, item_id, sub_id, wanted_id, root, old_file = await _seed(db, tmp_path)
+    async with db.session() as session:
+        # 基线已被手工 Remux 抢先刷高
+        wanted = await session.get(WantedItem, wanted_id)
+        wanted.quality = {"resolution": "1080p", "media_source": "Blu-ray", "remux": True}
+        await session.commit()
+    # 洗版 attempt 诚实交付了它声称的 Blu-ray 重编码（低于新基线但符合声称）
+    new_file = await _add_upgrade_delivery(
+        db, sub_id, item_id, library.id, root,
+        claimed_quality={"resolution": "1080p", "media_source": "Blu-ray"},
+        probed={"resolution": "1080p", "bit_rate": 15_000_000},
+    )
+    async with db.session() as session:
+        await close_fulfilled_wanted(session, item_id)
+        wanted = await session.get(WantedItem, wanted_id)
+        assert wanted.upgrade_verify_failures == 0  # 不计熔断
+        attempt = (
+            await session.execute(
+                select(SubscriptionDownloadAttempt).where(
+                    SubscriptionDownloadAttempt.info_hash == "new1"
+                )
+            )
+        ).scalar_one()
+        assert attempt.status == DownloadAttemptStatus.CANCELLED  # 不是 FAILED
+        assert "抢先" in (attempt.cleanup_note or "")
+        assert not new_file.exists()  # 不需要的结果仍进回收站
+        acts = list(
+            (
+                await session.execute(
+                    select(SubscriptionActivity).where(
+                        SubscriptionActivity.type == "upgrade_verify_failed"
+                    )
+                )
+            ).scalars()
+        )
+        assert acts == []  # 没有错误的证伪指控

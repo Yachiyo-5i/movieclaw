@@ -566,6 +566,9 @@ async def _try_candidates(
             quality=candidate.attrs.model_dump(exclude_defaults=True),
             hit_and_run=candidate.hit_and_run,
             owned_by_movieclaw=not result.already_exists,
+            # 试用源继承被替换源的投递目的：洗版源的替代仍是洗版投递，
+            # 晋升后入库验证与在途去重才能正确认领它
+            purpose=attempt.purpose,
             status=DownloadAttemptStatus.TRIAL,
             baseline_completed_bytes=0 if not result.already_exists else None,
             last_completed_bytes=0 if not result.already_exists else None,
@@ -637,6 +640,13 @@ async def _current_attempt_wanted(
         for unit in attempt.units
         if isinstance(unit, list) and len(unit) == 2
     }
+    if attempt.purpose == "upgrade":
+        # 洗版 attempt 的目标工单是 imported 行（工单不重开、info_hash 指向
+        # 旧版本），缺口语义的 hash 关联恒空——不分流的话死掉的洗版源
+        # 永远搜得到却投不出替代源
+        from movieclaw_api.services.subscription.upgrade import upgrade_attempt_wanted_rows
+
+        return await upgrade_attempt_wanted_rows(session, attempt)
     rows = list(
         (
             await session.execute(

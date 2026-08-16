@@ -166,6 +166,42 @@ async def fill_snapshots(
 
 
 # ---------------------------------------------------------------------------
+# 洗版 attempt 的工单解析（状态机的关键差异点）
+# ---------------------------------------------------------------------------
+
+
+async def upgrade_attempt_wanted_rows(
+    session: AsyncSession,
+    attempt: SubscriptionDownloadAttempt,
+    *,
+    in_scope_only: bool = True,
+) -> list[WantedItem]:
+    """洗版 attempt 照看的工单：按 attempt.units 定位 **imported** 行。
+
+    缺口语义的关联（``wanted.info_hash == attempt.info_hash ∧ status 在途``）
+    对洗版 attempt 恒为空——工单不重开、info_hash 直到确认前仍指向旧版本。
+    死种巡检 / 试用目标判定 / 换源候选评估凡是要回答"这个 attempt 还在为谁
+    工作"，洗版语义必须走本函数，否则洗版 attempt 会被当成"工单已闭合"
+    错误完结（真实教训：投递后首个巡检 tick 即被打成 IMPORTED）。
+    """
+    units = {
+        (int(u[0]), int(u[1]))
+        for u in attempt.units
+        if isinstance(u, list) and len(u) == 2
+    }
+    if not units:
+        return []
+    conditions = [
+        WantedItem.subscription_id == attempt.subscription_id,
+        WantedItem.status == WantedStatus.IMPORTED,
+    ]
+    if in_scope_only:
+        conditions.append(WantedItem.in_scope.is_(True))  # type: ignore[attr-defined]
+    rows = list((await session.execute(select(WantedItem).where(*conditions))).scalars())
+    return [r for r in rows if (r.season_number, r.episode_number) in units]
+
+
+# ---------------------------------------------------------------------------
 # 入库验证：实测说了算（quality-upgrade.md §6.3）
 # ---------------------------------------------------------------------------
 
@@ -306,11 +342,13 @@ async def verify_upgrades(session: AsyncSession, media_item_id: int) -> None:
             )
         ).scalars()
     )
-    attempt_by_unit: dict[tuple[int, tuple[int, int]], SubscriptionDownloadAttempt] = {}
+    attempts_by_unit: dict[tuple[int, tuple[int, int]], list[SubscriptionDownloadAttempt]] = {}
     for attempt in attempts:
         for u in attempt.units:
             if isinstance(u, list) and len(u) == 2:
-                attempt_by_unit[(attempt.subscription_id, (int(u[0]), int(u[1])))] = attempt
+                attempts_by_unit.setdefault(
+                    (attempt.subscription_id, (int(u[0]), int(u[1]))), []
+                ).append(attempt)
 
     files = list(
         (
@@ -343,11 +381,28 @@ async def verify_upgrades(session: AsyncSession, media_item_id: int) -> None:
     for wanted in rows:
         unit = (wanted.season_number, wanted.episode_number)
         unit_files = files_by_unit.get(unit) or []
-        if len(unit_files) < 2 and (wanted.subscription_id, unit) not in attempt_by_unit:
+        if len(unit_files) < 2 and (wanted.subscription_id, unit) not in attempts_by_unit:
             continue  # 单版本且无在途洗版：没有可裁决的事
         baseline = QualitySnapshot.model_validate(wanted.quality)
         spec = specs.get(wanted.subscription_id)
-        attempt = attempt_by_unit.get((wanted.subscription_id, unit))
+        # 同一单元可能同时挂着旧洗版源（等替换）与试用源两个 attempt：优先
+        # 选与单元文件来源精确对应的那个（site/torrent 匹配），避免把试用源
+        # 交付的文件记到死源头上；无精确匹配时取最新创建的
+        unit_attempts = attempts_by_unit.get((wanted.subscription_id, unit), [])
+        attempt = None
+        for att in sorted(
+            unit_attempts, key=lambda a: (a.created_at or utcnow(), a.id or 0), reverse=True
+        ):
+            if att.site_id and any(
+                f.site_id == att.site_id and f.torrent_id == att.torrent_id
+                for f in files_by_unit.get(unit, [])
+            ):
+                attempt = att
+                break
+        if attempt is None and unit_attempts:
+            attempt = max(
+                unit_attempts, key=lambda a: (a.created_at or utcnow(), a.id or 0)
+            )
         # 混合投递（缺口+洗版同一 attempt）里，缺口单元也在 attempt.units 中，
         # 但它是靠这次投递才入库的——不是洗版目标，绝不能拿它走证伪分支。
         # 判据：单元必须在 attempt 创建之前就已入库，才算该 attempt 要洗的对象
@@ -368,11 +423,14 @@ async def verify_upgrades(session: AsyncSession, media_item_id: int) -> None:
         best_file: LibraryFile | None = None
         best_snapshot: QualitySnapshot | None = None
         best_key: tuple[int, int, int] = (-1, -1, -1)
+        snapshots_by_file: dict[int, QualitySnapshot] = {}
         for file in unit_files:
             name_attrs = None
             if attempt is not None and attempt.quality and _file_from_attempt(file, attempt):
                 name_attrs = QualitySnapshot.model_validate(attempt.quality)
             snapshot = snapshot_from_file(file, name_attrs)
+            if file.id is not None:
+                snapshots_by_file[file.id] = snapshot
             key = (
                 resolution_rank(snapshot.resolution, _NEUTRAL_SPEC) or 0,
                 source_tier(snapshot.media_source, snapshot.remux) or 0,
@@ -476,7 +534,7 @@ async def verify_upgrades(session: AsyncSession, media_item_id: int) -> None:
         elif attempt is not None and any(
             _file_from_attempt(f, attempt) for f in unit_files
         ):
-            # ---- 证伪：洗版投递的文件已入库但实测不构成升级 ----
+            # ---- 洗版投递的文件已入库但不构成升级：区分"造假"与"被抢先" ----
             now = utcnow()
             trash_paths = []
             from_attempt = [f for f in unit_files if _file_from_attempt(f, attempt)]
@@ -489,6 +547,29 @@ async def verify_upgrades(session: AsyncSession, media_item_id: int) -> None:
                     if trashed:
                         trash_paths.append(trashed)
                     await session.delete(file)
+            # 资源是否诚实：投递文件的实测快照没有低于其声称档位 → 资源没
+            # 撒谎，只是基线在下载期间被更优版本（如手工入库）抢先刷高。
+            # 诚实资源不计熔断、不进排除清单、不写证伪活动——错误的惩罚会
+            # 把好资源永久拉黑
+            claimed = QualitySnapshot.model_validate(attempt.quality or {})
+            attempt_measured = [
+                snapshots_by_file[f.id] for f in from_attempt if f.id in snapshots_by_file
+            ]
+            honest = any(not _better(claimed, m, spec) for m in attempt_measured)
+            if honest:
+                attempt.status = DownloadAttemptStatus.CANCELLED
+                attempt.cleanup_note = (
+                    "洗版下载完成时基线已被更优版本抢先，本次结果不再需要；"
+                    "保留下载器任务"
+                )
+                attempt.updated_at = now
+                await session.commit()
+                logger.info(
+                    "洗版抢先收口：条目 #%s %s 的洗版结果已被更优版本取代",
+                    media_item_id,
+                    _unit_text(wanted),
+                )
+                continue
             attempt.status = DownloadAttemptStatus.FAILED
             attempt.cleanup_note = "洗版证伪：实测档位不高于当前版本，候选已排除"
             attempt.updated_at = now

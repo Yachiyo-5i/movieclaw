@@ -45,6 +45,9 @@ from movieclaw_api.services.subscription.release_forecast import (
     next_forecast_probe_times_by_wanted,
     refresh_release_forecasts,
 )
+from movieclaw_api.services.subscription.upgrade import (
+    upgrade_attempt_wanted_rows,
+)
 from movieclaw_api.services.subscription.replacement import (
     fail_trial,
     promote_trial,
@@ -81,6 +84,7 @@ __all__ = [
     "promote_trial",
     "quality_not_lower",
     "reconcile_pending_cleanup",
+    "upgrade_attempt_wanted_rows",
     "upgrade_ready",
     "replacement_backoff",
     "recompute_subscription_status",
