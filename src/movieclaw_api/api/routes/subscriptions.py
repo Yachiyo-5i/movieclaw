@@ -378,7 +378,20 @@ async def get_subscription(
     service = _service(session)
     sub, item, wanted = await service.detail(subscription_id)
     resource_timings = await service.resource_timings(subscription_id)
-    return ok(SubscriptionDetailView.from_detail(sub, item, wanted, resource_timings))
+    # 洗版派生状态需要规则组 spec（解析失败按未配置处理，不阻塞详情页）
+    from movieclaw_db.models import RuleSet
+    from movieclaw_matcher import RuleSetSpec
+
+    rule_spec = None
+    rule_set = await session.get(RuleSet, sub.rule_set_id)
+    if rule_set is not None:
+        try:
+            rule_spec = RuleSetSpec.model_validate(rule_set.spec or {})
+        except ValueError:
+            rule_spec = None
+    return ok(
+        SubscriptionDetailView.from_detail(sub, item, wanted, resource_timings, rule_spec)
+    )
 
 
 @router.get(

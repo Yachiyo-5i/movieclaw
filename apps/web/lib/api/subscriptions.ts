@@ -74,6 +74,20 @@ export interface SubscriptionProgress {
   downloaded: number;
   /** 已整理入库（终态） */
   imported: number;
+  /** 已入库但仍在洗版中的单元数（详情接口计算；列表接口恒为 0） */
+  upgrading: number;
+}
+
+/** 单元的洗版派生状态（见 movieclaw_api WantedUpgradeView）；标签由后端生成。 */
+export interface WantedUpgrade {
+  /** 是否洗版中（可证明低于目标且未熔断） */
+  active: boolean;
+  /** 当前版本档位标签（如「1080p WEB-DL」） */
+  current_label: string;
+  /** 洗版目标档位标签（如「1080p Remux」） */
+  target_label: string;
+  /** 已洗版搜索次数 */
+  search_attempts: number;
 }
 
 export interface Subscription {
@@ -175,6 +189,8 @@ export interface WantedItem {
   imported_at: string | null;
   /** 在途工单锚定的种子 hash；据此与 listActiveSubscriptionDownloads 的进度组对上 */
   info_hash: string | null;
+  /** 洗版派生状态；规则组未配洗版目标或单元未入库时为 null */
+  upgrade: WantedUpgrade | null;
 }
 
 export interface SubscriptionDetail extends Subscription {
@@ -203,6 +219,12 @@ export interface RuleSetSpec {
   subtitle_languages_require?: string[];
   /** 要求的音轨语言（cmn=国语、yue=粤语…）；空=不限 */
   audio_languages_require?: string[];
+  /** 洗版目标片源档；缺省=不洗版（docs/design/quality-upgrade.md §3.2） */
+  upgrade_source?: "web-dl" | "blu-ray" | "remux" | null;
+  /** 洗版目标分辨率；缺省=分辨率偏好首选（都缺省则 1080p），须在 resolutions 内 */
+  cutoff_resolution?: string | null;
+  /** [预留] 站点白名单；空=全部启用站点 */
+  sites?: string[];
 }
 
 export interface RuleSet {
@@ -566,7 +588,10 @@ export interface SubscriptionActivity {
     | "replacement_searched"
     | "replacement_trial"
     | "replacement_promoted"
-    | "replacement_cleanup";
+    | "replacement_cleanup"
+    | "upgrade_grabbed"
+    | "upgraded"
+    | "upgrade_verify_failed";
   message: string;
   payload: Record<string, unknown>;
   created_at: string;

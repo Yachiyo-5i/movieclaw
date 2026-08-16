@@ -311,6 +311,8 @@ class ProgressView(BaseModel):
     grabbed: int
     downloaded: int
     imported: int
+    # 已入库但仍在洗版中的单元数（详情视图计算；列表视图恒为 0，前端不消费）
+    upgrading: int = 0
 
 
 class SubscriptionView(BaseModel):
@@ -474,6 +476,19 @@ class ResourceTimingView(BaseModel):
         )
 
 
+class WantedUpgradeView(BaseModel):
+    """单元的洗版派生状态（docs/design/quality-upgrade.md §8.3/§9）。
+
+    只在"已入库且规则组配置了洗版目标"的单元上出现；标签由后端用统一的
+    档位阶梯生成，前端零拼接直接展示。
+    """
+
+    active: bool = Field(description="是否洗版中（可证明低于目标且未熔断）")
+    current_label: str = Field(description="当前版本档位标签（如「1080p WEB-DL」）")
+    target_label: str = Field(description="洗版目标档位标签（如「1080p Remux」）")
+    search_attempts: int = Field(description="已洗版搜索次数")
+
+
 class WantedView(BaseModel):
     id: int
     season_number: int
@@ -493,6 +508,8 @@ class WantedView(BaseModel):
     grabbed_at: datetime | None
     downloaded_at: datetime | None
     imported_at: datetime | None
+    # 洗版派生状态；规则组未配洗版目标或单元未入库时为 null
+    upgrade: WantedUpgradeView | None = None
 
     @field_serializer(
         "next_search_at", "last_search_at", "grabbed_at", "downloaded_at", "imported_at"
@@ -537,12 +554,14 @@ class SubscriptionDetailView(SubscriptionView):
         item: MediaItem,
         wanted_rows: list[WantedItem],
         resource_timings: dict[tuple[int, int], dict[str, object]] | None = None,
+        rule_spec: object | None = None,
     ) -> SubscriptionDetailView:
         counts: dict[str, int] = {}
         for w in wanted_rows:
             counts[w.status] = counts.get(w.status, 0) + 1
         base = SubscriptionView.from_model(sub, item, counts)
-        return cls(
+        upgrades = _wanted_upgrades(wanted_rows, rule_spec)
+        view = cls(
             **base.model_dump(),
             wanted=[
                 WantedView.from_model(
@@ -552,6 +571,44 @@ class SubscriptionDetailView(SubscriptionView):
                 for w in wanted_rows
             ],
         )
+        for row in view.wanted:
+            row.upgrade = upgrades.get((row.season_number, row.episode_number))
+        view.progress.upgrading = sum(
+            1 for u in upgrades.values() if u is not None and u.active
+        )
+        return view
+
+
+def _wanted_upgrades(
+    wanted_rows: list[WantedItem], rule_spec: object | None
+) -> dict[tuple[int, int], WantedUpgradeView | None]:
+    """按规则组 spec 派生每个已入库单元的洗版状态（后端统一生成标签）。
+
+    规则组未配洗版目标 / spec 无法解析 → 全部 None（前端不显示洗版信息）。
+    """
+    from movieclaw_matcher import (
+        QualitySnapshot,
+        RuleSetSpec,
+        provably_below_cutoff,
+        quality_label,
+        upgrade_target_label,
+    )
+
+    if not isinstance(rule_spec, RuleSetSpec) or rule_spec.upgrade_source is None:
+        return {}
+    target = upgrade_target_label(rule_spec) or ""
+    result: dict[tuple[int, int], WantedUpgradeView | None] = {}
+    for w in wanted_rows:
+        if w.status != "imported" or not w.quality:
+            continue
+        snapshot = QualitySnapshot.model_validate(w.quality)
+        result[(w.season_number, w.episode_number)] = WantedUpgradeView(
+            active=w.in_scope and provably_below_cutoff(snapshot, rule_spec),
+            current_label=quality_label(snapshot),
+            target_label=target,
+            search_attempts=w.search_attempts,
+        )
+    return result
 
 
 class SubscriptionCreateView(BaseModel):

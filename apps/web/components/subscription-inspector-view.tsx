@@ -19,7 +19,7 @@ import { Modal } from "@/components/modal";
 import { PageNav } from "@/components/page-nav";
 import { usePageTitle } from "@/lib/use-page-title";
 import { PosterImage } from "@/components/poster-image";
-import { specSummary } from "@/components/rule-sets-panel";
+import { specSummary, upgradeTargetLabel } from "@/components/rule-sets-panel";
 import { useSubscribeEntry } from "@/components/subscribe-entry";
 import { SubscriptionAdjustDialog } from "@/components/subscription-adjust-dialog";
 import {
@@ -132,10 +132,13 @@ export function SubscriptionInspectorView({ id }: { id: number }) {
     return map;
   }, [downloads]);
 
-  const ruleSetName = useMemo(
-    () => ruleSets.find((r) => r.id === detail?.rule_set_id)?.name ?? `#${detail?.rule_set_id}`,
-    [ruleSets, detail],
-  );
+  const ruleSetName = useMemo(() => {
+    const rs = ruleSets.find((r) => r.id === detail?.rule_set_id);
+    if (!rs) return `#${detail?.rule_set_id}`;
+    // 规则组配了洗版目标时在 fact 里带出（quality-upgrade.md §8.3）
+    const target = upgradeTargetLabel(rs.spec);
+    return target ? `${rs.name} · 洗到 ${target}` : rs.name;
+  }, [ruleSets, detail]);
   usePageTitle(detail?.media.title);
 
   // 兜底态（加载中/失败）也渲染 PageNav（片名未知，末项留空）：向外壳登记
@@ -174,6 +177,15 @@ export function SubscriptionInspectorView({ id }: { id: number }) {
   }
 
   const meta = subscriptionStatusMeta[detail.status];
+  // 复合态（quality-upgrade.md §8.3）：内容收齐了但还有单元在洗更高版本。
+  // 「已收齐」语义不变（洗版不影响完成判定），只在文案上如实补一句
+  const upgradingCount = detail.progress.upgrading ?? 0;
+  const statusLabel =
+    detail.status === "completed" && upgradingCount > 0
+      ? `已收齐 · 洗版中（${upgradingCount}）`
+      : detail.status === "active" && upgradingCount > 0 && detail.progress.wanted === 0
+        ? `${meta.label} · 洗版中（${upgradingCount}）`
+        : meta.label;
   const isMovie = detail.media.kind === "movie";
   const poster = detail.media.poster_url ? cachedImageUrl(detail.media.poster_url) : null;
 
@@ -299,7 +311,7 @@ export function SubscriptionInspectorView({ id }: { id: number }) {
               className="size-1.5 rounded-full shadow-[0_0_0_4px_rgba(255,255,255,0.05)]"
               style={{ backgroundColor: meta.color }}
             />
-            {meta.label}
+            {statusLabel}
           </span>
         </div>
 
@@ -908,6 +920,8 @@ function activityColor(type: SubscriptionActivity["type"]): string {
     case "downloaded":
     case "imported":
     case "replacement_promoted":
+    case "upgrade_grabbed":
+    case "upgraded":
       return "#4ade80";
     case "match_rejected":
     case "dispatch_failed":
@@ -915,6 +929,7 @@ function activityColor(type: SubscriptionActivity["type"]): string {
       return "#f87171";
     case "paused":
     case "download_stalled":
+    case "upgrade_verify_failed":
       return "#f5c451";
     default:
       return "#6aa7ff";
@@ -1143,6 +1158,17 @@ function resourceTimingNote(timing: ResourceTiming | null, previous: boolean): s
 
 function wantedPresentation(w: WantedItem): { label: string; color: string; note: string } {
   if (w.status === "imported") {
+    // 洗版中（quality-upgrade.md §8.3）：已入库但规则组的洗版目标还没达到。
+    // 标签与差距文案由后端统一生成（当前档 → 目标档），前端零拼接
+    if (w.upgrade?.active) {
+      return {
+        label: "洗版中",
+        color: "#2dd4bf",
+        note:
+          `当前 ${w.upgrade.current_label} → 目标 ${w.upgrade.target_label}` +
+          (w.upgrade.search_attempts > 0 ? ` · 已搜 ${w.upgrade.search_attempts} 次` : ""),
+      };
+    }
     return { label: "已入库", color: "#4ade80", note: `入库于 ${formatDateTime(w.imported_at)}` };
   }
   if (w.status === "downloaded") {
