@@ -368,6 +368,73 @@ def test_task_center_aggregates_live_downloads_and_subscription_context(client) 
     ]
 
 
+def test_task_center_manual_task_links_site_torrent_page(client) -> None:
+    """手动下载锚定了站点种子 ID 时，任务中心带回站点身份与种子详情页。"""
+    from movieclaw_db.engine import get_database
+    from movieclaw_db.models import (
+        Library,
+        ManualDownloadIntent,
+        MediaItem,
+        SiteTorrent,
+        TorrentSource,
+    )
+
+    c, _ = client
+    c.post("/api/v1/downloaders", json=_PAYLOAD)
+    info_hash = "f" * 40
+    _fake_torrents.append(
+        TorrentBrief(
+            name="Manual.Movie.2160p",
+            content_name="Manual.Movie.2160p",
+            completed=False,
+            info_hash=info_hash,
+            progress=0.2,
+            state="downloading",
+        )
+    )
+
+    async def seed() -> None:
+        async with get_database().session() as session:
+            media = MediaItem(
+                kind="movie",
+                tmdb_id=54321,
+                title="手动种子页测试",
+                original_title="Manual Page Test",
+            )
+            library = Library(name="手动种子页测试库", kind="movie", root_paths=["/media"])
+            session.add_all([media, library])
+            await session.flush()
+            assert media.id is not None and library.id is not None
+            session.add(
+                ManualDownloadIntent(
+                    info_hash=info_hash,
+                    media_item_id=media.id,
+                    library_id=library.id,
+                    site_id="pt-demo",
+                    torrent_id="777",
+                )
+            )
+            session.add(
+                SiteTorrent(
+                    site_id="pt-demo",
+                    torrent_id="777",
+                    title="Manual.Movie.2160p",
+                    detail_url="https://pt.example.com/details.php?id=777",
+                    source=TorrentSource.LIST,
+                )
+            )
+            await session.commit()
+
+    asyncio.run(seed())
+
+    items = c.get("/api/v1/downloaders/tasks").json()["data"]["items"]
+    assert len(items) == 1
+    assert items[0]["source"] == "manual"
+    assert items[0]["site_id"] == "pt-demo"
+    assert items[0]["site_name"] == "pt-demo"
+    assert items[0]["page_url"] == "https://pt.example.com/details.php?id=777"
+
+
 def test_task_center_degrades_single_downloader_failure(client) -> None:
     """一台下载器读取失败只标记来源异常，不能拖垮其余下载器任务。"""
     c, _ = client

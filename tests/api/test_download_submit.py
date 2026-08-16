@@ -546,6 +546,7 @@ def test_auto_route_submits_to_watch_and_anchors_info_hash(client, monkeypatch) 
         "/api/v1/downloaders/submit",
         json={
             **_SUBMIT,
+            "torrent_id": "8866",
             "auto_route": True,
             "media_kind": "movie",
             "tmdb_id": 9527,
@@ -565,6 +566,8 @@ def test_auto_route_submits_to_watch_and_anchors_info_hash(client, monkeypatch) 
     intent = asyncio.run(load_intent())
     assert intent.info_hash == "a" * 40
     assert intent.library_id == library["id"]
+    # 站点种子 ID 随身份锚落库，任务中心据此反查详情页提供「打开种子页」
+    assert intent.torrent_id == "8866"
 
 
 def test_anchor_sweeps_stale_orphan_intents(client) -> None:

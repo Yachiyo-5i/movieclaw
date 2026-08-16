@@ -211,34 +211,6 @@ async def _relations(
             ),
         }
 
-    # 反查站点种子详情页：投递台账记了 site_id + torrent_id，站点快照索引里
-    # 存有面向浏览器的 detail_url。查不到（快照被淘汰/旧数据）就不给链接。
-    site_pairs = {
-        (meta["_site_id"], meta["_torrent_id"])
-        for meta in subscription_meta.values()
-        if meta.get("_site_id") and meta.get("_torrent_id")
-    }
-    page_urls: dict[tuple[str, str], str] = {}
-    if site_pairs:
-        rows = await session.execute(
-            select(SiteTorrent.site_id, SiteTorrent.torrent_id, SiteTorrent.detail_url).where(
-                or_(
-                    *(
-                        and_(SiteTorrent.site_id == site_id, SiteTorrent.torrent_id == torrent_id)
-                        for site_id, torrent_id in site_pairs
-                    )
-                )
-            )
-        )
-        page_urls = {
-            (site_id, torrent_id): detail_url
-            for site_id, torrent_id, detail_url in rows
-            if detail_url
-        }
-    for meta in subscription_meta.values():
-        if meta.get("_site_id") and meta.get("_torrent_id"):
-            meta["_page_url"] = page_urls.get((meta["_site_id"], meta["_torrent_id"]))
-
     subscriptions: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for key, meta in subscription_meta.items():
         info_hash, _subscription_id = key
@@ -265,6 +237,7 @@ async def _relations(
             "intent_created_at": intent.created_at,
             "library_id": intent.library_id,
             "site_id": intent.site_id,
+            "torrent_id": intent.torrent_id,
             "media_item_id": media.id,
             "media_title": media.title,
             "media_kind": media.kind,
@@ -272,6 +245,42 @@ async def _relations(
         }
         for intent, media in manual_rows
     }
+
+    # 反查站点种子详情页：订阅投递台账与手动身份锚都记了 site_id + torrent_id，
+    # 站点快照索引里存有面向浏览器的 detail_url。查不到（快照未覆盖的老种子
+    # /旧数据）就不给链接，仅少一个跳转入口。
+    subscription_entries = [entry for group in subscriptions.values() for entry in group]
+    site_pairs = {
+        (entry["_site_id"], entry["_torrent_id"])
+        for entry in subscription_entries
+        if entry.get("_site_id") and entry.get("_torrent_id")
+    } | {
+        (entry["site_id"], entry["torrent_id"])
+        for entry in manual.values()
+        if entry.get("site_id") and entry.get("torrent_id")
+    }
+    if site_pairs:
+        rows = await session.execute(
+            select(SiteTorrent.site_id, SiteTorrent.torrent_id, SiteTorrent.detail_url).where(
+                or_(
+                    *(
+                        and_(SiteTorrent.site_id == site_id, SiteTorrent.torrent_id == torrent_id)
+                        for site_id, torrent_id in site_pairs
+                    )
+                )
+            )
+        )
+        page_urls = {
+            (site_id, torrent_id): detail_url
+            for site_id, torrent_id, detail_url in rows
+            if detail_url
+        }
+        for entry in subscription_entries:
+            if entry.get("_site_id") and entry.get("_torrent_id"):
+                entry["_page_url"] = page_urls.get((entry["_site_id"], entry["_torrent_id"]))
+        for entry in manual.values():
+            if entry.get("site_id") and entry.get("torrent_id"):
+                entry["_page_url"] = page_urls.get((entry["site_id"], entry["torrent_id"]))
     return dict(subscriptions), manual
 
 
@@ -483,7 +492,8 @@ def _task_dict(
         "site_name": _site_display_name(site_id),
         "page_url": next(
             (entry["_page_url"] for entry in subscriptions if entry.get("_page_url")), None
-        ),
+        )
+        or (manual or {}).get("_page_url"),
         "resolution": quality.get("resolution"),
         "media_source": quality.get("media_source"),
         "media_item_id": (media or {}).get("media_item_id"),

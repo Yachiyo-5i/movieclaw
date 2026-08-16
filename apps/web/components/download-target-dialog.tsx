@@ -33,6 +33,8 @@ import {
 export interface DownloadTargetRequest {
   site_id: string;
   download_url: string;
+  /** 站点内种子 ID：随提交锚定，任务中心据此提供「打开种子页」 */
+  torrent_id: string;
   /** 解析出的条目身份；三件套不全时为 null（智能入库选项不出现） */
   identity: { kind: "movie" | "tv"; title: string; year: number } | null;
   subtitle: string | null;
@@ -114,6 +116,7 @@ export async function submitRememberedTarget(
   return submitTorrentDownload({
     site_id: request.site_id,
     download_url: request.download_url,
+    torrent_id: request.torrent_id,
     ...libraryPart,
     ...(target.kind === "dir" ? { save_path: target.savePath } : {}),
     ...(target.downloaderId != null ? { downloader_id: target.downloaderId } : {}),
@@ -433,6 +436,7 @@ function DialogContent({
     void submitTorrentDownload({
       site_id: request.site_id,
       download_url: request.download_url,
+      torrent_id: request.torrent_id,
       ...(option.kind === "smart" && identity && manualTarget?.tmdb_id != null
         ? {
             auto_route: true,
