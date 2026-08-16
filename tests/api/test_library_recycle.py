@@ -486,6 +486,53 @@ async def test_delete_single_file_refuses_disc_dir_containing_other_version(db, 
 
 
 @pytest.mark.asyncio
+async def test_item_delete_covers_sibling_version_dirs(db, tmp_path):
+    """同级版本目录规范（docs/design/disc-version-layout.md §2）：整条目
+    删除按行收集条目目录，条目目录与直接躺根下的原盘版本目录都被整删，
+    库根本身不动。"""
+    from movieclaw_api.services.library.items import delete_item_files
+    from movieclaw_db.models import MediaItem
+    from movieclaw_db.models.library import Library
+
+    root = tmp_path / "movies"
+    entry = root / "某电影 (2020)"
+    entry.mkdir(parents=True)
+    (entry / "某电影 (2020).mkv").write_bytes(b"file")
+    disc_version = root / "某电影 (2020) - 4K原盘"
+    (disc_version / "BDMV").mkdir(parents=True)
+    (disc_version / "BDMV" / "index.bdmv").write_bytes(b"disc")
+    async with db.session() as session:
+        library = await LibraryRepository(session).create(
+            name="电影库-版本目录", kind="movie", root_paths=[str(root)]
+        )
+        item = MediaItem(kind="movie", tmdb_id=913, title="某电影", original_title="M", year=2020)
+        session.add(item)
+        await session.flush()
+        rows = []
+        for path, container in ((entry / "某电影 (2020).mkv", "mkv"), (disc_version, "bluray")):
+            row = LibraryFile(
+                library_id=library.id,
+                media_item_id=item.id,
+                file_path=str(path),
+                size_bytes=4,
+                source=FileSource.SCANNED,
+                container=container,
+            )
+            session.add(row)
+            rows.append(row)
+        await session.commit()
+        for row in rows:
+            await session.refresh(row)
+        library_obj = await session.get(Library, library.id)
+        result = await delete_item_files(session, library_obj, item.id, rows, rows)
+        assert result.errors == []
+        assert result.rows_deleted == 2
+    assert not entry.exists()
+    assert not disc_version.exists()
+    assert root.is_dir()  # 库根本身绝不动
+
+
+@pytest.mark.asyncio
 async def test_orphan_sweep_spares_tracked_sidecars(db, tmp_path):
     """孤儿清扫豁免在案主文件的附属文件：字幕随主文件进回收站时 mtime
     保留原值可能早已超期，不能被当孤儿提前扫掉——它归 purge 通道管。"""

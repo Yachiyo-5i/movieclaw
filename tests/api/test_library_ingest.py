@@ -228,6 +228,79 @@ async def test_movie_hardlink_import_and_ledger(db, tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_movie_import_avoids_disc_entry_dir(db, tmp_path, monkeypatch):
+    """入库落点避让（docs/design/disc-version-layout.md §3）：条目目录本身
+    是原盘时，新文件改落同级版本目录 ``标题 (年份) - 标签``，绝不钻进
+    原盘内部（下游播放器丢版本、扫描误标缺失、旧盘清理殃及新文件）。"""
+    root, watch = tmp_path / "movies", tmp_path / "watch"
+    watch.mkdir()
+    library_id = await _make_library(db, kind=MediaKind.MOVIE, root=root)
+    item = await _make_item(db, kind=MediaKind.MOVIE, title="某电影", year=2020)
+    _stub_identify(monkeypatch, item)
+    monkeypatch.setattr(ingest_mod, "probe_media", lambda p: _FAKE_SPEC)
+
+    disc_entry = root / "某电影 (2020)"  # 扁平摆放：条目目录即原盘（生态规范形态）
+    (disc_entry / "BDMV" / "STREAM").mkdir(parents=True)
+    (disc_entry / "BDMV" / "STREAM" / "00000.m2ts").write_bytes(b"disc")
+
+    entry = watch / "Some.Movie.2020.1080p"
+    entry.mkdir()
+    (entry / "some.movie.mkv").write_bytes(b"video")
+
+    await _sweep_twice(db, library_id, watch)
+
+    target = root / "某电影 (2020) - 1080p" / "某电影 (2020).mkv"
+    assert target.exists()
+    assert not (disc_entry / "某电影 (2020).mkv").exists()  # 原盘内部零新增
+    async with db.session() as session:
+        files = list((await session.execute(select(LibraryFile))).scalars().all())
+    assert [f.file_path for f in files] == [str(target)]
+    assert files[0].media_item_id == item.id  # 与原盘版本同条目归并
+
+
+@pytest.mark.asyncio
+async def test_movie_import_reuses_existing_version_dir(db, tmp_path, monkeypatch):
+    """版本目录已存在（同标签再次入库）→ 复用目录，文件级冲突退让兜底。"""
+    root, watch = tmp_path / "movies", tmp_path / "watch"
+    watch.mkdir()
+    library_id = await _make_library(db, kind=MediaKind.MOVIE, root=root)
+    item = await _make_item(db, kind=MediaKind.MOVIE, title="某电影", year=2020)
+    _stub_identify(monkeypatch, item)
+    monkeypatch.setattr(ingest_mod, "probe_media", lambda p: _FAKE_SPEC)
+
+    (root / "某电影 (2020)" / "BDMV").mkdir(parents=True)
+    version_dir = root / "某电影 (2020) - 1080p"
+    version_dir.mkdir()
+    (version_dir / "某电影 (2020).mkv").write_bytes(b"earlier version")
+
+    entry = watch / "Some.Movie.2020.Better"
+    entry.mkdir()
+    (entry / "better.mkv").write_bytes(b"new video")
+
+    await _sweep_twice(db, library_id, watch)
+
+    fallback = version_dir / "某电影 (2020) - 1080p.mkv"  # 冲突退让命名
+    assert fallback.exists()
+    assert (version_dir / "某电影 (2020).mkv").read_bytes() == b"earlier version"
+
+
+def test_avoid_disc_entry_dir_pure(tmp_path):
+    """落点避让纯函数：非原盘原样返回；原盘退同级版本目录；同名版本目录
+    也是原盘时追加序号，绝不落进任何原盘内部。"""
+    base = tmp_path / "某电影 (2020)"
+    (base / "BDMV").mkdir(parents=True)
+    assert ingest_mod._avoid_disc_entry_dir(str(base), "2160p") == str(
+        tmp_path / "某电影 (2020) - 2160p"
+    )
+    (tmp_path / "某电影 (2020) - 2160p" / "VIDEO_TS").mkdir(parents=True)
+    assert ingest_mod._avoid_disc_entry_dir(str(base), "2160p") == str(
+        tmp_path / "某电影 (2020) - 2160p (2)"
+    )
+    plain = tmp_path / "别的电影 (2021)"
+    assert ingest_mod._avoid_disc_entry_dir(str(plain), "2160p") == str(plain)
+
+
+@pytest.mark.asyncio
 async def test_ingest_job_reports_only_files_added_by_current_run(db, tmp_path, monkeypatch):
     """任务中心只展示本 Job 新增的文件，不混入批次里此前已入库的文件。"""
     root, watch = tmp_path / "tv", tmp_path / "watch"

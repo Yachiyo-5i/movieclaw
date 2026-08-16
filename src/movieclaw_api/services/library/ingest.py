@@ -113,12 +113,17 @@ from sqlmodel import select
 
 from movieclaw_api.services import jobs
 from movieclaw_api.services.import_watch_config import rule_target_label
-from movieclaw_api.services.library.config import derive_entry_dir, derive_save_path
+from movieclaw_api.services.library.config import (
+    derive_entry_dir,
+    derive_save_path,
+    sanitize_folder_name,
+)
 from movieclaw_api.services.library.fsops import rename_no_replace
 from movieclaw_api.services.library.layout import (
     IN_PROGRESS_MARKERS,
     VIDEO_EXTS,
     entry_base_name,
+    is_disc_dir,
     season_from_dir,
     trailing_index_episode,
 )
@@ -1368,6 +1373,9 @@ async def _ingest_entry(
             )
             await asyncio.sleep(2)
 
+    # 发布信息以条目名为准（比单集文件名完整），与入库管线的种子名口径一致
+    release_attrs = enrich(entry.name if entry.is_dir() else entry.stem)
+
     if staging is not None:
         # 自定义目录与库入库共用同一命名规范——回流文件名天然规范，
         # 库根扫描识别精准命中，这就是两段链路的全部衔接
@@ -1379,9 +1387,12 @@ async def _ingest_entry(
             return await conclude(
                 IngestStatus.FAILED, f"媒体库「{dest_library.name}」没有配置根路径，无法入库"
             )
-
-    # 发布信息以条目名为准（比单集文件名完整），与入库管线的种子名口径一致
-    release_attrs = enrich(entry.name if entry.is_dir() else entry.stem)
+        # 入库落点避让（docs/design/disc-version-layout.md §3）：条目目录
+        # 本身已是原盘时改落同级版本目录。标签与 _transfer 的版本标签同源
+        version_label = (
+            (spec.resolution if spec else None) or release_attrs.media_source or "V2"
+        )
+        dest_dir = _avoid_disc_entry_dir(dest_dir, version_label)
     base = entry_base_name(item)
     repo = LibraryFileRepository(session)
     assert item.id is not None
@@ -1769,6 +1780,28 @@ def _same_payload(a: Path, b: Path) -> bool:
         return a.stat().st_size == b.stat().st_size
     except OSError:
         return False
+
+
+def _avoid_disc_entry_dir(dest_dir: str, version_label: str) -> str:
+    """入库落点避让：目标条目目录本身已是原盘目录（BDMV/VIDEO_TS）时，
+    改落同级版本目录 ``标题 (年份) - {标签}``（docs/design/disc-version-layout.md §3）。
+
+    生态规范不支持"原盘目录内部再放文件"：嵌套会让下游播放器丢版本、
+    库扫描误标缺失（扫描不进原盘目录）、旧盘清理殃及新文件。判物理不判
+    台账——用户刚手动摆好原盘、扫描还没收编的窗口期也必须避让。
+    """
+    base = Path(dest_dir)
+    if not is_disc_dir(base):
+        return dest_dir
+    label = sanitize_folder_name(version_label)
+    candidate = base.with_name(f"{base.name} - {label}")
+    serial = 2
+    while is_disc_dir(candidate):
+        # 同名版本目录也被手动摆了原盘：追加序号，绝不落进任何原盘内部
+        candidate = base.with_name(f"{base.name} - {label} ({serial})")
+        serial += 1
+    logger.info("目标条目目录是原盘，入库落点避让到同级版本目录：%s → %s", base, candidate)
+    return str(candidate)
 
 
 def _resolve_transfer_target(src: Path, dst: Path, version_label: str) -> Path | None:

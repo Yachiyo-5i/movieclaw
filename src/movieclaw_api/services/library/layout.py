@@ -80,6 +80,16 @@ IN_PROGRESS_MARKERS = (
 )
 
 
+def is_disc_dir(directory: Path) -> bool:
+    """原盘目录判定：蓝光（BDMV）或 DVD（VIDEO_TS）结构。
+
+    扫描（原盘按目录整体入账、不进内部遍历）与监听导入（入库落点避让，
+    docs/design/disc-version-layout.md §3）共用同一判据——放在本模块
+    避免 scan ↔ ingest 的循环导入。
+    """
+    return (directory / "BDMV").is_dir() or (directory / "VIDEO_TS").is_dir()
+
+
 # 季目录名："Season 02" / "S02" / "Specials" / "特别篇"
 _SEASON_DIR = re.compile(r"^(?:season[ ._-]*(\d{1,3})|s(\d{1,3}))$", re.IGNORECASE)
 _SPECIALS_DIR = re.compile(r"^(?:specials?|特别篇|特典)$", re.IGNORECASE)

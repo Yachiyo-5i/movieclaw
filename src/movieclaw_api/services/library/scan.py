@@ -63,6 +63,7 @@ from movieclaw_api.services.library.layout import (
     SCAN_VIDEO_EXTS,
     STRM_EXT,
     entry_dirs,
+    is_disc_dir,
     season_from_dir,
     trailing_index_episode,
 )
@@ -1016,14 +1017,33 @@ async def _scan(
         # upsert_by_path 会自动清除标记。判定须读行上的当前路径而非快照
         # 的旧 key：改名归并（_try_relink）会把行迁到本轮刚遍历过的新路径
         prefixes = [f"{r.rstrip('/')}/" for r in scanned_roots]
+        # 原盘内部的行（存量嵌套/手动放入）：_walk_videos 不进原盘目录，
+        # seen 恒不含它们，按 seen 判会误标缺失且永不自愈——这类行改按
+        # 物理存在性对账（docs/design/disc-version-layout.md §4）。正常库
+        # 这类行为零，逐行 stat 成本可忽略
+        disc_prefixes = [
+            f"{row.file_path.rstrip('/')}/"
+            for row in known.values()
+            if row.container in ("bluray", "dvd")
+        ]
         now = utcnow()
         for row in known.values():
             path_str = row.file_path
-            if row.state != FileState.IN_PLACE or path_str in seen_paths:
+            if path_str in seen_paths:
                 continue
             if not any(path_str.startswith(prefix) for prefix in prefixes):
                 continue
             assert row.id is not None
+            if any(path_str.startswith(dp) for dp in disc_prefixes):
+                exists = Path(path_str).exists()
+                if row.state == FileState.IN_PLACE and not exists:
+                    await repo.mark_missing(row.id, since=now)
+                    summary.marked_missing += 1
+                elif row.state == FileState.MISSING and exists:
+                    await repo.clear_missing_flag(row.id)
+                continue
+            if row.state != FileState.IN_PLACE:
+                continue
             await repo.mark_missing(row.id, since=now)
             summary.marked_missing += 1
 
@@ -1624,11 +1644,6 @@ async def preview_root_path_reconcile(
     return preview
 
 
-def _is_disc_dir(directory: Path) -> bool:
-    """原盘目录判定：蓝光（BDMV）或 DVD（VIDEO_TS）结构。"""
-    return (directory / "BDMV").is_dir() or (directory / "VIDEO_TS").is_dir()
-
-
 def unit_name(file: Path, is_disc: bool) -> str:
     """识别单元的"干净名字"：普通文件去扩展名，原盘目录名**原样保留**。
 
@@ -1697,7 +1712,7 @@ def _walk_videos(
             if entry.is_dir():
                 if name.startswith(".") or name.lower() in _IGNORE_DIRS:
                     continue
-                if _is_disc_dir(entry):
+                if is_disc_dir(entry):
                     yield entry, True
                     continue
                 stack.append(entry)

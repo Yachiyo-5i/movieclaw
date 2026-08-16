@@ -1,6 +1,7 @@
 # 原盘目录与多版本摆放规范（入库落点避让）
 
-> 状态：设计定稿，待实施。
+> 状态：已实施（§3 入库落点避让、§4 扫描存在性对账、§6 测试清单全量落地；
+> `is_disc_dir` 判据已迁至 `layout.py` 公共约定层）。
 > 关联：docs/design/quality-upgrade.md（洗版）、docs/design/library-file-recycle.md（回收）、
 > docs/design/library.md（媒体库总纲）。
 
