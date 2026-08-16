@@ -109,8 +109,8 @@ export function ArtworkPickerDialog({
       </div>
 
       {locked && (
-        <div className="flex items-center justify-between gap-3 border-b border-white/[0.08] bg-[#7dd3fc]/[0.07] px-6 py-2.5 max-md:px-5">
-          <span className="text-sub text-[#7dd3fc]">
+        <div className="flex items-center justify-between gap-3 border-b border-white/[0.08] bg-[var(--info)]/[0.07] px-6 py-2.5 max-md:px-5">
+          <span className="text-sub text-[var(--info)]">
             当前{tab === "poster" ? "海报" : "背景"}由你手动选定，刷新元数据不会覆盖
           </span>
           <button

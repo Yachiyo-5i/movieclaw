@@ -265,8 +265,8 @@ export function WebhookSection() {
       )}
 
       {revealed && (
-        <div className="rounded-xl border border-[#4ade80]/30 bg-[#4ade80]/10 p-4">
-          <p className="text-body font-medium text-[#4ade80]">
+        <div className="rounded-xl border border-[var(--ok)]/30 bg-[var(--ok)]/10 p-4">
+          <p className="text-body font-medium text-[var(--ok)]">
             「{revealed.name}」的签名密钥（仅显示这一次，请立即保存）
           </p>
           <div className="mt-2 flex items-center gap-2">
@@ -418,8 +418,8 @@ function EndpointRow({
     : last == null
       ? { label: "未投递过", color: "#c0c4cc" }
       : last.ok
-        ? { label: `投递成功 · ${formatRelativeTime(last.at)}`, color: "#4ade80" }
-        : { label: `投递失败 · ${formatRelativeTime(last.at)}`, color: "#ff6b6b" };
+        ? { label: `投递成功 · ${formatRelativeTime(last.at)}`, color: "var(--ok)" }
+        : { label: `投递失败 · ${formatRelativeTime(last.at)}`, color: "var(--danger)" };
 
   return (
     <div className="flex flex-wrap items-center gap-x-3.5 gap-y-2 p-4">
@@ -488,7 +488,7 @@ function DeliveryList({ records }: { records: WebhookDelivery[] }) {
         >
           <span
             className="size-1.5 shrink-0 rounded-full"
-            style={{ background: r.ok ? "#4ade80" : "#ff6b6b" }}
+            style={{ background: r.ok ? "var(--ok)" : "var(--danger)" }}
           />
           <span className="w-44 shrink-0 truncate font-mono">{r.event}</span>
           <span className="shrink-0">

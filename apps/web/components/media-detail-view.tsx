@@ -225,7 +225,7 @@ export function MediaDetailView({
                 ——那读起来是「烂到 0 分」。海报卡片与条目详情页都是这个口径 */}
             {item.rating > 0 && (
               <span className="flex items-center gap-1.5">
-                <StarIcon className="size-4 text-[#f5c451]" />
+                <StarIcon className="size-4 text-[var(--warn)]" />
                 <span className="text-title-sm font-bold text-white">{item.rating.toFixed(1)}</span>
               </span>
             )}

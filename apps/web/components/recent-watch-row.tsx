@@ -140,7 +140,7 @@ function RecentWatchCard({ item }: { item: RecentWatchItem }) {
               </span>
             )}
             {item.played && (
-              <span className="flex size-6 items-center justify-center rounded-full bg-emerald-400 text-[#07120c] shadow-lg">
+              <span className="flex size-6 items-center justify-center rounded-full bg-[var(--ok)] text-[#07120c] shadow-lg">
                 <CheckIcon className="size-3.5 stroke-[2.5]" />
               </span>
             )}
@@ -156,7 +156,7 @@ function RecentWatchCard({ item }: { item: RecentWatchItem }) {
           {progress != null ? (
             <div className="h-[3px] overflow-hidden rounded-full bg-white/25">
               <div
-                className={`h-full rounded-full ${item.played ? "bg-emerald-400" : "bg-[var(--accent-2)]"}`}
+                className={`h-full rounded-full ${item.played ? "bg-[var(--ok)]" : "bg-[var(--accent-2)]"}`}
                 style={{ width: `${progress}%` }}
               />
             </div>

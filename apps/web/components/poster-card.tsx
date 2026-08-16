@@ -287,7 +287,7 @@ function PosterCardContent({
           <span
             className={`tnum absolute right-2 flex items-center gap-1 rounded-md bg-black/70 px-1.5 py-0.5 text-caption font-semibold text-white ${item.ribbon && !compactLeftRibbon ? "top-12" : "top-2"}`}
           >
-            <StarIcon className="size-3 text-[#f5c451]" />
+            <StarIcon className="size-3 text-[var(--warn)]" />
             {item.rating.toFixed(1)}
           </span>
         )}
@@ -304,7 +304,7 @@ function PosterCardContent({
                 {item.posterFooter.tracking && (
                   <span
                     aria-hidden="true"
-                    className="size-1.5 rounded-full bg-[#4ade80] shadow-[0_0_7px_rgba(74,222,128,0.55)]"
+                    className="size-1.5 rounded-full bg-[var(--ok)] shadow-[0_0_7px_rgba(74,222,128,0.55)]"
                   />
                 )}
                 {item.posterFooter.value}
@@ -371,7 +371,7 @@ function PosterCardContent({
           {item.extent && <span>{item.extent}</span>}
           {item.libraryStatus && (
             <span className="flex shrink-0 items-center gap-1.5 text-emerald-300/90">
-              <span className="size-1.5 rounded-full bg-emerald-400" />
+              <span className="size-1.5 rounded-full bg-[var(--ok)]" />
               在库
             </span>
           )}
@@ -410,7 +410,7 @@ function PosterCardActionButton({
     // 在库标识：非交互，与库存格下方的绿点语言一致。
     return (
       <span className="flex h-7 items-center gap-1.5 rounded-full bg-white/[0.18] px-3 text-caption font-semibold text-white/90">
-        <span className="size-1.5 rounded-full bg-[#4ade80]" />
+        <span className="size-1.5 rounded-full bg-[var(--ok)]" />
         在库
       </span>
     );
@@ -453,7 +453,7 @@ function PosterCardActionButton({
     >
       {existingSub ? (
         <>
-          <CheckIcon className="size-3 text-[#4ade80]" />
+          <CheckIcon className="size-3 text-[var(--ok)]" />
           已订阅
         </>
       ) : (

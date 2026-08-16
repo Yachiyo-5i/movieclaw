@@ -710,8 +710,8 @@ export function LibraryDetailView({ libraryId }: { libraryId: number }) {
           busy) && (
           <div className="mt-2.5 flex flex-wrap items-center gap-2">
             {busy && (
-              <span className="flex items-center gap-1.5 rounded-full border border-[#7dd3fc]/35 bg-[#7dd3fc]/[0.12] px-3 py-1 text-sub font-semibold text-[#7dd3fc]">
-                <span className="size-3 animate-spin rounded-full border-[1.5px] border-[#7dd3fc]/30 border-t-[#7dd3fc]" />
+              <span className="flex items-center gap-1.5 rounded-full border border-[var(--info)]/35 bg-[var(--info)]/[0.12] px-3 py-1 text-sub font-semibold text-[var(--info)]">
+                <span className="size-3 animate-spin rounded-full border-[1.5px] border-[var(--info)]/30 border-t-[var(--info)]" />
                 {busyText(
                   library.scanning ? library.scan_progress : library.organize_progress,
                 )}
@@ -720,14 +720,14 @@ export function LibraryDetailView({ libraryId }: { libraryId: number }) {
             {/* 刷新元数据的按钮已收进 ⋯ 菜单；它是全量重刷、耗时长，
                 进度另用下方的面板完整展示（到哪部了、在做什么） */}
             {importing > 0 && (
-              <span className="flex items-center gap-1.5 rounded-full border border-[#7dd3fc]/35 bg-[#7dd3fc]/[0.12] px-3 py-1 text-sub font-semibold text-[#7dd3fc]">
-                <span className="size-1.5 animate-pulse rounded-full bg-[#7dd3fc]" />
+              <span className="flex items-center gap-1.5 rounded-full border border-[var(--info)]/35 bg-[var(--info)]/[0.12] px-3 py-1 text-sub font-semibold text-[var(--info)]">
+                <span className="size-1.5 animate-pulse rounded-full bg-[var(--info)]" />
                 已发现 {importing} 个新文件 · 写入完成后自动入库
               </span>
             )}
             {libraryJobs.length > 0 && (
-              <span className="flex items-center gap-1.5 rounded-full border border-[#7dd3fc]/35 bg-[#7dd3fc]/[0.12] px-3 py-1 text-sub font-semibold text-[#7dd3fc]">
-                <span className="size-1.5 animate-pulse rounded-full bg-[#7dd3fc]" />
+              <span className="flex items-center gap-1.5 rounded-full border border-[var(--info)]/35 bg-[var(--info)]/[0.12] px-3 py-1 text-sub font-semibold text-[var(--info)]">
+                <span className="size-1.5 animate-pulse rounded-full bg-[var(--info)]" />
                 {libraryJobs.length} 个后台任务正在处理库内影片
               </span>
             )}
@@ -741,13 +741,16 @@ export function LibraryDetailView({ libraryId }: { libraryId: number }) {
                 {missing.length} 个条目缺失
               </button>
             )}
+            {/* 待识别与待复核都是「识别环节没搞定、等人工看一眼」，同属 --warn。
+                两者的区别由文案承担：紫色曾经暗示它们是两类不同的东西，而紫在
+                订阅首页表示「等着就行」，同一个色在两页说反话。 */}
             {unidentified.length > 0 && (
               <button
                 type="button"
                 onClick={() => setIssueTab("unidentified")}
-                className="flex items-center gap-1.5 rounded-full border border-[#f5c451]/35 bg-[#f5c451]/[0.12] px-3 py-1 text-sub font-semibold text-[#f5c451] transition hover:bg-[#f5c451]/[0.22]"
+                className="flex items-center gap-1.5 rounded-full border border-[var(--warn)]/35 bg-[var(--warn)]/[0.12] px-3 py-1 text-sub font-semibold text-[var(--warn)] transition hover:bg-[var(--warn)]/[0.22]"
               >
-                <span className="size-1.5 rounded-full bg-[#f5c451]" />
+                <span className="size-1.5 rounded-full bg-[var(--warn)]" />
                 {unidentifiedFiles} 个文件待识别
                 {unidentified.length > 1 ? ` · ${unidentified.length} 组` : ""}
               </button>
@@ -756,9 +759,9 @@ export function LibraryDetailView({ libraryId }: { libraryId: number }) {
               <button
                 type="button"
                 onClick={() => setIssueTab("review")}
-                className="flex items-center gap-1.5 rounded-full border border-[#c4b5fd]/35 bg-[#c4b5fd]/[0.12] px-3 py-1 text-sub font-semibold text-[#c4b5fd] transition hover:bg-[#c4b5fd]/[0.22]"
+                className="flex items-center gap-1.5 rounded-full border border-[var(--warn)]/35 bg-[var(--warn)]/[0.12] px-3 py-1 text-sub font-semibold text-[var(--warn)] transition hover:bg-[var(--warn)]/[0.22]"
               >
-                <span className="size-1.5 rounded-full bg-[#c4b5fd]" />
+                <span className="size-1.5 rounded-full bg-[var(--warn)]" />
                 {review.length} 个条目待复核身份
               </button>
             )}
@@ -959,7 +962,7 @@ function LibraryActionsMenu({
           <MoreIcon className="size-[18px] max-md:size-[22px]" />
           {/* 收起的长任务在跑：触发按钮点一个小点，不至于被菜单藏住 */}
           {running && (
-            <span className="absolute right-1 top-1 size-1.5 animate-pulse rounded-full bg-[#7dd3fc]" />
+            <span className="absolute right-1 top-1 size-1.5 animate-pulse rounded-full bg-[var(--info)]" />
           )}
         </button>
       </DropdownMenu.Trigger>
@@ -1022,10 +1025,10 @@ function MetadataRefreshPanel({
   const percent =
     state.total > 0 ? Math.min(100, Math.round((state.processed / state.total) * 100)) : 0;
   return (
-    <div className="mt-3 rounded-xl border border-[#7dd3fc]/25 bg-[#7dd3fc]/[0.07] px-4 py-3">
+    <div className="mt-3 rounded-xl border border-[var(--info)]/25 bg-[var(--info)]/[0.07] px-4 py-3">
       <div className="flex items-center justify-between gap-3">
-        <div className="flex min-w-0 items-center gap-2 text-sub font-semibold text-[#7dd3fc]">
-          <span className="size-3 shrink-0 animate-spin rounded-full border-[1.5px] border-[#7dd3fc]/30 border-t-[#7dd3fc]" />
+        <div className="flex min-w-0 items-center gap-2 text-sub font-semibold text-[var(--info)]">
+          <span className="size-3 shrink-0 animate-spin rounded-full border-[1.5px] border-[var(--info)]/30 border-t-[var(--info)]" />
           <span className="truncate">
             {state.stopping ? "正在停止刷新" : "正在刷新元数据"}
             {state.total > 0 ? ` ${state.processed}/${state.total}` : ""}
@@ -1044,7 +1047,7 @@ function MetadataRefreshPanel({
       {/* 进度条：全量刷新常以分钟计，一条能看出"在动"的进度很重要 */}
       <div className="mt-2 h-1 overflow-hidden rounded-full bg-white/[0.08]">
         <div
-          className="h-full rounded-full bg-[#7dd3fc] transition-[width] duration-500"
+          className="h-full rounded-full bg-[var(--info)] transition-[width] duration-500"
           style={{ width: `${percent}%` }}
         />
       </div>
@@ -1129,10 +1132,10 @@ const InventoryCell = memo(function InventoryCell({
         </div>
         {workingLabel && (
           <>
-            <span className="pointer-events-none absolute inset-0 rounded-xl ring-2 ring-[#7dd3fc] ring-offset-0" />
+            <span className="pointer-events-none absolute inset-0 rounded-xl ring-2 ring-[var(--info)] ring-offset-0" />
             {/* 不用 backdrop-blur：海报墙每格一个模糊合成层会放大滚动时的 GPU 压力，底色加实即可 */}
-            <span className="pointer-events-none absolute inset-x-0 bottom-0 flex items-center gap-1.5 rounded-b-xl bg-[rgba(7,12,20,0.92)] px-2 py-1.5 text-micro font-medium text-[#7dd3fc]">
-              <span className="size-2.5 shrink-0 animate-spin rounded-full border-[1.5px] border-[#7dd3fc]/30 border-t-[#7dd3fc]" />
+            <span className="pointer-events-none absolute inset-x-0 bottom-0 flex items-center gap-1.5 rounded-b-xl bg-[rgba(7,12,20,0.92)] px-2 py-1.5 text-micro font-medium text-[var(--info)]">
+              <span className="size-2.5 shrink-0 animate-spin rounded-full border-[1.5px] border-[var(--info)]/30 border-t-[var(--info)]" />
               <span className="truncate">{workingLabel}</span>
             </span>
           </>
@@ -1141,7 +1144,7 @@ const InventoryCell = memo(function InventoryCell({
       {abnormalLabel && (
         <p className="text-on-image mt-1.5 flex items-center gap-1.5 truncate text-caption text-[var(--text-muted)]">
           <span
-            className={`size-1.5 shrink-0 rounded-full ${dead ? "bg-white/30" : "bg-[#f5c451]"}`}
+            className={`size-1.5 shrink-0 rounded-full ${dead ? "bg-white/30" : "bg-[var(--warn)]"}`}
           />
           <span className="truncate">{abnormalLabel}</span>
         </p>
@@ -1581,7 +1584,7 @@ function IssueDrawer({
 
         {/* 「放错库了」修复引导：认领解决不了这一类，不给引导用户会在认领里打转 */}
         {open === "unidentified" && kindMismatchFiles > 0 && (
-          <p className="mx-5 mt-3 rounded-lg bg-[#f5c451]/[0.1] px-3 py-2 text-caption leading-5 text-[#f5c451]">
+          <p className="mx-5 mt-3 rounded-lg bg-[var(--warn)]/[0.1] px-3 py-2 text-caption leading-5 text-[var(--warn)]">
             有 {kindMismatchFiles} 个文件的实际类型与本库不符（
             {movie ? "剧集文件在电影库" : "电影文件在剧集库"}
             ），认领无法解决。个别文件放错了：把文件移到对应类型的库即可；整库类型建错了：
@@ -1683,7 +1686,7 @@ function MissingRow({
           <span className="ml-2 text-sub font-normal text-[var(--text-muted)]">{summary}</span>
         </span>
         {done ? (
-          <span className="text-sub text-[#4ade80]">{done}</span>
+          <span className="text-sub text-[var(--ok)]">{done}</span>
         ) : (
           <span className="flex shrink-0 items-center gap-2">
             <button
@@ -1723,7 +1726,7 @@ function MissingRow({
         )}
       </div>
       {item.subscription_id && !done && (
-        <p className="mt-1 text-caption text-[#f5c451]/80">该条目有订阅在追踪</p>
+        <p className="mt-1 text-caption text-[var(--warn)]/80">该条目有订阅在追踪</p>
       )}
       {error && <p className="mt-1 text-caption text-red-300">{error}</p>}
     </div>
@@ -1821,7 +1824,7 @@ function StatusBadge({ group }: { group: UnidentifiedGroup }) {
       title={group.reason ?? undefined}
       className={`shrink-0 rounded-md px-1.5 py-0.5 text-caption ${
         meta.tone === "warn"
-          ? "bg-[#f5c451]/[0.16] text-[#f5c451]"
+          ? "bg-[var(--warn)]/[0.16] text-[var(--warn)]"
           : "bg-white/[0.07] text-[var(--text-muted)]"
       }`}
     >

@@ -641,13 +641,13 @@ function LibraryCard({
           {!busy && (importing > 0 || stats.unidentified_count > 0) && (
             <div className="absolute inset-x-2.5 bottom-2 flex flex-wrap items-center gap-1.5">
               {importing > 0 && (
-                <span className="flex items-center gap-1.5 rounded-full border border-[#7dd3fc]/35 bg-black/55 px-2 py-0.5 text-micro font-semibold text-[#7dd3fc] backdrop-blur-md">
-                  <span className="size-1.5 animate-pulse rounded-full bg-[#7dd3fc]" />
+                <span className="flex items-center gap-1.5 rounded-full border border-[var(--info)]/35 bg-black/55 px-2 py-0.5 text-micro font-semibold text-[var(--info)] backdrop-blur-md">
+                  <span className="size-1.5 animate-pulse rounded-full bg-[var(--info)]" />
                   {importing} 个新文件入库中
                 </span>
               )}
               {stats.unidentified_count > 0 && (
-                <span className="rounded-full border border-[#f5c451]/35 bg-black/55 px-2 py-0.5 text-micro font-semibold text-[#f5c451] backdrop-blur-md">
+                <span className="rounded-full border border-[var(--warn)]/35 bg-black/55 px-2 py-0.5 text-micro font-semibold text-[var(--warn)] backdrop-blur-md">
                   {stats.unidentified_count} 个待识别
                 </span>
               )}

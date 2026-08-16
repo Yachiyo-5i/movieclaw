@@ -1011,7 +1011,7 @@ function BackdropTile({
               e.stopPropagation();
               onDelete();
             }}
-            className="absolute left-1.5 top-1.5 hidden size-[18px] items-center justify-center rounded-full bg-black/60 text-white/90 backdrop-blur transition-colors hover:bg-[var(--danger)] hover:text-white group-hover/tile:flex"
+            className="absolute left-1.5 top-1.5 hidden size-[18px] items-center justify-center rounded-full bg-black/60 text-white/90 backdrop-blur transition-colors hover:bg-[var(--danger-solid)] hover:text-white group-hover/tile:flex"
           >
             <XIcon className="size-3" />
           </button>

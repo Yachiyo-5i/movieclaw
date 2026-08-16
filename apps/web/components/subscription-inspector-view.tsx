@@ -775,7 +775,7 @@ function RuleSetSwitchDialog({
                     )}
                   </span>
                   {current && (
-                    <span className="shrink-0 text-caption font-medium text-[#4ade80]">
+                    <span className="shrink-0 text-caption font-medium text-[var(--ok)]">
                       当前使用 ✓
                     </span>
                   )}
@@ -842,7 +842,7 @@ function ProgressStrip({
         className="mt-2 flex h-1.5 w-full overflow-hidden rounded-full bg-white/[0.12]"
       >
         <div
-          className="bg-[#4ade80]"
+          className="bg-[var(--ok)]"
           style={{ width: `${(imported / denom) * 100}%` }}
         />
         <div
@@ -851,8 +851,8 @@ function ProgressStrip({
         />
       </div>
       <div className="tnum mt-2 flex flex-wrap items-center gap-x-4 gap-y-1.5 text-caption text-white/45">
-        <ProgressLegend color="#4ade80" label={`已入库 ${imported}`} />
-        <ProgressLegend color="#6aa7ff" label={`下载中 ${inPipeline}`} />
+        <ProgressLegend color="var(--ok)" label={`已入库 ${imported}`} />
+        <ProgressLegend color="var(--info)" label={`下载中 ${inPipeline}`} />
         <ProgressLegend color="rgba(255,255,255,0.2)" label={`缺失 ${wanted}`} />
       </div>
     </div>
@@ -908,16 +908,16 @@ function activityColor(type: SubscriptionActivity["type"]): string {
     case "downloaded":
     case "imported":
     case "replacement_promoted":
-      return "#4ade80";
+      return "var(--ok)";
     case "match_rejected":
     case "dispatch_failed":
     case "import_failed":
-      return "#f87171";
+      return "var(--danger)";
     case "paused":
     case "download_stalled":
-      return "#f5c451";
+      return "var(--warn)";
     default:
-      return "#6aa7ff";
+      return "var(--info)";
   }
 }
 
@@ -945,7 +945,7 @@ function ActivityTimeline({ activities }: { activities: SubscriptionActivity[] }
               <div className="flex flex-col items-center">
                 <span
                   className="mt-[7px] size-2 shrink-0 rounded-full"
-                  style={{ backgroundColor: color, boxShadow: `0 0 8px ${color}55` }}
+                  style={{ backgroundColor: color, boxShadow: `0 0 8px color-mix(in oklab, ${color} 33%, transparent)` }}
                 />
                 {!last && <span className="mt-1.5 w-px flex-1 bg-white/[0.08]" />}
               </div>
@@ -1055,7 +1055,7 @@ function WantedRow({
         </span>
         <span
           className="shrink-0 rounded-full px-2 py-0.5 text-micro font-semibold"
-          style={{ backgroundColor: `${color}22`, color }}
+          style={{ backgroundColor: `color-mix(in oklab, ${color} 13%, transparent)`, color }}
         >
           {label}
         </span>
@@ -1086,7 +1086,7 @@ function WantedRow({
           aria-valuemax={100}
         >
           <div
-            className="h-full rounded-full bg-[#34d399] transition-[width] duration-700"
+            className="h-full rounded-full bg-[var(--ok)] transition-[width] duration-700"
             style={{ width: `${Math.min(100, Math.max(1, live.progress * 100))}%` }}
           />
         </div>
@@ -1143,19 +1143,19 @@ function resourceTimingNote(timing: ResourceTiming | null, previous: boolean): s
 
 function wantedPresentation(w: WantedItem): { label: string; color: string; note: string } {
   if (w.status === "imported") {
-    return { label: "已入库", color: "#4ade80", note: `入库于 ${formatDateTime(w.imported_at)}` };
+    return { label: "已入库", color: "var(--ok)", note: `入库于 ${formatDateTime(w.imported_at)}` };
   }
   if (w.status === "downloaded") {
     return {
       label: "已下载",
-      color: "#4ade80",
+      color: "var(--ok)",
       note: `完成于 ${formatDateTime(w.downloaded_at ?? w.grabbed_at)}，待整理入库`,
     };
   }
   if (w.status === "grabbed") {
     return {
       label: "已提交下载",
-      color: "#34d399",
+      color: "var(--ok)",
       note: `${formatRelativeTime(w.grabbed_at)}提交给下载器`,
     };
   }
@@ -1187,21 +1187,21 @@ function wantedPresentation(w: WantedItem): { label: string; color: string; note
       .join("、");
     return {
       label: "预测窗口",
-      color: "#f5c451",
+      color: "var(--warn)",
       note: `预计 ${formatDateTime(forecast.window_start)} ～ ${formatDateTime(forecast.window_end)}，重点探测 ${sites}`,
     };
   }
   if (w.air_date && new Date(w.air_date) > now) {
     return {
       label: "待播出",
-      color: "#f5c451",
+      color: "var(--warn)",
       note: `${w.air_date} 播出，${formatDateTime(w.next_search_at)} 起兜底搜索`,
     };
   }
   if (due <= new Date()) {
     return {
       label: "排队搜索",
-      color: "#6aa7ff",
+      color: "var(--info)",
       note: w.last_search_at
         ? `上次搜索 ${formatRelativeTime(w.last_search_at)}`
         : "等待搜索任务执行",
@@ -1220,7 +1220,7 @@ function wantedPresentation(w: WantedItem): { label: string; color: string; note
   }
   return {
     label: "冷却中",
-    color: "#6aa7ff",
+    color: "var(--info)",
     note: `暂无合适资源，${formatDateTime(w.next_search_at)} 再试`,
   };
 }

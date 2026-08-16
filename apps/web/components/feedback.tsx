@@ -72,8 +72,8 @@ const TOAST_DURATION_MS: Record<ToastTone, number> = {
 };
 
 const TONE_DOT: Record<ToastTone, string> = {
-  success: "bg-[#4ade80]",
-  error: "bg-red-400",
+  success: "bg-[var(--ok)]",
+  error: "bg-[var(--danger)]",
   info: "bg-white/60",
 };
 

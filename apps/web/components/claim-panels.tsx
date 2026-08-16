@@ -117,7 +117,7 @@ export function ClaimConfirmPanel({
               </span>
             ) : null}
             {item && item.rating > 0 ? (
-              <span className="text-sub text-[#f5c451]">★ {item.rating.toFixed(1)}</span>
+              <span className="text-sub text-[var(--warn)]">★ {item.rating.toFixed(1)}</span>
             ) : null}
           </div>
           {seed.reasons && seed.reasons.length > 0 && (

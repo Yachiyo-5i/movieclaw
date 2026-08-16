@@ -31,10 +31,10 @@ import { LiquidGlassButton, LiquidGlassInput } from "@/vendor/liquid-glass";
 
 /** 站点验证状态 → 展示文案与颜色 */
 const STATUS_META: Record<SiteStatus, { label: string; color: string }> = {
-  active: { label: "已验证", color: "#4ade80" },
-  verifying: { label: "验证中", color: "#6aa7ff" },
+  active: { label: "已验证", color: "var(--ok)" },
+  verifying: { label: "验证中", color: "var(--info)" },
   pending: { label: "待验证", color: "#c0c4cc" },
-  failed: { label: "验证失败", color: "#ff6b6b" },
+  failed: { label: "验证失败", color: "var(--danger)" },
 };
 
 /** 授权类型 → 中文名 */
@@ -484,7 +484,7 @@ function SiteCard({
             )}
             <span
               className="flex shrink-0 items-center gap-1.5 rounded-full px-2 py-0.5 text-caption font-medium"
-              style={{ background: `${meta.color}1f`, color: meta.color }}
+              style={{ background: `color-mix(in oklab, ${meta.color} 12%, transparent)`, color: meta.color }}
             >
               <span className="size-1.5 rounded-full" style={{ background: meta.color }} />
               {meta.label}

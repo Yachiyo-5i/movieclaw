@@ -32,7 +32,7 @@ export function ExtensionCard() {
     installed === null
       ? { label: "检测中…", color: "#c0c4cc" }
       : installed
-        ? { label: "已安装", color: "#4ade80" }
+        ? { label: "已安装", color: "var(--ok)" }
         : { label: "未检测到", color: "#c0c4cc" };
 
   return (
@@ -61,7 +61,7 @@ export function ExtensionCard() {
 
       {installed ? (
         <p className="mt-4 rounded-xl bg-white/[0.03] px-4 py-3 text-body text-[var(--text-muted)]">
-          <CheckIcon className="mr-1.5 inline size-4 text-[#4ade80]" />
+          <CheckIcon className="mr-1.5 inline size-4 text-[var(--ok)]" />
           插件已就绪。打开支持的站点页面，点击浏览器工具栏的 MovieClaw
           图标即可同步该站 Cookie；首次使用请先点下方「同步令牌」生成并填入插件。
         </p>
@@ -254,7 +254,7 @@ function StatusDot({ on }: { on: boolean }) {
     <span className="flex shrink-0 items-center gap-1.5 text-sub text-[var(--text-muted)]">
       <span
         className="size-2 rounded-full"
-        style={{ background: on ? "#4ade80" : "#c0c4cc" }}
+        style={{ background: on ? "var(--ok)" : "#c0c4cc" }}
       />
       {on ? "已启用" : "未启用"}
     </span>
@@ -296,7 +296,7 @@ function TokenRow({ token, createdAt }: { token: string; createdAt: string | nul
           aria-label="复制令牌"
           className="btn-glass shrink-0 px-2 py-1 text-sub font-medium"
         >
-          {copied ? <CheckIcon className="size-4 text-[#4ade80]" /> : <CopyIcon className="size-4" />}
+          {copied ? <CheckIcon className="size-4 text-[var(--ok)]" /> : <CopyIcon className="size-4" />}
         </button>
       </div>
       {createdAt && (

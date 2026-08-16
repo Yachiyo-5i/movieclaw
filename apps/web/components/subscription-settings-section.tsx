@@ -43,9 +43,9 @@ export function SubscriptionSettingsSection() {
 
 /** 状态 → 颜色/文案（节点、检查项、库行共用一套语义）。 */
 const STATUS_META = {
-  ok: { dot: "bg-[#4ade80]", text: "text-[#4ade80]", label: "正常" },
-  warn: { dot: "bg-amber-400", text: "text-amber-300", label: "降级" },
-  error: { dot: "bg-[#ff6b6b]", text: "text-[#ff6b6b]", label: "有问题" },
+  ok: { dot: "bg-[var(--ok)]", text: "text-[var(--ok)]", label: "正常" },
+  warn: { dot: "bg-[var(--warn)]", text: "text-[var(--warn)]", label: "降级" },
+  error: { dot: "bg-[var(--danger)]", text: "text-[var(--danger)]", label: "有问题" },
 } as const;
 
 type Status = keyof typeof STATUS_META;
@@ -212,7 +212,7 @@ function SetupChecklist({ health }: { health: PipelineHealth }) {
           <div key={step.label} className="flex items-center gap-3">
             <span
               className={`flex size-5 shrink-0 items-center justify-center rounded-full text-caption font-semibold ${
-                step.done ? "bg-[#4ade80]/20 text-[#4ade80]" : "bg-white/10 text-white/70"
+                step.done ? "bg-[var(--ok)]/20 text-[var(--ok)]" : "bg-white/10 text-white/70"
               }`}
             >
               {step.done ? "✓" : i + 1}
@@ -662,7 +662,7 @@ function SimulatePanel() {
                 />
               )}
               {preview.ok ? (
-                <p className="flex items-center gap-1.5 pt-1 text-sub font-medium text-[#4ade80]">
+                <p className="flex items-center gap-1.5 pt-1 text-sub font-medium text-[var(--ok)]">
                   ✓ 全链路可行：订阅后即可自动下载并整理入库
                 </p>
               ) : (
