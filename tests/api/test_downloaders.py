@@ -200,8 +200,10 @@ def test_task_center_aggregates_live_downloads_and_subscription_context(client) 
         DownloadAttemptStatus,
         MediaItem,
         RuleSet,
+        SiteTorrent,
         Subscription,
         SubscriptionDownloadAttempt,
+        TorrentSource,
         WantedItem,
         WantedStatus,
         utcnow,
@@ -295,6 +297,8 @@ def test_task_center_aggregates_live_downloads_and_subscription_context(client) 
                     subscription_id=subscription.id,
                     downloader_id=downloader_id,
                     info_hash=missing_hash,
+                    site_id="pt-demo",
+                    torrent_id="4321",
                     torrent_title="Missing.Show.S01E02",
                     units=[[1, 2]],
                     quality={"resolution": "1080p", "media_source": "WEB-DL"},
@@ -302,6 +306,16 @@ def test_task_center_aggregates_live_downloads_and_subscription_context(client) 
                     hit_and_run=False,
                     status=DownloadAttemptStatus.ACTIVE,
                     last_progress_at=utcnow() - timedelta(minutes=16),
+                )
+            )
+            # 站点快照索引里存有该种子的详情页，任务中心据此提供"打开种子页"
+            session.add(
+                SiteTorrent(
+                    site_id="pt-demo",
+                    torrent_id="4321",
+                    title="Missing.Show.S01E02",
+                    detail_url="https://pt.example.com/details.php?id=4321",
+                    source=TorrentSource.LIST,
                 )
             )
             await session.commit()
@@ -329,6 +343,14 @@ def test_task_center_aggregates_live_downloads_and_subscription_context(client) 
     assert by_hash[external_hash]["progress"] == 0.42
     assert by_hash[missing_hash]["state"] == "missing"
     assert by_hash[missing_hash]["downloader_id"] == downloader_id
+    # 投递台账带回站点身份、详情页与质量快照；外部任务没有这些信息
+    assert by_hash[missing_hash]["site_id"] == "pt-demo"
+    assert by_hash[missing_hash]["site_name"] == "pt-demo"
+    assert by_hash[missing_hash]["page_url"] == "https://pt.example.com/details.php?id=4321"
+    assert by_hash[missing_hash]["resolution"] == "1080p"
+    assert by_hash[missing_hash]["media_source"] == "WEB-DL"
+    assert by_hash[external_hash]["site_id"] is None
+    assert by_hash[external_hash]["page_url"] is None
     assert by_hash[missing_hash]["can_replace"] is True
     assert by_hash[missing_hash]["no_progress_seconds"] >= 15 * 60
     assert "立即换种" in by_hash[missing_hash]["rescue_message"]
@@ -344,6 +366,73 @@ def test_task_center_aggregates_live_downloads_and_subscription_context(client) 
             "task_count": 2,
         }
     ]
+
+
+def test_task_center_manual_task_links_site_torrent_page(client) -> None:
+    """手动下载锚定了站点种子 ID 时，任务中心带回站点身份与种子详情页。"""
+    from movieclaw_db.engine import get_database
+    from movieclaw_db.models import (
+        Library,
+        ManualDownloadIntent,
+        MediaItem,
+        SiteTorrent,
+        TorrentSource,
+    )
+
+    c, _ = client
+    c.post("/api/v1/downloaders", json=_PAYLOAD)
+    info_hash = "f" * 40
+    _fake_torrents.append(
+        TorrentBrief(
+            name="Manual.Movie.2160p",
+            content_name="Manual.Movie.2160p",
+            completed=False,
+            info_hash=info_hash,
+            progress=0.2,
+            state="downloading",
+        )
+    )
+
+    async def seed() -> None:
+        async with get_database().session() as session:
+            media = MediaItem(
+                kind="movie",
+                tmdb_id=54321,
+                title="手动种子页测试",
+                original_title="Manual Page Test",
+            )
+            library = Library(name="手动种子页测试库", kind="movie", root_paths=["/media"])
+            session.add_all([media, library])
+            await session.flush()
+            assert media.id is not None and library.id is not None
+            session.add(
+                ManualDownloadIntent(
+                    info_hash=info_hash,
+                    media_item_id=media.id,
+                    library_id=library.id,
+                    site_id="pt-demo",
+                    torrent_id="777",
+                )
+            )
+            session.add(
+                SiteTorrent(
+                    site_id="pt-demo",
+                    torrent_id="777",
+                    title="Manual.Movie.2160p",
+                    detail_url="https://pt.example.com/details.php?id=777",
+                    source=TorrentSource.LIST,
+                )
+            )
+            await session.commit()
+
+    asyncio.run(seed())
+
+    items = c.get("/api/v1/downloaders/tasks").json()["data"]["items"]
+    assert len(items) == 1
+    assert items[0]["source"] == "manual"
+    assert items[0]["site_id"] == "pt-demo"
+    assert items[0]["site_name"] == "pt-demo"
+    assert items[0]["page_url"] == "https://pt.example.com/details.php?id=777"
 
 
 def test_task_center_degrades_single_downloader_failure(client) -> None:

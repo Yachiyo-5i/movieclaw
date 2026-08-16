@@ -274,6 +274,7 @@ async def anchor_manual_download(
     media_item_id: int,
     library_id: int,
     site_id: str,
+    torrent_id: str | None = None,
 ) -> None:
     """按 infohash 保存手动下载的已确认身份，供监听导入完成后直接认领。
 
@@ -303,6 +304,7 @@ async def anchor_manual_download(
                 media_item_id=media_item_id,
                 library_id=library_id,
                 site_id=site_id,
+                torrent_id=torrent_id,
             )
         )
         try:
@@ -326,6 +328,17 @@ async def anchor_manual_download(
                 library_id,
             )
             return
+    # 同一 hash 即同一份内容：旧锚缺站点种子 ID 时用本次提交补全（只补
+    # 同站信息，跨站同种不能把别站的种子 ID 配到旧站点上）；身份归属不变。
+    if (
+        torrent_id
+        and not existing.torrent_id
+        and (existing.site_id is None or existing.site_id == site_id)
+    ):
+        existing.site_id = site_id
+        existing.torrent_id = torrent_id
+        existing.updated_at = utcnow()
+        await session.commit()
     if existing.media_item_id != media_item_id or existing.library_id != library_id:
         logger.warning(
             "手动下载 hash=%s 已锚定到 media_item=%s/library=%s；"

@@ -2417,6 +2417,7 @@ function DownloadButton({ hit, className }: { hit: TorrentHit; className: string
     const req: DownloadTargetRequest = {
       site_id: hit.site_id,
       download_url: hit.download_url,
+      torrent_id: hit.torrent_id,
       identity:
         mediaType && title && attrs?.year != null
           ? { kind: mediaType, title, year: attrs.year }

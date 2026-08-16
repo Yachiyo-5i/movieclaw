@@ -4,7 +4,6 @@ import { useMemo, useState } from "react";
 
 import type { Route } from "next";
 import Link from "next/link";
-import { useRouter } from "next/navigation";
 
 import {
   JOB_STATUS_LABELS,
@@ -1164,15 +1163,14 @@ function DownloadTaskFeedItem({
   const title = grouped
     ? task.name || task.media_title || task.info_hash
     : task.media_title || task.name || task.info_hash;
-  const sourceLabel =
-    task.source === "subscription"
-      ? "订阅投递"
-      : task.source === "manual"
-        ? "手动下载"
-        : "下载器任务";
   const note = downloadTaskNote(task, ingestJob);
   const showReplace = shouldOfferInlineReplacement(task);
   const firstSubscription = task.subscriptions[0];
+  // 种子名前用站点徽标回答"这个资源从哪来"；画面规格与片源紧随其后，
+  // 弥补高度同质化的 release 名。状态与进度由底部生命周期承担，不再重复。
+  const specs = [task.resolution, task.media_source].filter(
+    (item): item is string => item != null,
+  );
 
   return (
     <div className={grouped ? "py-2.5 first:pt-1 last:pb-1" : ""}>
@@ -1188,27 +1186,27 @@ function DownloadTaskFeedItem({
                 实时
               </span>
             )}
+            {task.site_name && (
+              <span className="shrink-0 rounded-full border border-white/[0.14] bg-white/[0.06] px-1.5 py-0.5 text-[11px] font-medium leading-none text-white/55">
+                {task.site_name}
+              </span>
+            )}
             <OverflowText className="flex-1">{title}</OverflowText>
           </h3>
-          <p className="mt-1 flex flex-wrap items-center gap-x-1.5 text-caption">
-            <span className="font-medium" style={{ color: meta.color }}>
-              {meta.label}
-            </span>
-            {percent != null && (
-              <>
-                <span aria-hidden="true" className="text-white/25">·</span>
-                <span className="tnum text-white/55">{Math.min(100, Math.max(0, percent))}%</span>
-              </>
-            )}
-            {!ingestOwnsState && task.state === "downloading" && task.dlspeed_bytes != null && task.dlspeed_bytes > 0 && (
-              <>
-                <span aria-hidden="true" className="text-white/25">·</span>
-                <span className="tnum text-white/42">↓ {formatBytes(task.dlspeed_bytes)}/s</span>
-              </>
-            )}
-          </p>
+          {specs.length > 0 && (
+            <p className="mt-1 flex flex-wrap items-center gap-x-1.5 text-caption text-white/45">
+              {specs.map((spec, index) => (
+                <span key={spec} className="flex items-center gap-x-1.5">
+                  {index > 0 && (
+                    <span aria-hidden="true" className="text-white/25">·</span>
+                  )}
+                  {spec}
+                </span>
+              ))}
+            </p>
+          )}
         </div>
-        {(firstSubscription || task.downloader_id != null) && (
+        {(task.page_url != null || task.downloader_id != null) && (
           <DownloadTaskActionsMenu
             task={task}
             deleting={deleting}
@@ -1233,14 +1231,24 @@ function DownloadTaskFeedItem({
           />
         </div>
       )}
-      <div className="mt-1.5 flex flex-wrap items-center gap-x-2.5 gap-y-1 text-caption text-white/32">
-        <span>{sourceLabel}</span>
-        <span>{task.downloader_name || "下载器未找到"}</span>
-        {task.size_bytes != null && <span>{formatBytes(task.size_bytes)}</span>}
-        {!ingestOwnsState && task.eta_seconds != null && (
-          <span>剩余约 {formatDuration(task.eta_seconds)}</span>
-        )}
-      </div>
+      {/* 大小/速度/剩余时间合并成一行；投递来源与下载器名由生命周期"已投递"承担 */}
+      {(task.size_bytes != null ||
+        (!ingestOwnsState &&
+          ((task.state === "downloading" && task.dlspeed_bytes != null && task.dlspeed_bytes > 0) ||
+            task.eta_seconds != null))) && (
+        <div className="mt-1.5 flex flex-wrap items-center gap-x-2.5 gap-y-1 text-caption text-white/38">
+          {task.size_bytes != null && <span className="tnum">{formatBytes(task.size_bytes)}</span>}
+          {!ingestOwnsState &&
+            task.state === "downloading" &&
+            task.dlspeed_bytes != null &&
+            task.dlspeed_bytes > 0 && (
+              <span className="tnum">↓ {formatBytes(task.dlspeed_bytes)}/s</span>
+            )}
+          {!ingestOwnsState && task.eta_seconds != null && (
+            <span>剩余约 {formatDuration(task.eta_seconds)}</span>
+          )}
+        </div>
+      )}
       {firstSubscription && (
         <div className="mt-2 flex flex-wrap items-center gap-x-2 gap-y-1 text-caption">
           <span className="text-white/30">
@@ -1414,7 +1422,7 @@ function DownloadTaskCard({
               <OverflowText>{title}</OverflowText>
             </h3>
           </div>
-          {(firstSubscription || task.downloader_id != null) && (
+          {(task.page_url != null || task.downloader_id != null) && (
             <DownloadTaskActionsMenu
               task={task}
               deleting={deleting}
@@ -1697,7 +1705,7 @@ function DownloadLifecycle({
   );
 }
 
-/** 查看订阅与删除仍收进右上角菜单；需要处理的换种动作跟随提示就近展示。 */
+/** 打开种子页与删除收进右上角菜单；查看订阅由分组标题承担，不在此重复。 */
 function DownloadTaskActionsMenu({
   task,
   deleting,
@@ -1709,20 +1717,19 @@ function DownloadTaskActionsMenu({
   replacing: boolean;
   onDelete: (task: DownloadTask) => void;
 }) {
-  const router = useRouter();
-  const firstSubscription = task.subscriptions[0];
   return (
     <TaskActionsMenu
       ariaLabel={`${task.name || task.info_hash}的更多操作`}
       disabled={deleting || replacing}
       items={[
-        ...(firstSubscription
+        ...(task.page_url
           ? [
               {
-                id: "subscription",
-                label: "查看订阅",
-                onSelect: () =>
-                  router.push(`/subscriptions/${firstSubscription.id}` as Route),
+                id: "torrent-page",
+                label: "打开种子页",
+                onSelect: () => {
+                  window.open(task.page_url!, "_blank", "noopener,noreferrer");
+                },
               },
             ]
           : []),

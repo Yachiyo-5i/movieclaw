@@ -219,6 +219,7 @@ async def submit_download(
             media_item_id=manual_item.id,
             library_id=library.id,
             site_id=payload.site_id,
+            torrent_id=payload.torrent_id,
         )
     view = DownloadSubmitView(
         info_hash=result.info_hash,

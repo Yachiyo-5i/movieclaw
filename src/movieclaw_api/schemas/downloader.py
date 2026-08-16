@@ -133,6 +133,15 @@ class DownloadTaskView(BaseModel):
         "unknown",
     ]
     source: Literal["subscription", "manual", "external"]
+    # -- 种子来源与规格（movieclaw 投递的任务才有）：站点身份、详情页入口
+    # 与投递时的质量快照，供任务中心展示"这个种子从哪来、什么规格"。
+    site_id: str | None = None
+    site_name: str | None = Field(default=None, description="来源站点显示名；未知站点回落 site_id")
+    page_url: str | None = Field(
+        default=None, description="站点种子详情页 URL；能定位到站内种子时提供"
+    )
+    resolution: str | None = Field(default=None, description="投递时快照的分辨率，如 2160p")
+    media_source: str | None = Field(default=None, description="投递时快照的片源，如 WEB-DL")
     media_item_id: int | None = None
     media_title: str | None = None
     media_kind: str | None = None
@@ -254,6 +263,10 @@ class DownloadSubmitPayload(BaseModel):
 
     site_id: str = Field(min_length=1, description="种子所属站点 ID（TorrentHit.site_id）")
     download_url: str = Field(min_length=1, description="种子下载入口（TorrentHit.download_url）")
+    # 站点内种子 ID：随身份锚落库，任务中心据此反查详情页提供「打开种子页」
+    torrent_id: str | None = Field(
+        default=None, description="站点内种子 ID（TorrentHit.torrent_id）"
+    )
     # 入库目标（可选）：带 library_id 时保存目录改为由库推导（主根/标题 (年份)）。
     # title/year 来自搜索结果的解析实体；无法确定条目身份时只带 library_id，
     # 落到库主根目录。三者都缺省 = 维持原行为（下载器默认目录）。

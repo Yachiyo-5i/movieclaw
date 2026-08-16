@@ -44,3 +44,6 @@ class ManualDownloadIntent(TimestampMixin, table=True):
         description="按收藏范围路由后确认的目标媒体库",
     )
     site_id: str | None = Field(default=None, description="来源站点（追溯用）")
+    # 站点内种子 ID：与 site_id 一起反查 site_torrent 的详情页，供任务中心
+    # 提供「打开种子页」。旧数据/前端未传时为 NULL，仅少一个跳转入口
+    torrent_id: str | None = Field(default=None, description="站点内种子 ID；NULL=未知")
