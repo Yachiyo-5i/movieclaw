@@ -48,6 +48,7 @@ from movieclaw_media.models import (
     MediaRow,
     MediaSearchItem,
     MediaSource,
+    MediaVideo,
 )
 from movieclaw_media.service import MediaDiscoverService
 from movieclaw_media.tmdb import (
@@ -75,6 +76,7 @@ __all__ = [
     "MediaRow",
     "MediaSearchItem",
     "MediaSource",
+    "MediaVideo",
     "DoubanClient",
     "DoubanDiscoverService",
     "DoubanError",

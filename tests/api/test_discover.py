@@ -25,6 +25,7 @@ from movieclaw_media.models import (
     MediaRow,
     MediaSearchItem,
     MediaSource,
+    MediaVideo,
 )
 
 
@@ -176,6 +177,16 @@ class _StubTmdbService(_StubService):
                 aliases=["示例别名"],
                 source_url="https://www.themoviedb.org/",
             ),
+            videos=[
+                MediaVideo(
+                    key="abc123",
+                    name="正式预告",
+                    kind="预告片",
+                    thumbnail_url="https://i.ytimg.com/vi/abc123/hqdefault.jpg",
+                    embed_url="https://www.youtube-nocookie.com/embed/abc123",
+                    watch_url="https://www.youtube.com/watch?v=abc123",
+                )
+            ],
             collection=MediaCollection(id="7", name="示例系列", items=[card, series_card]),
         )
 
@@ -388,6 +399,17 @@ def test_get_title_details_consumes_title_ref(client: TestClient, monkeypatch) -
             "role": None,
             "avatar_url": "https://image.tmdb.org/t/p/w185/director.jpg",
             "tmdb_person_id": 99,
+        }
+    ]
+    # 预告片原样透出：播放地址由后端拼好，前端不再拼接 YouTube URL
+    assert data["videos"] == [
+        {
+            "key": "abc123",
+            "name": "正式预告",
+            "kind": "预告片",
+            "thumbnail_url": "https://i.ytimg.com/vi/abc123/hqdefault.jpg",
+            "embed_url": "https://www.youtube-nocookie.com/embed/abc123",
+            "watch_url": "https://www.youtube.com/watch?v=abc123",
         }
     ]
     assert data["collection"]["name"] == "示例系列"

@@ -192,6 +192,25 @@ class MediaImage(BaseModel):
     height: int
 
 
+class MediaVideo(BaseModel):
+    """详情页的一段预告片/花絮。
+
+    TMDB 只给出 YouTube 的视频 key，**不提供可直接播放的视频流**，因此播放这一步
+    依赖浏览器自身能连上 YouTube——服务端配的代理帮不上忙。封面图则不同：它是
+    普通图片，前端统一走 /images/proxy 由服务端回源缓存，所以只要服务端能出网，
+    即使浏览器连不上 YouTube，预告片卡片也照样完整展示并给出外链入口。
+    """
+
+    key: str = Field(description="YouTube 视频 ID（前端当作不透明键使用）")
+    name: str = Field(description="视频标题，TMDB 原样给出（多为英文）")
+    kind: str = Field(description="中文类型标签：预告片 / 先导预告 / 片段 / 花絮 / 幕后")
+    thumbnail_url: str = Field(
+        description="YouTube 封面图；4:3 带上下黑边，前端按 cover 裁切即得 16:9 画面"
+    )
+    embed_url: str = Field(description="内嵌播放地址（youtube-nocookie，不落跟踪 cookie）")
+    watch_url: str = Field(description="YouTube 站内地址，供无法内嵌时外链打开")
+
+
 class MediaCollection(BaseModel):
     """电影所属系列及其全部作品；剧集和不属于系列的电影没有此字段。"""
 
@@ -205,6 +224,9 @@ class MediaDetail(BaseModel):
 
     card: MediaCard
     facts: MediaFacts
+    videos: list[MediaVideo] = Field(
+        default_factory=list, description="预告片与花絮（正式预告在前）；豆瓣来源恒为空"
+    )
     backdrops: list[MediaImage] = Field(default_factory=list, description="剧照（16:9 宽幅）")
     posters: list[MediaImage] = Field(
         default_factory=list, description="海报（2:3 竖版，配置语言优先）"

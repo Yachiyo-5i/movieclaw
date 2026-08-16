@@ -155,9 +155,19 @@ interface MediaImageDto {
   height: number;
 }
 
+interface MediaVideoDto {
+  key: string;
+  name: string;
+  kind: string;
+  thumbnail_url: string;
+  embed_url: string;
+  watch_url: string;
+}
+
 interface DiscoveredTitleDetailsDto {
   title: DiscoveredTitleDto;
   metadata: DiscoveredTitleMetadataDto;
+  videos?: MediaVideoDto[];
   backdrops: MediaImageDto[];
   posters: MediaImageDto[];
   collection: {
@@ -457,9 +467,20 @@ export interface MediaImage {
   height: number;
 }
 
+/** 一段预告片；播放地址由后端拼好，前端只负责内嵌与外链两种打开方式。 */
+export interface MediaVideo {
+  key: string;
+  name: string;
+  kind: string;
+  thumbnailUrl: string;
+  embedUrl: string;
+  watchUrl: string;
+}
+
 export interface MediaDetailData {
   item: MediaItem;
   info: MediaDetailInfo;
+  videos: MediaVideo[];
   backdrops: MediaImage[];
   posters: MediaImage[];
   collection?: { id: string; name: string; items: MediaItem[] };
@@ -480,6 +501,21 @@ function toImage(dto: MediaImageDto): MediaImage {
     fullUrl: cachedImageUrl(dto.full_url),
     width: dto.width,
     height: dto.height,
+  };
+}
+
+/**
+ * 预告片转换：封面走图片缓存（服务端回源，浏览器连不上 YouTube 也能看到卡片），
+ * 播放与外链地址保持原样——它们必须由浏览器直连 YouTube。
+ */
+function toVideo(dto: MediaVideoDto): MediaVideo {
+  return {
+    key: dto.key,
+    name: dto.name,
+    kind: dto.kind,
+    thumbnailUrl: cachedImageUrl(dto.thumbnail_url),
+    embedUrl: dto.embed_url,
+    watchUrl: dto.watch_url,
   };
 }
 
@@ -518,6 +554,7 @@ export async function fetchDiscoveredTitleDetails(
       aliases: dto.metadata.aliases,
       sourceUrl: dto.metadata.source_url ?? undefined,
     },
+    videos: (dto.videos ?? []).map(toVideo),
     backdrops: dto.backdrops.map(toImage),
     posters: dto.posters.map(toImage),
     collection: dto.collection

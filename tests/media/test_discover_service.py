@@ -509,6 +509,64 @@ async def test_detail_images_mapping() -> None:
     assert detail.posters[0].preview_url.startswith(f"{_IMAGE_BASE}/w342/")
 
 
+async def test_detail_videos_filtered_and_ordered() -> None:
+    """预告片：只留 YouTube 的可用类型，按「类型 → 官方 → 发布时间倒序」排。"""
+    svc = _service(
+        {
+            "movie/603": {
+                **_MOVIE_DETAIL,
+                "videos": {
+                    "results": [
+                        {"key": "f1", "name": "Featurette", "site": "YouTube",
+                         "type": "Featurette", "official": True, "published_at": "2026-01-01"},
+                        {"key": "t-old", "name": "Trailer 1", "site": "YouTube",
+                         "type": "Trailer", "official": True, "published_at": "2025-11-01"},
+                        {"key": "t-new", "name": "Trailer 2", "site": "YouTube",
+                         "type": "Trailer", "official": True, "published_at": "2025-12-20"},
+                        {"key": "t-fan", "name": "粉丝自制", "site": "YouTube",
+                         "type": "Trailer", "official": False, "published_at": "2026-02-01"},
+                        {"key": "teaser", "name": "", "site": "YouTube",
+                         "type": "Teaser", "official": True, "published_at": "2025-08-01"},
+                        # 非 YouTube 与无价值类型都不进列表
+                        {"key": "vimeo", "name": "Vimeo 版", "site": "Vimeo",
+                         "type": "Trailer", "official": True, "published_at": "2026-03-01"},
+                        {"key": "recap", "name": "前情提要", "site": "YouTube",
+                         "type": "Recap", "official": True, "published_at": "2026-03-01"},
+                    ]
+                },
+            }
+        }
+    )
+    detail = await svc.media_detail(MediaKind.MOVIE, 603)
+
+    assert [v.key for v in detail.videos] == ["t-new", "t-old", "t-fan", "teaser", "f1"]
+    first = detail.videos[0]
+    assert first.kind == "预告片"
+    assert first.thumbnail_url == "https://i.ytimg.com/vi/t-new/hqdefault.jpg"
+    assert first.embed_url == "https://www.youtube-nocookie.com/embed/t-new"
+    assert first.watch_url == "https://www.youtube.com/watch?v=t-new"
+    # name 为空的条目用类型标签兜底，卡片上不会出现无名视频
+    assert detail.videos[3].name == "先导预告"
+
+
+async def test_detail_requests_multilingual_videos() -> None:
+    """必须显式放开视频语言：只要 zh-CN 的话绝大多数影片一条预告都没有。"""
+    client = StubTmdbClient({"genre/movie/list": _GENRES, "movie/603": _MOVIE_DETAIL})
+    svc = MediaDiscoverService(client, image_base_url=_IMAGE_BASE)
+    await svc.media_detail(MediaKind.MOVIE, 603)
+
+    params = next(params for path, params in client.calls if path == "movie/603")
+    assert "videos" in params["append_to_response"]
+    assert params["include_video_language"] == "zh,en,null"
+
+
+async def test_detail_without_videos_is_empty() -> None:
+    """上游没有 videos 字段（豆瓣来源、老缓存）时安静返回空列表。"""
+    svc = _service({"movie/603": _MOVIE_DETAIL})
+    detail = await svc.media_detail(MediaKind.MOVIE, 603)
+    assert detail.videos == []
+
+
 async def test_tv_detail_fields() -> None:
     tv_detail = {
         "id": 1399,
