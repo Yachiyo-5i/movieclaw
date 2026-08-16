@@ -95,13 +95,14 @@ function RecentWatchCard({ item }: { item: RecentWatchItem }) {
   const progress = item.played ? 100 : item.progress_percent;
   const timeLabel = playbackClock(item);
   const artworkUrl = isEpisode ? item.episode_still_url : item.backdrop_url;
-  const newEpisodeLabel =
-    isEpisode && item.new_episode_count > 0 ? `新入库 ${item.new_episode_count} 集` : null;
+  // 角标回答“还能接着看几集”：已经看过的集不计，因此整部剧看完后角标自然消失。
+  const unwatchedLabel =
+    isEpisode && item.unwatched_ahead_count > 0 ? `未看 ${item.unwatched_ahead_count} 集` : null;
 
   return (
     <Link
       href={itemHref(item)}
-      aria-label={`${item.title}${context ? `，${context}` : ""}，${stateLabel(item, timeLabel != null)}${timeLabel ? `，已播 ${timeLabel}` : ""}${newEpisodeLabel ? `，${newEpisodeLabel}` : ""}`}
+      aria-label={`${item.title}${context ? `，${context}` : ""}，${stateLabel(item, timeLabel != null)}${timeLabel ? `，已播 ${timeLabel}` : ""}${unwatchedLabel ? `，${unwatchedLabel}` : ""}`}
       {...tapGuard}
       className="group/recent w-[224px] shrink-0 outline-none max-md:w-[200px] xl:w-[240px]"
     >
@@ -131,12 +132,12 @@ function RecentWatchCard({ item }: { item: RecentWatchItem }) {
           <MoviePosterFill title={item.title} posterUrl={item.poster_url} />
         )}
         <div className="pointer-events-none absolute inset-x-0 bottom-0 h-16 bg-gradient-to-t from-black/75 to-transparent" />
-        {/* 右上角统一放"状态角标"：看完的对勾与新入库提示同排，不再和底部进度抢位置。 */}
-        {(newEpisodeLabel || item.played) && (
+        {/* 右上角统一放"状态角标"：看完的对勾与未看提示同排，不再和底部进度抢位置。 */}
+        {(unwatchedLabel || item.played) && (
           <div className="pointer-events-none absolute right-2 top-2 flex items-center gap-1.5">
-            {newEpisodeLabel && (
+            {unwatchedLabel && (
               <span className="tnum rounded-full border border-emerald-200/25 bg-[rgba(5,46,34,0.76)] px-2 py-0.5 text-micro font-semibold text-emerald-100 shadow-[0_5px_16px_rgba(0,0,0,0.32)] backdrop-blur-md">
-                {newEpisodeLabel}
+                {unwatchedLabel}
               </span>
             )}
             {item.played && (

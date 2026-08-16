@@ -22,8 +22,8 @@ export interface RecentWatchItem {
   season_number: number;
   episode_number: number;
   episode_title: string | null;
-  /** 最近一次播放之后，同一媒体库中新进入且仍在位的分集数；电影恒为 0。 */
-  new_episode_count: number;
+  /** 同一媒体库中排在最近播放那一集之后、仍在位且从未看过的分集数；电影恒为 0。 */
+  unwatched_ahead_count: number;
   position_ms: number;
   duration_ms: number | null;
   progress_percent: number | null;

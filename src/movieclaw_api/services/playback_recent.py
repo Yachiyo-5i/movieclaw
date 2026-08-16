@@ -7,8 +7,9 @@ Jellyfin 只负责把播放事实写进 ``playback_state``；首页直接读取�
 
 from __future__ import annotations
 
-from sqlalchemy import and_, case, func
+from sqlalchemy import and_, func, or_
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 from sqlmodel import select
 
 from movieclaw_api.core.config import get_settings
@@ -79,21 +80,26 @@ async def recent_watch_items(
         .subquery()
     )
 
-    # 同一集可能同时存在 1080p / 2160p 等多个版本；提醒统计按季集单元聚合，
-    # 并使用该单元**第一次**进入本库的时间，避免播放后洗版被误报成“新入库 1 集”。
-    # available 用全部版本判断当前是否至少还有一份在位，已全部缺失的集不提醒。
+    # 角标口径是“还有多少集可以接着看”，而不是“入库时间比我最近播放新”。
+    # 纯时间口径有两处硬伤，都会给用户发无意义的提醒：
+    #   1. 不看是否已经看过——整部剧看完之后，补齐旧季、重扫或任何一次入库
+    #      都会重新催一遍，而用户根本没有可看的新内容；
+    #   2. 入库时间本身不可靠——洗版成功会把旧版本的台账行物理删除
+    #      （services/subscription/upgrade.py），该集的入库时间被刷新成洗版
+    #      那一刻，早就看过的老集会被误报成“新入库”。
+    # 因此改为统计：本库仍有在位文件、季集排在卡片锚点之后、且当前成员从未
+    # 看过的分集。同一集的多个版本（1080p / 2160p）按季集聚合后只算一集。
     library_episode_units = (
         select(
             LibraryFile.library_id.label("library_id"),
             LibraryFile.media_item_id.label("media_item_id"),
             LibraryFile.season_number.label("season_number"),
             LibraryFile.episode_number.label("episode_number"),
-            func.min(LibraryFile.created_at).label("first_added_at"),
-            func.max(
-                case((LibraryFile.missing_since.is_(None), 1), else_=0)  # type: ignore[union-attr]
-            ).label("available"),
         )
-        .where(LibraryFile.media_item_id.is_not(None))  # type: ignore[union-attr]
+        .where(
+            LibraryFile.media_item_id.is_not(None),  # type: ignore[union-attr]
+            LibraryFile.missing_since.is_(None),  # type: ignore[union-attr]
+        )
         .group_by(
             LibraryFile.library_id,
             LibraryFile.media_item_id,
@@ -102,18 +108,44 @@ async def recent_watch_items(
         )
         .subquery()
     )
-    new_episode_count = (
+    # 判定“看过”只认播放事实：播放过（last_played_at 非空）或被显式标记已看。
+    # 只收藏、只记忆过轨选择而从未播放的状态行不算看过。别名是必须的——不加
+    # 别名，SQLAlchemy 会把这里的 playback_state 与外层锚点行自动关联成同一张表。
+    watched_state = aliased(PlaybackState)
+    watched_unit = (
+        select(watched_state.id)
+        .where(
+            watched_state.member_id == member_id,
+            watched_state.media_item_id == library_episode_units.c.media_item_id,
+            watched_state.season_number == library_episode_units.c.season_number,
+            watched_state.episode_number == library_episode_units.c.episode_number,
+            or_(
+                watched_state.played.is_(True),  # type: ignore[union-attr]
+                watched_state.last_played_at.is_not(None),  # type: ignore[union-attr]
+            ),
+        )
+        .exists()
+    )
+    unwatched_ahead_count = (
         select(func.count())
         .select_from(library_episode_units)
         .where(
             library_episode_units.c.library_id == Library.id,
             library_episode_units.c.media_item_id == PlaybackState.media_item_id,
-            library_episode_units.c.available == 1,
-            library_episode_units.c.first_added_at > PlaybackState.last_played_at,
+            # 季集按字典序严格大于卡片锚点：补齐的旧季、洗版的老集都排在锚点
+            # 之前，不会被当成“可以接着看”的内容。
+            or_(
+                library_episode_units.c.season_number > PlaybackState.season_number,
+                and_(
+                    library_episode_units.c.season_number == PlaybackState.season_number,
+                    library_episode_units.c.episode_number > PlaybackState.episode_number,
+                ),
+            ),
+            ~watched_unit,
         )
         .correlate(Library, PlaybackState)
         .scalar_subquery()
-        .label("new_episode_count")
+        .label("unwatched_ahead_count")
     )
 
     statement = (
@@ -129,7 +161,7 @@ async def recent_watch_items(
             MediaEpisode.still_file,
             MediaEpisode.still_path,
             func.max(LibraryFile.duration_seconds).label("file_duration_seconds"),
-            new_episode_count,
+            unwatched_ahead_count,
         )
         .join(ranked_states, ranked_states.c.state_id == PlaybackState.id)
         .join(MediaItem, MediaItem.id == PlaybackState.media_item_id)
@@ -186,7 +218,7 @@ async def recent_watch_items(
         episode_still_file,
         episode_still_path,
         file_duration_seconds,
-        added_episode_count,
+        unwatched_ahead,
     ) in rows:
         if item.id is None or item.id in seen_items or state.last_played_at is None:
             continue
@@ -225,7 +257,7 @@ async def recent_watch_items(
                 season_number=state.season_number,
                 episode_number=state.episode_number,
                 episode_title=episode_name or None,
-                new_episode_count=int(added_episode_count or 0) if item.kind == "tv" else 0,
+                unwatched_ahead_count=int(unwatched_ahead or 0) if item.kind == "tv" else 0,
                 position_ms=state.position_ms,
                 duration_ms=duration_ms,
                 progress_percent=_progress_percent(state.position_ms, duration_ms),
