@@ -158,6 +158,15 @@ export function MediaDetailView({
   const libraryReturnTo = buildDiscoveryReturnPath(source, type ?? item.type, id);
 
   const isMovie = item.type === "movie";
+  // 电影入库即完成：再摆「订阅追踪 / 搜索资源」等于邀请用户重下一遍已有的片子，
+  // 隐藏后由上方的「在库」信息条接手（点库名直达条目，想看就去看）。
+  // 剧集不适用同一条规则——在库不等于收齐，缺集与未来新季仍要靠订阅追更或
+  // 手动找资源，所以剧集在库时两个按钮照常显示；口径与海报卡的
+  // libraryInventoryAction（电影 none、剧集 follow/backfill）一致。
+  const ownedMovie = isMovie && libraryLinks.length > 0;
+  // 已订阅的在库电影仍保留状态键：它是「管理 / 取消订阅」入口，不是再订一次的号召。
+  const showSubscribeButton = canSubscribe && (Boolean(sub) || !ownedMovie);
+  const showSearchButton = canSearch && !ownedMovie;
   const directorCast =
     info?.directorCredits.length
       ? info.directorCredits.map((director) => ({
@@ -296,48 +305,51 @@ export function MediaDetailView({
             </div>
           )}
 
-          {/* 操作区：已订阅的影片主按钮变为状态展示（点击进入管理弹层可取消订阅） */}
-          <div className="mt-5 flex flex-wrap items-center gap-3 max-md:mt-3.5 max-md:gap-2">
-            {canSubscribe && (sub ? (
-              <button
-                type="button"
-                onClick={openSubscribe}
+          {/* 操作区：已订阅的影片主按钮变为状态展示（点击进入管理弹层可取消订阅）。
+              在库电影会把两个按钮都收掉，此时整行无内容就不渲染，免得留一段空白。 */}
+          {(showSubscribeButton || showSearchButton || sub) && (
+            <div className="mt-5 flex flex-wrap items-center gap-3 max-md:mt-3.5 max-md:gap-2">
+              {showSubscribeButton && (sub ? (
+                <button
+                  type="button"
+                  onClick={openSubscribe}
+                  className="btn-glass flex h-10 items-center gap-2 bg-white/10 px-5 text-ui font-medium backdrop-blur-md transition hover:bg-white/15"
+                >
+                  <CheckIcon
+                    className="size-4"
+                    style={{ color: subscriptionStatusMeta[sub.status].color }}
+                  />
+                  已订阅 · {subscriptionStatusMeta[sub.status].label}
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  onClick={openSubscribe}
+                  className="btn-accent flex h-10 items-center gap-2 rounded-full px-5 text-ui font-semibold"
+                >
+                  <BellIcon className="size-4" />
+                  订阅追踪
+                </button>
+              ))}
+              {/* 搜索资源：不订阅、只想手动找种子下一次的直达口（此前只能回 ⌘K 重打片名） */}
+              {showSearchButton && <Link
+                href={`/search?q=${encodeURIComponent(item.title)}` as Route}
                 className="btn-glass flex h-10 items-center gap-2 bg-white/10 px-5 text-ui font-medium backdrop-blur-md transition hover:bg-white/15"
               >
-                <CheckIcon
-                  className="size-4"
-                  style={{ color: subscriptionStatusMeta[sub.status].color }}
-                />
-                已订阅 · {subscriptionStatusMeta[sub.status].label}
-              </button>
-            ) : (
-              <button
-                type="button"
-                onClick={openSubscribe}
-                className="btn-accent flex h-10 items-center gap-2 rounded-full px-5 text-ui font-semibold"
-              >
-                <BellIcon className="size-4" />
-                订阅追踪
-              </button>
-            ))}
-            {/* 搜索资源：不订阅、只想手动找种子下一次的直达口（此前只能回 ⌘K 重打片名） */}
-            {canSearch && <Link
-              href={`/search?q=${encodeURIComponent(item.title)}` as Route}
-              className="btn-glass flex h-10 items-center gap-2 bg-white/10 px-5 text-ui font-medium backdrop-blur-md transition hover:bg-white/15"
-            >
-              <SearchIcon className="size-4" />
-              搜索资源
-            </Link>}
-            {sub && (
-              <span className="text-on-image flex items-center gap-1.5 text-sub text-[var(--text-muted)]">
-                <span
-                  className="size-1.5 rounded-full"
-                  style={{ backgroundColor: subscriptionStatusMeta[sub.status].color }}
-                />
-                {subscriptionProgressNote(sub)}
-              </span>
-            )}
-          </div>
+                <SearchIcon className="size-4" />
+                搜索资源
+              </Link>}
+              {sub && (
+                <span className="text-on-image flex items-center gap-1.5 text-sub text-[var(--text-muted)]">
+                  <span
+                    className="size-1.5 rounded-full"
+                    style={{ backgroundColor: subscriptionStatusMeta[sub.status].color }}
+                  />
+                  {subscriptionProgressNote(sub)}
+                </span>
+              )}
+            </div>
+          )}
         </div>
       </div>
 
