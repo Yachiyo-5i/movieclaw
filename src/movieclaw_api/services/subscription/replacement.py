@@ -66,17 +66,42 @@ TRIAL_PROGRESS_BYTES = 1024 * 1024
 _IN_FLIGHT = (WantedStatus.GRABBED, WantedStatus.DOWNLOADED)
 _replacement_lock = asyncio.Lock()
 _RESOLUTION_RE = re.compile(r"(\d{3,4})")
-_SOURCE_RANK = {
-    "hdtv": 10,
-    "web-rip": 20,
-    "webrip": 20,
-    "web-dl": 30,
-    "webdl": 30,
-    "blu-ray": 40,
-    "bluray": 40,
-    "uhd blu-ray": 50,
-    "uhd bluray": 50,
+
+# 片源序以 matcher 的统一片源档阶梯为基（quality-upgrade.md Phase 7 收编，
+# 洗版与换源共用同一张表），换源侧保留两点特有语义：
+# ① UHD Blu-ray 比 Blu-ray 高半档——换源的"不降级"要挡住 UHD→普通蓝光
+#   （洗版语义里 UHD 由分辨率轴表达，同为 T4）；
+# ② 值匹配按子串容错并带别名（存量 attempt.quality 可能存有 webdl/bluray
+#   等未带连字符写法）。
+# 相比旧表补全了 BDRip/HDRip/DVD 等档（此前 rank=None 被当"未知"处理）。
+_SOURCE_ALIASES: dict[str, tuple[str, ...]] = {
+    "uhd blu-ray": ("uhd blu-ray", "uhd bluray"),
+    "hd-dvd": ("hd-dvd", "hddvd"),
+    "blu-ray": ("blu-ray", "bluray"),
+    "web-dl": ("web-dl", "webdl"),
+    "webrip": ("webrip", "web-rip"),
+    "bdrip": ("bdrip",),
+    "hdrip": ("hdrip",),
+    "dvdrip": ("dvdrip",),
+    "hdtvrip": ("hdtvrip",),
+    "hdtv": ("hdtv",),
+    "tvrip": ("tvrip",),
+    "dvd": ("dvd",),
 }
+
+
+def _build_source_rank() -> dict[str, int]:
+    from movieclaw_matcher import source_tier
+
+    return {
+        alias: (source_tier(canonical, False) or 0) * 10
+        + (5 if canonical == "uhd blu-ray" else 0)
+        for canonical, aliases in _SOURCE_ALIASES.items()
+        for alias in aliases
+    }
+
+
+_SOURCE_RANK = _build_source_rank()
 
 
 def replacement_backoff(attempts: int) -> timedelta:
