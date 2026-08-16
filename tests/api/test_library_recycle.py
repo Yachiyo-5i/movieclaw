@@ -16,6 +16,7 @@ from movieclaw_api.services.library.recycle import (
     purge_file,
     recycle_file,
     restore_file,
+    sweep_orphan_trash,
 )
 from movieclaw_db.engine import dispose_db, get_database, init_db
 from movieclaw_db.migrations import run_migrations
@@ -333,3 +334,182 @@ async def test_recycle_keeps_disc_dir_in_place_and_purge_removes_it(db, tmp_path
         assert await purge_file(session, row) is True  # 立即清理支持目录
         await session.commit()
     assert not disc.exists()
+
+
+@pytest.mark.asyncio
+async def test_recycle_moves_strm_placeholder(db, tmp_path):
+    """strm 占位文件天然只有一个硬链接，但它是文本指针不是做种载荷——
+    必须豁免做种保护正常移入回收站，否则永远原地留置无法自动清理。"""
+    file_id, path, root = await _seed_file(db, tmp_path, hardlink=False, name="Movie.2020.strm")
+    async with db.session() as session:
+        row = await session.get(LibraryFile, file_id)
+        outcome = await recycle_file(
+            session, row, reason="upgrade_replaced", trigger=_TRIGGER, note="洗版替换"
+        )
+        await session.commit()
+        assert outcome == "moved_to_trash"
+        assert not path.exists()
+        assert row.file_path.startswith(str(root / ".movieclaw-trash"))
+        assert row.purge_after is not None  # 正常按保留期倒计时
+
+
+@pytest.mark.asyncio
+async def test_sidecars_follow_recycle_restore_and_purge(db, tmp_path):
+    """附属文件（字幕/NFO）随主文件进回收站、随恢复搬回、随清理删除；
+    同名不同容器的视频是独立版本，绝不连带。"""
+    file_id, path, root = await _seed_file(db, tmp_path)
+    srt = path.with_name(path.stem + ".zh.srt")
+    srt.write_text("字幕")
+    nfo = path.with_name(path.stem + ".nfo")
+    nfo.write_text("<movie/>")
+    sibling = path.with_name(path.stem + ".mp4")  # 独立版本，不是附属
+    sibling.write_bytes(b"other version")
+    trash_dir = root / ".movieclaw-trash"
+
+    async with db.session() as session:
+        row = await session.get(LibraryFile, file_id)
+        assert (
+            await recycle_file(
+                session, row, reason="upgrade_replaced", trigger=_TRIGGER, note="洗版替换"
+            )
+            == "moved_to_trash"
+        )
+        await session.commit()
+        trash_main = row.file_path
+    assert not srt.exists() and not nfo.exists()  # 附属跟随进回收站
+    trash_stem = os.path.splitext(os.path.basename(trash_main))[0]
+    assert (trash_dir / f"{trash_stem}.zh.srt").exists()
+    assert (trash_dir / f"{trash_stem}.nfo").exists()
+    assert sibling.exists()  # 独立版本原地不动
+
+    async with db.session() as session:
+        row = await session.get(LibraryFile, file_id)
+        assert await restore_file(session, row) is True
+        await session.commit()
+    assert srt.exists() and nfo.exists()  # 附属随恢复搬回
+    assert not (trash_dir / f"{trash_stem}.zh.srt").exists()
+
+    async with db.session() as session:
+        row = await session.get(LibraryFile, file_id)
+        await recycle_file(
+            session, row, reason="upgrade_replaced", trigger=_TRIGGER, note="洗版替换"
+        )
+        assert await purge_file(session, row) is True
+        await session.commit()
+    assert not (trash_dir / f"{trash_stem}.zh.srt").exists()  # 附属随清理删除
+    assert not (trash_dir / f"{trash_stem}.nfo").exists()
+    assert sibling.exists()
+
+
+@pytest.mark.asyncio
+async def test_purge_refuses_disc_dir_containing_other_files(db, tmp_path):
+    """爆炸半径保护：原盘目录里还有其他在案文件（如监听导入落在目录内的
+    新版本）时拒绝整树删除；目录清空账面后才允许清理。"""
+    root = tmp_path / "movies"
+    disc = root / "某电影 (2020)" / "某电影.BluRay.原盘"
+    (disc / "BDMV" / "STREAM").mkdir(parents=True)
+    (disc / "BDMV" / "STREAM" / "00000.m2ts").write_bytes(b"disc")
+    inner_new = disc / "某电影.2160p.Remux.mkv"  # 站点目录结构原样落盘的新版本
+    inner_new.write_bytes(b"new")
+    async with db.session() as session:
+        library = await LibraryRepository(session).create(
+            name="电影库-原盘嵌套", kind="movie", root_paths=[str(root)]
+        )
+        disc_row = LibraryFile(
+            library_id=library.id, file_path=str(disc), size_bytes=4, source=FileSource.SCANNED
+        )
+        inner_row = LibraryFile(
+            library_id=library.id,
+            file_path=str(inner_new),
+            size_bytes=3,
+            source=FileSource.IMPORTED,
+        )
+        session.add(disc_row)
+        session.add(inner_row)
+        await session.commit()
+        await session.refresh(disc_row)
+
+        await recycle_file(
+            session, disc_row, reason="upgrade_replaced", trigger=_TRIGGER, note="洗版替换"
+        )
+        assert await purge_file(session, disc_row) is False  # 目录内有别的在案文件
+        assert disc.is_dir() and inner_new.exists()
+
+        await session.delete(inner_row)
+        await session.flush()
+        assert await purge_file(session, disc_row) is True  # 账面清空后允许
+        await session.commit()
+    assert not disc.exists()
+
+
+@pytest.mark.asyncio
+async def test_delete_single_file_refuses_disc_dir_containing_other_version(db, tmp_path):
+    """单文件删除的同款爆炸半径保护：旧原盘目录里住着新版本文件时，
+    整目录删除必须拒绝并报可读错误。"""
+    from movieclaw_api.services.library.items import delete_single_file
+    from movieclaw_db.models import MediaItem
+    from movieclaw_db.models.library import Library
+
+    root = tmp_path / "movies"
+    disc = root / "某电影 (2020)" / "某电影.BluRay.原盘"
+    (disc / "BDMV").mkdir(parents=True)
+    (disc / "BDMV" / "index.bdmv").write_bytes(b"disc")
+    inner_new = disc / "某电影.2160p.Remux.mkv"
+    inner_new.write_bytes(b"new")
+    async with db.session() as session:
+        library = await LibraryRepository(session).create(
+            name="电影库-原盘删除", kind="movie", root_paths=[str(root)]
+        )
+        item = MediaItem(kind="movie", tmdb_id=912, title="某电影", original_title="M", year=2020)
+        session.add(item)
+        await session.flush()
+        rows = []
+        for file_path in (disc, inner_new):
+            row = LibraryFile(
+                library_id=library.id,
+                media_item_id=item.id,
+                file_path=str(file_path),
+                size_bytes=3,
+                source=FileSource.SCANNED,
+            )
+            session.add(row)
+            rows.append(row)
+        await session.commit()
+        for row in rows:
+            await session.refresh(row)
+
+        library_obj = await session.get(Library, library.id)
+        result = await delete_single_file(session, library_obj, rows[0], rows, rows)
+        assert result.rows_deleted == 0
+        assert any("目录内还有其他在案文件" in err for err in result.errors)
+    assert disc.is_dir() and inner_new.exists()
+
+
+@pytest.mark.asyncio
+async def test_orphan_sweep_spares_tracked_sidecars(db, tmp_path):
+    """孤儿清扫豁免在案主文件的附属文件：字幕随主文件进回收站时 mtime
+    保留原值可能早已超期，不能被当孤儿提前扫掉——它归 purge 通道管。"""
+    import time
+
+    file_id, path, root = await _seed_file(db, tmp_path)
+    srt = path.with_name(path.stem + ".zh.srt")
+    srt.write_text("字幕")
+    old = time.time() - 30 * 86400
+    os.utime(srt, (old, old))  # 字幕 mtime 远超保留期
+    async with db.session() as session:
+        row = await session.get(LibraryFile, file_id)
+        await recycle_file(
+            session, row, reason="upgrade_replaced", trigger=_TRIGGER, note="洗版替换"
+        )
+        await session.commit()
+        trash_stem = os.path.splitext(os.path.basename(row.file_path))[0]
+    trash_dir = root / ".movieclaw-trash"
+    trash_srt = trash_dir / f"{trash_stem}.zh.srt"
+    assert trash_srt.exists()
+    orphan = trash_dir / "上古遗留.mkv"
+    orphan.write_bytes(b"orphan")
+    os.utime(orphan, (old, old))
+
+    await sweep_orphan_trash()
+    assert not orphan.exists()  # 真孤儿被清
+    assert trash_srt.exists()  # 在案主文件的附属被豁免

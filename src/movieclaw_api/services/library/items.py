@@ -1285,6 +1285,19 @@ async def delete_single_file(
         result.errors.append(f"「{path}」不在库根路径之内，已跳过（不删库外文件）")
         return result
 
+    # 原盘目录形态整树删除前查台账：监听导入按站点原始目录结构落盘，
+    # 新版本文件可能就在旧原盘目录里面——rmtree 会把它一起炸掉
+    if path.is_dir():
+        prefix = str(path).rstrip("/") + "/"
+        if any(
+            other.id != row.id and other.file_path.startswith(prefix)
+            for other in all_library_files
+        ):
+            result.errors.append(
+                f"「{path}」目录内还有其他在案文件（可能是新入库的版本），已跳过整目录删除"
+            )
+            return result
+
     ok = await asyncio.to_thread(_remove_file_with_sidecars, path, result)
     if ok:
         result.rows_deleted = 1

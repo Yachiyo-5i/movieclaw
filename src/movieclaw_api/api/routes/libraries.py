@@ -2153,7 +2153,9 @@ async def purge_library_file(
         raise BadRequestException("该文件不在待回收状态；删除在位文件请用「删除文件」")
     file_name = PurePath(row.file_path).name
     if not await purge_file(session, row):
-        raise ConflictException(f"清理「{file_name}」失败，请检查文件权限后重试")
+        raise ConflictException(
+            f"清理「{file_name}」失败：目录内还有其他在案文件（需先处理），或文件权限不足——详见服务日志"
+        )
     await session.commit()
     return ok({}, message=f"「{file_name}」已清理")
 
