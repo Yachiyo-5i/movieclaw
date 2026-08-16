@@ -24,10 +24,34 @@ function itemHref(item: RecentWatchItem): Route {
   return `${base}?from=recent` as Route;
 }
 
-function stateLabel(item: RecentWatchItem): string {
+/** 毫秒 → 播放器风格时钟，只有超过一小时才带小时位，短片保持 12:34 的紧凑写法。 */
+function clock(ms: number): string {
+  const total = Math.max(0, Math.round(ms / 1000));
+  const seconds = String(total % 60).padStart(2, "0");
+  const minutes = Math.floor(total / 60) % 60;
+  const hours = Math.floor(total / 3600);
+  if (hours <= 0) return `${minutes}:${seconds}`;
+  return `${hours}:${String(minutes).padStart(2, "0")}:${seconds}`;
+}
+
+/**
+ * 「已播 / 总时长」文本。只在"看了一半"时出现：
+ * 已看完的作品右上角有对勾就够了，尚未开播或后端没探到时长的也不必占位，
+ * 卡片上始终只保留当下最有用的那一条信息。
+ */
+function playbackClock(item: RecentWatchItem): string | null {
+  if (item.played || item.position_ms <= 0 || !item.duration_ms) return null;
+  return `${clock(item.position_ms)} / ${clock(item.duration_ms)}`;
+}
+
+/**
+ * 卡片底部第三行的状态文案。卡片上已经用时钟展示进度时不再重复百分比，
+ * 这一行只回答"什么时候看的"。
+ */
+function stateLabel(item: RecentWatchItem, hasClock: boolean): string {
   const ago = formatRelativeTime(item.last_played_at);
   if (item.played) return `${ago}已看完`;
-  if (item.position_ms > 0 && item.progress_percent != null) {
+  if (item.position_ms > 0 && item.progress_percent != null && !hasClock) {
     return `${ago}观看到 ${item.progress_percent}%`;
   }
   if (item.position_ms > 0) return `${ago}观看过`;
@@ -59,15 +83,17 @@ export function RecentWatchRow({ items }: { items: RecentWatchItem[] | null }) {
 
 function RecentWatchCard({ item }: { item: RecentWatchItem }) {
   const tapGuard = useTapGuard();
-  const code = item.kind === "tv" ? episodeCode(item) : null;
-  const context =
-    item.kind === "tv"
-      ? item.episode_title
-      : item.year
-        ? String(item.year)
-        : "";
-  const progress = item.played ? 100 : item.progress_percent;
   const isEpisode = item.kind === "tv";
+  const code = isEpisode ? episodeCode(item) : null;
+  // 集号不再压在剧照左上角（会跟角标、进度挤在一起），改到片名下方的副标题里，
+  // 与分集标题连读成「S01E02 · 集名」，海报本身保持干净。
+  const context = isEpisode
+    ? [code, item.episode_title].filter(Boolean).join(" · ")
+    : item.year
+      ? String(item.year)
+      : "";
+  const progress = item.played ? 100 : item.progress_percent;
+  const timeLabel = playbackClock(item);
   const artworkUrl = isEpisode ? item.episode_still_url : item.backdrop_url;
   const newEpisodeLabel =
     isEpisode && item.new_episode_count > 0 ? `新入库 ${item.new_episode_count} 集` : null;
@@ -75,7 +101,7 @@ function RecentWatchCard({ item }: { item: RecentWatchItem }) {
   return (
     <Link
       href={itemHref(item)}
-      aria-label={`${item.title}${context ? `，${context}` : ""}，${stateLabel(item)}${newEpisodeLabel ? `，${newEpisodeLabel}` : ""}`}
+      aria-label={`${item.title}${context ? `，${context}` : ""}，${stateLabel(item, timeLabel != null)}${timeLabel ? `，已播 ${timeLabel}` : ""}${newEpisodeLabel ? `，${newEpisodeLabel}` : ""}`}
       {...tapGuard}
       className="group/recent w-[224px] shrink-0 outline-none max-md:w-[200px] xl:w-[240px]"
     >
@@ -105,39 +131,48 @@ function RecentWatchCard({ item }: { item: RecentWatchItem }) {
           <MoviePosterFill title={item.title} posterUrl={item.poster_url} />
         )}
         <div className="pointer-events-none absolute inset-x-0 bottom-0 h-16 bg-gradient-to-t from-black/75 to-transparent" />
-        {code && (
-          <span className="tnum absolute left-2 top-2 rounded-md border border-white/15 bg-black/65 px-1.5 py-0.5 text-micro font-semibold tracking-wide text-white backdrop-blur-md">
-            {code}
-          </span>
-        )}
-        {newEpisodeLabel && (
-          <span className="tnum absolute right-2 top-2 rounded-full border border-emerald-200/25 bg-[rgba(5,46,34,0.76)] px-2 py-0.5 text-micro font-semibold text-emerald-100 shadow-[0_5px_16px_rgba(0,0,0,0.32)] backdrop-blur-md">
-            {newEpisodeLabel}
-          </span>
-        )}
-        {item.played && (
-          <span className="absolute bottom-2 right-2 flex size-6 items-center justify-center rounded-full bg-emerald-400 text-[#07120c] shadow-lg">
-            <CheckIcon className="size-3.5 stroke-[2.5]" />
-          </span>
-        )}
-        {progress != null && (
-          <div className="absolute inset-x-2 bottom-2 h-[3px] overflow-hidden rounded-full bg-white/25">
-            <div
-              className={`h-full rounded-full ${item.played ? "bg-emerald-400" : "bg-[var(--accent-2)]"}`}
-              style={{ width: `${progress}%` }}
-            />
+        {/* 右上角统一放"状态角标"：看完的对勾与新入库提示同排，不再和底部进度抢位置。 */}
+        {(newEpisodeLabel || item.played) && (
+          <div className="pointer-events-none absolute right-2 top-2 flex items-center gap-1.5">
+            {newEpisodeLabel && (
+              <span className="tnum rounded-full border border-emerald-200/25 bg-[rgba(5,46,34,0.76)] px-2 py-0.5 text-micro font-semibold text-emerald-100 shadow-[0_5px_16px_rgba(0,0,0,0.32)] backdrop-blur-md">
+                {newEpisodeLabel}
+              </span>
+            )}
+            {item.played && (
+              <span className="flex size-6 items-center justify-center rounded-full bg-emerald-400 text-[#07120c] shadow-lg">
+                <CheckIcon className="size-3.5 stroke-[2.5]" />
+              </span>
+            )}
           </div>
         )}
-        {!item.played && item.position_ms > 0 && progress == null && (
-          <div className="absolute inset-x-2 bottom-2 h-[3px] rounded-full bg-[var(--accent-2)]/60" />
-        )}
+        {/* 底部只留进度：看了一半时在进度条上方补一行「已播 / 总时长」。 */}
+        <div className="pointer-events-none absolute inset-x-2 bottom-2 space-y-1">
+          {timeLabel && (
+            <span className="tnum text-on-image block text-micro font-semibold text-white/85">
+              {timeLabel}
+            </span>
+          )}
+          {progress != null ? (
+            <div className="h-[3px] overflow-hidden rounded-full bg-white/25">
+              <div
+                className={`h-full rounded-full ${item.played ? "bg-emerald-400" : "bg-[var(--accent-2)]"}`}
+                style={{ width: `${progress}%` }}
+              />
+            </div>
+          ) : (
+            item.position_ms > 0 && (
+              <div className="h-[3px] rounded-full bg-[var(--accent-2)]/60" />
+            )
+          )}
+        </div>
       </div>
       <p className="mt-2 truncate text-ui font-semibold text-[var(--text)]">{item.title}</p>
       {context && (
         <p className="tnum mt-0.5 truncate text-sub text-[var(--text-muted)]">{context}</p>
       )}
       <p className="tnum mt-0.5 truncate text-caption text-[var(--text-faint)]">
-        {stateLabel(item)}
+        {stateLabel(item, timeLabel != null)}
       </p>
     </Link>
   );
