@@ -108,7 +108,7 @@ from pathlib import Path, PurePosixPath
 from typing import NamedTuple
 from uuid import uuid4
 
-from sqlalchemy import update
+from sqlalchemy import or_, update
 from sqlmodel import select
 
 from movieclaw_api.services import jobs
@@ -388,19 +388,34 @@ def _ingest_path_id(entry_path: str) -> str:
     return hashlib.sha256(entry_path.encode("utf-8")).hexdigest()
 
 
-def _ingest_dedupe_key(entry_path: str) -> str:
-    return f"library.ingest:{_ingest_path_id(entry_path)}"
+def _ingest_dedupe_key(entry_path: str, fingerprint: str | None = None) -> str:
+    """条目的入库去重键；边下边入库的每一批 ready 文件再按指纹分桶。
+
+    整树入库沿用纯路径键（一个条目同时只该有一个作业）。分批入库必须分桶：
+    blocked 属于活跃状态，若各批共用一个键，某一批因识别失败挂起后，
+    ``return_existing`` 会把后续每一批都并回那个挂起作业，同条目剩余各集就
+    永久堵死——而任务中心只显示那一个受阻任务，用户根本看不出还有几集被
+    连坐。分桶后挂起的老批次留在原地等人工，新批次自己往前走。
+    """
+    key = f"library.ingest:{_ingest_path_id(entry_path)}"
+    return f"{key}:{fingerprint}" if fingerprint else key
 
 
 async def _latest_ingest_job(session, entry_path: str):
-    """返回同一监听条目的最近 Job，供巡检处理去重与终态意图。"""
+    """返回同一监听条目的最近 Job（含各分批入库批次），供巡检去重与终态意图。"""
     from movieclaw_db.models import Job
 
+    prefix = _ingest_dedupe_key(entry_path)
     return (
         (
             await session.execute(
                 select(Job)
-                .where(Job.dedupe_key == _ingest_dedupe_key(entry_path))
+                .where(
+                    or_(
+                        Job.dedupe_key == prefix,
+                        Job.dedupe_key.startswith(f"{prefix}:"),  # type: ignore[union-attr]
+                    )
+                )
                 .order_by(Job.created_at.desc())
             )
         )
@@ -464,7 +479,10 @@ async def enqueue_ingest_job(
         subject=entry.name,
         input_data=input_data,
         resources=resources,
-        dedupe_key=_ingest_dedupe_key(str(entry)),
+        # 分批入库按本批 ready 指纹分桶，各批互不牵连（见 _ingest_dedupe_key）
+        dedupe_key=_ingest_dedupe_key(
+            str(entry), snap.fingerprint if ready_files is not None else None
+        ),
         conflict_policy="return_existing",
         handler_revision=_ingest_handler_revision(),
         # 下载落地后的环境故障按小时退避；给足一天自动自愈窗口，超过后
@@ -888,6 +906,33 @@ async def _completed_file_batch(entry: Path, matches: list) -> _DownloadFileBatc
     return _DownloadFileBatch(files=tuple(ready), consumable_hashes=consumable)
 
 
+async def _claimed_by_blocked_batches(session, entry_path: str) -> frozenset[str]:
+    """已被挂起的分批入库作业认领的文件（条目内相对路径）。
+
+    挂起批次的白名单钉死了这些文件，它们只能等人工或解析能力升级。后续批次
+    必须避开——否则新一批会把同一个识别不出的文件再拉进来、整批跟着挂起，
+    剩下的集依旧进不了库（连坐的第二种形态：不是被旧作业拦住，而是被它带的
+    那个坏文件拖住）。
+    """
+    from movieclaw_db.models import Job
+
+    prefix = _ingest_dedupe_key(entry_path)
+    rows = (
+        await session.execute(
+            select(Job).where(
+                Job.dedupe_key.startswith(f"{prefix}:"),  # type: ignore[union-attr]
+                Job.status == JobStatus.BLOCKED,
+            )
+        )
+    ).scalars()
+    return frozenset(
+        str(ready["path"])
+        for job in rows
+        for ready in (job.input_data or {}).get("ready_files") or ()
+        if isinstance(ready, dict) and ready.get("path")
+    )
+
+
 async def _deferred_flipped(prefix: str) -> bool:
     """挂起条目是否出现整种完成或新的单文件安全批次。
 
@@ -980,6 +1025,32 @@ async def _maybe_wake_blocked_job(
         logger.info("监听条目内容变化，重新唤醒等待中的任务：%s（job=%s）", entry.name, job.id)
 
 
+def _superseded_blocked_batch(
+    job,
+    snap: _EntrySnapshot | None,
+    partial_batch: _DownloadFileBatch | None,
+) -> bool:
+    """挂起的分批入库作业是否已被新的一轮处理取代。
+
+    分批作业的白名单已经钉死，只能等人工或解析能力升级——但同条目剩下的集与
+    它无关：后续批次、以及整种下完后的整树入库，都必须能绕过它继续推进。只有
+    "又是同一批"才让它继续拦着（否则会并发重复搬同一批文件）。
+
+    整树作业挂起时不适用：它覆盖整个条目，没有"下一批"的说法，重复放行只会
+    每轮重建同一个作业。
+    """
+    if job.status != JobStatus.BLOCKED:
+        return False
+    input_data = job.input_data or {}
+    if "ready_files" not in input_data:
+        return False
+    if partial_batch is None:
+        return True  # 整种已下完：整树入库不该被某一批的挂起连坐
+    if snap is None:
+        return False
+    return str(input_data.get("detected_fingerprint") or "") != snap.fingerprint
+
+
 async def _process_entry(
     rule: ImportWatch,
     library: Library | None,
@@ -1045,13 +1116,37 @@ async def _process_entry(
         if latest_job is not None and latest_job.status in ACTIVE_JOB_STATUSES:
             if latest_job.status == JobStatus.BLOCKED:
                 await _maybe_wake_blocked_job(session, entry, record, latest_job, parser_retry)
-            # Job 已接管后不再反复遍历条目树（blocked 例外，见唤醒助手）；
-            # 运行、等待重试与待人工认领都以统一状态机为事实源。
-            _stability.pop(path_str, None)
-            if partial_batch is None:
-                _deferred.pop(path_str, None)
-            _failed_retry.pop(path_str, None)
-            return
+            # 挂起的分批入库不能连坐后面的集：该批的白名单已经钉死，靠指纹
+            # 唤醒只会让它按旧白名单反复重跑，因此它只能等人工——但剩下的集
+            # 跟它无关，必须允许按新指纹另立作业继续往前走。
+            if not _superseded_blocked_batch(latest_job, snap, partial_batch):
+                # Job 已接管后不再反复遍历条目树（blocked 例外，见唤醒助手）；
+                # 运行、等待重试与待人工认领都以统一状态机为事实源。
+                _stability.pop(path_str, None)
+                if partial_batch is None:
+                    _deferred.pop(path_str, None)
+                _failed_retry.pop(path_str, None)
+                return
+            if partial_batch is not None:
+                # 放行的新批次要避开挂起批次已认领的文件。剔除后重算快照：
+                # 指纹要与真实白名单一致，它同时是本批的去重分桶键。
+                claimed = await _claimed_by_blocked_batches(session, path_str)
+                remaining = tuple(
+                    ready for ready in partial_batch.files if ready.relative_path not in claimed
+                )
+                if not remaining:
+                    return  # 本轮完成的文件全在挂起批次里：等人工，无事可做
+                if len(remaining) != len(partial_batch.files):
+                    # 仍有文件卡在挂起批次里，种子不能算消费完毕
+                    partial_batch = _DownloadFileBatch(files=remaining, consumable_hashes=())
+                    try:
+                        snap = await asyncio.to_thread(
+                            _snapshot_ready_files, entry, list(remaining)
+                        )
+                    except IngestSourceChanged:
+                        return
+                    if not snap.videos:
+                        return
 
         if snap is None:
             snap = await asyncio.to_thread(_snapshot, entry)

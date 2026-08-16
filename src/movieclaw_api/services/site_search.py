@@ -1,4 +1,11 @@
-"""跨站点聚合搜索——把一个关键词并发投递给所有可用站点，合并结果。
+"""跨站点聚合搜索/浏览——把一次查询并发投递给所有可用站点，合并结果。
+
+两种模式共用一条管线
+------------------
+关键词非空 = **搜索**（打各站搜索页）；关键词留空 = **浏览**（打各站种子浏览页，
+只按分类翻页看最新发布）。分岔只发生在 ``_fetch_one`` 里选调 ``search`` 还是
+``list_torrents`` 这一处，扇出、错误隔离、结果富化、流式事件全部共用，
+因此前端也只需要一套渲染。
 
 为什么可以并发
 --------------
@@ -10,7 +17,7 @@
 错误隔离（核心不变量）
 --------------------
 单站失败（认证过期 / 网络异常 / 站点改版解析失败）**绝不能拖垮整次搜索**。每个站点
-的搜索都包在 ``_search_one`` 的 try/except 里，失败降级为「该站 0 条 + 可读中文原因」，
+的取数都包在 ``_fetch_one`` 的 try/except 里，失败降级为「该站 0 条 + 可读中文原因」，
 其它站点照常返回。错误文案复用 ``verification.friendly_error``，与站点验证的报错口径一致。
 
 站点实例一律通过 ``SiteAccessManager`` 复用（已认证、连接池共享），调用方**不 close**。
@@ -90,10 +97,22 @@ async def _active_sites() -> list[SiteCredential]:
     return [c for c in creds if c.enabled and c.status == ConfigStatus.ACTIVE]
 
 
-async def _search_one(
-    cred: SiteCredential, query: SearchQuery
+async def _fetch_one(
+    cred: SiteCredential,
+    *,
+    keyword: str,
+    categories: list[TorrentCategory] | None = None,
+    page: int = 1,
 ) -> tuple[list[TorrentHit], SiteSearchStatus]:
-    """搜索单个站点，全程吞异常：失败降级为带 error 的状态，不向上抛。
+    """从单个站点取一页种子，全程吞异常：失败降级为带 error 的状态，不向上抛。
+
+    **关键词有无决定走哪个入口**，这是「搜索」与「浏览」共用一条管线的分岔点：
+    - ``keyword`` 非空 → ``site.search``，站点的搜索页（torrents.php?search=…）；
+    - ``keyword`` 为空 → ``site.list_torrents``，站点的**种子浏览页**（分类 + 翻页），
+      对应"不输关键词、只挑分类逛最新发布"的场景。
+
+    两个入口返回的条目类型完全相同（``TorrentListItem``），因此下游的富化、
+    错误隔离、流式事件全部无需区分模式。
 
     成功与失败的状态里都带 ``elapsed_ms``：失败站的耗时尤其有诊断价值
     （十几秒后才失败的基本是超时，秒失败的多半是认证/解析问题）。
@@ -104,22 +123,31 @@ async def _search_one(
     elapsed = lambda: int((time.monotonic() - started) * 1000)  # noqa: E731
     try:
         site = await get_site_access().get(site_id)  # 已认证共享实例，勿 close
-        result = await site.search(query)
+        if keyword:
+            result = await site.search(
+                SearchQuery(keyword=keyword, categories=categories or None, page=page)
+            )
+            items = result.items
+        else:
+            listed = await site.list_torrents(categories=categories or None, page=page)
+            items = listed.items
         # 给每条结果挂上来源站点标识 + 扩充属性；扩充含 NER 推理，整批进工作线程
-        hits = await asyncio.to_thread(_build_hits, site_id, name, result.items)
+        hits = await asyncio.to_thread(_build_hits, site_id, name, items)
         return hits, SiteSearchStatus(
             site_id=site_id, site_name=name, count=len(hits), elapsed_ms=elapsed()
         )
     except Exception as exc:  # noqa: BLE001 —— 单站失败必须隔离，不能拖垮整次搜索
         reason = friendly_error(exc)
-        logger.warning("站点 %s 搜索失败：%s", site_id, reason)
+        logger.warning(
+            "站点 %s %s失败：%s", site_id, "搜索" if keyword else "浏览种子列表", reason
+        )
         return [], SiteSearchStatus(
             site_id=site_id, site_name=name, count=0, error=reason, elapsed_ms=elapsed()
         )
 
 
 async def stream_search_all_sites(
-    keyword: str,
+    keyword: str = "",
     categories: list[TorrentCategory] | None = None,
     site_ids: list[str] | None = None,
     label: str | None = None,
@@ -136,7 +164,9 @@ async def stream_search_all_sites(
     调用方（客户端断开等）提前关闭生成器时，finally 会取消所有未完成的站点搜索任务，
     不留孤儿请求。
 
-    :param keyword: 关键词（支持 IMDb ID，具体识别由各站实现决定）。
+    :param keyword: 关键词（支持 IMDb ID，具体识别由各站实现决定）。**留空 = 浏览模式**：
+        改打各站的种子浏览页（``list_torrents``），按分类逛最新发布，事件序列与
+        载荷结构和搜索完全一致，前端不需要两套渲染。
     :param categories: 分类组合过滤（tracker 层原生支持多分类）；空/None 表示不限分类。
     :param site_ids: 站点子集；空/None 表示全部可用站点。勾选的站点当前不可用
         （禁用/验证未通过）时直接跳过，不产生错误——口径与「全部站点」一致。
@@ -152,7 +182,6 @@ async def stream_search_all_sites(
     if site_ids:
         wanted = set(site_ids)
         sites = [c for c in sites if c.site_id in wanted]
-    query = SearchQuery(keyword=keyword, categories=categories or None, page=page)
     started = time.monotonic()
 
     yield (
@@ -170,7 +199,12 @@ async def stream_search_all_sites(
     )
 
     # 扇出并发：先建齐所有任务再逐个宣告 site_start，各站从此刻起同时在跑
-    tasks = [asyncio.create_task(_search_one(c, query)) for c in sites]
+    tasks = [
+        asyncio.create_task(
+            _fetch_one(c, keyword=keyword, categories=categories, page=page)
+        )
+        for c in sites
+    ]
     for c in sites:
         yield (
             "site_start",
@@ -222,7 +256,7 @@ async def stream_search_all_sites(
 
 
 async def search_all_sites(
-    keyword: str,
+    keyword: str = "",
     categories: list[TorrentCategory] | None = None,
     site_ids: list[str] | None = None,
     label: str | None = None,

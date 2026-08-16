@@ -15,6 +15,7 @@ import {
   RefreshIcon,
   SearchIcon,
 } from "@/components/icons";
+import { MediaSourceAnnotationDialog } from "@/components/media-source-annotation-dialog";
 import { Modal } from "@/components/modal";
 import { PageNav } from "@/components/page-nav";
 import { usePageTitle } from "@/lib/use-page-title";
@@ -29,6 +30,7 @@ import {
   listActiveSubscriptionDownloads,
   listRuleSets,
   listSubscriptionActivities,
+  runSubscriptionUpgradeRound,
   searchMissingSubscriptionResources,
   setSubscriptionFollowFuture,
   setSubscriptionTrackingState,
@@ -43,6 +45,7 @@ import {
 } from "@/lib/api/subscriptions";
 import { formatBytes, formatDuration } from "@/lib/format";
 import { cachedImageUrl } from "@/lib/image-proxy";
+import { seasonsWithIndeterminate } from "@/lib/media-source-annotation";
 import { shouldShowResourceTiming } from "@/lib/resource-timing";
 import { subscriptionStatusMeta } from "@/lib/subscription-ui";
 import { formatDateTime, formatRelativeTime } from "@/lib/time";
@@ -491,7 +494,23 @@ export function SubscriptionInspectorView({
 
       <div className="mt-4">
         {tab === "wanted" ? (
-          <WantedBreakdown wanted={detail.wanted} isMovie={isMovie} downloads={downloadByHash} />
+          <WantedBreakdown
+            wanted={detail.wanted}
+            isMovie={isMovie}
+            downloads={downloadByHash}
+            mediaItemId={detail.media.media_item_id}
+            canAnnotate={isAdmin}
+            onAnnotated={async (message) => {
+              // 标注已刷新快照：顺手重跑一轮体检完成排期（幂等），再刷新详情
+              try {
+                await runSubscriptionUpgradeRound(id);
+                toast.success(`${message}，已重新体检并排期洗版`);
+              } catch {
+                toast.success(message);
+              }
+              reload();
+            }}
+          />
         ) : (
           <ActivityTimeline activities={activities} />
         )}
@@ -1057,12 +1076,22 @@ function WantedBreakdown({
   wanted,
   isMovie,
   downloads,
+  mediaItemId,
+  canAnnotate,
+  onAnnotated,
 }: {
   wanted: WantedItem[];
   isMovie: boolean;
   /** info_hash → 实时下载快照（无在途工单时为空 Map） */
   downloads: Map<string, SubscriptionDownload>;
+  mediaItemId: number;
+  /** 片源标注是库数据纠错（管理员动作），与后端 require_admin 对齐 */
+  canAnnotate: boolean;
+  /** 片源标注成功后回调（父组件重跑体检 + 刷新 + toast） */
+  onAnnotated: (message: string) => void | Promise<void>;
 }) {
+  // 「无法确认档位」季的标注弹窗（docs/design/media-source-annotation.md §5.1）
+  const [annotateSeason, setAnnotateSeason] = useState<number | null>(null);
   if (wanted.length === 0) {
     return (
       <p className="rounded-2xl border border-white/[0.07] bg-[rgba(14,16,22,0.45)] p-5 text-sub leading-6 text-[var(--text-muted)] backdrop-blur-xl">
@@ -1077,6 +1106,7 @@ function WantedBreakdown({
     list.push(w);
     seasons.set(w.season_number, list);
   }
+  const annotatable = canAnnotate ? seasonsWithIndeterminate(wanted) : new Set<number>();
 
   return (
     <div className="space-y-4">
@@ -1087,16 +1117,29 @@ function WantedBreakdown({
             key={season}
             className="overflow-hidden rounded-2xl border border-white/[0.07] bg-[rgba(14,16,22,0.45)] backdrop-blur-xl"
           >
-            {!isMovie && (
-              <p className="border-b border-white/[0.06] px-5 py-2.5 text-sub font-semibold text-white/80">
-                {season === 0 ? "特别篇" : `第 ${season} 季`}
-                <span className="ml-2 font-normal text-[var(--text-faint)]">
-                  {items.filter((w) => w.status !== "wanted").length}/{items.length} 已安排
+            {(!isMovie || annotatable.has(season)) && (
+              <p className="flex items-center border-b border-white/[0.06] px-5 py-2.5 text-sub font-semibold text-white/80">
+                <span className="min-w-0 flex-1 truncate">
+                  {isMovie ? "正片" : season === 0 ? "特别篇" : `第 ${season} 季`}
+                  {!isMovie && (
+                    <span className="ml-2 font-normal text-[var(--text-faint)]">
+                      {items.filter((w) => w.status !== "wanted").length}/{items.length} 已安排
+                    </span>
+                  )}
+                  {items.some((w) => w.upgrade?.active) && (
+                    <span className="ml-2 font-normal text-[#2dd4bf]/80">
+                      洗版中 {items.filter((w) => w.upgrade?.active).length}
+                    </span>
+                  )}
                 </span>
-                {items.some((w) => w.upgrade?.active) && (
-                  <span className="ml-2 font-normal text-[#2dd4bf]/80">
-                    洗版中 {items.filter((w) => w.upgrade?.active).length}
-                  </span>
+                {annotatable.has(season) && (
+                  <button
+                    type="button"
+                    onClick={() => setAnnotateSeason(season)}
+                    className="shrink-0 rounded-md border border-white/[0.12] px-2 py-0.5 text-caption font-medium text-white/75 transition hover:bg-white/[0.07] hover:text-white"
+                  >
+                    标注片源
+                  </button>
                 )}
               </p>
             )}
@@ -1112,6 +1155,19 @@ function WantedBreakdown({
             </ul>
           </div>
         ))}
+
+      {annotateSeason !== null && (
+        <MediaSourceAnnotationDialog
+          mediaItemId={mediaItemId}
+          seasonNumber={annotateSeason}
+          isMovie={isMovie}
+          onClose={() => setAnnotateSeason(null)}
+          onApplied={async (message) => {
+            setAnnotateSeason(null);
+            await onAnnotated(message);
+          }}
+        />
+      )}
     </div>
   );
 }
@@ -1248,7 +1304,7 @@ function wantedPresentation(w: WantedItem): { label: string; color: string; note
       return {
         label: "已入库",
         color: "var(--ok)",
-        note: `${w.upgrade.current_label} · 无法确认是否低于洗版目标，不自动洗；可手动选种替换`,
+        note: `${w.upgrade.current_label} · 无法确认是否低于洗版目标，不自动洗；可在季标题「标注片源」，或手动选种替换`,
       };
     }
     if (w.upgrade) {

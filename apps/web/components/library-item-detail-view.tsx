@@ -53,6 +53,7 @@ import { SubtitleGenPanel } from "@/components/subtitle-gen-panel";
 import { SubtitlePreviewDialog } from "@/components/subtitle-preview-dialog";
 import { getDiscoveryReturnPath } from "@/lib/discovery-return-path";
 import { formatBytes, formatRuntimeMinutes, formatVideoResolution } from "@/lib/format";
+import { USER_LOWEST_SOURCE, mediaSourceDisplayLabel } from "@/lib/media-source-annotation";
 import { useDoubanAppHref } from "@/lib/douban-app-link";
 import { resolveRequestUrl } from "@/lib/http";
 import { cachedImageUrl } from "@/lib/image-proxy";
@@ -1748,7 +1749,12 @@ function FileRow({
             <dt className="text-[var(--text-faint)]">文件尺寸</dt>
             <dd className="tnum text-[var(--text-muted)]">{formatBytes(file.size_bytes)}</dd>
             <dt className="text-[var(--text-faint)]">片源</dt>
-            <dd className="text-[var(--text-muted)]">{file.media_source || "未识别"}</dd>
+            <dd className="text-[var(--text-muted)]">
+              {mediaSourceDisplayLabel(file.media_source) || "未识别"}
+              {file.media_source_manual && file.media_source !== USER_LOWEST_SOURCE && (
+                <span className="ml-1.5 text-[var(--text-faint)]">（人工标注）</span>
+              )}
+            </dd>
             <dt className="text-[var(--text-faint)]">画面规格</dt>
             <dd className="tnum text-[var(--text-muted)]">
               {pictureInfo || "未能探测（文件不可达或尚未扫描）"}

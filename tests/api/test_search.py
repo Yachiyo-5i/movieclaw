@@ -1,6 +1,7 @@
 """跨站点聚合搜索接口的端到端测试。
 
-覆盖：多站结果合并、单站失败被隔离成 error、分类过滤参数透传、关键词必填校验。
+覆盖：多站结果合并、单站失败被隔离成 error、分类过滤参数透传、
+关键词留空时改走站点种子浏览页（浏览模式）。
 站点访问（活跃站点列表 + 站点实例）被替换为「假实现」，不触库、不发真实网络请求，
 使断言可确定。「只搜已启用且验证通过的站点」这条判据与种子同步共用同一实现
 （_active_sites），此处不重复覆盖，只覆盖搜索本身的合并与隔离逻辑。
@@ -14,7 +15,13 @@ from fastapi.testclient import TestClient
 
 import movieclaw_api.services.site_search as site_search
 from movieclaw_api.core.config import get_settings
-from movieclaw_tracker.models import SearchQuery, SearchResult, TorrentListItem
+from movieclaw_tracker.models import (
+    SearchQuery,
+    SearchResult,
+    TorrentCategory,
+    TorrentListItem,
+    TorrentListPage,
+)
 
 
 @dataclass
@@ -25,18 +32,31 @@ class _Cred:
 
 
 class _FakeSite:
-    """假站点：记录收到的 SearchQuery，按预设返回结果或抛错。"""
+    """假站点：记录收到的搜索/浏览参数，按预设返回结果或抛错。"""
 
     def __init__(self, items: list[TorrentListItem] | None = None, error: Exception | None = None):
         self._items = items or []
         self._error = error
         self.last_query: SearchQuery | None = None
+        # 浏览模式收到的参数（分类, 页码）；未被浏览过为 None
+        self.last_browse: tuple[list[TorrentCategory] | None, int] | None = None
 
     async def search(self, query: SearchQuery) -> SearchResult:
         self.last_query = query
         if self._error is not None:
             raise self._error
         return SearchResult(items=self._items, page=query.page, total_pages=1)
+
+    async def list_torrents(
+        self,
+        *,
+        categories: list[TorrentCategory] | None = None,
+        page: int = 1,
+    ) -> TorrentListPage:
+        self.last_browse = (categories, page)
+        if self._error is not None:
+            raise self._error
+        return TorrentListPage(items=self._items, page=page, total_pages=1)
 
 
 class _FakeManager:
@@ -161,10 +181,44 @@ def test_search_unknown_site_subset_yields_empty(client: TestClient, monkeypatch
     assert data["sites"] == []
 
 
-def test_search_requires_keyword(client: TestClient) -> None:
-    # 缺 keyword → 422；空 keyword 也被 min_length 拦下
-    assert client.get("/api/v1/search/torrents").status_code == 422
-    assert client.get("/api/v1/search/torrents", params={"keyword": ""}).status_code == 422
+def test_browse_without_keyword_hits_torrent_list_page(client: TestClient, monkeypatch) -> None:
+    """不传关键词 = 浏览模式：走站点的种子列表页而非搜索页，分类与页码照常透传。"""
+    fake_site = _FakeSite(items=[_item("m1", "最新发布")])
+    _wire(monkeypatch, {"mteam": fake_site})
+
+    data = client.get(
+        "/api/v1/search/torrents", params={"categories": ["movie"], "page": 2}
+    ).json()["data"]
+
+    assert data["total"] == 1
+    assert data["keyword"] == ""
+    assert fake_site.last_query is None  # 没有发起搜索
+    assert fake_site.last_browse is not None
+    categories, page = fake_site.last_browse
+    assert [c.value for c in categories] == ["movie"]
+    assert page == 2
+
+
+def test_blank_keyword_is_treated_as_browse(client: TestClient, monkeypatch) -> None:
+    """只有空白的关键词等同于不传（前端 URL 残留 q= 时不该退化成搜空串）。"""
+    fake_site = _FakeSite(items=[_item("m1", "最新发布")])
+    _wire(monkeypatch, {"mteam": fake_site})
+
+    resp = client.get("/api/v1/search/torrents", params={"keyword": "   "})
+
+    assert resp.status_code == 200
+    assert fake_site.last_query is None
+    assert fake_site.last_browse is not None
+
+
+def test_browse_is_not_recorded_in_history(client: TestClient, monkeypatch) -> None:
+    """浏览不是可复现的搜索，不该占用搜索历史。"""
+    _wire(monkeypatch, {"mteam": _FakeSite(items=[_item("m1", "最新发布")])})
+
+    client.get("/api/v1/search/torrents", params={"categories": ["movie"]})
+
+    history = client.get("/api/v1/search/history").json()["data"]
+    assert history == []
 
 
 def test_search_rejects_invalid_category(client: TestClient) -> None:
@@ -189,7 +243,7 @@ async def test_search_offloads_enrichment_to_worker_thread(monkeypatch) -> None:
     fake_sites = {"mteam": _FakeSite(items=[_item("m1", "沙丘"), _item("m2", "沙丘2")])}
     monkeypatch.setattr(site_search, "get_site_access", lambda: _FakeManager(fake_sites))
 
-    hits, status = await site_search._search_one(_Cred("mteam"), SearchQuery(keyword="沙丘"))
+    hits, status = await site_search._fetch_one(_Cred("mteam"), keyword="沙丘")
 
     assert status.error is None
     assert len(hits) == 2

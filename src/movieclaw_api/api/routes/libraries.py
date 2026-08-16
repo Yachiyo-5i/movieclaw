@@ -36,6 +36,8 @@ from movieclaw_api.schemas.library import (
     LibrarySearchGroupView,
     LibraryView,
     LocalMetaView,
+    MediaSourceAnnotationCandidateView,
+    MediaSourceAnnotationPayload,
     MetadataRefreshView,
     MissingClearPayload,
     MissingFileView,
@@ -78,6 +80,7 @@ from movieclaw_api.schemas.response import ApiResponse, ok
 from movieclaw_api.services import jobs, media_scrape
 from movieclaw_api.services.auth import Principal
 from movieclaw_api.services.library import claim as library_claim
+from movieclaw_api.services.library import source_annotation
 from movieclaw_api.services.library.access import (
     assert_library_visible,
     visible_library_ids,
@@ -1705,6 +1708,7 @@ def _file_view(row: LibraryFile, external_subs: list[str]) -> LibraryFileView:
         frame_rate=row.frame_rate,
         color_space=row.color_space,
         media_source=row.media_source,
+        media_source_manual=row.media_source_manual,
         release_group=row.release_group,
         source=row.source,
         season_number=row.season_number,
@@ -2287,6 +2291,71 @@ async def reidentify_library_item(
             message=message,
         ),
         message=message,
+    )
+
+
+@router.get(
+    # 两段路径：单段会被更早注册的 GET /{library_id} 先匹配（路径参数 422）
+    "/media-source-annotations/candidates",
+    response_model=ApiResponse[list[MediaSourceAnnotationCandidateView]],
+    summary="整季片源标注的预览：列出将被标注的文件（片源未知或既有人工标注）",
+    operation_id="library.items.list-media-source-annotation-candidates",
+    dependencies=[Depends(require_admin)],
+)
+async def list_media_source_annotation_candidates(
+    media_item_id: int,
+    season_number: int = Query(ge=0, description="季号；电影传 0"),
+    session: AsyncSession = Depends(get_session),
+) -> ApiResponse[list[MediaSourceAnnotationCandidateView]]:
+    rows = await source_annotation.list_annotation_candidates(
+        session, media_item_id=media_item_id, season_number=season_number
+    )
+    return ok(
+        [
+            MediaSourceAnnotationCandidateView(
+                file_id=row.id,  # type: ignore[arg-type]  # 落库后必有主键
+                file_name=PurePath(row.file_path).name,
+                episode_number=row.episode_number,
+                size_bytes=row.size_bytes,
+                media_source=row.media_source,
+                media_source_manual=row.media_source_manual,
+            )
+            for row in rows
+        ]
+    )
+
+
+@router.post(
+    "/media-source-annotations",
+    response_model=ApiResponse[dict],
+    summary="整季人工标注片源：把「无法确认」的洗版单元变为可判定",
+    operation_id="library.items.annotate-media-source",
+    dependencies=[Depends(require_admin)],
+)
+async def annotate_item_media_source(
+    payload: MediaSourceAnnotationPayload,
+    session: AsyncSession = Depends(get_session),
+) -> ApiResponse[dict]:
+    """docs/design/media-source-annotation.md：只动片源未知与既有人工标注的
+    在位文件，并同步刷新对应订阅工单的质量快照出处维度。不触发搜索——
+    前端标注成功后重跑一轮 upgrade-runs 完成排期。定位走 body（与
+    missing-record-clearances 同风格）：订阅侧入口拿不到库 id，条目 id 已足够。"""
+    item = await session.get(MediaItem, payload.media_item_id)
+    if item is None:
+        raise NotFoundException(f"条目不存在：id={payload.media_item_id}")
+    result = await source_annotation.annotate_media_source(
+        session,
+        media_item_id=payload.media_item_id,
+        season_number=payload.season_number,
+        media_source=payload.media_source,
+    )
+    label = "最低档（人工标注）" if payload.media_source == "user-lowest" else payload.media_source
+    return ok(
+        result,
+        message=(
+            f"已将 {result['files']} 个文件的片源标注为 {label}"
+            f"，并刷新 {result['snapshots']} 个单元的质量快照"
+        ),
     )
 
 

@@ -970,7 +970,8 @@ export function SearchResults({ query, onResearch, grabForSubscriptionId }: Sear
       <header className="relative z-20 shrink-0 px-6 pb-3 pt-4 max-md:px-4 max-md:pt-3">
         <div className="flex flex-wrap items-center gap-x-2.5 gap-y-1.5">
           <h1 className="text-on-image text-title-lg font-semibold tracking-[-0.01em] text-white">
-            “{query.keyword}”
+            {/* 浏览模式（无关键词）标题落在动作上，具体范围由右边的分类药丸交代 */}
+            {query.keyword ? `“${query.keyword}”` : "最新资源"}
           </h1>
           {query.scope.label && (
             <span className="rounded-full bg-black/30 px-2.5 py-0.5 text-caption text-[var(--accent)] backdrop-blur-sm">
@@ -1100,7 +1101,11 @@ export function SearchResults({ query, onResearch, grabForSubscriptionId }: Sear
         ) : phase === "done" ? (
           <EmptyHint
             title="没有找到匹配的资源"
-            hint="换个关键词，或检查已配置站点是否验证通过。"
+            hint={
+              query.keyword
+                ? "换个关键词，或检查已配置站点是否验证通过。"
+                : "换个分类，或检查已配置站点是否验证通过。"
+            }
           />
         ) : null}
 

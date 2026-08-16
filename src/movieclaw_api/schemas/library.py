@@ -405,6 +405,9 @@ class LibraryFileView(BaseModel):
     frame_rate: float | None
     color_space: str | None
     media_source: str | None
+    media_source_manual: bool = Field(
+        default=False, description="片源为人工标注（含 user-lowest 哨兵）"
+    )
     release_group: str | None
     source: str = Field(description="imported（入库管线）/ scanned（存量扫描）")
     season_number: int
@@ -777,6 +780,31 @@ class ClaimBatchPayload(BaseModel):
         max_length=160,
         description="Discover 返回的 TMDB 影视条目稳定引用，如 tmdb:tv:1396",
     )
+
+
+class MediaSourceAnnotationPayload(BaseModel):
+    """整季片源人工标注（docs/design/media-source-annotation.md §4）。
+
+    值域与洗版片源档阶梯对齐；``user-lowest`` 是「不确定，按最低档处理」
+    的显式哨兵（T0，会触发整季自动洗版重下）。
+    """
+
+    media_item_id: int = Field(description="媒体条目 id")
+    season_number: int = Field(ge=0, description="季号；电影固定 0")
+    media_source: Literal["Remux", "Blu-ray", "WEB-DL", "WEBRip", "HDTV", "user-lowest"] = (
+        Field(description="标注的片源档")
+    )
+
+
+class MediaSourceAnnotationCandidateView(BaseModel):
+    """标注弹窗预览的一行：将被标注的文件（片源未知或此前人工标注）。"""
+
+    file_id: int
+    file_name: str
+    episode_number: int
+    size_bytes: int
+    media_source: str | None = Field(description="当前片源；null=未知")
+    media_source_manual: bool = Field(description="当前值是否为此前的人工标注")
 
 
 class ReviewItemView(BaseModel):

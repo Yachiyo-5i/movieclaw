@@ -64,14 +64,21 @@ export type DownloadTaskState =
   | "missing"
   | "unknown";
 
+/** 追踪单元的工单状态；分批入库时同一个种子里各集会停在不同状态。 */
+export type DownloadTaskUnitStatus = "wanted" | "grabbed" | "downloaded" | "imported";
+
 export interface DownloadTaskSubscription {
   id: number;
   media_item_id: number;
   media_title: string;
   media_kind: string;
   poster_url: string | null;
-  /** imported=true 表示该集已完成入库（季包边下边入库时逐集翻真） */
-  units: { season_number: number; episode_number: number; imported: boolean }[];
+  /** 种子声明覆盖的**全集**（含已入库的集），不是"还欠哪些集"。 */
+  units: {
+    season_number: number;
+    episode_number: number;
+    status: DownloadTaskUnitStatus;
+  }[];
 }
 
 /** 下载器实时任务；订阅/手动来源由后端按 infohash 关联，不复制下载状态。 */

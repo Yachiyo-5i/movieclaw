@@ -55,7 +55,14 @@ export default function SearchPage() {
   const forSubRaw = params.get("for_sub");
   const grabForSubscriptionId =
     forSubRaw != null && /^\d+$/.test(forSubRaw) ? Number(forSubRaw) : null;
-  usePageTitle(query ? `搜索“${query.keyword}”` : null);
+  // 浏览模式（无关键词）的标题按范围来：「浏览电影」/「浏览站点资源」
+  usePageTitle(
+    query
+      ? query.keyword
+        ? `搜索“${query.keyword}”`
+        : `浏览${query.scope.label ?? "站点资源"}`
+      : null,
+  );
 
   if (!query) {
     if (typeof window !== "undefined") router.replace("/");
@@ -93,7 +100,8 @@ export default function SearchPage() {
     <SearchVerticals
       key={torrentKey}
       query={query}
-      vertical={vertical}
+      // 浏览模式没有关键词，影视/媒体库两个垂直无从谈起，强制落在站点资源上
+      vertical={query.keyword ? vertical : "torrent"}
       grabForSubscriptionId={grabForSubscriptionId}
       onSwitch={switchVertical}
       onScopeSwitch={switchScope}
@@ -126,6 +134,8 @@ function SearchVerticals({
 }) {
   const { visibleTabs } = useSearchPrefs();
   const searchAccess = useSearchAccess();
+  // 浏览模式：无关键词，只逛站点资源的分类列表页
+  const browsing = !query.keyword;
   // 各垂直是否已被访问过：访问过才挂载、之后保活
   const [visited, setVisited] = useState<Record<SearchVertical, boolean>>(() => ({
     media: vertical === "media",
@@ -136,14 +146,24 @@ function SearchVerticals({
     setVisited((prev) => (prev[vertical] ? prev : { ...prev, [vertical]: true }));
   }, [vertical]);
   useEffect(() => {
-    if (!searchAccess.ready || searchAccess.available.length === 0) return;
+    // 浏览模式不做垂直兜底：没有关键词时切到影视/媒体库只会得到一个空搜索，
+    // 无权用站点资源的成员由下面的空态提示接住
+    if (browsing || !searchAccess.ready || searchAccess.available.length === 0) return;
     if (!searchAccess.available.includes(vertical) && searchAccess.firstAvailable) {
       onSwitch(searchAccess.firstAvailable);
     }
-  }, [onSwitch, searchAccess.available, searchAccess.firstAvailable, searchAccess.ready, vertical]);
+  }, [
+    browsing,
+    onSwitch,
+    searchAccess.available,
+    searchAccess.firstAvailable,
+    searchAccess.ready,
+    vertical,
+  ]);
 
-  const visibleVerticalTabs = VERTICAL_TABS.filter((tab) =>
-    searchAccess.available.includes(tab.id),
+  const visibleVerticalTabs = VERTICAL_TABS.filter(
+    (tab) =>
+      searchAccess.available.includes(tab.id) && (!browsing || tab.id === "torrent"),
   );
 
   if (searchAccess.ready && visibleVerticalTabs.length === 0) {

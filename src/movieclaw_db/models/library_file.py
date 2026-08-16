@@ -199,6 +199,12 @@ class LibraryFile(TimestampMixin, table=True):
 
     # -- 发布信息（来自文件名解析，enrich 复用）------------------------------
     media_source: str | None = Field(default=None, description="片源：WEB-DL/Blu-ray/…")
+    # 人工标注保护位（docs/design/media-source-annotation.md §3）：True 表示
+    # media_source 是用户手工判定的（含「按最低档」哨兵 user-lowest），自动
+    # 名称解析不得覆盖——upsert 保留人工值、重复行合并时人工值优先。
+    media_source_manual: bool = Field(
+        default=False, description="片源为人工标注；自动解析不得覆盖"
+    )
     release_group: str | None = Field(default=None, description="发布组")
 
     # -- 来源与追溯 ----------------------------------------------------------

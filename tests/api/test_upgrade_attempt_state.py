@@ -192,8 +192,10 @@ async def test_task_center_relations_associate_upgrade_attempt(db):
         entry = subscriptions["newhash"][0]
         assert entry["id"] == sub_id
         assert entry["media_item_id"] is not None  # 有影片身份 → 前端可分组
-        # 洗版覆盖的单元本就已在库（旧版本），units 如实标注 imported
-        assert entry["units"] == [{"season_number": 1, "episode_number": 1, "imported": True}]
+        # 洗版照看的是已入库单元，逐集状态如实反映这一点
+        assert entry["units"] == [
+            {"season_number": 1, "episode_number": 1, "status": "imported"}
+        ]
 
 
 @pytest.mark.asyncio

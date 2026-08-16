@@ -347,9 +347,10 @@ def test_task_center_aggregates_live_downloads_and_subscription_context(client) 
     assert (
         by_hash[linked_hash]["subscriptions"][0]["poster_url"] == by_hash[linked_hash]["poster_url"]
     )
+    # 没有 attempt 台账声明覆盖范围时，units 只含在途工单；同 hash 的已
+    # 入库集（上面 seed 的 S01E03）不会越过台账口径混进列表
     assert by_hash[linked_hash]["subscriptions"][0]["units"] == [
-        {"season_number": 1, "episode_number": 1, "imported": False},
-        {"season_number": 1, "episode_number": 3, "imported": True},
+        {"season_number": 1, "episode_number": 1, "status": "grabbed"}
     ]
     assert by_hash[external_hash]["source"] == "external"
     assert by_hash[external_hash]["progress"] == 0.42
@@ -479,6 +480,96 @@ def test_task_center_degrades_single_downloader_failure(client) -> None:
     sources = {source["id"]: source for source in payload["sources"]}
     assert sources[failed["id"]]["status"] == "error"
     assert "检查下载器连接" in sources[failed["id"]]["message"]
+
+
+def test_task_center_keeps_full_unit_coverage_during_partial_ingest(client) -> None:
+    """边下边入库时，覆盖集列表不能随入库推进缩水，且要带逐集状态。
+
+    真实事故：整季种子只下了 19%，其中 E01 完整落盘并先行入库。旧实现按在途
+    工单过滤 units，E01 一入库就从"覆盖剧集"里消失（显示成 E02–E10）；前端
+    又只能靠"有没有入库 Job"猜整体状态，把 19% 的下载显示成"入库完成"。
+    """
+    from movieclaw_db.engine import get_database
+    from movieclaw_db.models import (
+        DownloadAttemptStatus,
+        MediaItem,
+        RuleSet,
+        Subscription,
+        SubscriptionDownloadAttempt,
+        WantedItem,
+        WantedStatus,
+        utcnow,
+    )
+
+    c, _ = client
+    downloader_id = c.post("/api/v1/downloaders", json=_PAYLOAD).json()["data"]["id"]
+    info_hash = "e" * 40
+    _fake_torrents.append(
+        TorrentBrief(
+            name="Partial.Ingest.S01",
+            content_name="Partial.Ingest.S01",
+            completed=False,
+            info_hash=info_hash,
+            progress=0.19,
+            size_bytes=68685304935,
+            state="downloading",
+        )
+    )
+
+    async def seed() -> None:
+        async with get_database().session() as session:
+            media = MediaItem(kind="tv", tmdb_id=4242, title="边下边入库剧", original_title="PI")
+            rule = RuleSet(name="边下边入库规则")
+            session.add_all([media, rule])
+            await session.flush()
+            subscription = Subscription(
+                media_item_id=media.id, kind="tv", selected_seasons=[1], rule_set_id=rule.id
+            )
+            session.add(subscription)
+            await session.flush()
+            # E01 已入库，E02 已落盘待搬，E03 仍在下载
+            session.add_all(
+                [
+                    WantedItem(
+                        subscription_id=subscription.id,
+                        media_item_id=media.id,
+                        season_number=1,
+                        episode_number=episode,
+                        status=status,
+                        info_hash=info_hash,
+                    )
+                    for episode, status in (
+                        (1, WantedStatus.IMPORTED),
+                        (2, WantedStatus.DOWNLOADED),
+                        (3, WantedStatus.GRABBED),
+                    )
+                ]
+            )
+            session.add(
+                SubscriptionDownloadAttempt(
+                    subscription_id=subscription.id,
+                    downloader_id=downloader_id,
+                    info_hash=info_hash,
+                    torrent_title="Partial.Ingest.S01",
+                    units=[[1, 1], [1, 2], [1, 3]],
+                    status=DownloadAttemptStatus.ACTIVE,
+                    last_progress_at=utcnow(),
+                )
+            )
+            await session.commit()
+
+    asyncio.run(seed())
+    items = c.get("/api/v1/downloaders/tasks").json()["data"]["items"]
+    task = next(item for item in items if item["info_hash"] == info_hash)
+    # 已入库的 E01 仍留在覆盖列表里，且逐集状态可区分
+    assert task["subscriptions"][0]["units"] == [
+        {"season_number": 1, "episode_number": 1, "status": "imported"},
+        {"season_number": 1, "episode_number": 2, "status": "downloaded"},
+        {"season_number": 1, "episode_number": 3, "status": "grabbed"},
+    ]
+    # 下载轴不被入库进度污染：种子仍在下载
+    assert task["state"] == "downloading"
+    assert task["progress"] == 0.19
 
 
 def test_task_center_hides_completed_attempt_after_wanted_is_imported(client) -> None:

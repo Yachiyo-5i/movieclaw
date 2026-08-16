@@ -63,11 +63,14 @@ def _history_owner(principal: Principal) -> int:
 @router.get(
     "/torrents",
     response_model=ApiResponse[SearchResponse],
-    summary="跨站点并发搜索种子资源（支持多分类与站点子集）",
+    summary="跨站点并发搜索种子资源（关键词留空 = 按分类浏览各站种子列表）",
     operation_id="search.torrents",
 )
 async def search_torrents(
-    keyword: str = Query(..., min_length=1, description="搜索关键词，支持 IMDb ID"),
+    keyword: str = Query(
+        "",
+        description="搜索关键词，支持 IMDb ID；留空 = 浏览模式，改拉各站种子列表页",
+    ),
     categories: list[TorrentCategory] | None = Query(
         None, description="分类组合过滤（可多值：categories=movie&categories=tv）；不传表示不限分类"
     ),
@@ -91,7 +94,11 @@ async def search_torrents(
     单个站点失败（认证过期 / 网络异常等）不影响整体：其结果为空，并在
     ``data.sites[].error`` 里给出可读原因，供前端提示。
     成员的搜索面被其可用站点白名单进一步收窄（服务端强制，勾选绕不过）。
+
+    ``keyword`` 留空即**浏览模式**：不搜索，改按分类拉各站种子列表页
+    （站点自身的浏览页排序，通常是最新发布在前），响应结构与搜索完全一致。
     """
+    keyword = keyword.strip()
     result = await search_all_sites(
         keyword=keyword,
         categories=categories,
@@ -100,7 +107,9 @@ async def search_torrents(
         page=page,
         allowed_site_ids=await usable_site_ids(session, principal),
     )
-    if not no_history:
+    # 浏览模式不写历史：没有关键词的"逛列表"不是一次可复现的搜索，
+    # 记进历史只会挤占真正的搜索记录（点回去也无从重放）
+    if not no_history and keyword:
         history_id = await _record_history(
             session,
             keyword,
@@ -186,7 +195,10 @@ async def _save_snapshot(
     },
 )
 async def search_torrents_stream(
-    keyword: str = Query(..., min_length=1, description="搜索关键词，支持 IMDb ID"),
+    keyword: str = Query(
+        "",
+        description="搜索关键词，支持 IMDb ID；留空 = 浏览模式，改拉各站种子列表页",
+    ),
     categories: list[TorrentCategory] | None = Query(
         None, description="分类组合过滤（可多值）；不传表示不限分类"
     ),
@@ -211,12 +223,16 @@ async def search_torrents_stream(
     快的站点先出结果，前端边收边渲染，不再被最慢的站点拖住。载荷结构见
     schemas.search 的流式事件段；错误隔离口径与阻塞版一致（单站失败仅产生
     ``site_error`` 事件，不中断整个流）。
+
+    ``keyword`` 留空即浏览模式（按分类拉各站种子列表页），语义与阻塞版一致。
     """
+    keyword = keyword.strip()
     # 历史在流开始前落库：流式响应返回后请求级 session 的生命周期不再可靠；
     # 站点白名单同理（流式生成器运行时请求级 session 已不可用）
     allowed = await usable_site_ids(session, principal)
     history_id: int | None = None
-    if not no_history:
+    # 浏览模式不写历史，口径同阻塞版
+    if not no_history and keyword:
         history_id = await _record_history(
             session,
             keyword,

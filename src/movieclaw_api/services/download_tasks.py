@@ -88,7 +88,7 @@ async def _relations(
             )
         )
     ).all()
-    grouped_units: dict[tuple[str, int], list[dict[str, int]]] = defaultdict(list)
+    grouped_units: dict[tuple[str, int], set[tuple[int, int]]] = defaultdict(set)
     subscription_meta: dict[tuple[str, int], dict[str, Any]] = {}
     base_meta_by_subscription: dict[int, dict[str, Any]] = {}
     scoped_units_by_subscription: dict[int, set[tuple[int, int]]] = defaultdict(set)
@@ -96,12 +96,7 @@ async def _relations(
         assert wanted.info_hash is not None and subscription.id is not None
         info_hash = wanted.info_hash.lower()
         key = (info_hash, subscription.id)
-        unit = {
-            "season_number": wanted.season_number,
-            "episode_number": wanted.episode_number,
-            "imported": False,
-        }
-        grouped_units[key].append(unit)
+        grouped_units[key].add((wanted.season_number, wanted.episode_number))
         scoped_units_by_subscription[subscription.id].add(
             (wanted.season_number, wanted.episode_number)
         )
@@ -137,29 +132,36 @@ async def _relations(
             )
         )
     ).all()
-    # 洗版 attempt 的关联走升级语义（quality-upgrade.md §6.2）：工单不重开、
-    # info_hash 指向旧版本，缺口语义（在途工单 ∩ attempt 单元）对它恒为空——
-    # 必须按「attempt 单元 ∩ 已入库 in_scope 工单」关联，否则洗版种子会被
-    # 当成外部任务：无影片身份、任务中心不按影片分组（真实教训）
-    upgrade_subscription_ids = {
-        attempt.subscription_id
-        for attempt, _subscription, _media in attempt_rows
-        if attempt.purpose == "upgrade"
+    # 第二遍取数：把相关订阅的**全部**在域工单状态装进来（不限状态）。上面
+    # 的 _IN_FLIGHT 过滤决定「任务是否上榜」——已入库工单不能把早已完成的老
+    # 任务重新拉回列表；而卡片要展示的是种子覆盖的全集与逐集进度，已入库的
+    # 集不能从列表里消失。两个用途语义相反，必须分开取数。
+    related_subscription_ids = {subscription_id for _hash, subscription_id in subscription_meta} | {
+        attempt.subscription_id for attempt, _subscription, _media in attempt_rows
     }
-    imported_units_by_subscription: dict[int, set[tuple[int, int]]] = defaultdict(set)
-    if upgrade_subscription_ids:
+    unit_status_by_subscription: dict[int, dict[tuple[int, int], str]] = defaultdict(dict)
+    if related_subscription_ids:
         for w in (
             await session.execute(
                 select(WantedItem).where(
-                    WantedItem.subscription_id.in_(upgrade_subscription_ids),  # type: ignore[attr-defined]
-                    WantedItem.status == WantedStatus.IMPORTED,
+                    WantedItem.subscription_id.in_(related_subscription_ids),  # type: ignore[attr-defined]
                     WantedItem.in_scope.is_(True),  # type: ignore[attr-defined]
                 )
             )
         ).scalars():
-            imported_units_by_subscription[w.subscription_id].add(
+            unit_status_by_subscription[w.subscription_id][
                 (w.season_number, w.episode_number)
-            )
+            ] = str(w.status)
+    # 洗版 attempt 的关联走升级语义（quality-upgrade.md §6.2）：工单不重开、
+    # info_hash 指向旧版本，缺口语义（在途工单 ∩ attempt 单元）对它恒为空——
+    # 必须按「attempt 单元 ∩ 已入库 in_scope 工单」关联，否则洗版种子会被
+    # 当成外部任务：无影片身份、任务中心不按影片分组（真实教训）
+    imported_units_by_subscription: dict[int, set[tuple[int, int]]] = {
+        subscription_id: {
+            unit for unit, status in units.items() if status == WantedStatus.IMPORTED.value
+        }
+        for subscription_id, units in unit_status_by_subscription.items()
+    }
 
     for attempt, subscription, media in attempt_rows:
         assert subscription.id is not None
@@ -172,23 +174,20 @@ async def _relations(
         }
         relevant_units = attempt_units & scoped_units_by_subscription[subscription.id]
         if attempt.purpose == "upgrade":
-            relevant_units |= attempt_units & imported_units_by_subscription[subscription.id]
+            relevant_units |= attempt_units & imported_units_by_subscription.get(
+                subscription.id, set()
+            )
         # 尝试台账只是历史/救援状态，不能单独制造业务任务。主源直接按 hash
         # 关联；试用源和待清理旧源按覆盖单元关联，但都必须仍有入域在途目标
         # （洗版语义下"目标"即它照看的已入库单元）。
         if key not in subscription_meta and not relevant_units:
             continue
-        if key not in subscription_meta:
-            grouped_units[key] = [
-                {
-                    "season_number": season,
-                    "episode_number": episode,
-                    # 洗版任务覆盖的单元本就已在库（旧版本），如实标注
-                    "imported": (season, episode)
-                    in imported_units_by_subscription[subscription.id],
-                }
-                for season, episode in sorted(relevant_units)
-            ]
+        # 展示口径以 attempt 台账为准：它记的就是"这个种子声明覆盖哪些集"，
+        # 与各集是否已入库无关，因此分批入库推进时列表保持稳定。与订阅在域
+        # 单元取交集，避免种子多带的集越出订阅范围。
+        grouped_units[key] = attempt_units & set(
+            unit_status_by_subscription.get(subscription.id, {})
+        )
         # 纯洗版订阅可能没有任何缺口在途行，base_meta 里没有它——用 attempt
         # 查询自带的订阅/条目现场构造
         base_meta = base_meta_by_subscription.get(subscription.id) or {
@@ -218,48 +217,23 @@ async def _relations(
             ),
         }
 
-    # 季包边下边入库时，已入库的集已不是在途工单，但任务还在下载/做种，
-    # 用户需要知道包里哪些集完成了入库：按（infohash, 订阅）把 IMPORTED
-    # 单元补回覆盖列表。只补已存在的任务键——全部入库的种子没有在途单元，
-    # 不能借这条查询重新出现在任务中心。
-    active_hashes = {info_hash for info_hash, _subscription_id in grouped_units}
-    if active_hashes:
-        imported_rows = (
-            await session.execute(
-                select(WantedItem).where(
-                    WantedItem.status == WantedStatus.IMPORTED,
-                    WantedItem.in_scope.is_(True),  # type: ignore[attr-defined]
-                    WantedItem.info_hash.in_(active_hashes),  # type: ignore[union-attr]
-                )
-            )
-        ).scalars()
-        for wanted in imported_rows:
-            assert wanted.info_hash is not None
-            key = (wanted.info_hash.lower(), wanted.subscription_id)
-            units = grouped_units.get(key)
-            if units is None:
-                continue
-            spot = (wanted.season_number, wanted.episode_number)
-            if any((unit["season_number"], unit["episode_number"]) == spot for unit in units):
-                continue
-            units.append(
-                {
-                    "season_number": wanted.season_number,
-                    "episode_number": wanted.episode_number,
-                    "imported": True,
-                }
-            )
-
     subscriptions: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for key, meta in subscription_meta.items():
-        info_hash, _subscription_id = key
+        info_hash, subscription_id = key
+        statuses = unit_status_by_subscription.get(subscription_id, {})
         subscriptions[info_hash].append(
             {
                 **meta,
-                "units": sorted(
-                    grouped_units[key],
-                    key=lambda unit: (unit["season_number"], unit["episode_number"]),
-                ),
+                "units": [
+                    {
+                        "season_number": season,
+                        "episode_number": episode,
+                        # 工单已被换源等路径清理时按"已投递"兜底：任务还在
+                        # 下载器里，说明至少已经投递过
+                        "status": statuses.get((season, episode), WantedStatus.GRABBED.value),
+                    }
+                    for season, episode in sorted(grouped_units[key])
+                ],
             }
         )
 

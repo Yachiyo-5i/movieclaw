@@ -10,7 +10,9 @@ import {
  * /search 的查询参数，让结果页可刷新、可分享、可前进后退。
  *
  * 参数表：
- *   q        关键词（必填，缺失视为无效搜索）
+ *   q        关键词（缺失时必须有 browse=1，否则视为无效搜索）
+ *   browse   "1" = 浏览模式：不带关键词，按分类逛各站种子列表页
+ *            （关键词非空时不出现——有词就是搜索）
  *   tab      垂直类别："media" = 影视条目（豆瓣）/ "library" = 媒体库；
  *            缺失 = 站点资源（老链接兼容）
  *   label    范围的展示名（分类中文名 / 预设名；缺失 = 「全部」）
@@ -26,7 +28,10 @@ import {
  */
 export function buildSearchPath(query: SearchQuery, vertical?: SearchVertical): string {
   const params = new URLSearchParams();
-  params.set("q", query.keyword);
+  // 关键词为空 = 浏览模式。用显式的 browse=1 标记而不是「q 缺失即浏览」：
+  // 后者会让「手改地址删掉 q」这种误操作静默变成一次跨站浏览。
+  if (query.keyword) params.set("q", query.keyword);
+  else params.set("browse", "1");
   if (vertical === "media" || vertical === "library") params.set("tab", vertical);
   const { scope } = query;
   if (scope.label) params.set("label", scope.label);
@@ -38,10 +43,13 @@ export function buildSearchPath(query: SearchQuery, vertical?: SearchVertical): 
   return `/search?${params.toString()}`;
 }
 
-/** 从查询参数还原一次搜索；q 缺失/为空时返回 null（由页面重定向回首页）。 */
+/**
+ * 从查询参数还原一次搜索/浏览；q 与 browse=1 都没有时返回 null
+ * （由页面重定向回首页）。keyword 为空串即浏览模式，下游一路透传到后端。
+ */
 export function parseSearchQuery(params: URLSearchParams): SearchQuery | null {
-  const keyword = params.get("q")?.trim();
-  if (!keyword) return null;
+  const keyword = params.get("q")?.trim() ?? "";
+  if (!keyword && params.get("browse") !== "1") return null;
 
   // 分类白名单过滤：手改 URL 塞进未知分类时静默丢弃，避免透传给后端报错
   const categories = (params.get("cats") ?? "")

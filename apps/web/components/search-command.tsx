@@ -296,15 +296,17 @@ function SearchPalette({
 
   const submit = () => {
     const kw = keyword.trim();
-    if (!kw) return;
     if (!availableModes.includes(mode)) return;
     if (mode === "torrent") {
+      // 资源模式允许空关键词 = 浏览：直接逛选中分类的站点种子列表页，
+      // 对应"我不想搜某一部，就想看看这个分类最近出了什么"
       const tab = visibleTabs.find((t) => tabKeyOf(t) === tabKey);
       onSearch(kw, tab ? scopeOfTab(tab) : SCOPE_ALL, { vertical: "torrent" });
-    } else {
-      // 影视/媒体库都没有分类维度，范围恒为「全部」
-      onSearch(kw, SCOPE_ALL, { vertical: mode });
+      return;
     }
+    // 影视/媒体库没有「浏览」语义（无分类维度），空词不提交，范围恒为「全部」
+    if (!kw) return;
+    onSearch(kw, SCOPE_ALL, { vertical: mode });
   };
 
   /** 点开一条历史：按记录自身的垂直回放，有快照进快照预览，没有发起实时搜索。 */
@@ -531,12 +533,12 @@ function SearchPalette({
             {mode === "media"
               ? "在豆瓣中搜索影视条目"
               : mode === "torrent"
-                ? "跨全部已配置站点搜索种子"
+                ? "跨全部已配置站点搜索种子，留空回车 = 浏览该分类最新资源"
                 : "在媒体库中搜索已入库的影片"}
           </span>
           <span className="flex items-center gap-3 text-caption text-[var(--text-faint)] max-md:hidden">
             <span className="flex items-center gap-1">
-              <Kbd>⏎</Kbd> 搜索
+              <Kbd>⏎</Kbd> {mode === "torrent" && !keyword.trim() ? "浏览" : "搜索"}
             </span>
             <span className="flex items-center gap-1">
               <Kbd>Tab</Kbd> 切换范围

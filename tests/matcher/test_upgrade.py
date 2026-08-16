@@ -10,6 +10,7 @@ import pytest
 
 from movieclaw_enrich.models import TorrentAttrs
 from movieclaw_matcher import (
+    USER_LOWEST_SOURCE,
     QualitySnapshot,
     RuleSetSpec,
     TorrentCandidate,
@@ -370,3 +371,60 @@ def test_spec_old_json_reads_as_upgrade_disabled() -> None:
     """旧 spec JSON（无洗版字段）读出即"不洗版"——向前兼容。"""
     spec = RuleSetSpec.model_validate({"resolutions": ["1080p"], "free_only": True})
     assert spec.upgrade_source is None and spec.cutoff_resolution is None
+
+
+# ---------------------------------------------------------------------------
+# 片源人工标注（docs/design/media-source-annotation.md §2.2）：
+# T0「用户判定最低档」哨兵与 Remux 存为 media_source 值的两条路径
+# ---------------------------------------------------------------------------
+
+
+def test_user_lowest_is_provably_below_any_target() -> None:
+    """标了「不确定，按最低档」（T0）：同分辨率下可证明低于任何目标，进排期。"""
+    snap = _snap(resolution="2160p", media_source=USER_LOWEST_SOURCE)
+    spec = _spec(upgrade_source="web-dl", resolutions=["2160p", "1080p"])
+    assert provably_below_cutoff(snap, spec) is True
+    assert provably_at_cutoff(snap, spec) is False
+
+
+def test_system_unknown_stays_not_comparable() -> None:
+    """系统未知（None）语义不变：既证明不了低于目标也证明不了达标（第三态）。"""
+    snap = _snap(resolution="2160p")
+    spec = _spec(upgrade_source="web-dl", resolutions=["2160p", "1080p"])
+    assert provably_below_cutoff(snap, spec) is False
+    assert provably_at_cutoff(snap, spec) is False
+
+
+def test_any_known_tier_upgrades_user_lowest() -> None:
+    """任何已知档（哪怕 HDTV T1）都构成对 T0 的严格升级。"""
+    verdict = compare_upgrade(
+        _candidate(resolution="2160p", media_source="HDTV"),
+        _snap(resolution="2160p", media_source=USER_LOWEST_SOURCE),
+        _spec(upgrade_source="web-dl", resolutions=["2160p", "1080p"]),
+    )
+    assert verdict.accepted
+
+
+def test_unknown_candidate_never_upgrades_user_lowest() -> None:
+    """候选片源未知仍不可比——T0 不给未知候选开口子。"""
+    verdict = compare_upgrade(
+        _candidate(resolution="2160p"),
+        _snap(resolution="2160p", media_source=USER_LOWEST_SOURCE),
+        _spec(upgrade_source="web-dl", resolutions=["2160p", "1080p"]),
+    )
+    assert not verdict.accepted
+    assert verdict.reason_code == "upgrade_not_comparable"
+
+
+def test_annotated_remux_value_reaches_cutoff() -> None:
+    """标注 Remux 存为 media_source 值（library_file 无 remux 布尔列）：
+    档位表按值给 T5，达到任何目标停洗，标签自然显示。"""
+    snap = _snap(resolution="1080p", media_source="Remux")
+    assert provably_at_cutoff(snap, _spec(upgrade_source="remux")) is True
+    assert quality_label(snap) == "1080p Remux"
+
+
+def test_user_lowest_label_is_human_readable() -> None:
+    """哨兵值不能把 user-lowest 原样亮给用户。"""
+    snap = _snap(resolution="2160p", media_source=USER_LOWEST_SOURCE)
+    assert quality_label(snap) == "2160p 最低档（人工标注）"

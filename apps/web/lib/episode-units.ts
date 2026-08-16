@@ -1,8 +1,6 @@
 export interface EpisodeUnit {
   season_number: number;
   episode_number: number;
-  /** 该集是否已完成入库；缺省视为未入库 */
-  imported?: boolean;
 }
 
 export interface EpisodeSeasonSummary {
