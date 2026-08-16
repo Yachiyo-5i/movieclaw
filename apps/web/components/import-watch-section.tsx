@@ -204,7 +204,7 @@ export function ImportWatchSection() {
    看到数字、点开清单认领或忽略。 —— */
 
 const ENTRY_TABS: { status: IngestEntryStatus; label: string; tone: string }[] = [
-  { status: "pending", label: "待处理", tone: "text-[#f5c451]" },
+  { status: "pending", label: "待处理", tone: "text-[var(--warn)]" },
   { status: "failed", label: "失败", tone: "text-red-300" },
   { status: "imported", label: "已入库", tone: "text-[var(--text-muted)]" },
   { status: "ignored", label: "已忽略", tone: "text-[var(--text-muted)]" },

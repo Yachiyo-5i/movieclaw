@@ -28,7 +28,7 @@ import { LiquidGlassButton } from "@/vendor/liquid-glass";
 
 /** 连接状态 → 展示文案与颜色（与站点配置同语言） */
 const STATUS_META: Record<DownloaderStatus, { label: string; color: string }> = {
-  active: { label: "已连接", color: "#4ade80" },
+  active: { label: "已连接", color: "var(--ok)" },
   verifying: { label: "测试中", color: "#6aa7ff" },
   pending: { label: "待测试", color: "#c0c4cc" },
   failed: { label: "连接失败", color: "#ff6b6b" },

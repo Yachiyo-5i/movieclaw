@@ -182,7 +182,7 @@ export function ImageLightbox({
                   <path d="M12 3a9 9 0 1 1-9 9" />
                 </svg>
               ) : actionStatus === "done" ? (
-                <CheckIcon className="size-3.5 text-[#4ade80]" />
+                <CheckIcon className="size-3.5 text-[var(--ok)]" />
               ) : (
                 action.icon
               )}

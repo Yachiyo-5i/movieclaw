@@ -292,7 +292,7 @@ function ChannelAccountRowView({
     row.status === "stale"
       ? { label: "需重新绑定", color: "#ff6b6b" }
       : row.running
-        ? { label: "运行中", color: "#4ade80" }
+        ? { label: "运行中", color: "var(--ok)" }
         : { label: "未运行", color: "#c0c4cc" };
 
   return (

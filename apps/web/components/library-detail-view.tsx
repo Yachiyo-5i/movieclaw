@@ -1144,7 +1144,7 @@ const InventoryCell = memo(function InventoryCell({
       {abnormalLabel && (
         <p className="text-on-image mt-1.5 flex items-center gap-1.5 truncate text-caption text-[var(--text-muted)]">
           <span
-            className={`size-1.5 shrink-0 rounded-full ${dead ? "bg-white/30" : "bg-[#f5c451]"}`}
+            className={`size-1.5 shrink-0 rounded-full ${dead ? "bg-white/30" : "bg-[var(--warn)]"}`}
           />
           <span className="truncate">{abnormalLabel}</span>
         </p>
@@ -1584,7 +1584,7 @@ function IssueDrawer({
 
         {/* 「放错库了」修复引导：认领解决不了这一类，不给引导用户会在认领里打转 */}
         {open === "unidentified" && kindMismatchFiles > 0 && (
-          <p className="mx-5 mt-3 rounded-lg bg-[#f5c451]/[0.1] px-3 py-2 text-caption leading-5 text-[#f5c451]">
+          <p className="mx-5 mt-3 rounded-lg bg-[var(--warn)]/[0.1] px-3 py-2 text-caption leading-5 text-[var(--warn)]">
             有 {kindMismatchFiles} 个文件的实际类型与本库不符（
             {movie ? "剧集文件在电影库" : "电影文件在剧集库"}
             ），认领无法解决。个别文件放错了：把文件移到对应类型的库即可；整库类型建错了：
@@ -1686,7 +1686,7 @@ function MissingRow({
           <span className="ml-2 text-sub font-normal text-[var(--text-muted)]">{summary}</span>
         </span>
         {done ? (
-          <span className="text-sub text-[#4ade80]">{done}</span>
+          <span className="text-sub text-[var(--ok)]">{done}</span>
         ) : (
           <span className="flex shrink-0 items-center gap-2">
             <button
@@ -1726,7 +1726,7 @@ function MissingRow({
         )}
       </div>
       {item.subscription_id && !done && (
-        <p className="mt-1 text-caption text-[#f5c451]/80">该条目有订阅在追踪</p>
+        <p className="mt-1 text-caption text-[var(--warn)]/80">该条目有订阅在追踪</p>
       )}
       {error && <p className="mt-1 text-caption text-red-300">{error}</p>}
     </div>
@@ -1824,7 +1824,7 @@ function StatusBadge({ group }: { group: UnidentifiedGroup }) {
       title={group.reason ?? undefined}
       className={`shrink-0 rounded-md px-1.5 py-0.5 text-caption ${
         meta.tone === "warn"
-          ? "bg-[#f5c451]/[0.16] text-[#f5c451]"
+          ? "bg-[var(--warn)]/[0.16] text-[var(--warn)]"
           : "bg-white/[0.07] text-[var(--text-muted)]"
       }`}
     >

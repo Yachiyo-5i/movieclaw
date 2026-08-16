@@ -85,7 +85,7 @@ const todayArrivalStyle: Record<
     pulse: true,
   },
   整理中: {
-    node: "border-[var(--ok)]/70 bg-[var(--ok)] shadow-[0_0_13px_rgba(95,211,154,0.38)]",
+    node: "border-[var(--ok)]/70 bg-[var(--ok)] shadow-[0_0_13px_rgba(74,222,128,0.38)]",
     status: "border-[var(--ok)]/20 bg-[var(--ok)]/10 text-[var(--ok)]",
     time: "text-[var(--ok)]",
     pulse: false,

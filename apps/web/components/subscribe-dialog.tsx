@@ -280,7 +280,7 @@ export function SubscribeDialog({
           {prepared?.status === "ready" && prepared.existing_subscription_id && (
             <div className="mt-4">
               <p className="flex items-center gap-2 text-ui text-white/85">
-                <CheckIcon className="size-4 text-[#4ade80]" />
+                <CheckIcon className="size-4 text-[var(--ok)]" />
                 该{target.kind === "movie" ? "电影" : "剧集"}已在订阅中，movieclaw
                 正在持续追踪资源。
               </p>
@@ -308,7 +308,7 @@ export function SubscribeDialog({
           {prepared?.status === "ready" && !prepared.existing_subscription_id && (
             <div className="mt-4 space-y-5">
               {prepared.movie_owned && (
-                <p className="flex items-center gap-2 rounded-xl border border-[#4ade80]/25 bg-[#4ade80]/10 px-3.5 py-2.5 text-sub text-[#4ade80]">
+                <p className="flex items-center gap-2 rounded-xl border border-[var(--ok)]/25 bg-[var(--ok)]/10 px-3.5 py-2.5 text-sub text-[var(--ok)]">
                   <CheckIcon className="size-4 shrink-0" />
                   媒体库里已有这部电影，订阅后不会重复下载
                 </p>
@@ -385,7 +385,7 @@ export function SubscribeDialog({
                         {chips.length === 0 ? (
                           // 全不限是个危险默认：第一批抓到的可能是低清枪版或
                           // 零做种死种，用琥珀色把风险讲在订阅之前
-                          <span className="text-caption text-[#f5c451]/90">
+                          <span className="text-caption text-[var(--warn)]/90">
                             该规则组不限任何条件——可能抓到低画质或无人做种的资源，
                             建议在「设置 → 订阅 → 规则组」里加上分辨率与做种数限制
                           </span>
@@ -551,7 +551,7 @@ export function SeasonRow({
         </span>
         <span className="tnum text-caption text-[var(--text-faint)]">{progress}</span>
         {owned && (
-          <span className="tnum text-caption font-medium text-[#4ade80]/90">{owned}</span>
+          <span className="tnum text-caption font-medium text-[var(--ok)]/90">{owned}</span>
         )}
       </span>
       <input

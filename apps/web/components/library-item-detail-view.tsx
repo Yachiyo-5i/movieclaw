@@ -1449,7 +1449,7 @@ function EpisodeCard({
           }
         />
         {!episode.owned && (
-          <span className="absolute right-1.5 top-1.5 rounded bg-black/60 px-1.5 py-px text-micro font-semibold text-[#f5c451]">
+          <span className="absolute right-1.5 top-1.5 rounded bg-black/60 px-1.5 py-px text-micro font-semibold text-[var(--warn)]">
             缺
           </span>
         )}
@@ -1558,7 +1558,7 @@ function FileRow({
           </Tooltip>
         </button>
         {file.missing && (
-          <span className="shrink-0 rounded border border-[#f5c451]/30 px-1.5 py-px text-micro text-[#f5c451]/80">
+          <span className="shrink-0 rounded border border-[var(--warn)]/30 px-1.5 py-px text-micro text-[var(--warn)]/80">
             文件缺失
           </span>
         )}
@@ -2243,7 +2243,7 @@ function DeleteFileDialog({
               </p>
             </div>
             {isLast && (
-              <p className="mt-3 rounded-xl border border-[#f5c451]/30 bg-[#f5c451]/[0.06] px-3.5 py-2.5 text-sub leading-6 text-[#f5c451]">
+              <p className="mt-3 rounded-xl border border-[var(--warn)]/30 bg-[var(--warn)]/[0.06] px-3.5 py-2.5 text-sub leading-6 text-[var(--warn)]">
                 这是「{detail.title}」在本库的最后一个文件——删除将升级为整条目删除，
                 整个刮削目录（含 NFO/海报）一并清除，条目将从库存消失。
               </p>

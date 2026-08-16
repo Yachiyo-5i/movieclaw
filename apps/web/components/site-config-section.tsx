@@ -31,7 +31,7 @@ import { LiquidGlassButton, LiquidGlassInput } from "@/vendor/liquid-glass";
 
 /** 站点验证状态 → 展示文案与颜色 */
 const STATUS_META: Record<SiteStatus, { label: string; color: string }> = {
-  active: { label: "已验证", color: "#4ade80" },
+  active: { label: "已验证", color: "var(--ok)" },
   verifying: { label: "验证中", color: "#6aa7ff" },
   pending: { label: "待验证", color: "#c0c4cc" },
   failed: { label: "验证失败", color: "#ff6b6b" },

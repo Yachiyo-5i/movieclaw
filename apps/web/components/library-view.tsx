@@ -647,7 +647,7 @@ function LibraryCard({
                 </span>
               )}
               {stats.unidentified_count > 0 && (
-                <span className="rounded-full border border-[#f5c451]/35 bg-black/55 px-2 py-0.5 text-micro font-semibold text-[#f5c451] backdrop-blur-md">
+                <span className="rounded-full border border-[var(--warn)]/35 bg-black/55 px-2 py-0.5 text-micro font-semibold text-[var(--warn)] backdrop-blur-md">
                   {stats.unidentified_count} 个待识别
                 </span>
               )}

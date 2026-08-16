@@ -377,7 +377,7 @@ function ProgressDetails({
                   current
                     ? "border-[var(--info)] bg-[var(--info)]/15"
                     : completed
-                      ? "border-[#4ade80]/60 bg-[#4ade80]/10 text-[#7cf0a4]"
+                      ? "border-[var(--ok)]/60 bg-[var(--ok)]/10 text-[#7cf0a4]"
                       : "border-white/15"
                 }`}
               >
@@ -702,7 +702,7 @@ export function SubtitleGenPanel({
                   <div
                     className={`rounded-xl border p-4 ${
                       jobSucceeded
-                        ? "border-[#4ade80]/30 bg-[#4ade80]/[0.08] text-[#7cf0a4]"
+                        ? "border-[var(--ok)]/30 bg-[var(--ok)]/[0.08] text-[#7cf0a4]"
                         : "border-[#ff9f9f]/30 bg-[#ff9f9f]/[0.08] text-[#ffb4b4]"
                     }`}
                   >
@@ -873,7 +873,7 @@ export function SubtitleGenPanel({
                     AI 翻译。
                   </p>
                   {selectedCandidate?.requires_ocr && (
-                    <p className="mt-1.5 text-caption text-[#f5c451]/85">
+                    <p className="mt-1.5 text-caption text-[var(--warn)]/85">
                       当前选择的是图片字幕，需要先完成文字识别。
                     </p>
                   )}
@@ -888,13 +888,13 @@ export function SubtitleGenPanel({
 
               {!previewing && canPreparePgs && pgsConversion && (
                 <div className="space-y-3.5">
-                  <div className="rounded-xl border border-[#f5c451]/30 bg-[#f5c451]/[0.08] p-3.5">
-                    <p className="text-ui font-semibold text-[#f5c451]">
+                  <div className="rounded-xl border border-[var(--warn)]/30 bg-[var(--warn)]/[0.08] p-3.5">
+                    <p className="text-ui font-semibold text-[var(--warn)]">
                       {pgsConversion.language_confirmation_required
                         ? "请选择原字幕语言"
                         : "先识别图片字幕"}
                     </p>
-                    <p className="mt-1 text-sub leading-5 text-[#f5c451]/85">
+                    <p className="mt-1 text-sub leading-5 text-[var(--warn)]/85">
                       这份字幕是图片。MovieClaw 会先识别其中的文字，确认内容完整后再生成
                       {outputLabel(targetLanguage, bilingual ? secondaryLanguage : null)}字幕。
                     </p>
@@ -990,7 +990,7 @@ export function SubtitleGenPanel({
                   </p>
 
                   {preview.already_generated && (
-                    <p className="rounded-lg border border-[#f5c451]/25 bg-[#f5c451]/[0.07] px-3 py-2 text-sub text-[#f5c451]/90">
+                    <p className="rounded-lg border border-[var(--warn)]/25 bg-[var(--warn)]/[0.07] px-3 py-2 text-sub text-[var(--warn)]/90">
                       已有 AI 字幕，将被覆盖。
                     </p>
                   )}
