@@ -180,11 +180,14 @@ export function SubscriptionInspectorView({ id }: { id: number }) {
   // 复合态（quality-upgrade.md §8.3）：内容收齐了但还有单元在洗更高版本。
   // 「已收齐」语义不变（洗版不影响完成判定），只在文案上如实补一句
   const upgradingCount = detail.progress.upgrading ?? 0;
+  // 电影只有一个单元，「洗版中（1）」读着别扭——单单元不带计数
+  const upgradingText =
+    detail.progress.total > 1 ? `洗版中（${upgradingCount}）` : "洗版中";
   const statusLabel =
     detail.status === "completed" && upgradingCount > 0
-      ? `已收齐 · 洗版中（${upgradingCount}）`
+      ? `已收齐 · ${upgradingText}`
       : detail.status === "active" && upgradingCount > 0 && detail.progress.wanted === 0
-        ? `${meta.label} · 洗版中（${upgradingCount}）`
+        ? `${meta.label} · ${upgradingText}`
         : meta.label;
   const isMovie = detail.media.kind === "movie";
   const poster = detail.media.poster_url ? cachedImageUrl(detail.media.poster_url) : null;
@@ -840,6 +843,10 @@ function ProgressStrip({
   const { total, wanted, grabbed, downloaded, imported } = progress;
   const denom = Math.max(total, 1);
   const inPipeline = grabbed + downloaded;
+  // 洗版中 ⊆ 已入库：内容在手（计入分子），但版本还在向目标档位洗——
+  // 条带里用青色从绿色里分出来，图例给数字，不让色觉成为唯一通道
+  const upgrading = progress.upgrading ?? 0;
+  const importedSettled = Math.max(imported - upgrading, 0);
   return (
     <div className="mt-4 max-md:col-span-2 max-md:mt-1">
       <div className="flex items-center justify-between gap-4 text-sub">
@@ -850,12 +857,20 @@ function ProgressStrip({
       </div>
       <div
         role="img"
-        aria-label={`共 ${total} ${unitLabel}，已入库 ${imported}，下载中 ${inPipeline}，缺失 ${wanted}`}
+        aria-label={
+          `共 ${total} ${unitLabel}，已入库 ${imported}` +
+          (upgrading > 0 ? `（其中洗版中 ${upgrading}）` : "") +
+          `，下载中 ${inPipeline}，缺失 ${wanted}`
+        }
         className="mt-2 flex h-1.5 w-full overflow-hidden rounded-full bg-white/[0.12]"
       >
         <div
           className="bg-[#4ade80]"
-          style={{ width: `${(imported / denom) * 100}%` }}
+          style={{ width: `${(importedSettled / denom) * 100}%` }}
+        />
+        <div
+          className="bg-[#2dd4bf]"
+          style={{ width: `${(upgrading / denom) * 100}%` }}
         />
         <div
           className="bg-[#6aa7ff]"
@@ -863,7 +878,8 @@ function ProgressStrip({
         />
       </div>
       <div className="tnum mt-2 flex flex-wrap items-center gap-x-4 gap-y-1.5 text-caption text-white/45">
-        <ProgressLegend color="#4ade80" label={`已入库 ${imported}`} />
+        <ProgressLegend color="#4ade80" label={`已入库 ${importedSettled}`} />
+        {upgrading > 0 && <ProgressLegend color="#2dd4bf" label={`洗版中 ${upgrading}`} />}
         <ProgressLegend color="#6aa7ff" label={`下载中 ${inPipeline}`} />
         <ProgressLegend color="rgba(255,255,255,0.2)" label={`缺失 ${wanted}`} />
       </div>
@@ -920,9 +936,10 @@ function activityColor(type: SubscriptionActivity["type"]): string {
     case "downloaded":
     case "imported":
     case "replacement_promoted":
+      return "#4ade80";
     case "upgrade_grabbed":
     case "upgraded":
-      return "#4ade80";
+      return "#2dd4bf"; // 洗版专属青色，与「洗版中」徽标/进度条分段同源
     case "match_rejected":
     case "dispatch_failed":
     case "import_failed":
@@ -1024,6 +1041,11 @@ function WantedBreakdown({
                 <span className="ml-2 font-normal text-[var(--text-faint)]">
                   {items.filter((w) => w.status !== "wanted").length}/{items.length} 已安排
                 </span>
+                {items.some((w) => w.upgrade?.active) && (
+                  <span className="ml-2 font-normal text-[#2dd4bf]/80">
+                    洗版中 {items.filter((w) => w.upgrade?.active).length}
+                  </span>
+                )}
               </p>
             )}
             <ul className="divide-y divide-white/[0.05]">
@@ -1161,12 +1183,20 @@ function wantedPresentation(w: WantedItem): { label: string; color: string; note
     // 洗版中（quality-upgrade.md §8.3）：已入库但规则组的洗版目标还没达到。
     // 标签与差距文案由后端统一生成（当前档 → 目标档），前端零拼接
     if (w.upgrade?.active) {
+      // 搜索次数不进说明行——行尾已有统一的「已搜索 n 次」元素，重复即噪音
       return {
         label: "洗版中",
         color: "#2dd4bf",
-        note:
-          `当前 ${w.upgrade.current_label} → 目标 ${w.upgrade.target_label}` +
-          (w.upgrade.search_attempts > 0 ? ` · 已搜 ${w.upgrade.search_attempts} 次` : ""),
+        note: `当前 ${w.upgrade.current_label} → 目标 ${w.upgrade.target_label}`,
+      };
+    }
+    if (w.upgrade) {
+      // 规则组开了洗版但该单元已到顶/暂休：带出当前档位，让「库里是什么
+      // 版本」始终可见（自然学习路径，quality-upgrade.md §8.5）
+      return {
+        label: "已入库",
+        color: "#4ade80",
+        note: `${w.upgrade.current_label} · 入库于 ${formatDateTime(w.imported_at)}`,
       };
     }
     return { label: "已入库", color: "#4ade80", note: `入库于 ${formatDateTime(w.imported_at)}` };

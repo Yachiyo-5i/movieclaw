@@ -586,16 +586,16 @@ def _wanted_upgrades(
 
     规则组未配洗版目标 / spec 无法解析 → 全部 None（前端不显示洗版信息）。
     """
-    from movieclaw_matcher import (
-        QualitySnapshot,
-        RuleSetSpec,
-        provably_below_cutoff,
-        quality_label,
-        upgrade_target_label,
-    )
+    from movieclaw_matcher import QualitySnapshot, RuleSetSpec, quality_label, upgrade_target_label
 
     if not isinstance(rule_spec, RuleSetSpec) or rule_spec.upgrade_source is None:
         return {}
+    # upgrade_ready 与调度口径同源（含熔断冷却）——否则详情页显示"洗版中"
+    # 的同时 system_notice 却说该单元已暂停，两处互相打架
+    from movieclaw_api.services.subscription import upgrade_ready
+    from movieclaw_db.models import utcnow
+
+    now = utcnow()
     target = upgrade_target_label(rule_spec) or ""
     result: dict[tuple[int, int], WantedUpgradeView | None] = {}
     for w in wanted_rows:
@@ -603,7 +603,7 @@ def _wanted_upgrades(
             continue
         snapshot = QualitySnapshot.model_validate(w.quality)
         result[(w.season_number, w.episode_number)] = WantedUpgradeView(
-            active=w.in_scope and provably_below_cutoff(snapshot, rule_spec),
+            active=w.in_scope and upgrade_ready(w, rule_spec, now=now),
             current_label=quality_label(snapshot),
             target_label=target,
             search_attempts=w.search_attempts,

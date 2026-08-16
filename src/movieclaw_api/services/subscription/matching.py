@@ -125,6 +125,10 @@ class MediaContext:
     upgrade_wanted: dict[tuple[int, int], WantedItem] = field(default_factory=dict)
     upgrade_snapshots: dict[tuple[int, int], "QualitySnapshot"] = field(default_factory=dict)
     upgrade_excluded: frozenset[tuple[str, str]] = frozenset()
+    # 已入库但**不可洗**的单元（到顶/快照不可比/熔断冷却/洗版在途）：
+    # 整季包铁律的另一半——包覆盖到任何一个这样的单元就整体放弃洗版维度，
+    # 否则"为洗一部分重下整季"会把已到顶的集也重新下一遍
+    upgrade_blocked: dict[tuple[int, int], WantedItem] = field(default_factory=dict)
 
 
 @dataclass
@@ -199,7 +203,9 @@ def upgrade_ready(wanted: WantedItem, spec: RuleSetSpec, *, now: datetime) -> bo
     """该单元当下是否可参与洗版（quality-upgrade.md §2.4/§6.3 的调度口径）。
 
     - 快照必须能证明"低于洗版目标"（证明不了的安静，不打扰站点）；
-    - 证伪熔断中的单元（连续证伪达阈值且长冷却未到期）不参与。
+    - 证伪熔断中的单元（连续证伪达阈值且长冷却**未到期**）不参与。
+      冷却到期即恢复（计数由 postpone_upgrade_wanted 在恢复后清零重新观察）；
+      next_search_at 为 None 不算熔断中——排期缺失不能变成永久停摆。
     """
     from movieclaw_matcher import QualitySnapshot, provably_below_cutoff
 
@@ -208,8 +214,10 @@ def upgrade_ready(wanted: WantedItem, spec: RuleSetSpec, *, now: datetime) -> bo
     snapshot = QualitySnapshot.model_validate(wanted.quality)
     if not provably_below_cutoff(snapshot, spec):
         return False
-    if wanted.upgrade_verify_failures >= UPGRADE_FUSE_LIMIT and (
-        wanted.next_search_at is None or wanted.next_search_at > now
+    if (
+        wanted.upgrade_verify_failures >= UPGRADE_FUSE_LIMIT
+        and wanted.next_search_at is not None
+        and wanted.next_search_at > now
     ):
         return False  # 熔断冷却中
     return True
@@ -250,13 +258,14 @@ async def load_match_context(session: AsyncSession) -> dict[int, MediaContext]:
     }
     if upgrade_rule_ids:
         now = utcnow()
+        # 拿全部 imported 单元（含 quality NULL 的）：可洗的进 upgrade_wanted，
+        # 其余进 upgrade_blocked——铁律需要知道"包会不会碰到不该重下的集"
         result = await session.execute(
             select(WantedItem, Subscription)
             .join(Subscription, WantedItem.subscription_id == Subscription.id)  # type: ignore[arg-type]
             .where(
                 WantedItem.status == WantedStatus.IMPORTED,
                 WantedItem.in_scope.is_(True),  # type: ignore[attr-defined]
-                WantedItem.quality.isnot(None),  # type: ignore[union-attr]
                 Subscription.status == SubscriptionStatus.ACTIVE,
                 Subscription.rule_set_id.in_(upgrade_rule_ids),  # type: ignore[union-attr]
             )
@@ -264,7 +273,7 @@ async def load_match_context(session: AsyncSession) -> dict[int, MediaContext]:
         upgrade_subs: set[int] = set()
         for wanted, subscription in result.all():
             spec = specs.get(subscription.rule_set_id)
-            if spec is None or not upgrade_ready(wanted, spec, now=now):
+            if spec is None:
                 continue
             ctx = await _ensure_context(
                 session, contexts, wanted.media_item_id, subscription, spec
@@ -272,10 +281,13 @@ async def load_match_context(session: AsyncSession) -> dict[int, MediaContext]:
             if ctx is None:
                 continue
             unit = (wanted.season_number, wanted.episode_number)
-            ctx.upgrade_wanted[unit] = wanted
-            ctx.upgrade_snapshots[unit] = QualitySnapshot.model_validate(wanted.quality)
-            if subscription.id is not None:
-                upgrade_subs.add(subscription.id)
+            if wanted.quality and upgrade_ready(wanted, spec, now=now):
+                ctx.upgrade_wanted[unit] = wanted
+                ctx.upgrade_snapshots[unit] = QualitySnapshot.model_validate(wanted.quality)
+                if subscription.id is not None:
+                    upgrade_subs.add(subscription.id)
+            else:
+                ctx.upgrade_blocked[unit] = wanted
 
         if upgrade_subs:
             # 在途去重与证伪排除：一次载入相关订阅的洗版 attempt 历史
@@ -316,9 +328,11 @@ async def load_match_context(session: AsyncSession) -> dict[int, MediaContext]:
                 sub_id = ctx.subscription.id
                 if sub_id is None or not ctx.upgrade_wanted:
                     continue
-                for unit in in_flight.get(sub_id, ()):  # 在途单元本轮不再比
-                    ctx.upgrade_wanted.pop(unit, None)
+                for unit in in_flight.get(sub_id, ()):  # 在途单元本轮不再比，转入铁律阻挡集
+                    moved = ctx.upgrade_wanted.pop(unit, None)
                     ctx.upgrade_snapshots.pop(unit, None)
+                    if moved is not None:
+                        ctx.upgrade_blocked[unit] = moved
                 ctx.upgrade_excluded = frozenset(excluded.get(sub_id, set()))
 
     # 空上下文（缺口与洗版都为零）没有比对价值，剔除以便调用方快速返回
@@ -456,6 +470,10 @@ async def _resolve_upgrade(
         return [], None  # 既往证伪的候选（§4.3），不抓第二次
     covered = covered_units(match, units, published=published)
     if not covered:
+        return [], None
+    # 铁律的另一半：包还覆盖了不可洗的已入库单元（到顶/不可比/在途）→
+    # 抓它就是为洗一部分重下整季，整体放弃洗版维度
+    if ctx.upgrade_blocked and covered_units(match, ctx.upgrade_blocked, published=published):
         return [], None
     labels: tuple[str, str] | None = None
     for wanted in covered:

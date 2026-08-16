@@ -336,3 +336,81 @@ async def test_equal_manual_file_only_collected(db, tmp_path):
             ).scalars()
         )
         assert acts == []
+
+
+@pytest.mark.asyncio
+async def test_no_upgrade_rule_never_touches_files(db, tmp_path):
+    """未开洗版的规则组：手工塞入更优文件只静默刷新基线，绝不移动/删除
+    任何文件（删除性动作必须有洗版目标这个显式 opt-in）。"""
+    library, item_id, _sub, wanted_id, root, old_file = await _seed(db, tmp_path)
+    async with db.session() as session:
+        rule_set = (await session.execute(select(RuleSet))).scalar_one()
+        rule_set.spec = {}  # 关掉洗版
+        await session.commit()
+    better = root / "Testshow.S01E01.2160p.WEB-DL.mkv"
+    better.write_bytes(b"manual-4k")
+    async with db.session() as session:
+        session.add(
+            LibraryFile(
+                library_id=library.id,
+                media_item_id=item_id,
+                season_number=1,
+                episode_number=1,
+                file_path=str(better),
+                size_bytes=9,
+                source=FileSource.SCANNED,
+                resolution="2160p",
+                media_source="WEB-DL",
+                bit_rate=20_000_000,
+            )
+        )
+        await session.commit()
+        await close_fulfilled_wanted(session, item_id)
+        wanted = await session.get(WantedItem, wanted_id)
+        assert wanted.quality["resolution"] == "2160p"  # 基线静默刷新
+        assert old_file.exists() and better.exists()  # 两份文件都原地不动
+        assert not (root / ".movieclaw-trash").exists()
+        acts = list(
+            (
+                await session.execute(
+                    select(SubscriptionActivity).where(
+                        SubscriptionActivity.type.in_(("upgraded", "upgrade_verify_failed"))  # type: ignore[attr-defined]
+                    )
+                )
+            ).scalars()
+        )
+        assert acts == []
+
+
+@pytest.mark.asyncio
+async def test_mixed_attempt_gap_unit_not_refuted(db, tmp_path):
+    """混合投递（purpose=upgrade 的 attempt 同时覆盖缺口单元）：靠这次投递
+    才入库的缺口单元不能走证伪分支——判据是单元入库时间晚于 attempt 创建。"""
+    from datetime import timedelta as _td
+
+    library, item_id, sub_id, wanted_id, root, _old = await _seed(db, tmp_path)
+    async with db.session() as session:
+        wanted = await session.get(WantedItem, wanted_id)
+        attempt = (
+            await session.execute(
+                select(SubscriptionDownloadAttempt).where(
+                    SubscriptionDownloadAttempt.info_hash == "old1"
+                )
+            )
+        ).scalar_one()
+        # 模拟：attempt 是混合洗版投递，单元靠它入库（imported_at 晚于 attempt）
+        attempt.purpose = "upgrade"
+        attempt.created_at = utcnow() - _td(minutes=10)
+        wanted.imported_at = utcnow()
+        await session.commit()
+        await close_fulfilled_wanted(session, item_id)
+        wanted = await session.get(WantedItem, wanted_id)
+        attempt = (
+            await session.execute(
+                select(SubscriptionDownloadAttempt).where(
+                    SubscriptionDownloadAttempt.info_hash == "old1"
+                )
+            )
+        ).scalar_one()
+        assert wanted.upgrade_verify_failures == 0  # 没有被误证伪
+        assert attempt.status == DownloadAttemptStatus.COMPLETED  # 未被打成 FAILED

@@ -53,6 +53,9 @@ logger = logging.getLogger("movieclaw_api.subscription.upgrade")
 _BACKFILL_BATCH = 50
 _BACKFILL_TICK_SECONDS = 900
 
+# 排期补挂的全表轮转游标（进程内状态；重启丢失只是从头再扫一轮）
+_pending_arm_cursor = 0
+
 # 选"最优文件"用的中性偏好（内置默认分辨率序）：快照本身与规则组无关，
 # 只有多版本并存时需要一个稳定的挑选顺序
 _NEUTRAL_SPEC = RuleSetSpec()
@@ -345,6 +348,18 @@ async def verify_upgrades(session: AsyncSession, media_item_id: int) -> None:
         baseline = QualitySnapshot.model_validate(wanted.quality)
         spec = specs.get(wanted.subscription_id)
         attempt = attempt_by_unit.get((wanted.subscription_id, unit))
+        # 混合投递（缺口+洗版同一 attempt）里，缺口单元也在 attempt.units 中，
+        # 但它是靠这次投递才入库的——不是洗版目标，绝不能拿它走证伪分支。
+        # 判据：单元必须在 attempt 创建之前就已入库，才算该 attempt 要洗的对象
+        if (
+            attempt is not None
+            and (
+                wanted.imported_at is None
+                or attempt.created_at is None
+                or wanted.imported_at > attempt.created_at
+            )
+        ):
+            attempt = None
 
         # 逐文件算快照，按**快照**找最优（名称来源：来自洗版投递的文件用
         # attempt.quality——文件行本身可能还没有片源信息）
@@ -371,7 +386,16 @@ async def verify_upgrades(session: AsyncSession, media_item_id: int) -> None:
 
         # 验证是不设停止线的纯序比较：实测新快照严格优于基线即确认——
         # 手工塞入超过洗版目标的版本同样是合法升级（quality-upgrade.md §6.3）
+        upgrade_enabled = spec.upgrade_source is not None
         if _better(best_snapshot, baseline, spec):
+            if not upgrade_enabled:
+                # 未开洗版：只静默把基线刷新为实测最优（保持台账真实，日后
+                # 开洗版立即可用），**绝不**替换/移动用户的文件——删除性动作
+                # 必须有洗版目标这个显式 opt-in
+                wanted.quality = best_snapshot.model_dump(exclude_defaults=True)
+                wanted.updated_at = utcnow()
+                await session.commit()
+                continue
             # ---- 确认升级 ----
             now = utcnow()
             old_hash = wanted.info_hash
@@ -686,6 +710,8 @@ async def postpone_upgrade_wanted(
     if not rows:
         return 0
     specs = await _specs_for_subscriptions(session, {w.subscription_id for w in rows})
+    from movieclaw_api.services.subscription.matching import UPGRADE_FUSE_LIMIT
+
     postponed = 0
     for wanted in rows:
         spec = specs.get(wanted.subscription_id)
@@ -695,6 +721,11 @@ async def postpone_upgrade_wanted(
             wanted.next_search_at = None  # 自愈解除排期
             wanted.updated_at = now
             continue
+        # 熔断冷却已到期的单元走到这里说明它重新参赛：计数清零重新观察——
+        # 否则常规 7d 退避会被 upgrade_ready 误判成"仍在冷却"，把被动匹配
+        # （洗版主通道）无限期关掉
+        if wanted.upgrade_verify_failures >= UPGRADE_FUSE_LIMIT:
+            wanted.upgrade_verify_failures = 0
         if count_attempt:
             wanted.next_search_at = now + upgrade_backoff_delay(wanted.search_attempts)
             wanted.search_attempts += 1
@@ -760,23 +791,30 @@ async def backfill_upgrade_snapshots() -> None:
         )
 
         # 已有快照但尚未排期的单元（如规则组事后才配洗版目标）：本 tick 顺带
-        # 补排期。到顶/不可比的单元会被 arm 判否留在 NULL——查询量小，可接受
+        # 补排期。查询条件表达不了"可洗"（到顶/{} 哨兵会被 arm 判否留在
+        # NULL），所以用 id 游标轮转全表——既不让同一批判否行每 tick 重扫，
+        # 也不让 LIMIT 把排在后面的真正可洗单元饿死
+        global _pending_arm_cursor
         pending = list(
             (
                 await session.execute(
                     select(WantedItem)
                     .join(Subscription, Subscription.id == WantedItem.subscription_id)
                     .where(
+                        WantedItem.id > _pending_arm_cursor,  # type: ignore[operator]
                         WantedItem.status == WantedStatus.IMPORTED,  # type: ignore[arg-type]
                         WantedItem.in_scope.is_(True),  # type: ignore[attr-defined]
                         WantedItem.quality.isnot(None),  # type: ignore[union-attr]
                         WantedItem.next_search_at.is_(None),  # type: ignore[union-attr]
                         Subscription.rule_set_id.in_(upgrade_ids),  # type: ignore[union-attr]
                     )
+                    .order_by(WantedItem.id)  # type: ignore[arg-type]
                     .limit(_BACKFILL_BATCH * 4)
                 )
             ).scalars()
         )
+        # 游标是进程内状态：重启丢失只意味着从头再扫一轮，无害
+        _pending_arm_cursor = (pending[-1].id or 0) if pending else 0
         if pending:
             armed_late = await arm_upgrade_candidates(session, pending)
             if armed_late:

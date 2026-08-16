@@ -551,25 +551,31 @@ export function RuleSetEditorDialog({
               ))}
             </div>
             {upgradeSource !== "" && (
-              <div className="mt-2 flex flex-wrap items-center gap-1.5">
-                <span className="text-caption text-[var(--text-faint)]">目标分辨率</span>
-                {(resolutions.length ? resolutions : RESOLUTION_OPTIONS).map((option, i) => {
-                  const effective = cutoffResolution || resolutions[0] || "1080p";
-                  return (
-                    <ToggleChip
-                      key={option}
-                      active={effective === option}
-                      onClick={() =>
-                        setCutoffResolution(option === (resolutions[0] ?? "") ? "" : option)
-                      }
-                    >
-                      {option}
-                      {i === 0 && resolutions.length > 0 && (
-                        <span className="ml-1 text-micro text-[var(--text-faint)]">偏好首选</span>
-                      )}
-                    </ToggleChip>
-                  );
-                })}
+              <div className="mt-2 rounded-xl bg-white/[0.03] px-4 py-2.5">
+                <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-1.5">
+                  <span className="text-sub text-[var(--text-muted)]">目标分辨率</span>
+                  <div className="flex flex-wrap gap-1.5">
+                    {(resolutions.length ? resolutions : RESOLUTION_OPTIONS).map((option) => {
+                      const effective = cutoffResolution || resolutions[0] || "1080p";
+                      return (
+                        <ToggleChip
+                          key={option}
+                          active={effective === option}
+                          onClick={() =>
+                            setCutoffResolution(option === (resolutions[0] ?? "") ? "" : option)
+                          }
+                        >
+                          {option}
+                        </ToggleChip>
+                      );
+                    })}
+                  </div>
+                </div>
+                <p className="mt-1.5 text-caption text-[var(--text-faint)]">
+                  {resolutions.length > 0
+                    ? "缺省跟随上方分辨率偏好的第一位"
+                    : "未限定分辨率时缺省洗到 1080p（避免意外进入 4K 的磁盘占用）"}
+                </p>
               </div>
             )}
           </Field>

@@ -198,15 +198,22 @@ async def test_upgrade_rejects_not_better_and_at_cutoff_silently(db):
         assert activities == []
 
 
-@pytest.mark.asyncio
-async def test_pack_vetoed_when_any_unit_not_upgrade(db):
-    """整季包铁律：包覆盖的洗版单元有任一不构成升级 → 整体放弃洗版。
-    E01 是 WEB-DL（可洗）、E02 已是 Remux（到顶不在上下文），
-    E03 快照片源未知（不可比）→ 整季包否决。"""
-    item_id, sub_id, ids = await _seed(db, quality=None, units=())
+_PACK_REMUX = {
+    "resolution": "1080p",
+    "media_source": "Blu-ray",
+    "remux": True,
+    "seasons": [1],
+    "complete": True,
+}
+
+
+async def _seed_pack_units(db, sub_id, item_id, episodes_quality: dict[int, dict]):
+    """给整季包测试造带播出日期的 imported 单元（air_date 已过，包可覆盖）。"""
+    from datetime import date, timedelta
+
+    aired = date.today() - timedelta(days=30)
     async with db.session() as session:
-        # 手工造三个单元：E01 可洗、E03 不可比（同快照维度未知）
-        for episode, quality in ((1, _WEBDL), (3, {"resolution": "1080p"})):
+        for episode, quality in episodes_quality.items():
             session.add(
                 WantedItem(
                     subscription_id=sub_id,
@@ -215,25 +222,57 @@ async def test_pack_vetoed_when_any_unit_not_upgrade(db):
                     episode_number=episode,
                     status=WantedStatus.IMPORTED,
                     quality=quality,
+                    air_date=aired,
                     imported_at=utcnow(),
                 )
             )
         await session.commit()
-        row = _torrent(
-            "Testshow 2024 S01 1080p Blu-ray REMUX Complete",
-            attrs={
-                "resolution": "1080p",
-                "media_source": "Blu-ray",
-                "remux": True,
-                "seasons": [1],
-                "complete": True,
-            },
-        )
+
+
+@pytest.mark.asyncio
+async def test_pack_dispatches_when_all_units_washable(db):
+    """正向对照：包覆盖的单元全部可洗 → 整季包投递（防止铁律误伤）。"""
+    item_id, sub_id, _ = await _seed(db, quality=None, units=())
+    await _seed_pack_units(db, sub_id, item_id, {1: _WEBDL, 2: _WEBDL})
+    async with db.session() as session:
+        row = _torrent("Testshow 2024 S01 1080p Blu-ray REMUX Complete", attrs=_PACK_REMUX)
         session.add(row)
         await session.commit()
         await session.refresh(row)
         summary = await evaluate_and_dispatch(session, [row], source="被动匹配")
-        assert summary.dispatched_units == 0  # E03 不可比否决整包
+        assert summary.dispatched_units == 2
+
+
+@pytest.mark.asyncio
+async def test_pack_vetoed_by_at_cutoff_sibling(db):
+    """整季包铁律：E01 可洗但 E02 已到顶（Remux）→ 抓包等于把 E02 重下一遍，
+    整体放弃洗版维度。"""
+    item_id, sub_id, _ = await _seed(db, quality=None, units=())
+    await _seed_pack_units(
+        db, sub_id, item_id,
+        {1: _WEBDL, 2: {"resolution": "1080p", "media_source": "Blu-ray", "remux": True}},
+    )
+    async with db.session() as session:
+        row = _torrent("Testshow 2024 S01 1080p Blu-ray REMUX Complete", attrs=_PACK_REMUX)
+        session.add(row)
+        await session.commit()
+        await session.refresh(row)
+        summary = await evaluate_and_dispatch(session, [row], source="被动匹配")
+        assert summary.dispatched_units == 0
+
+
+@pytest.mark.asyncio
+async def test_pack_vetoed_by_incomparable_sibling(db):
+    """整季包铁律：E03 快照片源未知（不可比，不在可洗集合）同样阻挡整包。"""
+    item_id, sub_id, _ = await _seed(db, quality=None, units=())
+    await _seed_pack_units(db, sub_id, item_id, {1: _WEBDL, 3: {"resolution": "1080p"}})
+    async with db.session() as session:
+        row = _torrent("Testshow 2024 S01 1080p Blu-ray REMUX Complete", attrs=_PACK_REMUX)
+        session.add(row)
+        await session.commit()
+        await session.refresh(row)
+        summary = await evaluate_and_dispatch(session, [row], source="被动匹配")
+        assert summary.dispatched_units == 0
 
 
 @pytest.mark.asyncio
@@ -327,3 +366,67 @@ async def test_arming_and_search_now(db):
         await session.commit()
         assert reset == 1
         assert (utcnow() - wanted.next_search_at).total_seconds() < 5
+
+
+@pytest.mark.asyncio
+async def test_postpone_resets_expired_fuse_counter(db):
+    """熔断冷却到期后第一次搜索记账：计数清零重新观察——否则常规退避会被
+    误判成仍在冷却，把被动匹配无限期关掉。"""
+    from datetime import timedelta
+
+    from movieclaw_api.services.subscription.upgrade import postpone_upgrade_wanted
+
+    item_id, _sub, (wanted_id,) = await _seed(db, quality=_WEBDL)
+    async with db.session() as session:
+        wanted = await session.get(WantedItem, wanted_id)
+        wanted.upgrade_verify_failures = 3
+        wanted.next_search_at = utcnow() - timedelta(minutes=1)  # 冷却已到期
+        await session.commit()
+        await postpone_upgrade_wanted(session, item_id, delay=None, count_attempt=True)
+        wanted = await session.get(WantedItem, wanted_id)
+        assert wanted.upgrade_verify_failures == 0
+        assert wanted.next_search_at is not None  # 已按洗版退避重新排期
+
+
+@pytest.mark.asyncio
+async def test_import_clears_stale_gap_schedule(db):
+    """入库对账把缺口时代的 next_search_at 清空——否则 imported 单元会带着
+    旧排期进入洗版搜索队列，触发无谓的站点搜索。"""
+    from datetime import timedelta
+
+    from movieclaw_api.services.subscription.wanted_fulfillment import (
+        close_fulfilled_wanted,
+    )
+    from movieclaw_db.models import FileSource, LibraryFile
+    from movieclaw_db.repositories.library_repo import LibraryRepository
+
+    item_id, sub_id, (wanted_id,) = await _seed(
+        db, quality=None, wanted_status=WantedStatus.GRABBED
+    )
+    async with db.session() as session:
+        library = await LibraryRepository(session).create(
+            name="剧集库", kind="tv", root_paths=["/media/tv"]
+        )
+        wanted = await session.get(WantedItem, wanted_id)
+        wanted.next_search_at = utcnow() + timedelta(hours=4)  # 缺口时代的退避
+        session.add(
+            LibraryFile(
+                library_id=library.id,
+                media_item_id=item_id,
+                season_number=1,
+                episode_number=1,
+                file_path="/media/tv/e1.mkv",
+                size_bytes=1,
+                source=FileSource.IMPORTED,
+                resolution="1080p",
+                media_source="Blu-ray",
+                bit_rate=9_000_000,
+            )
+        )
+        await session.commit()
+        assert await close_fulfilled_wanted(session, item_id) == 1
+        wanted = await session.get(WantedItem, wanted_id)
+        assert wanted.status == WantedStatus.IMPORTED
+        # 旧排期已清；随后 arm 只对可洗单元重挂（本例 Blu-ray 未到 Remux，
+        # 规则组开了洗版 → 被重新排期为洗版搜索，语义正确）
+        assert wanted.quality["media_source"] == "Blu-ray"

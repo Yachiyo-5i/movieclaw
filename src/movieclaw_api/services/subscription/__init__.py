@@ -35,6 +35,7 @@ from movieclaw_api.services.subscription.matching import (
     evaluate_and_dispatch,
     load_match_context,
     units_text,
+    upgrade_ready,
 )
 from movieclaw_api.services.subscription.release_forecast import (
     FORECAST_MIN_INTERVAL,
@@ -80,6 +81,7 @@ __all__ = [
     "promote_trial",
     "quality_not_lower",
     "reconcile_pending_cleanup",
+    "upgrade_ready",
     "replacement_backoff",
     "recompute_subscription_status",
     "refresh_release_forecasts",

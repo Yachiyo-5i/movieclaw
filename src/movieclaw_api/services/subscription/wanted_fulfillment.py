@@ -64,6 +64,10 @@ async def close_fulfilled_wanted(session: AsyncSession, media_item_id: int) -> i
     for wanted in fulfilled:
         wanted.status = WantedStatus.IMPORTED
         wanted.imported_at = now
+        # 缺口时代的搜索排期就此作废——不清掉的话，imported 单元会带着旧的
+        # next_search_at 进入洗版搜索队列，触发无谓的站点搜索（洗版排期由
+        # arm_upgrade_candidates 按需重挂）
+        wanted.next_search_at = None
         wanted.updated_at = now
         by_subscription.setdefault(wanted.subscription_id, []).append(wanted)
     # 洗版基线：入库即落质量快照（与规则组是否开洗版无关——数据此刻最热，
