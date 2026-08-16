@@ -272,3 +272,48 @@ async def test_mixed_directory_falls_back_to_per_file(db, tmp_path) -> None:
     assert (moved_season / "机智的医生生活 (2020) - S01E01.zh.srt").is_file(), "字幕应跟着走"
     assert intruder.is_file(), "别人的文件必须留在原地"
     assert (entry / "poster.jpg").is_file(), "混合目录不整搬，刮削产物留在原目录"
+
+
+async def test_transfer_carries_in_place_trashed_file(db, tmp_path) -> None:
+    """原地待回收行（做种保护形态）的实体在条目目录里：必须随目录物理搬运、
+    路径改写、状态保持待回收——否则搬运后行路径陈旧被清理任务收敛，新库里
+    的无台账文件会被扫描重新收编（证伪版本借转移复活，回收机制的红线）。"""
+    from sqlmodel import select
+
+    from movieclaw_db.models import FileState, utcnow
+
+    source_id, target_id, item_id, entry, target_root = await _setup(db, tmp_path)
+    old_version = entry / "Season 01" / "旧版本.S01E01.mkv"
+    old_version.write_bytes(b"o" * 10)
+    async with get_database().session() as session:
+        session.add(
+            LibraryFile(
+                library_id=source_id,
+                media_item_id=item_id,
+                season_number=1,
+                episode_number=1,
+                file_path=str(old_version),
+                size_bytes=10,
+                source=FileSource.SCANNED,
+                state=FileState.TRASHED,
+                trashed_at=utcnow(),
+                trash_context={"reason": "upgrade_replaced", "trigger": {}, "note": "洗版替换"},
+            )
+        )
+        await session.commit()
+        await transfer_library_item(
+            source_id, item_id, TransferPayload(target_library_id=target_id), session=session
+        )
+    summary = await _drain_transfer(source_id, target_id)
+
+    assert summary.errors == []
+    moved = target_root / entry.name / "Season 01" / "旧版本.S01E01.mkv"
+    assert moved.is_file(), "原地待回收文件应随条目目录搬到目标库"
+    async with get_database().session() as session:
+        row = (
+            await session.execute(
+                select(LibraryFile).where(LibraryFile.file_path == str(moved))
+            )
+        ).scalar_one()
+        assert row.state == FileState.TRASHED  # 路径改写但状态不被搬运复活
+        assert row.library_id == target_id

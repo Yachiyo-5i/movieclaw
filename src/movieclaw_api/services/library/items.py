@@ -1175,6 +1175,14 @@ async def delete_item_files(
 
     for row in files:
         path = Path(row.file_path)
+        if row.state == FileState.MISSING:
+            continue  # 无磁盘实体，最后统一清账
+        if row.state == FileState.TRASHED:
+            # 待回收行按单文件清理：moved 形态的路径在 .movieclaw-trash 里，
+            # 绝不能让回收站目录被当作条目目录整删（会卷走其他条目的回收文件）
+            assert row.id is not None
+            files_to_remove[row.id] = path
+            continue
         entry = entry_dir_of(roots, path)
         if entry is None and row.container in ("bluray", "dvd"):
             entry = path  # 直接躺在根下的原盘目录：目录本身就是条目
@@ -1211,9 +1219,10 @@ async def delete_item_files(
             deleted_row_ids.add(row_id)
             result.freed_bytes += row.size_bytes
 
-    # missing 行没有磁盘实体，账直接清
+    # 缺失行没有磁盘实体，账直接清（待回收行不在此列——它有实体，
+    # 删除失败必须保留行，否则"账没了文件还在"，扫描会重新收编）
     for row in files:
-        if row.state != FileState.IN_PLACE:
+        if row.state == FileState.MISSING:
             assert row.id is not None
             deleted_row_ids.add(row.id)
 
@@ -1262,7 +1271,7 @@ async def delete_single_file(
         )
 
     result = DeleteResult()
-    if row.state != FileState.IN_PLACE:
+    if row.state == FileState.MISSING:
         await session.delete(row)
         result.rows_deleted = 1
         await session.commit()

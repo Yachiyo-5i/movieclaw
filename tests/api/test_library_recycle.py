@@ -192,3 +192,109 @@ async def test_in_place_scope_excludes_trashed(db, tmp_path):
             (await session.execute(select(LibraryFile).where(LibraryFile.in_place()))).scalars()
         )
         assert in_place == []
+
+
+async def _seed_item_with_two_versions(db, tmp_path):
+    """条目目录 + 在位新版本 + 已移入回收站的旧版本（删除流程交叉用例）。"""
+    from movieclaw_db.models import MediaItem
+
+    root = tmp_path / "tv"
+    entry = root / "某剧 (2020)"
+    entry.mkdir(parents=True, exist_ok=True)
+    new_file = entry / "某剧.S01E01.Remux.mkv"
+    new_file.write_bytes(b"new")
+    old_file = entry / "某剧.S01E01.WEB-DL.mkv"
+    old_file.write_bytes(b"old")
+    (tmp_path / "dl").mkdir(exist_ok=True)
+    os.link(old_file, tmp_path / "dl" / "old.mkv")  # 硬链形态 → recycle 会移入回收站
+    async with db.session() as session:
+        library = await LibraryRepository(session).create(
+            name="剧集库-删除交叉", kind="tv", root_paths=[str(root)]
+        )
+        item = MediaItem(kind="tv", tmdb_id=911, title="某剧", original_title="X", year=2020)
+        session.add(item)
+        await session.flush()
+        rows = []
+        for path in (new_file, old_file):
+            row = LibraryFile(
+                library_id=library.id,
+                media_item_id=item.id,
+                season_number=1,
+                episode_number=1,
+                file_path=str(path),
+                size_bytes=3,
+                source=FileSource.IMPORTED,
+            )
+            session.add(row)
+            rows.append(row)
+        await session.commit()
+        for row in rows:
+            await session.refresh(row)
+        old_row = rows[1]
+        await recycle_file(
+            session, old_row, reason="upgrade_replaced", trigger=_TRIGGER, note="洗版替换"
+        )
+        await session.commit()
+        assert old_row.state == FileState.TRASHED and ".movieclaw-trash" in old_row.file_path
+        return library.id, item.id, rows[0].id, old_row.id, root, entry
+
+
+@pytest.mark.asyncio
+async def test_delete_single_file_purges_trashed_row(db, tmp_path):
+    """单文件删除落在待回收行上：物理文件一并删除、行删除——绝不清账留文件
+    （行没了而文件还在，扫描会把它当新文件重新收编）。"""
+    from movieclaw_api.services.library.items import delete_single_file
+    from movieclaw_db.models.library import Library
+
+    library_id, _item, _new_id, old_id, _root, _entry = await _seed_item_with_two_versions(
+        db, tmp_path
+    )
+    async with db.session() as session:
+        library = await session.get(Library, library_id)
+        rows = list(
+            (
+                await session.execute(
+                    select(LibraryFile).where(LibraryFile.library_id == library_id)
+                )
+            ).scalars()
+        )
+        old_row = next(r for r in rows if r.id == old_id)
+        trash_path = old_row.file_path
+        result = await delete_single_file(session, library, old_row, rows, rows)
+        assert result.errors == []
+        assert result.rows_deleted == 1
+    from pathlib import Path as _P
+
+    assert not _P(trash_path).exists()  # 物理文件一并删除
+    async with db.session() as session:
+        assert await session.get(LibraryFile, old_id) is None
+
+
+@pytest.mark.asyncio
+async def test_item_delete_removes_trash_file_but_keeps_trash_dir(db, tmp_path):
+    """整条目删除：待回收文件按单文件清理——.movieclaw-trash 目录绝不被当作
+    条目目录整删（会卷走其他条目的回收文件）。"""
+    from movieclaw_api.services.library.items import delete_item_files
+    from movieclaw_db.models.library import Library
+
+    library_id, item_id, _new_id, old_id, root, entry = await _seed_item_with_two_versions(
+        db, tmp_path
+    )
+    trash_dir = root / ".movieclaw-trash"
+    (trash_dir / "别的条目的回收文件.mkv").write_bytes(b"other")  # 无台账的孤儿
+    async with db.session() as session:
+        library = await session.get(Library, library_id)
+        rows = list(
+            (
+                await session.execute(
+                    select(LibraryFile).where(LibraryFile.library_id == library_id)
+                )
+            ).scalars()
+        )
+        result = await delete_item_files(session, library, item_id, rows, rows)
+        assert result.errors == []
+    assert not entry.exists()  # 条目目录整删
+    assert trash_dir.is_dir()  # 回收站目录健在
+    assert (trash_dir / "别的条目的回收文件.mkv").exists()  # 别人的文件没被卷走
+    async with db.session() as session:
+        assert await session.get(LibraryFile, old_id) is None
