@@ -234,6 +234,7 @@ def test_task_center_aggregates_live_downloads_and_subscription_context(client) 
                 info_hash=external_hash,
                 progress=0.42,
                 dlspeed_bytes=2048,
+                upspeed_bytes=512,
                 state="downloading",
             ),
             TorrentBrief(
@@ -352,6 +353,7 @@ def test_task_center_aggregates_live_downloads_and_subscription_context(client) 
     ]
     assert by_hash[external_hash]["source"] == "external"
     assert by_hash[external_hash]["progress"] == 0.42
+    assert by_hash[external_hash]["upspeed_bytes"] == 512
     assert by_hash[missing_hash]["state"] == "missing"
     assert by_hash[missing_hash]["downloader_id"] == downloader_id
     # 投递台账带回站点身份、详情页与质量快照；外部任务没有这些信息

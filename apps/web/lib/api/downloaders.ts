@@ -85,6 +85,8 @@ export interface DownloadTask {
   progress: number | null;
   size_bytes: number | null;
   dlspeed_bytes: number | null;
+  /** 当前上传速度（字节/秒）；未知为 null */
+  upspeed_bytes: number | null;
   eta_seconds: number | null;
   state: DownloadTaskState;
   source: "subscription" | "manual" | "external";

@@ -122,6 +122,7 @@ class DownloadTaskView(BaseModel):
     progress: float | None = Field(default=None, ge=0, le=1)
     size_bytes: int | None = None
     dlspeed_bytes: int | None = None
+    upspeed_bytes: int | None = None
     eta_seconds: int | None = None
     state: Literal[
         "downloading",

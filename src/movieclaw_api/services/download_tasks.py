@@ -524,6 +524,7 @@ def _task_dict(
         "progress": torrent.progress if torrent is not None else None,
         "size_bytes": torrent.size_bytes if torrent is not None else None,
         "dlspeed_bytes": torrent.dlspeed_bytes if torrent is not None else None,
+        "upspeed_bytes": torrent.upspeed_bytes if torrent is not None else None,
         "eta_seconds": torrent.eta_seconds if torrent is not None else None,
         "state": state,
         "source": source,

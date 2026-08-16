@@ -1168,11 +1168,24 @@ function DownloadTaskFeedItem({
   const note = ingestJob != null ? null : downloadTaskNote(task, null);
   const showReplace = shouldOfferInlineReplacement(task);
   const firstSubscription = task.subscriptions[0];
-  // 种子名前用站点徽标回答"这个资源从哪来"；画面规格与片源紧随其后，
-  // 弥补高度同质化的 release 名。状态与进度由底部生命周期承担，不再重复。
-  const specs = [task.resolution, task.media_source].filter(
-    (item): item is string => item != null,
-  );
+  // 种子名前用站点徽标回答"这个资源从哪来"；画面规格、片源与文件尺寸紧随
+  // 其后，弥补高度同质化的 release 名。状态与进度由底部生命周期承担，不再
+  // 重复；速度与剩余时间单独一行，专注实时传输信息。
+  const specs = [
+    task.resolution,
+    task.media_source,
+    task.size_bytes != null ? formatBytes(task.size_bytes) : null,
+  ].filter((item): item is string => item != null);
+  // 下行速度只在真正下载时有意义；上行（做种）在下载中和等待入库期间都可能存在
+  const downSpeed =
+    !ingestOwnsState &&
+    task.state === "downloading" &&
+    task.dlspeed_bytes != null &&
+    task.dlspeed_bytes > 0
+      ? task.dlspeed_bytes
+      : null;
+  const upSpeed = task.upspeed_bytes != null && task.upspeed_bytes > 0 ? task.upspeed_bytes : null;
+  const etaSeconds = !ingestOwnsState ? task.eta_seconds : null;
 
   return (
     <div className={grouped ? "py-2.5 first:pt-1 last:pb-1" : ""}>
@@ -1233,22 +1246,12 @@ function DownloadTaskFeedItem({
           />
         </div>
       )}
-      {/* 大小/速度/剩余时间合并成一行；投递来源与下载器名由生命周期"已投递"承担 */}
-      {(task.size_bytes != null ||
-        (!ingestOwnsState &&
-          ((task.state === "downloading" && task.dlspeed_bytes != null && task.dlspeed_bytes > 0) ||
-            task.eta_seconds != null))) && (
+      {/* 实时传输单独一行：下行/上行速度与剩余时间；文件尺寸已并入规格行 */}
+      {(downSpeed != null || upSpeed != null || etaSeconds != null) && (
         <div className="mt-1.5 flex flex-wrap items-center gap-x-2.5 gap-y-1 text-caption text-white/38">
-          {task.size_bytes != null && <span className="tnum">{formatBytes(task.size_bytes)}</span>}
-          {!ingestOwnsState &&
-            task.state === "downloading" &&
-            task.dlspeed_bytes != null &&
-            task.dlspeed_bytes > 0 && (
-              <span className="tnum">↓ {formatBytes(task.dlspeed_bytes)}/s</span>
-            )}
-          {!ingestOwnsState && task.eta_seconds != null && (
-            <span>剩余约 {formatDuration(task.eta_seconds)}</span>
-          )}
+          {downSpeed != null && <span className="tnum">↓ {formatBytes(downSpeed)}/s</span>}
+          {upSpeed != null && <span className="tnum">↑ {formatBytes(upSpeed)}/s</span>}
+          {etaSeconds != null && <span>剩余约 {formatDuration(etaSeconds)}</span>}
         </div>
       )}
       {firstSubscription && (
