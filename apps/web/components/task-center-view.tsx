@@ -1039,20 +1039,6 @@ function partialIngestLabel(task: DownloadTask): string | null {
   return `已入库 ${summary.imported}/${summary.total} 集`;
 }
 
-/**
- * 「覆盖剧集」列的是种子声明覆盖的全集，本徽标补上其中已经进库的比例——两者
- * 分开表达，覆盖范围才不会随入库推进而缩水。
- */
-function ImportedUnitsBadge({ task }: { task: DownloadTask }) {
-  const summary = ingestUnitSummary(task);
-  if (summary == null || summary.total <= 1 || summary.imported === 0) return null;
-  return (
-    <span className="tnum shrink-0 rounded-md border border-[var(--ok)]/20 bg-[var(--ok)]/[0.07] px-2 py-1 text-[var(--ok)]">
-      已入库 {summary.imported}/{summary.total}
-    </span>
-  );
-}
-
 interface DownloadTaskGroup {
   key: string;
   mediaItemId: number | null;
@@ -1213,14 +1199,29 @@ function DownloadTaskFeedItem({
   const title = grouped
     ? task.name || task.media_title || task.info_hash
     : task.media_title || task.name || task.info_hash;
-  const note = downloadTaskNote(task, ingestJob);
+  // 有关联入库 Job 时不再单独出一行文字说明：入库阶段与解释由底部生命
+  // 周期承担，覆盖集标签会标注已入库进度，feed 行只保留下载态/换源提示
+  const note = ingestJob != null ? null : downloadTaskNote(task, null);
   const showReplace = shouldOfferInlineReplacement(task);
   const firstSubscription = task.subscriptions[0];
-  // 种子名前用站点徽标回答"这个资源从哪来"；画面规格与片源紧随其后，
-  // 弥补高度同质化的 release 名。状态与进度由底部生命周期承担，不再重复。
-  const specs = [task.resolution, task.media_source].filter(
-    (item): item is string => item != null,
-  );
+  // 种子名前用站点徽标回答"这个资源从哪来"；画面规格、片源与文件尺寸紧随
+  // 其后，弥补高度同质化的 release 名。状态与进度由底部生命周期承担，不再
+  // 重复；速度与剩余时间单独一行，专注实时传输信息。
+  const specs = [
+    task.resolution,
+    task.media_source,
+    task.size_bytes != null ? formatBytes(task.size_bytes) : null,
+  ].filter((item): item is string => item != null);
+  // 下行速度只在真正下载时有意义；上行（做种）在下载中和等待入库期间都可能存在
+  const downSpeed =
+    !ingestOwnsState &&
+    task.state === "downloading" &&
+    task.dlspeed_bytes != null &&
+    task.dlspeed_bytes > 0
+      ? task.dlspeed_bytes
+      : null;
+  const upSpeed = task.upspeed_bytes != null && task.upspeed_bytes > 0 ? task.upspeed_bytes : null;
+  const etaSeconds = !ingestOwnsState ? task.eta_seconds : null;
 
   return (
     <div className={grouped ? "py-2.5 first:pt-1 last:pb-1" : ""}>
@@ -1281,31 +1282,17 @@ function DownloadTaskFeedItem({
           />
         </div>
       )}
-      {/* 大小/速度/剩余时间合并成一行；投递来源与下载器名由生命周期"已投递"承担 */}
-      {(task.size_bytes != null ||
-        (!ingestOwnsState &&
-          ((task.state === "downloading" && task.dlspeed_bytes != null && task.dlspeed_bytes > 0) ||
-            task.eta_seconds != null))) && (
+      {/* 实时传输单独一行：下行/上行速度与剩余时间；文件尺寸已并入规格行 */}
+      {(downSpeed != null || upSpeed != null || etaSeconds != null) && (
         <div className="mt-1.5 flex flex-wrap items-center gap-x-2.5 gap-y-1 text-caption text-white/38">
-          {task.size_bytes != null && <span className="tnum">{formatBytes(task.size_bytes)}</span>}
-          {!ingestOwnsState &&
-            task.state === "downloading" &&
-            task.dlspeed_bytes != null &&
-            task.dlspeed_bytes > 0 && (
-              <span className="tnum">↓ {formatBytes(task.dlspeed_bytes)}/s</span>
-            )}
-          {!ingestOwnsState && task.eta_seconds != null && (
-            <span>剩余约 {formatDuration(task.eta_seconds)}</span>
-          )}
+          {downSpeed != null && <span className="tnum">↓ {formatBytes(downSpeed)}/s</span>}
+          {upSpeed != null && <span className="tnum">↑ {formatBytes(upSpeed)}/s</span>}
+          {etaSeconds != null && <span>剩余约 {formatDuration(etaSeconds)}</span>}
         </div>
       )}
       {firstSubscription && (
         <div className="mt-2 flex flex-wrap items-center gap-x-2 gap-y-1 text-caption">
-          <span className="text-white/30">
-            {firstSubscription.media_kind === "tv" ? "覆盖剧集" : "下载内容"}
-          </span>
           <EpisodeUnitsLabel units={firstSubscription.units} />
-          <ImportedUnitsBadge task={task} />
         </div>
       )}
       <DownloadLifecycle task={task} ingestJob={ingestJob} variant="feed" />
@@ -1526,11 +1513,7 @@ function DownloadTaskCard({
         )}
         {firstSubscription && (
           <div className="mt-2.5 flex flex-wrap items-start gap-x-2 gap-y-1.5 text-caption">
-            <span className="shrink-0 py-1 text-white/35">
-              {firstSubscription.media_kind === "tv" ? "覆盖剧集" : "下载内容"}
-            </span>
             <EpisodeUnitsLabel units={firstSubscription.units} />
-            <ImportedUnitsBadge task={task} />
           </div>
         )}
         <div className="mt-2.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-caption text-white/40">
@@ -1854,8 +1837,9 @@ function downloadTaskNote(
 }
 
 /**
- * 多集资源默认显示连续区间，点击后按季查看完整集号。原生 details 保留了
- * 键盘与读屏交互，也不会为了这块纯展示状态引入额外 React 状态。
+ * 多集资源默认显示连续区间，同一标签内并列入库进度；点击后按季查看完整
+ * 集号，已入库的集标绿。原生 details 保留了键盘与读屏交互，也不会为了
+ * 这块纯展示状态引入额外 React 状态。
  */
 function EpisodeUnitsLabel({
   units,
@@ -1864,14 +1848,29 @@ function EpisodeUnitsLabel({
 }) {
   const summary = summarizeEpisodeUnits(units);
   if (!summary) return null;
+  const importedKeys = new Set(
+    units
+      .filter((unit) => unit.status === "imported")
+      .map((unit) => `${unit.season_number}:${unit.episode_number}`),
+  );
+  const importedCount = importedKeys.size;
   if (summary.kind === "movie" || summary.episodeCount <= 1) {
-    return <span className="tnum">{summary.label}</span>;
+    return (
+      <span className="tnum">
+        {summary.label}
+        {summary.kind === "episodes" && importedCount > 0 && (
+          <span className="text-[var(--ok)]">（已入库）</span>
+        )}
+      </span>
+    );
   }
 
   return (
     <details className="group min-w-0 max-w-full open:basis-full open:w-full">
       <summary
-        aria-label={`覆盖 ${summary.episodeCount} 集：${summary.fullLabel}。展开查看全部集号`}
+        aria-label={`覆盖 ${summary.episodeCount} 集：${summary.fullLabel}。${
+          importedCount > 0 ? `其中 ${importedCount} 集已入库。` : ""
+        }展开查看全部集号`}
         className="flex w-fit max-w-full cursor-pointer list-none items-center gap-1.5 rounded-md border border-[var(--info)]/20 bg-[var(--info)]/[0.07] px-2 py-1 text-[var(--info)] transition-colors hover:bg-[var(--info)]/[0.11] [&::-webkit-details-marker]:hidden"
       >
         <OverflowText
@@ -1884,6 +1883,11 @@ function EpisodeUnitsLabel({
         >
           {summary.label}
         </OverflowText>
+        {importedCount > 0 && (
+          <span className="tnum shrink-0 text-[var(--ok)]">
+            （有 {importedCount} 集已入库）
+          </span>
+        )}
         <ChevronRightIcon className="size-3 shrink-0 rotate-90 transition-transform group-open:-rotate-90" />
       </summary>
       <div className="mt-2 max-w-xl space-y-2.5 rounded-xl border border-white/[0.07] bg-white/[0.035] px-3 py-2.5">
@@ -1894,14 +1898,22 @@ function EpisodeUnitsLabel({
               <span className="font-normal text-white/35">共 {season.episodes.length} 集</span>
             </div>
             <div className="flex flex-wrap gap-1.5">
-              {season.episodes.map((episode) => (
-                <span
-                  key={episode}
-                  className="tnum rounded-md bg-white/[0.055] px-1.5 py-0.5 text-micro text-white/60"
-                >
-                  E{String(episode).padStart(2, "0")}
-                </span>
-              ))}
+              {season.episodes.map((episode) => {
+                const imported = importedKeys.has(`${season.seasonNumber}:${episode}`);
+                return (
+                  <span
+                    key={episode}
+                    title={imported ? "已入库" : undefined}
+                    className={`tnum rounded-md px-1.5 py-0.5 text-micro ${
+                      imported
+                        ? "bg-[var(--ok)]/[0.16] text-[var(--ok)]"
+                        : "bg-white/[0.055] text-white/60"
+                    }`}
+                  >
+                    E{String(episode).padStart(2, "0")}
+                  </span>
+                );
+              })}
             </div>
           </div>
         ))}

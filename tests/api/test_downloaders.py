@@ -234,6 +234,7 @@ def test_task_center_aggregates_live_downloads_and_subscription_context(client) 
                 info_hash=external_hash,
                 progress=0.42,
                 dlspeed_bytes=2048,
+                upspeed_bytes=512,
                 state="downloading",
             ),
             TorrentBrief(
@@ -290,6 +291,16 @@ def test_task_center_aggregates_live_downloads_and_subscription_context(client) 
                         status=WantedStatus.GRABBED,
                         info_hash=missing_hash,
                     ),
+                    # 季包边下边入库：同一 hash 的已入库集要以 imported 标注
+                    # 补回覆盖列表，让前端标绿
+                    WantedItem(
+                        subscription_id=subscription.id,
+                        media_item_id=media.id,
+                        season_number=1,
+                        episode_number=3,
+                        status=WantedStatus.IMPORTED,
+                        info_hash=linked_hash,
+                    ),
                 ]
             )
             session.add(
@@ -336,11 +347,14 @@ def test_task_center_aggregates_live_downloads_and_subscription_context(client) 
     assert (
         by_hash[linked_hash]["subscriptions"][0]["poster_url"] == by_hash[linked_hash]["poster_url"]
     )
+    # 没有 attempt 台账声明覆盖范围时，units 只含在途工单；同 hash 的已
+    # 入库集（上面 seed 的 S01E03）不会越过台账口径混进列表
     assert by_hash[linked_hash]["subscriptions"][0]["units"] == [
         {"season_number": 1, "episode_number": 1, "status": "grabbed"}
     ]
     assert by_hash[external_hash]["source"] == "external"
     assert by_hash[external_hash]["progress"] == 0.42
+    assert by_hash[external_hash]["upspeed_bytes"] == 512
     assert by_hash[missing_hash]["state"] == "missing"
     assert by_hash[missing_hash]["downloader_id"] == downloader_id
     # 投递台账带回站点身份、详情页与质量快照；外部任务没有这些信息

@@ -112,6 +112,7 @@ class TorrentBrief(BaseModel):
     completed_bytes: int | None = None
     size_bytes: int | None = None
     dlspeed_bytes: int | None = None
+    upspeed_bytes: int | None = None
     eta_seconds: int | None = None
     state: str = "unknown"
 
