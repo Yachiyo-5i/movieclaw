@@ -17,6 +17,7 @@ export function MediaRow({
   moreLabel = "查看完整榜单",
   cardAction,
   cardHref,
+  cardRevealInfoOnTouch = false,
 }: {
   row: MediaRowData;
   moreHref?: Route;
@@ -31,6 +32,12 @@ export function MediaRow({
    * 返回 undefined 的条目回落到默认的发现页详情。
    */
   cardHref?: (item: MediaItem) => Route | undefined;
+  /**
+   * 触摸端首次点按先展开卡片信息层。媒体库「最近添加」行没有悬浮操作键，
+   * 默认规则不会给它「首点展开」，手机上季集范围与入库时间就完全读不到——
+   * 这类纯信息层的行需要显式打开。
+   */
+  cardRevealInfoOnTouch?: boolean;
 }) {
   return (
     // content-visibility：视口外的整行（标题 + 几十张海报卡）跳过布局与绘制，
@@ -61,6 +68,7 @@ export function MediaRow({
               item={item}
               action={typeof cardAction === "function" ? cardAction(item) : cardAction}
               href={cardHref?.(item)}
+              revealInfoOnTouch={cardRevealInfoOnTouch}
             />
           </div>
         ))}

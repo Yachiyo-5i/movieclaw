@@ -37,6 +37,8 @@ export interface PosterCardProps {
   /** 点击目标覆盖：传入即直接链接到该地址（媒体库「最近添加」行跳
    *  库内条目详情），缺省走发现页详情（useMediaDetail.open） */
   href?: Route;
+  /** 触摸端首次点按是否先展开纯信息层；默认仍单击直达详情。 */
+  revealInfoOnTouch?: boolean;
 }
 
 /**
@@ -119,13 +121,27 @@ function resolveRibbon(
   return null;
 }
 
-export function PosterCard({ item, action, href }: PosterCardProps) {
+export function PosterCard({ item, action, href, revealInfoOnTouch }: PosterCardProps) {
   // 点击整卡（含 hover 信息层）进入该影片的详情页
   const { open } = useMediaDetail();
   if (href) {
-    return <PosterCardVisual item={item} action={action} href={href} />;
+    return (
+      <PosterCardVisual
+        item={item}
+        action={action}
+        href={href}
+        revealInfoOnTouch={revealInfoOnTouch}
+      />
+    );
   }
-  return <PosterCardVisual item={item} action={action} onClick={() => open(item)} />;
+  return (
+    <PosterCardVisual
+      item={item}
+      action={action}
+      onClick={() => open(item)}
+      revealInfoOnTouch={revealInfoOnTouch}
+    />
+  );
 }
 
 /** 统一海报视觉组件；传入 onClick 时才渲染为可点击按钮。 */
