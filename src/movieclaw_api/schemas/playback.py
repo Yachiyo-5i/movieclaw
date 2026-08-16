@@ -22,7 +22,9 @@ class RecentWatchItemView(BaseModel):
     season_number: int
     episode_number: int
     episode_title: str | None
-    new_episode_count: int
+    # 锚点之后、当前成员从未看过且文件在位的分集数——“还能接着看几集”，
+    # 不是“最近入库了几集”：看完全剧、补齐旧季与洗版都不该触发提醒。
+    unwatched_ahead_count: int
     position_ms: int
     duration_ms: int | None
     progress_percent: int | None
