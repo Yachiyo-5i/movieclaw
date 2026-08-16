@@ -100,7 +100,7 @@ function NoticeCenterInner({ collapsed }: { collapsed: boolean }) {
         {!collapsed && (
           <>
             <span className="flex-1 text-ui font-medium">待处理</span>
-            <span className="rounded-full bg-[var(--danger)] px-1.5 py-0.5 text-[11px] font-semibold leading-none text-white">
+            <span className="rounded-full bg-[var(--danger-solid)] px-1.5 py-0.5 text-[11px] font-semibold leading-none text-white">
               {notices.length}
             </span>
           </>

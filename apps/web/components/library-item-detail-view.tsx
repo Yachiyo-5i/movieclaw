@@ -2103,7 +2103,7 @@ function DeleteDialog({
                 type="button"
                 onClick={run}
                 disabled={!confirmed || busy}
-                className="flex items-center gap-2 rounded-full bg-[#c73838] px-5 py-2 text-ui font-semibold text-white transition hover:bg-[#d64545] disabled:cursor-not-allowed disabled:opacity-40"
+                className="flex items-center gap-2 rounded-full bg-[var(--danger-solid)] px-5 py-2 text-ui font-semibold text-white transition hover:bg-[var(--danger-solid-hover)] disabled:cursor-not-allowed disabled:opacity-40"
               >
                 {busy && (
                   <span className="size-3.5 animate-spin rounded-full border-2 border-white/30 border-t-white" />
@@ -2275,7 +2275,7 @@ function DeleteFileDialog({
                 type="button"
                 onClick={run}
                 disabled={!confirmed || busy}
-                className="flex items-center gap-2 rounded-full bg-[#c73838] px-5 py-2 text-ui font-semibold text-white transition hover:bg-[#d64545] disabled:cursor-not-allowed disabled:opacity-40"
+                className="flex items-center gap-2 rounded-full bg-[var(--danger-solid)] px-5 py-2 text-ui font-semibold text-white transition hover:bg-[var(--danger-solid-hover)] disabled:cursor-not-allowed disabled:opacity-40"
               >
                 {busy && (
                   <span className="size-3.5 animate-spin rounded-full border-2 border-white/30 border-t-white" />
