@@ -1167,7 +1167,7 @@ function wantedPresentation(w: WantedItem): { label: string; color: string; note
     return {
       label: "未定档",
       color: "#9ca3af",
-      note: "播出日期未公布，定档后自动排队",
+      note: "上映/播出日期未公布，定档后自动排队",
     };
   }
   const due = new Date(w.next_search_at);
@@ -1205,6 +1205,15 @@ function wantedPresentation(w: WantedItem): { label: string; color: string; note
       note: w.last_search_at
         ? `上次搜索 ${formatRelativeTime(w.last_search_at)}`
         : "等待搜索任务执行",
+    };
+  }
+  // 从未搜索过却排在未来 = 档期未到（电影上映+宽限、剧集播出+宽限），
+  // 不是"搜过没结果"的冷却——文案分开，别让用户误以为已经白搜过
+  if (!w.last_search_at) {
+    return {
+      label: "待搜索",
+      color: "#f5c451",
+      note: `档期未到，${formatDateTime(w.next_search_at)} 起兜底搜索`,
     };
   }
   return {

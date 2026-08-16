@@ -35,6 +35,26 @@ _YESTERDAY = (_TODAY - timedelta(days=1)).isoformat()
 _FUTURE = (_TODAY + timedelta(days=10)).isoformat()
 
 _ROUTES = {
+    "/3/movie/300": {
+        "id": 300,
+        "title": "未上映电影",
+        "original_title": "Upcoming Movie",
+        "release_date": (_TODAY + timedelta(days=30)).isoformat(),
+        "status": "Post Production",
+        "external_ids": {},
+        "alternative_titles": {"titles": []},
+        "translations": {"translations": []},
+    },
+    "/3/movie/301": {
+        "id": 301,
+        "title": "未定档电影",
+        "original_title": "Undated Movie",
+        "release_date": "",
+        "status": "In Production",
+        "external_ids": {},
+        "alternative_titles": {"titles": []},
+        "translations": {"translations": []},
+    },
     "/3/tv/200": {
         "id": 200,
         "name": "测试剧集",
@@ -144,6 +164,28 @@ async def test_search_now_resets_cooldown_and_logs(db) -> None:
             .all()
         )
         assert any("立即搜索" in a.message for a in acts)
+
+
+async def test_search_now_forces_movie_regardless_of_release(db) -> None:
+    """电影不受"未上映/未定档不搜"限制：用户强制触发就是"我现在就要搜一次"。"""
+    async with db.session() as session:
+        service = _service(session)
+
+        # 未上映（调度排在上映+宽限）：强制后清零到当下
+        upcoming = await service.create(MediaKind.MOVIE, 300)
+        w = list((await _wanted_map(session, upcoming.id)).values())[0]
+        assert w.next_search_at is not None and w.next_search_at > utcnow()
+        assert await service.search_now(upcoming.id) == 1
+        w = list((await _wanted_map(session, upcoming.id)).values())[0]
+        assert w.next_search_at is not None and w.next_search_at <= utcnow()
+
+        # 未定档（不可调度 NULL）：同样可以强制
+        undated = await service.create(MediaKind.MOVIE, 301)
+        w = list((await _wanted_map(session, undated.id)).values())[0]
+        assert w.next_search_at is None
+        assert await service.search_now(undated.id) == 1
+        w = list((await _wanted_map(session, undated.id)).values())[0]
+        assert w.next_search_at is not None and w.next_search_at <= utcnow()
 
 
 async def test_search_now_rejects_paused_and_empty(db) -> None:

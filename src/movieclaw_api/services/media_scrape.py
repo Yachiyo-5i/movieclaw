@@ -179,6 +179,10 @@ async def _scrape(media_item_id: int, *, force: bool, on_phase: PhaseHook = None
             # 新集出现或 air_date 改档后立即重建目标快照。快照内带 target_air_date，
             # 即使本次刷新中断，读取端也不会使用旧档期的预测。
             await refresh_release_forecasts(session, media_item_ids={media_item_id})
+        elif subscription is not None and kind is MediaKind.MOVIE:
+            # 电影的"定档回填"：TMDB 档期出现/变化、状态翻到已上映时，把哨兵
+            # 工单的搜索调度对齐最新上映信息（对应剧集 _grow_and_sync 的档期同步）
+            await _sync_movie_schedule(session, subscription, item, profile.release_date)
 
     _phase("下载图片")
     await download_item_assets(media_item_id, force=force)
@@ -897,6 +901,65 @@ async def _grow_and_sync(
         logger.info("《%s》发现 %d 个新集，已补工单", item.title, len(to_add))
     else:
         await session.commit()  # 只有档期同步时也要落盘
+
+
+async def _sync_movie_schedule(
+    session: AsyncSession,
+    subscription: Subscription,
+    item: MediaItem,
+    release_date,
+) -> None:
+    """电影订阅的档期同步：把 (0,0) 哨兵工单的搜索调度对齐最新上映信息。
+
+    只同步既有工单、绝不补建（电影没有"生长"；文件丢失走「重新下载」）。
+    改写规则：
+    - 未定档 → 定档/上映：任何时候都回填——用户强制搜过（attempts>0）也不能
+      让工单永远卡在不可调度；
+    - 已排期 → 档期变化：仅未搜过（attempts==0）且新旧至少一方在未来时改写。
+      两边都已到期属于"立即可搜"，没有可同步的档期；退避中的不打扰。
+    """
+    from movieclaw_api.services.subscription import movie_schedule
+
+    assert subscription.id is not None
+    repo = SubscriptionRepository(session)
+    rows = await repo.list_wanted(subscription.id)
+    row = next((w for w in rows if w.season_number == 0 and w.episode_number == 0), None)
+    if row is None or row.status != WantedStatus.WANTED:
+        return
+    next_search, priority = movie_schedule(release_date, item.status)
+    now = utcnow()
+    if row.next_search_at is None:
+        changed = next_search is not None
+    elif next_search is None:
+        changed = row.search_attempts == 0  # 撤档：真没档期就别到点空搜
+    else:
+        changed = (
+            row.search_attempts == 0
+            and next_search != row.next_search_at
+            and (next_search > now or row.next_search_at > now)
+        )
+    if not changed:
+        return
+    row.next_search_at = next_search
+    row.priority = priority
+    row.updated_at = now
+    session.add(row)
+    if next_search is not None:
+        message = f"《{item.title}》档期更新，{next_search.date().isoformat()} 起开始搜索资源"
+    else:
+        message = f"《{item.title}》档期撤销，重新定档/上映后再安排搜索"
+    await repo.add_activity(
+        SubscriptionActivity(
+            subscription_id=subscription.id,
+            type=ActivityType.ADJUSTED,
+            message=message,
+            payload={
+                "release_date": release_date.isoformat() if release_date else None,
+                "status": item.status,
+            },
+        )
+    )
+    logger.info("电影《%s》档期同步：%s", item.title, message)
 
 
 # ---------------------------------------------------------------------------

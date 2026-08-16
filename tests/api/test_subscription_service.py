@@ -18,7 +18,11 @@ from movieclaw_api.core.config import get_settings
 from movieclaw_api.exceptions import BadRequestException, ConflictException
 from movieclaw_api.services.media_library import MediaLibraryService
 from movieclaw_api.services.rule_sets import RuleSetService
-from movieclaw_api.services.subscription import FUTURE_GRACE, SubscriptionService
+from movieclaw_api.services.subscription import (
+    FUTURE_GRACE,
+    MOVIE_RELEASE_GRACE,
+    SubscriptionService,
+)
 from movieclaw_api.services.subscription.matching import publish_calendar_date
 from movieclaw_db.engine import dispose_db, get_database, init_db
 from movieclaw_db.migrations import run_migrations
@@ -56,6 +60,38 @@ _ROUTES = {
         "original_title": "Test Movie",
         "release_date": _AIRED,
         "status": "Released",
+        "external_ids": {},
+        "alternative_titles": {"titles": []},
+        "translations": {"translations": []},
+    },
+    # 电影上映感知调度的三个夹具：未上映（一个月后）/ 刚上映（3 天前，宽限内）/
+    # 未定档（制作中，无档期）
+    "/3/movie/101": {
+        "id": 101,
+        "title": "未上映电影",
+        "original_title": "Upcoming Movie",
+        "release_date": (_TODAY + timedelta(days=30)).isoformat(),
+        "status": "Post Production",
+        "external_ids": {},
+        "alternative_titles": {"titles": []},
+        "translations": {"translations": []},
+    },
+    "/3/movie/102": {
+        "id": 102,
+        "title": "刚上映电影",
+        "original_title": "Fresh Movie",
+        "release_date": (_TODAY - timedelta(days=3)).isoformat(),
+        "status": "Released",
+        "external_ids": {},
+        "alternative_titles": {"titles": []},
+        "translations": {"translations": []},
+    },
+    "/3/movie/103": {
+        "id": 103,
+        "title": "未定档电影",
+        "original_title": "Undated Movie",
+        "release_date": "",
+        "status": "In Production",
         "external_ids": {},
         "alternative_titles": {"titles": []},
         "translations": {"translations": []},
@@ -176,15 +212,45 @@ async def _mark(session, wanted: WantedItem, status: WantedStatus) -> None:
 
 
 async def test_movie_creates_single_backfill_unit(db) -> None:
-    """电影 = (0,0) 哨兵补旧工单：立即排队真实搜索。"""
+    """电影 = (0,0) 哨兵工单：上映已过宽限期 → 补旧，立即排队真实搜索。"""
     async with db.session() as session:
         sub = await _service(session).create(MediaKind.MOVIE, 100)
         wanted = await _wanted_of(session, sub.id)
 
     assert [(w.season_number, w.episode_number) for w in wanted] == [(0, 0)]
     assert wanted[0].status == WantedStatus.WANTED
-    assert wanted[0].next_search_at is not None  # 补旧：now
+    assert wanted[0].next_search_at is not None
+    assert wanted[0].next_search_at <= utcnow()  # 补旧：now
     assert sub.status == SubscriptionStatus.ACTIVE
+
+
+async def test_movie_release_aware_schedule(db) -> None:
+    """电影上映感知调度：未上映/刚上映=上映+宽限、未定档=NULL 等回填。
+
+    上映日不写进工单 air_date——covered_units 把 air_date 当发布时间物理上限，
+    写了会误杀早于 TMDB 档期流出的资源（分地区上映/提前数字发行）。
+    """
+    async with db.session() as session:
+        service = _service(session)
+        now = utcnow()
+
+        upcoming = await service.create(MediaKind.MOVIE, 101)
+        w = (await _wanted_of(session, upcoming.id))[0]
+        assert w.next_search_at is not None
+        assert w.next_search_at.date() == _TODAY + timedelta(days=30) + MOVIE_RELEASE_GRACE
+        assert w.priority > 0  # 与剧集追新同语义：被动匹配为主，到点漏抓兜底
+        assert w.air_date is None
+
+        fresh = await service.create(MediaKind.MOVIE, 102)
+        w = (await _wanted_of(session, fresh.id))[0]
+        assert w.next_search_at is not None
+        assert w.next_search_at > now  # 刚上映（宽限内）：不立即白搜
+        assert w.next_search_at.date() == _TODAY - timedelta(days=3) + MOVIE_RELEASE_GRACE
+
+        undated = await service.create(MediaKind.MOVIE, 103)
+        w = (await _wanted_of(session, undated.id))[0]
+        assert w.next_search_at is None  # 明确未上映且未定档：等定档回填
+        assert undated.status == SubscriptionStatus.ACTIVE
 
 
 async def test_tv_selected_seasons_full_domain_with_schedule_classes(db) -> None:

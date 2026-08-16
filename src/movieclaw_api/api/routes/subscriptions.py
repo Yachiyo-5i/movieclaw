@@ -472,7 +472,8 @@ async def search_subscription_now(
     principal: Principal = Depends(require_subscribe_capability),
     session: AsyncSession = Depends(get_session),
 ) -> ApiResponse[SearchNowView]:
-    """只重置"本来就能搜"的缺口（未定档/待播出/在途的不碰）；订阅暂停中、
+    """剧集只重置"本来就能搜"的缺口（未定档/待播出/在途的不碰）；电影是
+    用户强制——未上映/未定档也搜，搜完自动恢复上映档期调度。订阅暂停中、
     或没有可搜缺口时给可读中文错误。"""
     service = _service(session)
     await service.assert_can_manage(
