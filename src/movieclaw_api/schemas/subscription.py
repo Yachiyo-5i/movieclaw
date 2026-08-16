@@ -518,6 +518,11 @@ class WantedUpgradeView(BaseModel):
     current_label: str = Field(description="当前版本档位标签（如「1080p WEB-DL」）")
     target_label: str = Field(description="洗版目标档位标签（如「1080p Remux」）")
     search_attempts: int = Field(description="已洗版搜索次数")
+    indeterminate: bool = Field(
+        default=False,
+        description="无法确认档位：证明不了低于目标也证明不了已达标——"
+        "不参与自动洗版，可手动选种替换（§13.8）",
+    )
 
 
 class WantedView(BaseModel):
@@ -617,7 +622,14 @@ def _wanted_upgrades(
 
     规则组未配洗版目标 / spec 无法解析 → 全部 None（前端不显示洗版信息）。
     """
-    from movieclaw_matcher import QualitySnapshot, RuleSetSpec, quality_label, upgrade_target_label
+    from movieclaw_matcher import (
+        QualitySnapshot,
+        RuleSetSpec,
+        provably_at_cutoff,
+        provably_below_cutoff,
+        quality_label,
+        upgrade_target_label,
+    )
 
     if not isinstance(rule_spec, RuleSetSpec) or rule_spec.upgrade_source is None:
         return {}
@@ -630,7 +642,18 @@ def _wanted_upgrades(
     target = upgrade_target_label(rule_spec) or ""
     result: dict[tuple[int, int], WantedUpgradeView | None] = {}
     for w in wanted_rows:
-        if w.status != "imported" or not w.quality:
+        if w.status != "imported" or w.quality is None:
+            continue  # NULL=快照未回填（转瞬态），不展示半截结论
+        if not w.quality:
+            # {} 哨兵：完全无法识别。常驻如实展示（§13.8）——否则这类单元
+            # 在追踪明细里与档位健康的单元毫无区别，用户以为它在洗版盘子里
+            result[(w.season_number, w.episode_number)] = WantedUpgradeView(
+                active=False,
+                current_label="版本未识别",
+                target_label=target,
+                search_attempts=w.search_attempts,
+                indeterminate=True,
+            )
             continue
         snapshot = QualitySnapshot.model_validate(w.quality)
         result[(w.season_number, w.episode_number)] = WantedUpgradeView(
@@ -638,6 +661,8 @@ def _wanted_upgrades(
             current_label=quality_label(snapshot),
             target_label=target,
             search_attempts=w.search_attempts,
+            indeterminate=not provably_below_cutoff(snapshot, rule_spec)
+            and not provably_at_cutoff(snapshot, rule_spec),
         )
     return result
 

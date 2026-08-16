@@ -418,13 +418,16 @@ export function SubscriptionInspectorView({
                   <span className="whitespace-nowrap">立即搜索</span>
                 </button>
               )}
-              {canSubscribe && canSearch && detail.progress.wanted > 0 && (
+              {/* 有缺口，或配了洗版目标且有已入库单元（手选换版本，§13.8）时展示 */}
+              {canSubscribe &&
+                canSearch &&
+                (detail.progress.wanted > 0 || detail.wanted.some((w) => w.upgrade)) && (
                 <Link
                   href={
                     `/search?q=${encodeURIComponent(detail.media.title)}&for_sub=${detail.id}` as Route
                   }
                   className="btn-glass inline-flex h-10 min-w-0 items-center justify-center gap-1.5 border border-white/10 bg-white/[0.05] px-4 text-sub font-medium backdrop-blur-md max-md:h-11 max-md:px-2"
-                  title="到站点资源搜索里挑一条种子，直接投给本订阅（跳过规则组限制）"
+                  title="到站点资源搜索里挑一条种子，直接投给本订阅（跳过规则组限制；替换已入库版本时按入库实测裁决，证明更优才替换）"
                 >
                   <SearchIcon className="size-4 shrink-0" />
                   <span className="whitespace-nowrap">手动选种</span>
@@ -1237,6 +1240,15 @@ function wantedPresentation(w: WantedItem): { label: string; color: string; note
         label: "洗版中",
         color: "#2dd4bf",
         note: `当前 ${w.upgrade.current_label} → 目标 ${w.upgrade.target_label}`,
+      };
+    }
+    if (w.upgrade?.indeterminate) {
+      // 无法确认档位（§13.8）：不参与自动洗版——如实说明并给出人工出路，
+      // 否则这类单元与档位健康的单元毫无区别，用户以为它在洗版盘子里
+      return {
+        label: "已入库",
+        color: "#4ade80",
+        note: `${w.upgrade.current_label} · 无法确认是否低于洗版目标，不自动洗；可手动选种替换`,
       };
     }
     if (w.upgrade) {

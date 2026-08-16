@@ -88,6 +88,8 @@ export interface WantedUpgrade {
   target_label: string;
   /** 已洗版搜索次数 */
   search_attempts: number;
+  /** 无法确认档位（证明不了低于目标也证明不了达标）：不参与自动洗版，可手动选种替换 */
+  indeterminate: boolean;
 }
 
 export interface Subscription {

@@ -906,6 +906,36 @@ async def _verify_upgrades_locked(session: AsyncSession, media_item_id: int) -> 
             trash_paths = []
             from_attempt = [f for f in unit_files if _file_from_attempt(f, attempt)]
             others = [f for f in unit_files if not _file_from_attempt(f, attempt)]
+            if attempt.manual:
+                # 手动选种（§13.8）：用户显式挑的文件绝不能被系统丢弃。
+                # 未能证明更优 → 新旧版本共存保留，不计熔断、不进排除清单。
+                # 基线刷新为实测最优——手选常常是给"无法确认"单元补一个
+                # 命名可信的版本，新文件档位可知时基线随之修复
+                attempt.status = DownloadAttemptStatus.RETAINED
+                attempt.cleanup_note = (
+                    "手动选种版本已入库：实测未能证明优于原版本，新旧版本共存"
+                    "保留（未自动替换）；不需要的版本可在库详情删除"
+                )
+                attempt.updated_at = now
+                wanted.quality = best_snapshot.model_dump(exclude_defaults=True)
+                wanted.updated_at = now
+                await session.commit()
+                await repo.add_activity(
+                    SubscriptionActivity(
+                        subscription_id=wanted.subscription_id,
+                        wanted_item_id=wanted.id,
+                        type=ActivityType.UPGRADE_VERIFY_FAILED,
+                        message=(
+                            f"{_unit_text(wanted)}手选版本已入库，但实测未能证明更优："
+                            "新旧版本共存保留，未自动替换；不需要的版本可在库详情删除"
+                        ),
+                        payload={
+                            "reason": "manual_retained",
+                            "units": [[wanted.season_number, wanted.episode_number]],
+                        },
+                    )
+                )
+                continue
             # 防御：旧版本文件必须还在位才移走证伪文件（宁可留下劣质版本，
             # 也绝不把单元清空）
             if others:

@@ -367,6 +367,10 @@ class SubscriptionDownloadAttempt(TimestampMixin, table=True):
     # 洗版在途去重、活动文案分流与旧版本清理定位都以此为据
     # （docs/design/quality-upgrade.md §6.2）。
     purpose: str = Field(default="download", description="投递目的：download / upgrade")
+    # 手动选种标记：用户显式挑的种子。洗版验证据此改变裁决——未能证明
+    # 更优时新旧版本共存保留（绝不丢弃用户挑的文件），也不计熔断/排除
+    # （docs/design/quality-upgrade.md §13.8）。
+    manual: bool = Field(default=False, description="是否手动选种投递（用户显式选择）")
 
     status: str = Field(default=DownloadAttemptStatus.ACTIVE, index=True)
     last_downloader_state: str | None = Field(default=None)

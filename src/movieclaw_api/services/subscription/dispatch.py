@@ -56,6 +56,7 @@ async def dispatch(
     source: str,
     upgrade_rows: list[WantedItem] | None = None,
     upgrade_labels: tuple[str, str] | None = None,
+    manual: bool = False,
 ) -> bool:
     """把候选投递给下载器，满足给定的一批工单。返回是否有实际投递发生。
 
@@ -64,6 +65,9 @@ async def dispatch(
     版本，直到入库验证确认升级），只进 attempt 的 units 台账；attempt 标记
     ``purpose="upgrade"`` 供在途去重与旧版清理定位。``upgrade_labels`` 是
     (当前档位, 候选档位) 的展示标签，进活动文案。
+
+    ``manual``：手动选种投递（用户显式选择）。落在 attempt.manual 上，
+    洗版验证据此在"未能证明更优"时保留共存而不是证伪（§13.8）。
     """
     from movieclaw_api.services.subscription.core import recompute_subscription_status
     from movieclaw_api.services.subscription.matching import (
@@ -221,6 +225,9 @@ async def dispatch(
                     or (existing_attempt is not None and existing_attempt.purpose == "upgrade")
                     else "download"
                 ),
+                # 同理粘性：承担过手动选种语义就保持（验证裁决据此分流）
+                "manual": manual
+                or (existing_attempt is not None and existing_attempt.manual),
                 "status": (
                     DownloadAttemptStatus.ACTIVE
                     if attempt_alive

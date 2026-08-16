@@ -320,7 +320,7 @@ function unitNote(u: UpgradeRunUnit): string {
     case "at_cutoff":
       return `当前 ${u.current_label ?? "未知"}，已达洗版目标`;
     case "not_comparable":
-      return "无法确认当前版本是否低于目标，不自动洗；可到资源搜索里手动选种替换";
+      return "无法确认当前版本是否低于目标，不自动洗；可用「手动选种」挑一条可信资源替换";
     case "missing":
       return "库里没有该单元，将照常搜索下载补齐";
   }
