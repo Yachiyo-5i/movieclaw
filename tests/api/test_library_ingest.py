@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -907,6 +908,113 @@ async def test_file_scoped_blocked_job_not_woken_by_tree_fingerprint(db, tmp_pat
     async with db.session() as session:
         all_jobs = list((await session.execute(select(Job))).scalars())
     assert len(all_jobs) == 1
+
+
+@pytest.mark.asyncio
+async def test_blocked_batch_does_not_stall_remaining_episodes(db, tmp_path, monkeypatch):
+    """某一批挂起后，同条目剩下的集必须能继续入库，不被连坐。
+
+    blocked 属于活跃状态，巡检见到就跳过整个条目；各批又曾共用一个 dedupe_key，
+    于是 E01 识别失败挂起会把 E02–E10 全部永久堵死，而任务中心只显示那一个
+    受阻任务，用户看不出后面还有几集被连累（回归）。
+    """
+    from movieclaw_downloader import TorrentBrief, TorrentFile, TorrentStatus
+
+    root, watch = tmp_path / "tv", tmp_path / "watch"
+    watch.mkdir()
+    library_id = await _make_library(db, kind=MediaKind.TV, root=root)
+    await _make_rule(db, library_id=library_id, source=watch)
+    item = await _make_item(db, kind=MediaKind.TV, title="连坐测试剧", year=2026)
+    _stub_identify(monkeypatch, item)
+    monkeypatch.setattr(ingest_mod, "probe_media", lambda _path: _FAKE_SPEC)
+
+    async def no_assets(_media_item_id: int) -> None:
+        return None
+
+    monkeypatch.setattr("movieclaw_api.services.media_scrape.ensure_assets", no_assets)
+    # ep1 解析不出集号 → 第一批挂起；ep2 正常
+    monkeypatch.setattr(
+        ingest_mod,
+        "_unit",
+        lambda file, _entry: (1, 0) if file.stem == "ep1" else (1, 2),
+    )
+
+    entry = watch / "Collateral.Show.S01"
+    entry.mkdir()
+    ep1 = entry / "ep1.mkv"
+    ep2 = entry / "ep2.mkv"
+    ep1.write_bytes(b"episode-1")
+    ep2.write_bytes(b"episode-2-partial")
+    completed = TorrentBrief(
+        name=entry.name, content_name=entry.name, completed=True, info_hash="done-hash"
+    )
+    downloading = TorrentBrief(
+        name=entry.name, content_name=entry.name, completed=False, info_hash="writing-hash"
+    )
+
+    def _status(info_hash: str, name: Path, done: bool) -> TorrentStatus:
+        size = name.stat().st_size
+        return TorrentStatus(
+            info_hash=info_hash,
+            name=entry.name,
+            progress=1.0 if done else 0.5,
+            completed=done,
+            save_path=str(watch),
+            files=[
+                TorrentFile(
+                    path=f"{entry.name}/{name.name}",
+                    size_bytes=size,
+                    completed_bytes=size if done else 3,
+                )
+            ],
+        )
+
+    # 可变开关：第二轮把 ep2 也切成已完成
+    ep2_done = {"value": False}
+
+    async def briefs():
+        return [completed, downloading]
+
+    async def statuses(_matches):
+        return [
+            (SimpleNamespace(path_mappings=None), _status(completed.info_hash, ep1, True)),
+            (
+                SimpleNamespace(path_mappings=None),
+                _status(downloading.info_hash, ep2, ep2_done["value"]),
+            ),
+        ]
+
+    monkeypatch.setattr(ingest_mod, "_downloader_briefs", briefs)
+    monkeypatch.setattr(ingest_mod, "_matched_torrent_statuses", statuses)
+    async with db.session() as session:
+        rule = (await session.execute(select(ImportWatch))).scalar_one()
+        library = await session.get(Library, library_id)
+        assert library is not None
+
+    # 第一轮：只有 ep1 完成，批次作业因解析缺口挂起
+    await ingest_mod._sweep_dir(rule, library)
+    async with db.session() as session:
+        first = (await session.execute(select(Job))).scalar_one()
+    await jobs.init_job_dispatcher(max_parallel=1)
+    blocked = await _wait_job_status(first.id, JobStatus.BLOCKED)
+    assert blocked.error["code"] == "INGEST_EPISODE_PARSE_REQUIRED"
+
+    # 第二轮：ep2 落盘，必须另立作业，而不是并回挂起的那一批
+    ep2_done["value"] = True
+    await ingest_mod._sweep_dir(rule, library)
+    async with db.session() as session:
+        all_jobs = list((await session.execute(select(Job))).scalars())
+    assert len(all_jobs) == 2, "新一批被挂起作业连坐，没能另立作业"
+    follow_up = next(job for job in all_jobs if job.id != first.id)
+    await _wait_job_status(follow_up.id, JobStatus.SUCCEEDED)
+
+    # ep2 已进库；挂起的 ep1 留在原地等人工，没有被静默带走
+    season = root / "连坐测试剧 (2026)" / "Season 01"
+    assert (season / "连坐测试剧 (2026) - S01E02.mkv").read_bytes() == b"episode-2-partial"
+    async with db.session() as session:
+        still_blocked = await session.get(Job, first.id)
+        assert still_blocked is not None
+        assert still_blocked.status == JobStatus.BLOCKED
 
 
 @pytest.mark.asyncio
