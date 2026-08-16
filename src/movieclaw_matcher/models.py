@@ -46,6 +46,18 @@ class DvPolicy(StrEnum):
     FORBID = "forbid"  # 排除含 DV 标记的资源（不影响其他 HDR 格式）
 
 
+class UpgradeSource(StrEnum):
+    """洗版目标片源档（规则组的"洗到哪一档"选项，docs/design/quality-upgrade.md §3.2）。
+
+    只暴露三个用户语言里的档位；完整的片源档阶梯（含 Rip/TV 录制类）内置在
+    decision.py，不暴露配置。
+    """
+
+    WEB_DL = "web-dl"  # 洗到 WEB-DL
+    BLU_RAY = "blu-ray"  # 洗到蓝光重编码
+    REMUX = "remux"  # 洗到原盘 Remux
+
+
 class HrUnknownPolicy(StrEnum):
     """H&R 状态未知（NULL）时的处理策略。
 
@@ -106,12 +118,22 @@ class RuleSetSpec(BaseModel):
         description="要求的音轨语言（任一命中即过，如 [\"cmn\"]=要国语）；空=不限",
     )
 
+    # -- 洗版（docs/design/quality-upgrade.md §3.2）--------------------------
+    # 两个字段都缺省 = 不洗版。洗版目标 = (cutoff_resolution 或 resolutions
+    # 首选或 1080p, upgrade_source)，比较用 decision.py 的档位阶梯。
+    upgrade_source: UpgradeSource | None = Field(
+        default=None,
+        description="洗版目标片源档（web-dl/blu-ray/remux）；None=不洗版",
+    )
+    cutoff_resolution: str | None = Field(
+        default=None,
+        description="洗版目标分辨率；None=取 resolutions 首选（都缺省则 1080p，"
+        "保守缺省避免把用户意外带进 4K 的磁盘占用）",
+    )
+
     # -- 预留（本期不消费，字段先占位保证 spec 向前兼容）--------------------
     sites: list[str] = Field(
         default_factory=list, description="[预留] 站点白名单；空=全部启用站点"
-    )
-    cutoff_resolution: str | None = Field(
-        default=None, description="[预留] 洗版上限（P6 启用）"
     )
 
     @model_validator(mode="after")
@@ -121,6 +143,21 @@ class RuleSetSpec(BaseModel):
             raise ValueError(
                 "hdr=forbid 与 dv=require 互相矛盾：DV 属于 HDR 家族，"
                 "「排除 HDR」会排除一切 DV 资源，无法同时「必须 DV」"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_upgrade_target(self) -> RuleSetSpec:
+        """洗版目标分辨率必须是规则组自己接受的分辨率，否则永远洗不到。"""
+        if (
+            self.cutoff_resolution is not None
+            and self.resolutions
+            and self.cutoff_resolution.casefold()
+            not in {r.casefold() for r in self.resolutions}
+        ):
+            raise ValueError(
+                f"洗版目标分辨率 {self.cutoff_resolution} 不在允许的分辨率列表中，"
+                "规则组自己都不接受的分辨率无法作为洗版目标"
             )
         return self
 
@@ -199,3 +236,40 @@ class RuleVerdict:
     score: int = 0
     reason_code: str | None = None
     reason_text: str | None = None
+
+
+class QualitySnapshot(BaseModel):
+    """单元当前版本的质量快照（``wanted_item.quality`` JSON 列的 schema）。
+
+    洗版比较的唯一基线（docs/design/quality-upgrade.md §4）。取值原则：
+    **能实测的维度以 ffprobe 为准，实测不出的出处维度采信名称解析**——
+    resolution/hdr/bit_rate 来自 probe（值域归一到 enrich 词表），
+    media_source/remux/release_group 来自种子名或文件名 enrich。
+    所有字段可缺省 = 未知（三态铁律：未知不当已知用，见 decision.py 的
+    部分可比规则）。
+    """
+
+    resolution: str | None = None  # 归一化分辨率（2160p/1080p/…）；probe 优先
+    media_source: str | None = None  # 片源（WEB-DL/Blu-ray/…）；名称来源
+    remux: bool = False  # 是否原盘 Remux；名称来源（缺席即否定，同 TorrentAttrs）
+    release_group: str | None = None  # 制作组；仅展示
+    hdr: list[str] = Field(default_factory=list)  # HDR 格式（DV/HDR10/…）；仅展示
+    bit_rate: int | None = None  # 实测码率（bps）；留证据供详情页展示，不参与档位
+
+
+@dataclass(frozen=True)
+class UpgradeVerdict:
+    """洗版判定结果（docs/design/quality-upgrade.md §5）。
+
+    拒绝码只有三个：``upgrade_not_comparable``（关键维度无法识别）、
+    ``upgrade_at_cutoff``（当前版本已达洗版目标）、``upgrade_not_better``
+    （候选档位不高于当前版本）。reason_text 与 RuleVerdict 同约定——
+    完整中文句子；接受时 current_label/candidate_label 供"从 X 洗到 Y"
+    的活动文案使用。
+    """
+
+    accepted: bool
+    reason_code: str | None = None
+    reason_text: str | None = None
+    current_label: str | None = None  # 当前版本档位中文标签（如 "1080p WEB-DL"）
+    candidate_label: str | None = None  # 候选档位中文标签（如 "1080p Remux"）

@@ -629,7 +629,10 @@ class RuleSetPayload(BaseModel):
             "未填写的条件均不限制。\n\n"
             "subtitle_languages_require：要求的字幕语言（BCP 47，任一命中即通过）。\n\n"
             "audio_languages_require：要求的音轨语言（BCP 47，任一命中即通过）。\n\n"
-            '示例：{"resolutions":["2160p"],"free_only":true}'
+            "upgrade_source 洗版目标片源档（web-dl/blu-ray/remux，缺省=不洗版）、"
+            "cutoff_resolution 洗版目标分辨率（缺省=resolutions 首选，"
+            "必须在 resolutions 允许范围内）。\n\n"
+            '示例：{"resolutions":["2160p"],"free_only":true,"upgrade_source":"remux"}'
         ),
     )
 

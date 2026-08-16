@@ -268,6 +268,21 @@ class WantedItem(TimestampMixin, table=True):
 
     grabbed_at: datetime | None = Field(default=None, description="投递成功时间")
 
+    # -- 洗版（docs/design/quality-upgrade.md §4/§6）--------------------------
+    # 满足该单元的当前版本质量快照（QualitySnapshot schema，movieclaw_matcher）。
+    # 洗版比较的唯一基线：只在"确认升级"时刷新（基线单调），实测维度以
+    # ffprobe 为准、出处维度采信名称解析。NULL=未满足或无法识别（不参与洗版）。
+    quality: dict | None = Field(
+        default=None,
+        sa_column=Column(JSON, nullable=True),
+        description="当前版本质量快照（洗版基线）；NULL=未满足或无法识别",
+    )
+    # 洗版证伪熔断计数：连续证伪达到阈值后该单元洗版转入长冷却并提示人工介入，
+    # 防连环造假资源烧流量烧 ratio；确认升级成功时清零。
+    upgrade_verify_failures: int = Field(
+        default=0, description="洗版候选连续证伪次数；确认升级时清零"
+    )
+
     # -- 入库管线（媒体库 L2）------------------------------------------------
     # 真实投递成功时记录种子 infohash——check_download_progress 据此轮询
     # 下载器进度；dry-run 投递不产生 infohash，工单停在 grabbed 不进管线。
@@ -346,6 +361,10 @@ class SubscriptionDownloadAttempt(TimestampMixin, table=True):
         default=False,
         description="提交前下载器中不存在该任务；只有这类任务才允许自动清理",
     )
+    # 投递目的：download=常规缺口下载（缺省）/ upgrade=洗版投递。
+    # 洗版在途去重、活动文案分流与旧版本清理定位都以此为据
+    # （docs/design/quality-upgrade.md §6.2）。
+    purpose: str = Field(default="download", description="投递目的：download / upgrade")
 
     status: str = Field(default=DownloadAttemptStatus.ACTIVE, index=True)
     last_downloader_state: str | None = Field(default=None)

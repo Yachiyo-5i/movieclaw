@@ -1,12 +1,34 @@
-"""选优（内核第三步）：同一单元的多个通过候选，投谁。
+"""选优与洗版比较（内核第三步）。
 
-排序规则（已确认决策）：**整季包优先于单集**——一个种子覆盖一季，搜索与
-下载管理成本最低；同类内按规则评分降序，评分相同做种多者优先（下得快）。
+选优：同一单元的多个通过候选投谁——**整季包优先于单集**（已确认决策），
+同类内按规则评分降序，评分相同做种多者优先（下得快）。
+
+洗版（docs/design/quality-upgrade.md §2/§5）：候选是否构成对现有版本的升级。
+核心是一条**二元组字典序**的档位阶梯：
+
+    rank = (分辨率位次, 片源档)     # 分辨率严格优先，字典序比较
+
+- 分辨率位次取规则组 ``resolutions`` 的偏好顺序（第一位最高）——复用用户
+  已经表达过的偏好；未配置时用内置默认序（高清优先）；
+- 片源档内置固定不暴露配置：Remux > 蓝光重编码 > WEB-DL > Rip 类 > TV 录制类；
+- **未知不可比，但只在未知的维度上**（部分可比）：分辨率双方已知即可定
+  分辨率维度的序；片源未知时同分辨率的比较判否——只在能证明的维度上行动；
+- 升级要求**严格更高**（rank 相等不洗），离散档位天然免疫微小差异抖动；
+- 评分公式（免费/做种）不参与"是否构成升级"——那是"现在下谁划算"，
+  不是"这个版本更好"，两件事分开。
 """
 
 from __future__ import annotations
 
-from movieclaw_matcher.models import IdentityMatch, RuleVerdict, TorrentCandidate
+from movieclaw_enrich.models import TorrentAttrs
+from movieclaw_matcher.models import (
+    IdentityMatch,
+    QualitySnapshot,
+    RuleSetSpec,
+    RuleVerdict,
+    TorrentCandidate,
+    UpgradeVerdict,
+)
 
 Entry = tuple[TorrentCandidate, IdentityMatch, RuleVerdict]
 
@@ -19,4 +41,270 @@ def pick_best(entries: list[Entry]) -> Entry | None:
     return max(
         accepted,
         key=lambda e: (e[1].is_pack, e[2].score, e[0].seeders or 0),
+    )
+
+
+# ---------------------------------------------------------------------------
+# 片源档阶梯（内置，不暴露配置；值域对齐 movieclaw_enrich.vocab.MEDIA_SOURCE）
+# ---------------------------------------------------------------------------
+
+# Remux 是封装方式不是片源，单独用 remux 布尔判定为最高档 T5
+_REMUX_TIER = 5
+
+# 片源 → 档位。键为 casefold 后的归一值；不在表中/None = 片源未知（不可比）。
+# 与换源 replacement._SOURCE_RANK 相比补全了 BDRip/HDRip/DVD 等档
+# （Phase 7 会把换源迁移到本表，消除两套片源序）。
+_SOURCE_TIER: dict[str, int] = {
+    # T4 光盘重编码
+    "uhd blu-ray": 4,
+    "blu-ray": 4,
+    "hd-dvd": 4,
+    # T3 流媒体原流
+    "web-dl": 3,
+    # T2 二压 Rip 类
+    "webrip": 2,
+    "bdrip": 2,
+    "hdrip": 2,
+    "dvdrip": 2,
+    # T1 TV 录制类与 DVD
+    "hdtv": 1,
+    "hdtvrip": 1,
+    "tvrip": 1,
+    "dvd": 1,
+}
+
+# 未配置 resolutions 时的内置默认偏好序（高清优先），与 rules.py 的
+# _DEFAULT_RESOLUTION_SCORE 同方向、覆盖面更全（快照可能出现 576p 等低档值）
+_DEFAULT_RESOLUTION_LADDER = ["4320p", "2160p", "1440p", "1080p", "720p", "576p", "480p"]
+
+# 洗版目标分辨率的兜底缺省：resolutions 与 cutoff_resolution 都缺省时用它。
+# 保守取 1080p——不因为开了洗版就把用户意外带进 4K 的磁盘占用
+# （调研里 44GB Forrest Gump 的教训，quality-upgrade-research.md §3 主题 E）。
+_FALLBACK_CUTOFF_RESOLUTION = "1080p"
+
+# 洗版目标片源档的展示名（upgrade_source 值 → 中文语境标签）
+_TARGET_SOURCE_LABEL = {"web-dl": "WEB-DL", "blu-ray": "蓝光", "remux": "Remux"}
+_TARGET_SOURCE_TIER = {"web-dl": 3, "blu-ray": 4, "remux": _REMUX_TIER}
+
+
+def source_tier(media_source: str | None, remux: bool) -> int | None:
+    """片源 → 档位；未知片源返回 None（不可比，绝不当最低档处理）。"""
+    if remux:
+        return _REMUX_TIER
+    if not media_source:
+        return None
+    return _SOURCE_TIER.get(media_source.casefold())
+
+
+def _resolution_ladder(spec: RuleSetSpec) -> list[str]:
+    """生效的分辨率偏好序（casefold）。配置了 resolutions 就完全以它为准——
+    不在列表中的分辨率位次未知（如 1080p-only 规则下的手工 480p 文件），
+    宁可让该单元安静，也不做数值猜测导致意外下载。"""
+    ladder = spec.resolutions or _DEFAULT_RESOLUTION_LADDER
+    return [r.casefold() for r in ladder]
+
+
+def _resolution_rank(resolution: str | None, spec: RuleSetSpec) -> int | None:
+    """分辨率位次，越大越优；未知/不在偏好序中返回 None。"""
+    if not resolution:
+        return None
+    ladder = _resolution_ladder(spec)
+    key = resolution.casefold()
+    if key not in ladder:
+        return None
+    return len(ladder) - ladder.index(key)
+
+
+def _target(spec: RuleSetSpec) -> tuple[str, int]:
+    """洗版目标 (分辨率, 片源档)。调用前提：spec.upgrade_source 已配置。"""
+    resolution = (
+        spec.cutoff_resolution
+        or (spec.resolutions[0] if spec.resolutions else None)
+        or _FALLBACK_CUTOFF_RESOLUTION
+    )
+    return resolution, _TARGET_SOURCE_TIER[spec.upgrade_source.value]
+
+
+def quality_label(snapshot: QualitySnapshot | TorrentAttrs) -> str:
+    """档位的人话标签（"1080p Remux" / "2160p WEB-DL" / "1080p 片源未知"），
+    供活动文案与详情页展示。"""
+    resolution = snapshot.resolution or "分辨率未知"
+    if snapshot.remux:
+        return f"{resolution} Remux"
+    return f"{resolution} {snapshot.media_source or '片源未知'}"
+
+
+def upgrade_target_label(spec: RuleSetSpec) -> str | None:
+    """洗版目标的人话标签（"2160p Remux"）；未配置洗版返回 None。"""
+    if spec.upgrade_source is None:
+        return None
+    resolution, _ = _target(spec)
+    return f"{resolution} {_TARGET_SOURCE_LABEL[spec.upgrade_source.value]}"
+
+
+def provably_below_cutoff(snapshot: QualitySnapshot | None, spec: RuleSetSpec) -> bool:
+    """该单元是否**可证明**低于洗版目标（调度口径，quality-upgrade.md §2.4）。
+
+    只有可证明"还差着"的单元才参与洗版排期——证明不了的（快照缺失、
+    分辨率位次未知、同分辨率但片源未知）一律安静，不打扰站点。
+    """
+    if spec.upgrade_source is None or snapshot is None:
+        return False
+    cur_res = _resolution_rank(snapshot.resolution, spec)
+    if cur_res is None:
+        return False
+    target_resolution, target_tier = _target(spec)
+    tgt_res = _resolution_rank(target_resolution, spec)
+    if tgt_res is None:  # 目标分辨率不在偏好序（配置矛盾，校验器已拦，防御处理）
+        return False
+    if cur_res < tgt_res:
+        return True
+    if cur_res > tgt_res:
+        return False
+    cur_tier = source_tier(snapshot.media_source, snapshot.remux)
+    return cur_tier is not None and cur_tier < target_tier
+
+
+def compare_upgrade(
+    candidate: TorrentCandidate, snapshot: QualitySnapshot, spec: RuleSetSpec
+) -> UpgradeVerdict:
+    """洗版判定：候选是否构成对当前版本的**严格**升级（quality-upgrade.md §5）。
+
+    前提：候选已通过规则组硬过滤（evaluate_rules）。三个否定出口 + 一个
+    肯定出口，reason_text 为完整中文句子。
+    """
+    if spec.upgrade_source is None:
+        raise ValueError("规则组未配置洗版目标，不应调用洗版比较")
+
+    current_label = quality_label(snapshot)
+    candidate_label = quality_label(candidate.attrs)
+
+    cur_res = _resolution_rank(snapshot.resolution, spec)
+    if cur_res is None:
+        return _upgrade_reject(
+            "upgrade_not_comparable",
+            "无法识别当前版本的分辨率，洗版比较不成立",
+            current_label,
+            candidate_label,
+        )
+    cand_res = _resolution_rank(candidate.attrs.resolution, spec)
+    if cand_res is None:
+        return _upgrade_reject(
+            "upgrade_not_comparable",
+            f"无法识别候选的分辨率（{candidate.attrs.resolution or '未标注'}），洗版比较不成立",
+            current_label,
+            candidate_label,
+        )
+
+    # 停止线：当前版本已达洗版目标（分辨率位次更高，或同位次且片源档达标）
+    target_resolution, target_tier = _target(spec)
+    tgt_res = _resolution_rank(target_resolution, spec)
+    cur_tier = source_tier(snapshot.media_source, snapshot.remux)
+    if tgt_res is not None and (
+        cur_res > tgt_res
+        or (cur_res == tgt_res and cur_tier is not None and cur_tier >= target_tier)
+    ):
+        return _upgrade_reject(
+            "upgrade_at_cutoff",
+            f"当前版本 {current_label} 已达到洗版目标（{upgrade_target_label(spec)}），不再洗版",
+            current_label,
+            candidate_label,
+        )
+
+    # 升级判定：字典序严格更高。分辨率位次先决；同位次时比片源档，
+    # 任一侧片源未知即无法证明"更好"，判否（部分可比原则）
+    if cand_res > cur_res:
+        return UpgradeVerdict(
+            accepted=True, current_label=current_label, candidate_label=candidate_label
+        )
+    if cand_res < cur_res:
+        return _upgrade_reject(
+            "upgrade_not_better",
+            f"候选 {candidate_label} 的分辨率偏好低于当前版本 {current_label}，不构成升级",
+            current_label,
+            candidate_label,
+        )
+    cand_tier = source_tier(candidate.attrs.media_source, candidate.attrs.remux)
+    if cand_tier is None:
+        return _upgrade_reject(
+            "upgrade_not_comparable",
+            f"无法识别候选的片源（{candidate.attrs.media_source or '未标注'}），"
+            "同分辨率下无法证明是升级",
+            current_label,
+            candidate_label,
+        )
+    if cur_tier is None:
+        return _upgrade_reject(
+            "upgrade_not_comparable",
+            "当前版本片源无法识别，同分辨率下无法证明候选更好",
+            current_label,
+            candidate_label,
+        )
+    if cand_tier <= cur_tier:
+        return _upgrade_reject(
+            "upgrade_not_better",
+            f"候选 {candidate_label} 的片源档不高于当前版本 {current_label}，不构成升级",
+            current_label,
+            candidate_label,
+        )
+    return UpgradeVerdict(
+        accepted=True, current_label=current_label, candidate_label=candidate_label
+    )
+
+
+def _upgrade_reject(
+    code: str, text: str, current_label: str, candidate_label: str
+) -> UpgradeVerdict:
+    return UpgradeVerdict(
+        accepted=False,
+        reason_code=code,
+        reason_text=text,
+        current_label=current_label,
+        candidate_label=candidate_label,
+    )
+
+
+# ---------------------------------------------------------------------------
+# 质量快照构造（quality-upgrade.md §4.1：实测优先，出处采信名称）
+# ---------------------------------------------------------------------------
+
+# probe 的 HDR 标签 → enrich 词表值域（两侧命名空间在此消化并单测锁死）
+_PROBE_HDR_TO_VOCAB = {
+    "dolby vision": "DV",
+    "hdr10+": "HDR10+",
+    "hdr10": "HDR10",
+    "hlg": "HLG",
+}
+
+
+def build_snapshot(
+    name_attrs: TorrentAttrs | QualitySnapshot | None,
+    *,
+    probed: bool = False,
+    probe_resolution: str | None = None,
+    probe_hdr_label: str | None = None,
+    probe_bit_rate: int | None = None,
+) -> QualitySnapshot:
+    """按"可实测性分层"构造质量快照。
+
+    - ``name_attrs``：名称解析来源（投递时的 TorrentAttrs 快照，或文件名
+      enrich 结果）——出处维度（media_source/remux/release_group）的唯一来源；
+    - ``probed=True`` 表示文件经过 ffprobe 实测：resolution/hdr 以实测为准
+      （probe 的 hdr=None 是**测得 SDR**，不是未知，因此覆盖为空列表）；
+      实测拿不到分辨率（探测失败）时回落名称值；
+    - ``probed=False``（纯名称路径）：resolution/hdr 也取名称值。
+    """
+    resolution = name_attrs.resolution if name_attrs else None
+    hdr = list(name_attrs.hdr) if name_attrs else []
+    if probed:
+        resolution = probe_resolution or resolution
+        mapped = _PROBE_HDR_TO_VOCAB.get((probe_hdr_label or "").casefold())
+        hdr = [mapped] if mapped else []
+    return QualitySnapshot(
+        resolution=resolution,
+        media_source=name_attrs.media_source if name_attrs else None,
+        remux=bool(name_attrs.remux) if name_attrs else False,
+        release_group=name_attrs.release_group if name_attrs else None,
+        hdr=hdr,
+        bit_rate=probe_bit_rate,
     )

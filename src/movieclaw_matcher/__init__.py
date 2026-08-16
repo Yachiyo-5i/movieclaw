@@ -15,7 +15,15 @@ movieclaw_api 的 services 层编排（docs/design/subscription.md 第 3 节）�
 - decision.py 选优：整季包优先，同类按评分（认领等有状态操作在 services 层）
 """
 
-from movieclaw_matcher.decision import pick_best
+from movieclaw_matcher.decision import (
+    build_snapshot,
+    compare_upgrade,
+    pick_best,
+    provably_below_cutoff,
+    quality_label,
+    source_tier,
+    upgrade_target_label,
+)
 from movieclaw_matcher.identity import match_identity, normalize_title
 from movieclaw_matcher.models import (
     DvPolicy,
@@ -23,9 +31,12 @@ from movieclaw_matcher.models import (
     HrUnknownPolicy,
     IdentityMatch,
     MediaIdentity,
+    QualitySnapshot,
     RuleSetSpec,
     RuleVerdict,
     TorrentCandidate,
+    UpgradeSource,
+    UpgradeVerdict,
 )
 from movieclaw_matcher.rules import evaluate_rules
 
@@ -35,11 +46,20 @@ __all__ = [
     "HrUnknownPolicy",
     "IdentityMatch",
     "MediaIdentity",
+    "QualitySnapshot",
     "RuleSetSpec",
     "RuleVerdict",
     "TorrentCandidate",
+    "UpgradeSource",
+    "UpgradeVerdict",
     "match_identity",
     "normalize_title",
     "evaluate_rules",
     "pick_best",
+    "build_snapshot",
+    "compare_upgrade",
+    "provably_below_cutoff",
+    "quality_label",
+    "source_tier",
+    "upgrade_target_label",
 ]
