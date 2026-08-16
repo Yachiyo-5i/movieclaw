@@ -31,6 +31,7 @@ from movieclaw_db.engine import get_database
 from movieclaw_db.models import (
     ActivityType,
     MediaItem,
+    MediaMetadata,
     SiteTorrent,
     Subscription,
     SubscriptionActivity,
@@ -47,6 +48,7 @@ from movieclaw_db.repositories import (
     TorrentRepository,
 )
 from movieclaw_enrich import ENRICH_VERSION
+from movieclaw_media.models import MediaKind
 from movieclaw_scheduler.registry import register_task
 from movieclaw_tracker.models import TorrentCategory
 
@@ -175,6 +177,21 @@ async def _search_one_media(media_id: int) -> None:
                 select(Subscription).where(Subscription.media_item_id == media_id)
             )
         ).scalar_one_or_none()
+        # 电影的调度地板：搜索未果后的退避不能早于"上映 + 宽限"——用户强制
+        # 搜索一部未上映的电影后，档期要恢复原定节奏，而不是被 15 分钟起步的
+        # 退避曲线打乱、在明知没资源的窗口里反复空搜。
+        movie_plan: tuple | None = None
+        if item is not None and item.kind == MediaKind.MOVIE.value:
+            from movieclaw_api.services.subscription.core import movie_schedule
+
+            release_date = (
+                await session.execute(
+                    select(MediaMetadata.release_date).where(
+                        MediaMetadata.media_item_id == media_id
+                    )
+                )
+            ).scalar_one_or_none()
+            movie_plan = movie_schedule(release_date, item.status)
     if item is None or subscription is None:
         return
 
@@ -234,7 +251,9 @@ async def _search_one_media(media_id: int) -> None:
 
         # 仍未满足的到期工单：计一次尝试并按退避曲线排下次
         # （洗版单元走独立的 7d/14d/30d 慢退避，见 upgrade.py）
-        postponed = await _postpone_open_wanted(session, media_id, delay=None, count_attempt=True)
+        postponed = await _postpone_open_wanted(
+            session, media_id, delay=None, count_attempt=True, movie_plan=movie_plan
+        )
         await postpone_upgrade_wanted(session, media_id, delay=None, count_attempt=True)
 
         await repo.add_activity(
@@ -321,12 +340,21 @@ async def _persist_hits(session: AsyncSession, hits: list[TorrentHit]) -> list[S
 
 
 async def _postpone_open_wanted(
-    session: AsyncSession, media_id: int, *, delay, count_attempt: bool
+    session: AsyncSession,
+    media_id: int,
+    *,
+    delay,
+    count_attempt: bool,
+    movie_plan: tuple | None = None,
 ) -> int:
     """给该条目下仍到期未满足的工单排下一次搜索。
 
     - ``delay`` 给定：统一顺延该间隔（搜索失败场景，不计尝试次数）；
-    - ``delay=None``：按各自的 search_attempts 走退避曲线，并 +1 尝试。
+    - ``delay=None``：按各自的 search_attempts 走退避曲线，并 +1 尝试；
+    - ``movie_plan``：电影的上映感知调度（``movie_schedule`` 的结果），作为
+      退避的地板——下次搜索不早于"上映 + 宽限"；影片未定档时直接回到不可
+      调度，等元数据刷新定档回填。两种情况都对应"用户强制搜索了一部还没到
+      档期的电影"，搜完恢复原定节奏。
     返回被顺延的工单数。
     """
     now = utcnow()
@@ -343,8 +371,15 @@ async def _postpone_open_wanted(
     postponed = 0
     for wanted in rows:
         if count_attempt:
+            next_at = now + backoff_delay(wanted.search_attempts)
+            if movie_plan is not None:
+                plan_at, _priority = movie_plan
+                if plan_at is None:
+                    next_at = None  # 未定档：回到等待定档，不再空搜
+                elif plan_at > next_at:
+                    next_at = plan_at  # 上映宽限未到：退避不早于原定档期
             values = {
-                "next_search_at": now + backoff_delay(wanted.search_attempts),
+                "next_search_at": next_at,
                 "search_attempts": wanted.search_attempts + 1,
                 "last_search_at": now,
                 "updated_at": now,

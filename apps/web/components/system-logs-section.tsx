@@ -374,8 +374,8 @@ export function SystemLogsSection() {
           <span className="flex items-center gap-1.5 text-sub text-[var(--text-muted)]">
             {refreshMs > 0 && isLatestDay && (
               <span className="relative flex size-1.5">
-                <span className="absolute inline-flex size-full animate-ping rounded-full bg-emerald-400/60" />
-                <span className="relative inline-flex size-1.5 rounded-full bg-emerald-400/90" />
+                <span className="absolute inline-flex size-full animate-ping rounded-full bg-[var(--ok)]/60" />
+                <span className="relative inline-flex size-1.5 rounded-full bg-[var(--ok)]/90" />
               </span>
             )}
             自动刷新

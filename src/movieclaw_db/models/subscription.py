@@ -195,10 +195,14 @@ class WantedItem(TimestampMixin, table=True):
     剧集特别季是 (0, n≥1)，与电影不冲突。
 
     调度语义（创建时写死，铁律：本地缓存只用来追新，补旧永远真实搜索）：
-    - 补旧（air_date 已过/电影）：next_search_at=now，立即排队真实 PT 搜索；
+    - 补旧（air_date 已过）：next_search_at=now，立即排队真实 PT 搜索；
     - 追新（未来播出）：next_search_at = air_date + 宽限期，被动匹配为主通道，
       到点未满足即天然漏抓兜底，零翻转机制；
     - 未定档：next_search_at=NULL（不可调度），F3 定档时回填。
+    电影哨兵单元走上映感知调度（movie_schedule）：已上映超宽限=补旧、
+    未上映/刚上映=上映+宽限、明确未上映且未定档=NULL 等 F3 回填；上映日
+    **不写进 air_date**——covered_units 会拿 air_date 当发布时间物理上限剔除
+    候选，而电影资源早于 TMDB 档期流出真实存在（分地区/提前数字发行）。
     """
 
     __tablename__ = "wanted_item"

@@ -632,7 +632,7 @@ function HeroSlide({
         <div className="tnum mt-3 flex flex-wrap items-center gap-x-3 gap-y-1.5 text-sub text-white/80">
           {item.rating > 0 && (
             <span className="flex items-center gap-1 font-semibold text-white">
-              <StarIcon className="size-3.5 text-[#f5c451]" />
+              <StarIcon className="size-3.5 text-[var(--warn)]" />
               {item.rating.toFixed(1)}
             </span>
           )}
@@ -641,7 +641,7 @@ function HeroSlide({
           {item.extent && <span>{item.extent}</span>}
           {item.libraryStatus && (
             <span className="flex items-center gap-1.5 text-emerald-300/90">
-              <span className="size-1.5 rounded-full bg-emerald-400" />
+              <span className="size-1.5 rounded-full bg-[var(--ok)]" />
               在库
             </span>
           )}
@@ -685,7 +685,7 @@ function HeroSlide({
           >
             {existingSub ? (
               <>
-                <CheckIcon className="size-4 text-[#4ade80]" />
+                <CheckIcon className="size-4 text-[var(--ok)]" />
                 已订阅
               </>
             ) : (

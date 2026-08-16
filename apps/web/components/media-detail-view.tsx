@@ -12,10 +12,14 @@ import {
   FolderIcon,
   PhotoIcon,
   BellIcon,
+  PlayIcon,
   SearchIcon,
   StarIcon,
+  XIcon,
 } from "@/components/icons";
 import { CastRow } from "@/components/cast-row";
+import { HScroller } from "@/components/h-scroller";
+import { Modal } from "@/components/modal";
 import { PageNav } from "@/components/page-nav";
 import { ImageLightbox, type LightboxAction } from "@/components/image-lightbox";
 import { MediaRow } from "@/components/media-row";
@@ -26,6 +30,7 @@ import {
   titleRef,
   type MediaDetailData,
   type MediaImage,
+  type MediaVideo,
 } from "@/lib/api/discover";
 import { useSubscribeEntry } from "@/components/subscribe-entry";
 import { useBackNavigation } from "@/lib/back-navigation";
@@ -58,10 +63,11 @@ import {
  *      已订阅的影片额外显示订阅状态与追更进度。
  *   4. 剧情简介 —— 四行折叠，只有真实溢出才显示展开入口。
  *   5. 演职员 —— 导演 / 主创与演员合并为同一条人物横滚条。
- *   6. 剧照与海报 —— Apple TV+ 式横滚图片条，胶囊标签切换类型，点图开灯箱。
- *   7. 系列电影 —— 展示完整系列。
- *   8. 相似推荐 —— 复用 MediaRow，点击可继续跳详情。
- *   9. 相关链接 —— 与媒体库详情一致，外部词条统一弱化到底部。
+ *   6. 预告片 —— YouTube 预告与花絮，点开在弹层里内嵌播放。
+ *   7. 剧照与海报 —— Apple TV+ 式横滚图片条，胶囊标签切换类型，点图开灯箱。
+ *   8. 系列电影 —— 展示完整系列。
+ *   9. 相似推荐 —— 复用 MediaRow，点击可继续跳详情。
+ *  10. 相关链接 —— 与媒体库详情一致，外部词条统一弱化到底部。
  *
  * 数据分两段呈现：点卡片时已有的列表字段（标题/海报/简介）立即渲染，
  * 地区、语言、上映日期、演职员、系列电影与相似推荐从稳定 titleRef 对应的详情接口
@@ -152,6 +158,15 @@ export function MediaDetailView({
   const libraryReturnTo = buildDiscoveryReturnPath(source, type ?? item.type, id);
 
   const isMovie = item.type === "movie";
+  // 电影入库即完成：再摆「订阅追踪 / 搜索资源」等于邀请用户重下一遍已有的片子，
+  // 隐藏后由上方的「在库」信息条接手（点库名直达条目，想看就去看）。
+  // 剧集不适用同一条规则——在库不等于收齐，缺集与未来新季仍要靠订阅追更或
+  // 手动找资源，所以剧集在库时两个按钮照常显示；口径与海报卡的
+  // libraryInventoryAction（电影 none、剧集 follow/backfill）一致。
+  const ownedMovie = isMovie && libraryLinks.length > 0;
+  // 已订阅的在库电影仍保留状态键：它是「管理 / 取消订阅」入口，不是再订一次的号召。
+  const showSubscribeButton = canSubscribe && (Boolean(sub) || !ownedMovie);
+  const showSearchButton = canSearch && !ownedMovie;
   const directorCast =
     info?.directorCredits.length
       ? info.directorCredits.map((director) => ({
@@ -219,7 +234,7 @@ export function MediaDetailView({
                 ——那读起来是「烂到 0 分」。海报卡片与条目详情页都是这个口径 */}
             {item.rating > 0 && (
               <span className="flex items-center gap-1.5">
-                <StarIcon className="size-4 text-[#f5c451]" />
+                <StarIcon className="size-4 text-[var(--warn)]" />
                 <span className="text-title-sm font-bold text-white">{item.rating.toFixed(1)}</span>
               </span>
             )}
@@ -290,48 +305,51 @@ export function MediaDetailView({
             </div>
           )}
 
-          {/* 操作区：已订阅的影片主按钮变为状态展示（点击进入管理弹层可取消订阅） */}
-          <div className="mt-5 flex flex-wrap items-center gap-3 max-md:mt-3.5 max-md:gap-2">
-            {canSubscribe && (sub ? (
-              <button
-                type="button"
-                onClick={openSubscribe}
+          {/* 操作区：已订阅的影片主按钮变为状态展示（点击进入管理弹层可取消订阅）。
+              在库电影会把两个按钮都收掉，此时整行无内容就不渲染，免得留一段空白。 */}
+          {(showSubscribeButton || showSearchButton || sub) && (
+            <div className="mt-5 flex flex-wrap items-center gap-3 max-md:mt-3.5 max-md:gap-2">
+              {showSubscribeButton && (sub ? (
+                <button
+                  type="button"
+                  onClick={openSubscribe}
+                  className="btn-glass flex h-10 items-center gap-2 bg-white/10 px-5 text-ui font-medium backdrop-blur-md transition hover:bg-white/15"
+                >
+                  <CheckIcon
+                    className="size-4"
+                    style={{ color: subscriptionStatusMeta[sub.status].color }}
+                  />
+                  已订阅 · {subscriptionStatusMeta[sub.status].label}
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  onClick={openSubscribe}
+                  className="btn-accent flex h-10 items-center gap-2 rounded-full px-5 text-ui font-semibold"
+                >
+                  <BellIcon className="size-4" />
+                  订阅追踪
+                </button>
+              ))}
+              {/* 搜索资源：不订阅、只想手动找种子下一次的直达口（此前只能回 ⌘K 重打片名） */}
+              {showSearchButton && <Link
+                href={`/search?q=${encodeURIComponent(item.title)}` as Route}
                 className="btn-glass flex h-10 items-center gap-2 bg-white/10 px-5 text-ui font-medium backdrop-blur-md transition hover:bg-white/15"
               >
-                <CheckIcon
-                  className="size-4"
-                  style={{ color: subscriptionStatusMeta[sub.status].color }}
-                />
-                已订阅 · {subscriptionStatusMeta[sub.status].label}
-              </button>
-            ) : (
-              <button
-                type="button"
-                onClick={openSubscribe}
-                className="btn-accent flex h-10 items-center gap-2 rounded-full px-5 text-ui font-semibold"
-              >
-                <BellIcon className="size-4" />
-                订阅追踪
-              </button>
-            ))}
-            {/* 搜索资源：不订阅、只想手动找种子下一次的直达口（此前只能回 ⌘K 重打片名） */}
-            {canSearch && <Link
-              href={`/search?q=${encodeURIComponent(item.title)}` as Route}
-              className="btn-glass flex h-10 items-center gap-2 bg-white/10 px-5 text-ui font-medium backdrop-blur-md transition hover:bg-white/15"
-            >
-              <SearchIcon className="size-4" />
-              搜索资源
-            </Link>}
-            {sub && (
-              <span className="text-on-image flex items-center gap-1.5 text-sub text-[var(--text-muted)]">
-                <span
-                  className="size-1.5 rounded-full"
-                  style={{ backgroundColor: subscriptionStatusMeta[sub.status].color }}
-                />
-                {subscriptionProgressNote(sub)}
-              </span>
-            )}
-          </div>
+                <SearchIcon className="size-4" />
+                搜索资源
+              </Link>}
+              {sub && (
+                <span className="text-on-image flex items-center gap-1.5 text-sub text-[var(--text-muted)]">
+                  <span
+                    className="size-1.5 rounded-full"
+                    style={{ backgroundColor: subscriptionStatusMeta[sub.status].color }}
+                  />
+                  {subscriptionProgressNote(sub)}
+                </span>
+              )}
+            </div>
+          )}
         </div>
       </div>
 
@@ -357,7 +375,14 @@ export function MediaDetailView({
         </div>
       )}
 
-      {/* —— 6. 剧照与海报 —— */}
+      {/* —— 6. 预告片：紧邻剧照，把「动态素材 + 静态素材」并成一段观感区 —— */}
+      {detail && detail.videos.length > 0 && (
+        <div className="mt-9 px-12 max-md:mt-6 max-md:px-4">
+          <TrailerRow title={item.title} videos={detail.videos} />
+        </div>
+      )}
+
+      {/* —— 7. 剧照与海报 —— */}
       {detail && (detail.backdrops.length > 0 || detail.posters.length > 0) && (
         <div className="mt-9 px-12 max-md:mt-6 max-md:px-4">
           <PhotoWall
@@ -368,7 +393,7 @@ export function MediaDetailView({
         </div>
       )}
 
-      {/* —— 7. 系列电影：使用 TMDB collection 的完整作品顺序，不混入相似推荐。 —— */}
+      {/* —— 8. 系列电影：使用 TMDB collection 的完整作品顺序，不混入相似推荐。 —— */}
       {collection && collection.items.length > 1 && (
         <div className="mt-9">
           <MediaRow
@@ -381,14 +406,14 @@ export function MediaDetailView({
         </div>
       )}
 
-      {/* —— 8. 相似推荐 —— */}
+      {/* —— 9. 相似推荐 —— */}
       {related.length > 0 && (
         <div className="mt-9">
           <MediaRow row={{ id: `related-${item.id}`, title: "相似推荐", items: related }} />
         </div>
       )}
 
-      {/* —— 9. 相关链接：与媒体库详情一致，固定在正文所有内容之后。 —— */}
+      {/* —— 10. 相关链接：与媒体库详情一致，固定在正文所有内容之后。 —— */}
       {(source === "tmdb" || info?.sourceUrl) && (
         <nav
           aria-label="外部词条"
@@ -481,6 +506,163 @@ function SourceLink({ href, label }: { href: string; label: string }) {
     >
       {label} ↗
     </a>
+  );
+}
+
+/**
+ * 预告片横滚条 + 内嵌播放弹层。
+ *
+ * 这里有一处绕不开的现实：TMDB 只给 YouTube 的视频 key，**没有可直接播放的
+ * 视频流**，所以「播放」这一步必须由浏览器直连 YouTube——本产品服务端配的
+ * 代理只作用于服务端自己的请求，帮不到浏览器。为此把两件事拆开处理：
+ *   - 封面图是普通图片，经 /images/proxy 由服务端回源缓存，因此**卡片一定能显示**；
+ *   - 播放用 youtube-nocookie 内嵌（点开才创建 iframe，不预加载也不落跟踪 cookie），
+ *     并在打开时探测浏览器能否直连 YouTube 图床；连不上就直接换成说明文案，
+ *     而不是留给用户一个永远转圈的黑框。
+ */
+function TrailerRow({ title, videos }: { title: string; videos: MediaVideo[] }) {
+  const [playing, setPlaying] = useState<MediaVideo | null>(null);
+
+  return (
+    <section>
+      <h2 className="text-on-image mb-3 text-body-lg font-semibold tracking-[-0.01em] text-[var(--text)]">
+        预告片
+      </h2>
+
+      <HScroller className="-mx-1 gap-3 px-1 pb-1 pt-1">
+        {videos.map((video) => (
+          <button
+            key={video.key}
+            type="button"
+            onClick={() => setPlaying(video)}
+            className="group/trailer w-[264px] shrink-0 text-left max-md:w-[208px]"
+          >
+            <div className="relative aspect-video overflow-hidden rounded-xl bg-[#141824] ring-1 ring-white/[0.08] transition-all duration-300 ease-out group-hover/trailer:-translate-y-1 group-hover/trailer:shadow-[0_16px_40px_rgba(0,0,0,0.55)] group-hover/trailer:ring-white/30">
+              {/* YouTube 封面是 4:3（上下带黑边），object-cover 裁进 16:9 恰好只剩画面 */}
+              <PosterImage
+                src={video.thumbnailUrl}
+                alt={`${title} ${video.kind}`}
+                className="size-full object-cover transition-transform duration-500 ease-out group-hover/trailer:scale-[1.05]"
+              />
+              <span className="pointer-events-none absolute inset-0 flex items-center justify-center bg-black/25 transition-colors group-hover/trailer:bg-black/10">
+                <span className="flex size-11 items-center justify-center rounded-full bg-black/55 text-white ring-1 ring-white/25 backdrop-blur-sm transition-transform duration-300 group-hover/trailer:scale-110">
+                  <PlayIcon className="ml-0.5 size-5" />
+                </span>
+              </span>
+              <span className="pointer-events-none absolute left-2 top-2 rounded-full bg-black/60 px-2 py-0.5 text-caption font-medium text-white/85 backdrop-blur-sm">
+                {video.kind}
+              </span>
+            </div>
+            <p className="mt-2 truncate text-sub text-[var(--text-muted)] transition-colors group-hover/trailer:text-[var(--text)]">
+              {video.name}
+            </p>
+          </button>
+        ))}
+      </HScroller>
+
+      {playing && (
+        <TrailerPlayer video={playing} title={title} onClose={() => setPlaying(null)} />
+      )}
+    </section>
+  );
+}
+
+/** 浏览器能否直连 YouTube：加载一张 YouTube 图床的小图作探针，超时按不可达算。 */
+type YoutubeReach = "checking" | "ok" | "blocked";
+
+function useYoutubeReachable(videoKey: string): YoutubeReach {
+  const [reach, setReach] = useState<YoutubeReach>("checking");
+
+  useEffect(() => {
+    setReach("checking");
+    // 探针刻意不走 /images/proxy：要测的正是「浏览器自己」的可达性，
+    // 走了代理就变成在测服务端，结论会反过来骗人。
+    const probe = new Image();
+    const timer = window.setTimeout(() => setReach("blocked"), 6000);
+    const settle = (result: YoutubeReach) => () => {
+      window.clearTimeout(timer);
+      setReach(result);
+    };
+    probe.onload = settle("ok");
+    probe.onerror = settle("blocked");
+    probe.src = `https://i.ytimg.com/vi/${videoKey}/default.jpg`;
+    return () => {
+      window.clearTimeout(timer);
+      probe.onload = null;
+      probe.onerror = null;
+    };
+  }, [videoKey]);
+
+  return reach;
+}
+
+function TrailerPlayer({
+  video,
+  title,
+  onClose,
+}: {
+  video: MediaVideo;
+  title: string;
+  onClose: () => void;
+}) {
+  const reach = useYoutubeReachable(video.key);
+
+  return (
+    // !max-w-4xl 压过 width="full" 的 max-w-none：播放器要够大但不必铺满桌面视口；
+    // Modal 自带的 max-md:!max-w-none 声明在后，窄屏仍是满宽底部抽屉。
+    <Modal open onClose={onClose} label={`${title} ${video.kind}`} width="full" panelClassName="!max-w-4xl">
+      <div className="flex items-start gap-3 px-4 py-3">
+        <div className="min-w-0 flex-1">
+          <p className="truncate text-ui font-medium text-[var(--text)]">{video.name}</p>
+          <p className="mt-0.5 text-caption text-[var(--text-muted)]">
+            {title} · {video.kind}
+          </p>
+        </div>
+        <button
+          type="button"
+          aria-label="关闭"
+          onClick={onClose}
+          className="btn-glass -mr-1 flex size-8 shrink-0 items-center justify-center !rounded-full"
+        >
+          <XIcon className="size-4" />
+        </button>
+      </div>
+
+      <div className="aspect-video w-full bg-black">
+        {reach === "blocked" ? (
+          <div className="flex size-full flex-col items-center justify-center gap-3 px-6 text-center">
+            <p className="text-ui font-medium text-[var(--text)]">当前浏览器无法直连 YouTube</p>
+            {/* 整段写成单个字符串字面量：JSX 会把源码换行折成空格，中文句子里
+                会平白多出一个空格。 */}
+            <p className="max-w-md text-sub leading-6 text-[var(--text-muted)]">
+              {
+                "预告片由 YouTube 提供，播放需要浏览器本机能访问它。服务端在「设置 → 网络」配的代理只作用于服务端自己抓数据，不经过播放器；给浏览器挂上代理后即可正常播放。"
+              }
+            </p>
+            <a
+              href={video.watchUrl}
+              target="_blank"
+              rel="noreferrer"
+              className="btn-glass flex h-9 items-center gap-2 px-4 text-sub font-medium text-[var(--text)]"
+            >
+              在 YouTube 打开 ↗
+            </a>
+          </div>
+        ) : (
+          // 点开才创建 iframe：详情页不为没人看的预告片预连 YouTube。
+          // nocookie 域 + rel=0（相关视频只限本频道），autoplay 对齐「点了就播」的预期。
+          <iframe
+            key={video.key}
+            src={`${video.embedUrl}?autoplay=1&rel=0`}
+            title={`${title} ${video.kind}`}
+            allow="accelerometer; autoplay; encrypted-media; gyroscope; picture-in-picture"
+            allowFullScreen
+            referrerPolicy="strict-origin-when-cross-origin"
+            className="size-full border-0"
+          />
+        )}
+      </div>
+    </Modal>
   );
 }
 

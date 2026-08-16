@@ -21,8 +21,10 @@ wanted_search / wanted_fulfillment / subscription_health）互相成环、靠函
 from movieclaw_api.services.subscription import wanted_search
 from movieclaw_api.services.subscription.core import (
     FUTURE_GRACE,
+    MOVIE_RELEASE_GRACE,
     SubscriptionService,
     expected_units,
+    movie_schedule,
     recompute_subscription_status,
     schedule_for,
 )
@@ -68,6 +70,7 @@ __all__ = [
     "FORECAST_VERSION",
     "FUTURE_GRACE",
     "MATCH_BATCH_SIZE",
+    "MOVIE_RELEASE_GRACE",
     "REFRESH_PER_TICK",
     "SubscriptionService",
     "close_fulfilled_wanted",
@@ -79,6 +82,7 @@ __all__ = [
     "forecast_probe_times_by_site",
     "kick_search_soon",
     "load_match_context",
+    "movie_schedule",
     "next_forecast_probe_times_by_wanted",
     "pipeline_health",
     "preview_dispatch_route",

@@ -40,6 +40,7 @@ from movieclaw_media.models import (
     MediaRow,
     MediaSearchItem,
     MediaSource,
+    MediaVideo,
 )
 from movieclaw_media.tmdb import TmdbClient, TmdbError
 
@@ -61,6 +62,19 @@ _IMAGES_LIMIT = 20
 # 详情页演职员条最多取多少位。TMDB 的 cast 已按 order 字段（剧组给的主次顺序）
 # 排好，取前 N 即主要演员；条目页是横滚条，比原先「词条信息里一行文字」能放得下更多
 _CAST_LIMIT = 16
+# 详情页预告片最多展示多少段（热门大片的 videos 动辄几十条，多是重复的地区版本）
+_VIDEOS_LIMIT = 8
+# TMDB 的 video type → 中文标签。只保留「与看片本身有关」的几类，
+# Opening Credits / Recap / Bloopers 之类对发现场景没有价值，直接丢弃。
+# 字典顺序同时充当排序权重：正式预告排在先导预告前，花絮类垫底。
+_VIDEO_KINDS = {
+    "Trailer": "预告片",
+    "Teaser": "先导预告",
+    "Clip": "片段",
+    "Featurette": "花絮",
+    "Behind the Scenes": "幕后",
+}
+_VIDEO_KIND_ORDER = {kind: index for index, kind in enumerate(_VIDEO_KINDS)}
 
 # TMDB 详情接口不随 language 参数翻译制片地区/语言字段，这里映射高频值，
 # 映射不到的原样展示（英文/ISO 代码），不影响功能
@@ -642,16 +656,18 @@ class MediaDiscoverService:
 
     async def _build_detail(self, kind: MediaKind, tmdb_id: int) -> MediaDetail:
         genre_map = await self._genre_map(kind)
-        # append_to_response：演职员/相似推荐/图片集随详情一次请求带回，省三次往返。
-        # include_image_language 必须显式给：默认按 language 过滤会把图滤到几乎没有
-        # ——剧照大多不带语言标注（null），海报则按语言分版本。
+        # append_to_response：演职员/相似推荐/图片集/预告片随详情一次请求带回，省四次往返。
+        # include_image_language / include_video_language 必须显式给：默认按 language
+        # 过滤会把素材滤到几乎没有——剧照大多不带语言标注（null），海报按语言分版本，
+        # 而预告片九成只有英文版，只要 zh-CN 的话绝大多数影片会一条都没有。
         primary_language = self._language.split("-")[0]
         data = await self._client.get(
             f"{kind.value}/{tmdb_id}",
             {
                 "language": self._language,
-                "append_to_response": "credits,recommendations,images",
+                "append_to_response": "credits,recommendations,images,videos",
                 "include_image_language": f"{primary_language},en,null",
+                "include_video_language": f"{primary_language},en,null",
             },
         )
         card = self._to_card(data, kind, genre_map)
@@ -670,6 +686,7 @@ class MediaDiscoverService:
         return MediaDetail(
             card=card,
             facts=self._facts(data, kind),
+            videos=self._videos(data),
             backdrops=backdrops,
             posters=posters,
             collection=collection,
@@ -716,6 +733,37 @@ class MediaDiscoverService:
             name=data.get("name") or summary.get("name") or "系列电影",
             items=cards,
         )
+
+    @staticmethod
+    def _videos(data: dict[str, Any]) -> list[MediaVideo]:
+        """详情里的视频集 → 预告片列表。
+
+        只保留 YouTube：TMDB 支持的另一个来源 Vimeo 在影视条目里近乎不存在，
+        为它单独适配一套封面与内嵌地址不划算，宁可少展示也不给出播不了的卡片。
+
+        排序为「类型权重 → 官方优先 → 发布时间倒序」，用户点开的第一条就是最新
+        的官方正式预告。分两次稳定排序实现：先按时间倒序，再按类型与官方标记，
+        比在一个 key 里同时表达正反两种方向可读得多。
+        """
+        results = [
+            raw
+            for raw in (data.get("videos") or {}).get("results", [])
+            if raw.get("key") and raw.get("site") == "YouTube" and raw.get("type") in _VIDEO_KINDS
+        ]
+        results.sort(key=lambda raw: raw.get("published_at") or "", reverse=True)
+        results.sort(key=lambda raw: (_VIDEO_KIND_ORDER[raw["type"]], not raw.get("official")))
+        return [
+            MediaVideo(
+                key=raw["key"],
+                # 少数条目的 name 为空，用类型标签兜底，卡片上不会出现无名视频
+                name=(raw.get("name") or "").strip() or _VIDEO_KINDS[raw["type"]],
+                kind=_VIDEO_KINDS[raw["type"]],
+                thumbnail_url=f"https://i.ytimg.com/vi/{raw['key']}/hqdefault.jpg",
+                embed_url=f"https://www.youtube-nocookie.com/embed/{raw['key']}",
+                watch_url=f"https://www.youtube.com/watch?v={raw['key']}",
+            )
+            for raw in results[:_VIDEOS_LIMIT]
+        ]
 
     def _images(self, data: dict[str, Any]) -> tuple[list[MediaImage], list[MediaImage]]:
         """详情里的图片集 → 剧照/海报列表（各取评分最高的前 N 张）。

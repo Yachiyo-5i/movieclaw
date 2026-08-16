@@ -3,7 +3,8 @@
 核心算法只有两个，全部围绕 E：
 
 - **初始化**：``_expected_units`` 按订阅参数展开期望单元，``_schedule_for`` 给每个
-  单元写死调度语义（补旧=now / 追新=air_date+宽限 / 未定档=NULL）；
+  单元写死调度语义（补旧=now / 追新=air_date+宽限 / 未定档=NULL）；电影另有
+  ``movie_schedule`` 的上映感知调度——未上映/刚上映不白搜，等宽限期到点兜底；
 - **diff 重算**：修改订阅时新增缺的、切换既有工单的 ``in_scope``；状态与投递
   历史不回退，退出范围的单元停止搜索、观察与救援。
 
@@ -41,6 +42,7 @@ from movieclaw_db.models import (
     DownloadAttemptStatus,
     MediaEpisode,
     MediaItem,
+    MediaMetadata,
     MediaSeason,
     SiteTorrent,
     Subscription,
@@ -65,10 +67,24 @@ logger = logging.getLogger("movieclaw_api.subscription")
 # 被动匹配通常在到点前满足工单；真到点仍缺的，worker 捞起即漏抓兜底。
 FUTURE_GRACE = timedelta(hours=48)
 
+# 电影的上映宽限期：上映日 + 该值 = 首次真实搜索时刻（movie_schedule）。
+# TMDB 的电影档期通常是最早的院线上映日，院线窗口内几乎不可能有正规资源，
+# 上来就搜只会空手而归；流媒体首发的影片虽然上映即有资源，但那类资源以新种
+# 进入站点 RSS，被动匹配会第一时间接住，不依赖主动搜索。7 天是"未上映/刚上映
+# 不白搜"与"别让搜索才能找到的既有资源干等太久"之间的折中——到期后若仍
+# 无资源，退避曲线很快收敛到每周一次。等不及的用户随时可以「立即搜索」强制。
+MOVIE_RELEASE_GRACE = timedelta(days=7)
+
 # 首页“预计入库”在缺少本剧历史样本时使用的冷启动值。出现真实入库记录后，
 # 会自动切换成该订阅自己的中位耗时，不把这个展示层兜底写进预测快照。
 _DEFAULT_RELEASE_TO_IMPORT_MINUTES = 60
 _DEFAULT_DOWNLOAD_TO_IMPORT_MINUTES = 10
+
+# 首页预告的前瞻窗口：订阅少的用户今天往往什么都不更新，只看今天会得到一个
+# 没有信息量的空栏目。窗口放宽到一周，配合“今天优先”收敛（见 today_arrivals），
+# 保证首页永远能回答“下一次是什么时候”。
+# 改这个值时记得同步 Web 空态文案里的“接下来 7 天”（subscriptions-view.tsx）。
+_UPCOMING_WINDOW_DAYS = 7
 
 # 剧集完结类 status：期望集合不再生长的判定输入之一
 _ENDED_STATUSES = frozenset({"Ended", "Canceled"})
@@ -98,7 +114,7 @@ class ExpectedUnit:
 
 @dataclass(frozen=True)
 class TodayArrivalCandidate:
-    """订阅首页的一行待入库剧集，以及由本剧历史得出的耗时基线。"""
+    """订阅首页的一行待入库内容，以及由本订阅历史得出的耗时基线。"""
 
     subscription: Subscription
     media: MediaItem
@@ -106,6 +122,33 @@ class TodayArrivalCandidate:
     next_probe_at: datetime | None
     release_to_import_minutes: int
     download_to_import_minutes: int
+    #: 该行预计入库/播出的站点日历日；today_arrivals 收敛后同一批候选共享同一天
+    expected_day: date
+    #: 距今天几天（0=今天）。站点日历与浏览器时区可能不同，判断“是不是今天”
+    #: 由服务端一次算好，前端不复制这套时区规则。
+    days_ahead: int
+
+
+def _expected_arrival_day(candidates: tuple[date | None, ...], today: date) -> date | None:
+    """从若干候选日历日里取今天或之后最早的一个；全部落在过去时返回 None。
+
+    早该播出却迟迟没抓到的旧集不算“待播预告”——它属于订阅详情页的缺口清单，
+    首页硬塞进来只会把过期日期当成未来安排展示。
+    """
+    upcoming = [day for day in candidates if day is not None and day >= today]
+    return min(upcoming) if upcoming else None
+
+
+def _focus_day_rows(
+    rows: list[TodayArrivalCandidate], today: date
+) -> list[TodayArrivalCandidate]:
+    """今天优先：今天有安排就只留今天，否则只留最近一个有安排的日子。"""
+    focus = (
+        today
+        if any(row.expected_day == today for row in rows)
+        else min((row.expected_day for row in rows), default=None)
+    )
+    return [row for row in rows if row.expected_day == focus]
 
 
 def _median_pipeline_minutes(
@@ -173,8 +216,10 @@ def expected_units(
 def schedule_for(kind: str, unit: ExpectedUnit) -> tuple[datetime | None, int]:
     """三类调度语义（创建时写死）：补旧=now / 追新=air+宽限 / 未定档=NULL。
 
-    电影没有播出日期概念，恒为补旧。追新工单给高优先级：新集是用户
-    最急着要的，worker 排序时优先处理。
+    电影在这里恒为补旧——本函数没有上映档期上下文，只服务"明确要资源"的
+    场景（如媒体库缺失重下）。订阅创建/调整会用 ``movie_schedule`` 的上映感知
+    结果覆盖它。追新工单给高优先级：新集是用户最急着要的，worker 排序时
+    优先处理。
     """
     now = utcnow()
     if kind == MediaKind.MOVIE.value:
@@ -185,6 +230,30 @@ def schedule_for(kind: str, unit: ExpectedUnit) -> tuple[datetime | None, int]:
         return now, 0  # 补旧：立即排队真实搜索
     first_due = datetime.combine(unit.air_date, datetime.min.time()) + FUTURE_GRACE
     return first_due, 10  # 追新：被动匹配为主，到点即漏抓兜底
+
+
+def movie_schedule(release_date: date | None, status: str | None) -> tuple[datetime | None, int]:
+    """电影的上映感知调度：未上映/刚上映不白搜，期间资源到来靠被动匹配兜住。
+
+    - 已定档：``上映日 + MOVIE_RELEASE_GRACE`` 之前不安排真实搜索（未来到期给
+      高优先级，与剧集追新同语义）；宽限已过按补旧立即排队；
+    - 未定档：TMDB status 明确还没上映（In Production / Post Production 等）时
+      不可调度，等元数据刷新定档/上映后回填；status 未知或已上映的老片没有
+      档期可依，保持"订阅即搜"——宁可白搜一次，不能让老片瘫在不可调度里。
+
+    工单的 ``air_date`` 不写上映日：``covered_units`` 把 air_date 当作"发布时间
+    物理上限"剔除候选，而电影资源早于 TMDB 档期流出真实存在（分地区上映、
+    提前数字发行），写了会把这类资源永久拒之门外。调度信息只落 next_search_at。
+    """
+    now = utcnow()
+    if release_date is not None:
+        available_at = datetime.combine(release_date, datetime.min.time()) + MOVIE_RELEASE_GRACE
+        if available_at <= now:
+            return now, 0  # 上映已过宽限：补旧，立即排队真实搜索
+        return available_at, 10  # 未上映/刚上映：被动匹配为主，到点漏抓兜底
+    if status is None or status == "Released":
+        return now, 0  # 无档期信息的老片/未知片：维持订阅即搜
+    return None, 0  # 明确未上映且未定档：等定档回填
 
 
 async def recompute_subscription_status(
@@ -348,7 +417,8 @@ class SubscriptionService:
         owned = await self._owned_units(item.id)
         skipped_owned = [u for u in units if (u.season_number, u.episode_number) in owned]
         units = [u for u in units if (u.season_number, u.episode_number) not in owned]
-        rows = [self._to_wanted(subscription, unit) for unit in units]
+        movie_plan = await self._movie_plan(item) if kind is MediaKind.MOVIE else None
+        rows = [self._to_wanted(subscription, unit, schedule=movie_plan) for unit in units]
         await self._repo.add_wanted(rows)
         created_message = self._created_message(item, kind, selected, follow_future, rows)
         if skipped_owned:
@@ -435,8 +505,9 @@ class SubscriptionService:
 
         expected_keys = {(u.season_number, u.episode_number) for u in expected}
         owned = await self._owned_units(subscription.media_item_id)
+        movie_plan = await self._movie_plan(item) if kind is MediaKind.MOVIE else None
         to_add = [
-            self._to_wanted(subscription, unit)
+            self._to_wanted(subscription, unit, schedule=movie_plan)
             for unit in expected
             if (unit.season_number, unit.episode_number) not in existing_keys
             and (unit.season_number, unit.episode_number) not in owned
@@ -678,6 +749,24 @@ class SubscriptionService:
             subscription = await self.create(
                 kind, item.tmdb_id, selected_seasons=seasons, library_id=library_id
             )
+            assert subscription.id is not None
+            # 重新下载与「立即搜索」同为用户强制：文件曾经存在，资源显然可得。
+            # 电影可能被"未上映/未定档缓搜"排到未来或不可调度（TMDB 档期与
+            # 现实不符时），这里把缺失单元改回立即排队，不能让用户点了却没动静
+            forced = 0
+            now = utcnow()
+            for row in await self._repo.list_wanted(subscription.id):
+                if (
+                    (row.season_number, row.episode_number) in units
+                    and row.status == WantedStatus.WANTED
+                    and (row.next_search_at is None or row.next_search_at > now)
+                ):
+                    row.next_search_at = now
+                    self._session.add(row)
+                    forced += 1
+            if forced:
+                await self._session.commit()
+                self._kick_search()
             return subscription, len(units)
 
         subscription = existing
@@ -703,7 +792,14 @@ class SubscriptionService:
                 requeued += 1
                 continue
             if row.status == WantedStatus.WANTED:
-                continue  # 本来就在队列里，别清人家的搜索退避
+                # 排在未来/不可调度的（电影未上映缓搜、未定档、退避冷却中）
+                # 清零到当下重新排队——重新下载与「立即搜索」同为用户强制，
+                # 文件曾经存在说明资源可得；search_attempts 保留，不清退避阶梯
+                if row.next_search_at is None or row.next_search_at > now:
+                    row.next_search_at = now
+                    self._session.add(row)
+                    requeued += 1
+                continue
             row.status = WantedStatus.WANTED
             row.info_hash = None
             row.grabbed_at = None
@@ -729,23 +825,30 @@ class SubscriptionService:
     async def search_now(self, subscription_id: int) -> int:
         """用户手动触发「立即搜索」：把可搜索的缺口工单全部重置为立刻到期。
 
-        只碰"本来就能搜"的工单——未定档（next_search_at 为 None）没有可用
-        的搜索时机，待播出（air_date 在未来）搜了也只会空手而归并打乱
-        "播出 + 宽限"的原定档期，两者都跳过。已在冷却退避中的工单清零到
-        "现在"，随后踢一次缺口搜索，不必等下个调度周期。返回重置的工单数。
+        剧集只碰"本来就能搜"的工单——未定档（next_search_at 为 None）没有
+        可用的搜索时机，待播出（air_date 在未来）搜了也只会空手而归并打乱
+        "播出 + 宽限"的原定档期，两者都跳过。电影不设这层限制：未上映/未定档
+        的缓搜只是系统的默认保守策略，用户主动触发就是明确的"我现在就要搜
+        一次"——搜完由搜索管线按上映档期把调度恢复原状（见 wanted_search 的
+        movie_plan 地板）。已在冷却退避中的工单清零到"现在"，随后踢一次
+        缺口搜索，不必等下个调度周期。返回重置的工单数。
         """
         subscription = await self._get_or_404(subscription_id)
         if subscription.status == SubscriptionStatus.PAUSED:
             raise BadRequestException("订阅已暂停，请先恢复追踪再触发搜索")
         now = utcnow()
         today = now.date()
+        is_movie = subscription.kind == MediaKind.MOVIE.value
         wanted = await self._repo.list_wanted(subscription_id, in_scope_only=True)
         reset = 0
         for w in wanted:
-            if w.status != WantedStatus.WANTED or w.next_search_at is None:
+            if w.status != WantedStatus.WANTED:
                 continue
-            if w.air_date is not None and w.air_date > today:
-                continue
+            if not is_movie:
+                if w.next_search_at is None:
+                    continue
+                if w.air_date is not None and w.air_date > today:
+                    continue
             w.next_search_at = now
             self._session.add(w)
             reset += 1
@@ -880,13 +983,24 @@ class SubscriptionService:
         return rows
 
     async def today_arrivals(self, *, member_id: int | None = None) -> list[TodayArrivalCandidate]:
-        """聚合今天待播或仍在下载/整理中的可见剧集，不查询外部下载器。
+        """聚合最近一次可能入库的可见内容，不查询外部下载器。
 
         资源预测只负责给出“何时可能出种”。首页把本订阅过往的
         ``投递→入库`` 中位耗时叠加上去，得到面向用户的预计入库时间；
         下载中的实时 ETA 由 Web 已有的全局下载快照进一步覆盖。
+
+        **今天优先**：候选先按 ``today .. today + _UPCOMING_WINDOW_DAYS`` 收集，
+        再**按媒体类型各自**收敛到一个焦点日——今天有安排就只回今天，否则只回
+        窗口内最近一个有安排的日子。首页因此永远只讲“下一次是什么时候”，既不会
+        在订阅少时空着，也不会退化成一张七天流水账。按类型分开收敛是因为首页的
+        分区切换就是按类型分的：混在一起收敛会让“电影今天在下载”顶掉“剧集三天后
+        更新”，切到剧集分区就只剩一句并不成立的“接下来一周没有更新”。
+
+        **电影只在管道内纳入**：电影没有播出日，未投递时给不出可信的预告时间，
+        常年在找资源的电影会天天占据首页；已投递/已下载的电影则和剧集一样，
+        “下载中 / 整理中”对用户完全成立。
         """
-        visible = await self.list_with_progress(kind=MediaKind.TV.value, member_id=member_id)
+        visible = await self.list_with_progress(member_id=member_id)
         subscriptions = {
             sub.id: (sub, media) for sub, media, _counts in visible if sub.id is not None
         }
@@ -900,6 +1014,7 @@ class SubscriptionService:
             by_subscription.setdefault(wanted.subscription_id, []).append(wanted)
 
         today = publish_calendar_date(utcnow())
+        horizon = today + timedelta(days=_UPCOMING_WINDOW_DAYS)
         candidates: list[TodayArrivalCandidate] = []
         for subscription_id, (subscription, media) in subscriptions.items():
             rows = by_subscription.get(subscription_id, [])
@@ -926,8 +1041,13 @@ class SubscriptionService:
                     # 模拟投递没有后续下载/入库链路，不应伪装成首页的“下载中”。
                     if wanted.info_hash is None:
                         continue
+                    # 已经在下载/整理链路里的内容随时可能落地，一律归入今天。
+                    expected_day = today
                 elif wanted.status == WantedStatus.WANTED:
                     if subscription.status != SubscriptionStatus.ACTIVE:
+                        continue
+                    # 电影没有播出日，还在找资源时给不出可信的预告时间。
+                    if media.kind == MediaKind.MOVIE.value:
                         continue
                     predicted = _forecast_predicted_at(wanted)
                     predicted_import_day = (
@@ -935,8 +1055,10 @@ class SubscriptionService:
                         if predicted is not None
                         else None
                     )
-                    if wanted.air_date != today and predicted_import_day != today:
+                    day = _expected_arrival_day((wanted.air_date, predicted_import_day), today)
+                    if day is None or day > horizon:
                         continue
+                    expected_day = day
                 else:
                     continue
 
@@ -948,8 +1070,21 @@ class SubscriptionService:
                         next_probe_at=next_probe_by_wanted.get(wanted.id or -1),
                         release_to_import_minutes=release_to_import,
                         download_to_import_minutes=download_to_import,
+                        expected_day=expected_day,
+                        days_ahead=(expected_day - today).days,
                     )
                 )
+
+        # 今天优先收敛：只留焦点日，避免首页把一周的安排一次性倒给用户。
+        # 按媒体类型各算一次——首页的分区切换正是按类型分的，混在一起收敛会让
+        # “电影今天在下载”顶掉“剧集三天后更新”，用户切到剧集分区就会看到一句
+        # 并不成立的“接下来一周没有更新”。前端过滤完当前分区后再收敛到最近一天。
+        by_kind: dict[str, list[TodayArrivalCandidate]] = {}
+        for row in candidates:
+            by_kind.setdefault(row.media.kind, []).append(row)
+        candidates = [
+            row for rows_of_kind in by_kind.values() for row in _focus_day_rows(rows_of_kind, today)
+        ]
 
         status_order = {
             WantedStatus.DOWNLOADED: 0,
@@ -1053,9 +1188,19 @@ class SubscriptionService:
     # 工单构造与派生状态（核心逻辑在模块级函数，服务只做委托）
     # ------------------------------------------------------------------
 
-    def _to_wanted(self, subscription: Subscription, unit: ExpectedUnit) -> WantedItem:
+    def _to_wanted(
+        self,
+        subscription: Subscription,
+        unit: ExpectedUnit,
+        *,
+        schedule: tuple[datetime | None, int] | None = None,
+    ) -> WantedItem:
+        """``schedule``：显式调度覆盖（电影传 ``movie_schedule`` 的上映感知结果）；
+        不传时按单元自身的三类调度语义。"""
         assert subscription.id is not None
-        next_search, priority = schedule_for(subscription.kind, unit)
+        next_search, priority = (
+            schedule if schedule is not None else schedule_for(subscription.kind, unit)
+        )
         return WantedItem(
             subscription_id=subscription.id,
             media_item_id=subscription.media_item_id,
@@ -1110,9 +1255,23 @@ class SubscriptionService:
         rows: list[WantedItem],
     ) -> str:
         """创建活动的中文摘要：把 E 的定义和调度分布一句话说清楚。"""
-        if kind is MediaKind.MOVIE:
-            return f"创建订阅《{item.title}》：已加入搜索队列，等待搜索任务寻找资源"
         now = utcnow()
+        if kind is MediaKind.MOVIE:
+            row = rows[0] if rows else None
+            if row is None:
+                return f"创建订阅《{item.title}》"
+            if row.next_search_at is None:
+                return (
+                    f"创建订阅《{item.title}》：影片尚未定档，定档/上映后自动安排搜索；"
+                    "期间站点新出的资源仍会被自动匹配"
+                )
+            if row.next_search_at > now:
+                return (
+                    f"创建订阅《{item.title}》：影片未上映或刚上映，"
+                    f"{row.next_search_at.date().isoformat()} 起开始搜索资源；"
+                    "期间站点新出的资源仍会被自动匹配"
+                )
+            return f"创建订阅《{item.title}》：已加入搜索队列，等待搜索任务寻找资源"
         immediate = sum(1 for w in rows if w.next_search_at is not None and w.next_search_at <= now)
         future = sum(1 for w in rows if w.next_search_at is not None and w.next_search_at > now)
         undated = sum(1 for w in rows if w.next_search_at is None)
@@ -1150,6 +1309,16 @@ class SubscriptionService:
         from movieclaw_api.services.subscription.wanted_search import kick_search_soon
 
         kick_search_soon()
+
+    async def _movie_plan(self, item: MediaItem) -> tuple[datetime | None, int]:
+        """电影哨兵工单的上映感知调度：上映日期取自条目档案（建档事务已写入）。"""
+        assert item.id is not None
+        release_date = (
+            await self._session.execute(
+                select(MediaMetadata.release_date).where(MediaMetadata.media_item_id == item.id)
+            )
+        ).scalar_one_or_none()
+        return movie_schedule(release_date, item.status)
 
     async def _owned_units(self, media_item_id: int) -> set[tuple[int, int]]:
         """库存 H：该条目在媒体库里已拥有的期望单元（媒体库 L3 联通）。"""

@@ -223,15 +223,19 @@ def test_today_arrivals_lists_today_episode_without_poster_or_progress(
     assert response.status_code == 200, response.text
     rows = response.json()["data"]
     assert len(rows) == 1
+    today = datetime.now(ZoneInfo("Asia/Shanghai")).date().isoformat()
     assert rows == [
         {
             "subscription_id": created.json()["data"]["subscription"]["id"],
             "wanted_id": rows[0]["wanted_id"],
             "media_title": "今日更新剧集",
+            "media_kind": "tv",
             "season_number": 1,
             "episode_number": 2,
             "status": "wanted",
-            "air_date": datetime.now(ZoneInfo("Asia/Shanghai")).date().isoformat(),
+            "air_date": today,
+            "expected_day": today,
+            "days_ahead": 0,
             "release_forecast": None,
             "next_probe_at": None,
             "info_hash": None,

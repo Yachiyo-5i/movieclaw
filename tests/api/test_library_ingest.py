@@ -733,6 +733,110 @@ async def test_completed_torrent_creates_file_scoped_job_while_sibling_downloads
 
 
 @pytest.mark.asyncio
+async def test_file_scoped_blocked_job_not_woken_by_tree_fingerprint(db, tmp_path, monkeypatch):
+    """文件级批次 blocked 后不被全树指纹差异反复唤醒；升级补偿仍只唤醒一次。
+
+    批次记录的 ready: 指纹与全树指纹永不相等，内容变化唤醒若不排除文件级
+    作业，会让 blocked 批次每轮巡检被拉起重跑再挂起（无限唤醒，回归）。
+    """
+    from movieclaw_downloader import TorrentBrief, TorrentFile, TorrentStatus
+
+    root, watch = tmp_path / "tv", tmp_path / "watch"
+    watch.mkdir()
+    library_id = await _make_library(db, kind=MediaKind.TV, root=root)
+    await _make_rule(db, library_id=library_id, source=watch)
+    item = await _make_item(db, kind=MediaKind.TV, title="批次挂起剧集", year=2026)
+    _stub_identify(monkeypatch, item)
+    monkeypatch.setattr(ingest_mod, "probe_media", lambda _path: _FAKE_SPEC)
+    # 已完成的 ep1 解析不出集号 → 批次作业以解析缺口挂起
+    monkeypatch.setattr(ingest_mod, "_unit", lambda _file, _entry: (1, 0))
+
+    entry = watch / "Blocked.Batch.S01"
+    entry.mkdir()
+    ep1 = entry / "ep1.mkv"
+    ep2 = entry / "ep2.mkv"
+    ep1.write_bytes(b"episode-1")
+    ep2.write_bytes(b"episode-2-partial")
+    completed = TorrentBrief(
+        name=entry.name, content_name=entry.name, completed=True, info_hash="completed-hash"
+    )
+    downloading = TorrentBrief(
+        name=entry.name, content_name=entry.name, completed=False, info_hash="downloading-hash"
+    )
+    complete_status = TorrentStatus(
+        info_hash=completed.info_hash,
+        name=entry.name,
+        progress=1.0,
+        completed=True,
+        save_path=str(watch),
+        files=[
+            TorrentFile(
+                path=f"{entry.name}/{ep1.name}",
+                size_bytes=ep1.stat().st_size,
+                completed_bytes=ep1.stat().st_size,
+            )
+        ],
+    )
+    writing_status = TorrentStatus(
+        info_hash=downloading.info_hash,
+        name=entry.name,
+        progress=0.5,
+        completed=False,
+        save_path=str(watch),
+        files=[
+            TorrentFile(
+                path=f"{entry.name}/{ep2.name}",
+                size_bytes=ep2.stat().st_size,
+                completed_bytes=3,
+            )
+        ],
+    )
+
+    async def briefs():
+        return [completed, downloading]
+
+    async def statuses(_matches):
+        return [
+            (SimpleNamespace(path_mappings=None), complete_status),
+            (SimpleNamespace(path_mappings=None), writing_status),
+        ]
+
+    monkeypatch.setattr(ingest_mod, "_downloader_briefs", briefs)
+    monkeypatch.setattr(ingest_mod, "_matched_torrent_statuses", statuses)
+    async with db.session() as session:
+        rule = (await session.execute(select(ImportWatch))).scalar_one()
+        library = await session.get(Library, library_id)
+        assert library is not None
+    await ingest_mod._sweep_dir(rule, library)
+    async with db.session() as session:
+        job = (await session.execute(select(Job))).scalar_one()
+    assert job.input_data.get("ready_files")
+    await jobs.init_job_dispatcher(max_parallel=1)
+    blocked = await _wait_job_status(job.id, JobStatus.BLOCKED)
+    assert blocked.error["code"] == "INGEST_EPISODE_PARSE_REQUIRED"
+
+    # 同修订号再巡检：不因 ready: 指纹与全树指纹不等而唤醒
+    await ingest_mod._sweep_dir(rule, library)
+    async with db.session() as session:
+        unchanged = await session.get(Job, job.id)
+        assert unchanged is not None
+        assert unchanged.status == JobStatus.BLOCKED
+
+    # 升级补偿对文件级作业照常生效：唤醒一次、按原白名单重跑后再次挂起
+    async with db.session() as session:
+        stored = await session.get(Job, job.id)
+        assert stored is not None
+        stored.handler_revision = "library.ingest.v1"
+        await session.commit()
+    await ingest_mod._sweep_dir(rule, library)
+    reblocked = await _wait_job_status(job.id, JobStatus.BLOCKED)
+    assert reblocked.handler_revision == ingest_mod._ingest_handler_revision()
+    async with db.session() as session:
+        all_jobs = list((await session.execute(select(Job))).scalars())
+    assert len(all_jobs) == 1
+
+
+@pytest.mark.asyncio
 async def test_file_scoped_job_never_falls_back_to_whole_directory():
     """白名单损坏时停止作业，不能静默扩大为整目录入库。"""
     with pytest.raises(jobs.JobFailed, match="文件级入库白名单无效"):
@@ -1360,6 +1464,206 @@ async def test_upgrade_unblocks_old_revision_parser_gap_job(db, tmp_path, monkey
     assert record.status == IngestStatus.IMPORTED
     assert record.imported_count == 2
     assert (root / "补偿剧集 (2026)" / "Season 01" / "补偿剧集 (2026) - S01E02.mkv").exists()
+
+
+async def _make_blocked_parser_gap_job(db, tmp_path, monkeypatch, *, title: str):
+    """公共铺垫：ep1 入库、ep2 解析不出集号 → 记录 pending + Job blocked。
+
+    返回 (root, watch, entry, rule, library, job)。parse_unit 对 ep2 永远
+    解析失败，其余 epN 解析为 (1, N)——改名/补集/能力升级场景在各测试里
+    自行推进。
+    """
+    root, watch = tmp_path / "tv", tmp_path / "watch"
+    watch.mkdir()
+    library_id = await _make_library(db, kind=MediaKind.TV, root=root)
+    await _make_rule(db, library_id=library_id, source=watch)
+    item = await _make_item(db, kind=MediaKind.TV, title=title, year=2026)
+    _stub_identify(monkeypatch, item)
+    monkeypatch.setattr(ingest_mod, "probe_media", lambda _path: _FAKE_SPEC)
+
+    def parse_unit(file, _entry):
+        if file.stem == "ep2":
+            return 1, 0
+        return 1, int(file.stem.removeprefix("ep"))
+
+    async def no_assets(_media_item_id: int) -> None:
+        return None
+
+    monkeypatch.setattr(ingest_mod, "_unit", parse_unit)
+    monkeypatch.setattr("movieclaw_api.services.media_scrape.ensure_assets", no_assets)
+
+    entry = watch / f"{title} S01"
+    entry.mkdir()
+    (entry / "ep1.mkv").write_bytes(b"episode-1")
+    (entry / "ep2.mkv").write_bytes(b"episode-2")
+    async with db.session() as session:
+        rule = (await session.execute(select(ImportWatch))).scalar_one()
+        library = await session.get(Library, library_id)
+        assert library is not None
+    await ingest_mod._sweep_dir(rule, library)
+    await ingest_mod._sweep_dir(rule, library)
+    async with db.session() as session:
+        job = (await session.execute(select(Job))).scalar_one()
+    await jobs.init_job_dispatcher(max_parallel=1)
+    blocked = await _wait_job_status(job.id, JobStatus.BLOCKED)
+    assert blocked.error["code"] == "INGEST_EPISODE_PARSE_REQUIRED"
+    return root, watch, entry, rule, library, job
+
+
+@pytest.mark.asyncio
+async def test_blocked_parser_gap_job_wakes_on_content_change(db, tmp_path, monkeypatch):
+    """blocked 不能堵死"内容变化自动重试"：条目内容变化时原地唤醒同一 Job。"""
+    root, _watch, entry, rule, library, job = await _make_blocked_parser_gap_job(
+        db, tmp_path, monkeypatch, title="补集剧集"
+    )
+
+    # 用户删掉解析不出的文件、换上修好的一集（指纹变化，条目路径不变）——
+    # 任务化之前这正是靠指纹对比自动重入库的场景
+    (entry / "ep2.mkv").unlink()
+    (entry / "ep3.mkv").write_bytes(b"episode-3!")
+    await ingest_mod._sweep_dir(rule, library)
+    completed = await _wait_job_status(job.id, JobStatus.SUCCEEDED)
+    assert completed.id == job.id
+
+    async with db.session() as session:
+        all_jobs = list((await session.execute(select(Job))).scalars())
+        record = (await session.execute(select(IngestEntry))).scalar_one()
+    assert len(all_jobs) == 1
+    assert record.status == IngestStatus.IMPORTED
+    assert record.imported_count == 2
+    assert (root / "补集剧集 (2026)" / "Season 01" / "补集剧集 (2026) - S01E03.mkv").exists()
+
+
+@pytest.mark.asyncio
+async def test_model_upgrade_wakes_blocked_parser_gap_job(db, tmp_path, monkeypatch):
+    """纯 NER 模型升级（代码修订不变）也要触发一次补偿：修订号含模型 tag。"""
+    root, _watch, _entry, rule, library, job = await _make_blocked_parser_gap_job(
+        db, tmp_path, monkeypatch, title="模型剧集"
+    )
+
+    # 模拟应用内一键更新模型后的重启：MOVIECLAW_NER_DIR 指向带新 tag 的目录，
+    # 同时新模型解析能力覆盖 ep2
+    model_dir = tmp_path / "models" / "torrent-ner-v9"
+    model_dir.mkdir(parents=True)
+    (model_dir / ".release-tag").write_text("torrent-ner-v9\n", encoding="utf-8")
+    monkeypatch.setenv("MOVIECLAW_NER_DIR", str(model_dir))
+    monkeypatch.setattr(
+        ingest_mod, "_unit", lambda file, _entry: (1, int(file.stem.removeprefix("ep")))
+    )
+
+    await ingest_mod._sweep_dir(rule, library)
+    completed = await _wait_job_status(job.id, JobStatus.SUCCEEDED)
+    assert (
+        completed.handler_revision == f"{ingest_mod._INGEST_HANDLER_REVISION}+torrent-ner-v9"
+    )
+
+    async with db.session() as session:
+        all_jobs = list((await session.execute(select(Job))).scalars())
+        record = (await session.execute(select(IngestEntry))).scalar_one()
+    assert len(all_jobs) == 1
+    assert record.status == IngestStatus.IMPORTED
+    assert record.imported_count == 2
+    assert (root / "模型剧集 (2026)" / "Season 01" / "模型剧集 (2026) - S01E02.mkv").exists()
+
+
+@pytest.mark.asyncio
+async def test_compensation_zero_new_import_keeps_imported_summary(db, tmp_path, monkeypatch):
+    """补偿重跑零新增时，message 不能丢掉"此前已入库 N 个文件"的事实。"""
+    root, watch = tmp_path / "tv", tmp_path / "watch"
+    watch.mkdir()
+    library_id = await _make_library(db, kind=MediaKind.TV, root=root)
+    await _make_rule(db, library_id=library_id, source=watch)
+    item = await _make_item(db, kind=MediaKind.TV, title="摘要剧集", year=2026)
+    _stub_identify(monkeypatch, item)
+    monkeypatch.setattr(ingest_mod, "probe_media", lambda _path: _FAKE_SPEC)
+    monkeypatch.setattr(
+        ingest_mod,
+        "_unit",
+        lambda file, _entry: (1, 1) if file.stem == "ep1" else (1, 0),
+    )
+
+    entry = watch / "摘要剧集 S01"
+    entry.mkdir()
+    (entry / "ep1.mkv").write_bytes(b"episode-1")
+    (entry / "ep2.mkv").write_bytes(b"episode-2")
+
+    # 制造旧版误标 imported 的部分入库台账，再触发升级补偿（解析能力未变）
+    await _sweep_twice(db, library_id, watch)
+    async with db.session() as session:
+        record = (await session.execute(select(IngestEntry))).scalar_one()
+        record.status = IngestStatus.IMPORTED
+        await session.commit()
+
+    async with db.session() as session:
+        rule = (await session.execute(select(ImportWatch))).scalar_one()
+        library = await session.get(Library, library_id)
+        assert library is not None
+    await ingest_mod._sweep_dir(rule, library)
+    await ingest_mod._sweep_dir(rule, library)
+    async with db.session() as session:
+        job = (await session.execute(select(Job))).scalar_one()
+    await jobs.init_job_dispatcher(max_parallel=1)
+    await _wait_job_status(job.id, JobStatus.BLOCKED)
+
+    async with db.session() as session:
+        record = (await session.execute(select(IngestEntry))).scalar_one()
+    assert record.status == IngestStatus.PENDING
+    assert record.imported_count == 1
+    assert "此前已入库 1 个文件" in (record.message or "")
+    assert "ep2.mkv」解析不出集号，未入库" in (record.message or "")
+
+
+@pytest.mark.asyncio
+async def test_staging_partial_import_not_auto_compensated(db, tmp_path, monkeypatch):
+    """有过成功搬运的中转记录不自动补偿：已消费的文件重跑会被重复上传。"""
+    root, watch, staging = tmp_path / "tv", tmp_path / "watch", tmp_path / "staging"
+    watch.mkdir()
+    staging.mkdir()
+    await _make_library(db, kind=MediaKind.TV, root=root)
+    item = await _make_item(db, kind=MediaKind.TV, title="中转剧集", year=2026)
+    _stub_identify(monkeypatch, item)
+    monkeypatch.setattr(ingest_mod, "probe_media", lambda _path: _FAKE_SPEC)
+    monkeypatch.setattr(
+        ingest_mod,
+        "_unit",
+        lambda file, _entry: (1, 1) if file.stem == "ep1" else (1, 0),
+    )
+    async with db.session() as session:
+        session.add(
+            ImportWatch(
+                source_path=str(watch), strategy="hardlink", kind="tv", target_path=str(staging)
+            )
+        )
+        await session.commit()
+
+    entry = watch / "中转剧集 S01"
+    entry.mkdir()
+    (entry / "ep1.mkv").write_bytes(b"episode-1")
+    (entry / "ep2.mkv").write_bytes(b"episode-2")
+    async with db.session() as session:
+        rule = (await session.execute(select(ImportWatch))).scalar_one()
+    for _ in range(2):
+        await ingest_mod._sweep_dir(rule, None, execute_inline=True)
+    transferred = staging / "中转剧集 (2026)" / "Season 01" / "中转剧集 (2026) - S01E01.mkv"
+    assert transferred.exists()
+
+    # 外部工具消费（上传后删除），且尚未回流入库；台账为旧版误标的 imported
+    transferred.unlink()
+    async with db.session() as session:
+        record = (await session.execute(select(IngestEntry))).scalar_one()
+        assert record.imported_count == 1
+        record.status = IngestStatus.IMPORTED
+        await session.commit()
+
+    await ingest_mod._sweep_dir(rule, None)
+    await ingest_mod._sweep_dir(rule, None)
+    async with db.session() as session:
+        all_jobs = list((await session.execute(select(Job))).scalars())
+        record = (await session.execute(select(IngestEntry))).scalar_one()
+    # 不建补偿任务、不重新搬运（否则 ep1 会被重复上传）；记录保持升级前状态
+    assert all_jobs == []
+    assert record.status == IngestStatus.IMPORTED
+    assert not transferred.exists()
 
 
 @pytest.mark.asyncio

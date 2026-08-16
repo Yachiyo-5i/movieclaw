@@ -489,7 +489,7 @@ function ServiceRow({
               }`}
             >
               <span
-                className={`size-1.5 rounded-full ${result.ok ? "bg-emerald-400" : "bg-red-400"}`}
+                className={`size-1.5 rounded-full ${result.ok ? "bg-[var(--ok)]" : "bg-[var(--danger)]"}`}
               />
               {result.ok ? (result.latency_ms !== null ? `连通 · ${result.latency_ms} ms` : "连通") : "不通"}
             </span>

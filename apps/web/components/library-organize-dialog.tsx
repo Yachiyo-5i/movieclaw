@@ -237,9 +237,9 @@ export function LibraryOrganizeDialog({
               ) : (
                 <>
                   {/* 风险告知：批量改名是半不可逆操作，三条风险必须看到 */}
-                  <div className="rounded-xl border border-[#f5c451]/30 bg-[#f5c451]/[0.08] px-4 py-3">
-                    <p className="text-sub font-semibold text-[#f5c451]">开始前请确认</p>
-                    <ul className="mt-1.5 list-disc space-y-1 pl-4 text-sub leading-5 text-[#f5c451]/85">
+                  <div className="rounded-xl border border-[var(--warn)]/30 bg-[var(--warn)]/[0.08] px-4 py-3">
+                    <p className="text-sub font-semibold text-[var(--warn)]">开始前请确认</p>
+                    <ul className="mt-1.5 list-disc space-y-1 pl-4 text-sub leading-5 text-[var(--warn)]/85">
                       <li>
                         改名直接发生在磁盘上，<strong>无法一键撤销</strong>；下方清单就是将要发生的全部变更。
                       </li>
@@ -320,7 +320,7 @@ export function LibraryOrganizeDialog({
                           >
                             {skip.file_path}
                           </p>
-                          <p className="mt-0.5 text-caption text-[#f5c451]/80">{skip.reason}</p>
+                          <p className="mt-0.5 text-caption text-[var(--warn)]/80">{skip.reason}</p>
                         </div>
                       ))}
                     </div>
@@ -399,8 +399,8 @@ export function LibraryOrganizeDialog({
         {phase === "done" && (
           <div className="scroll-thin min-h-0 flex-1 overflow-y-auto px-6 py-8">
             <div className="flex flex-col items-center gap-3">
-              <span className="flex size-11 items-center justify-center rounded-full bg-[#4ade80]/15">
-                <CheckIcon className="size-5 text-[#4ade80]" />
+              <span className="flex size-11 items-center justify-center rounded-full bg-[var(--ok)]/15">
+                <CheckIcon className="size-5 text-[var(--ok)]" />
               </span>
               <p className="text-body-lg font-semibold text-white">整理完成</p>
               <p className="text-center text-ui leading-6 text-[var(--text-muted)]">
@@ -415,11 +415,11 @@ export function LibraryOrganizeDialog({
                 {result && result.skipped > 0 ? `跳过 ${result.skipped} 个（原因见预览）。` : ""}
               </p>
               {result && result.errors.length > 0 && (
-                <div className="w-full rounded-xl border border-[#f5c451]/30 bg-[#f5c451]/[0.08] px-4 py-3">
-                  <p className="text-sub font-semibold text-[#f5c451]">
+                <div className="w-full rounded-xl border border-[var(--warn)]/30 bg-[var(--warn)]/[0.08] px-4 py-3">
+                  <p className="text-sub font-semibold text-[var(--warn)]">
                     {result.errors.length} 个文件处理时遇到问题（未被改动）
                   </p>
-                  <ul className="mt-1.5 space-y-1 text-caption leading-5 text-[#f5c451]/85">
+                  <ul className="mt-1.5 space-y-1 text-caption leading-5 text-[var(--warn)]/85">
                     {result.errors.map((message) => (
                       <li key={message} className="break-all">
                         {message}
@@ -446,8 +446,8 @@ export function LibraryOrganizeDialog({
 function StatChip({ tone, label }: { tone: "accent" | "ok" | "warn" | "muted"; label: string }) {
   const toneClass = {
     accent: "border-white/[0.18] bg-white/[0.12] text-white",
-    ok: "border-[#4ade80]/30 bg-[#4ade80]/10 text-[#4ade80]",
-    warn: "border-[#f5c451]/35 bg-[#f5c451]/[0.12] text-[#f5c451]",
+    ok: "border-[var(--ok)]/30 bg-[var(--ok)]/10 text-[var(--ok)]",
+    warn: "border-[var(--warn)]/35 bg-[var(--warn)]/[0.12] text-[var(--warn)]",
     muted: "border-white/[0.1] bg-white/[0.05] text-[var(--text-muted)]",
   }[tone];
   return (

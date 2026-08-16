@@ -1320,7 +1320,7 @@ function GroupHeader({
         )}
         {hasCompletePack && <span className={COMPLETE_BADGE_CLS}>全集包</span>}
         {freeCount > 0 && (
-          <span className="tnum rounded-md bg-[#4ade80]/15 px-1.5 py-0.5 text-micro font-semibold text-[#79d193]">
+          <span className="tnum rounded-md bg-[var(--ok)]/15 px-1.5 py-0.5 text-micro font-semibold text-[#79d193]">
             {freeCount} 个免费
           </span>
         )}
@@ -1976,7 +1976,7 @@ function SiteStatusSummary({
     ? "animate-pulse bg-[var(--accent)]"
     : failed > 0
       ? "bg-[#ff6b6b]"
-      : "bg-[#4ade80]";
+      : "bg-[var(--ok)]";
 
   return (
     <div className="relative">
@@ -2016,7 +2016,7 @@ function SiteStatusSummary({
                           ? "animate-pulse bg-[var(--accent)]"
                           : s.phase === "error"
                             ? "bg-[#ff6b6b]"
-                            : "bg-[#4ade80]"
+                            : "bg-[var(--ok)]"
                       }`}
                     />
                     <span className="min-w-0 flex-1 truncate text-sub text-[var(--text)]">
@@ -2161,7 +2161,7 @@ function PosterResults({ hits }: { hits: TorrentHit[] }) {
 function posterPromoBadges(hit: TorrentHit): { text: string; cls: string }[] {
   const badges: { text: string; cls: string }[] = [];
   if (hit.free || hit.download_volume_factor === 0) {
-    badges.push({ text: "免费", cls: "bg-[#4ade80]/90 text-[#052e16]" });
+    badges.push({ text: "免费", cls: "bg-[var(--ok)]/90 text-[#052e16]" });
   } else if (hit.download_volume_factor < 1) {
     badges.push({
       text: `${Math.round(hit.download_volume_factor * 100)}%`,
@@ -2545,7 +2545,7 @@ function GrabButton({ hit, className }: { hit: TorrentHit; className: string }) 
 function seederTone(n: number): string {
   if (n === 0) return "text-[#ff9a9a]";
   if (n < 5) return "text-[#fbbf24]";
-  if (n >= 100) return "font-semibold text-[#4ade80]";
+  if (n >= 100) return "font-semibold text-[var(--ok)]";
   return "text-[#79d193]";
 }
 
@@ -2845,7 +2845,7 @@ function Metric({
 function PromoBadges({ hit }: { hit: TorrentHit }) {
   const badges: { text: string; cls: string }[] = [];
   if (hit.free || hit.download_volume_factor === 0) {
-    badges.push({ text: "免费", cls: "bg-[#4ade80]/15 text-[#79d193]" });
+    badges.push({ text: "免费", cls: "bg-[var(--ok)]/15 text-[#79d193]" });
   } else if (hit.download_volume_factor < 1) {
     badges.push({
       text: `${Math.round(hit.download_volume_factor * 100)}%`,

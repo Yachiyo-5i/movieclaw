@@ -18,7 +18,12 @@ from movieclaw_api.core.config import get_settings
 from movieclaw_api.exceptions import BadRequestException, ConflictException
 from movieclaw_api.services.media_library import MediaLibraryService
 from movieclaw_api.services.rule_sets import RuleSetService
-from movieclaw_api.services.subscription import FUTURE_GRACE, SubscriptionService
+from movieclaw_api.services.subscription import (
+    FUTURE_GRACE,
+    MOVIE_RELEASE_GRACE,
+    SubscriptionService,
+)
+from movieclaw_api.services.subscription.matching import publish_calendar_date
 from movieclaw_db.engine import dispose_db, get_database, init_db
 from movieclaw_db.migrations import run_migrations
 from movieclaw_db.models import (
@@ -42,6 +47,12 @@ _YESTERDAY = (_TODAY - timedelta(days=1)).isoformat()
 _FUTURE_DATE = _TODAY + timedelta(days=10)
 _FUTURE = _FUTURE_DATE.isoformat()
 
+# 首页预告按站点业务日历（Asia/Shanghai）判断"今天"，UTC 凌晨会差一天，
+# 因此预告相关夹具统一用站点日历日构造，避免测试在特定时段假红。
+_SITE_TODAY = publish_calendar_date(utcnow())
+_SITE_TODAY_ISO = _SITE_TODAY.isoformat()
+_IN_WINDOW = (_SITE_TODAY + timedelta(days=3)).isoformat()
+
 _ROUTES = {
     "/3/movie/100": {
         "id": 100,
@@ -49,6 +60,38 @@ _ROUTES = {
         "original_title": "Test Movie",
         "release_date": _AIRED,
         "status": "Released",
+        "external_ids": {},
+        "alternative_titles": {"titles": []},
+        "translations": {"translations": []},
+    },
+    # 电影上映感知调度的三个夹具：未上映（一个月后）/ 刚上映（3 天前，宽限内）/
+    # 未定档（制作中，无档期）
+    "/3/movie/101": {
+        "id": 101,
+        "title": "未上映电影",
+        "original_title": "Upcoming Movie",
+        "release_date": (_TODAY + timedelta(days=30)).isoformat(),
+        "status": "Post Production",
+        "external_ids": {},
+        "alternative_titles": {"titles": []},
+        "translations": {"translations": []},
+    },
+    "/3/movie/102": {
+        "id": 102,
+        "title": "刚上映电影",
+        "original_title": "Fresh Movie",
+        "release_date": (_TODAY - timedelta(days=3)).isoformat(),
+        "status": "Released",
+        "external_ids": {},
+        "alternative_titles": {"titles": []},
+        "translations": {"translations": []},
+    },
+    "/3/movie/103": {
+        "id": 103,
+        "title": "未定档电影",
+        "original_title": "Undated Movie",
+        "release_date": "",
+        "status": "In Production",
         "external_ids": {},
         "alternative_titles": {"titles": []},
         "translations": {"translations": []},
@@ -80,6 +123,39 @@ _ROUTES = {
             {"episode_number": 2, "name": "E2", "air_date": _FUTURE},
             {"episode_number": 3, "name": "E3", "air_date": None},
         ],
+    },
+    # 首页预告夹具：202 = 三天后播（窗口内）、203 = 今天播
+    "/3/tv/202": {
+        "id": 202,
+        "name": "本周更新剧集",
+        "original_name": "This Week Show",
+        "first_air_date": _IN_WINDOW,
+        "status": "Returning Series",
+        "external_ids": {},
+        "alternative_titles": {"results": []},
+        "translations": {"translations": []},
+        "seasons": [{"season_number": 1}],
+    },
+    "/3/tv/202/season/1": {
+        "name": "第 1 季",
+        "air_date": _IN_WINDOW,
+        "episodes": [{"episode_number": 1, "name": "E1", "air_date": _IN_WINDOW}],
+    },
+    "/3/tv/203": {
+        "id": 203,
+        "name": "今日更新剧集",
+        "original_name": "Today Show",
+        "first_air_date": _SITE_TODAY_ISO,
+        "status": "Returning Series",
+        "external_ids": {},
+        "alternative_titles": {"results": []},
+        "translations": {"translations": []},
+        "seasons": [{"season_number": 1}],
+    },
+    "/3/tv/203/season/1": {
+        "name": "第 1 季",
+        "air_date": _SITE_TODAY_ISO,
+        "episodes": [{"episode_number": 1, "name": "E1", "air_date": _SITE_TODAY_ISO}],
     },
 }
 
@@ -136,15 +212,45 @@ async def _mark(session, wanted: WantedItem, status: WantedStatus) -> None:
 
 
 async def test_movie_creates_single_backfill_unit(db) -> None:
-    """电影 = (0,0) 哨兵补旧工单：立即排队真实搜索。"""
+    """电影 = (0,0) 哨兵工单：上映已过宽限期 → 补旧，立即排队真实搜索。"""
     async with db.session() as session:
         sub = await _service(session).create(MediaKind.MOVIE, 100)
         wanted = await _wanted_of(session, sub.id)
 
     assert [(w.season_number, w.episode_number) for w in wanted] == [(0, 0)]
     assert wanted[0].status == WantedStatus.WANTED
-    assert wanted[0].next_search_at is not None  # 补旧：now
+    assert wanted[0].next_search_at is not None
+    assert wanted[0].next_search_at <= utcnow()  # 补旧：now
     assert sub.status == SubscriptionStatus.ACTIVE
+
+
+async def test_movie_release_aware_schedule(db) -> None:
+    """电影上映感知调度：未上映/刚上映=上映+宽限、未定档=NULL 等回填。
+
+    上映日不写进工单 air_date——covered_units 把 air_date 当发布时间物理上限，
+    写了会误杀早于 TMDB 档期流出的资源（分地区上映/提前数字发行）。
+    """
+    async with db.session() as session:
+        service = _service(session)
+        now = utcnow()
+
+        upcoming = await service.create(MediaKind.MOVIE, 101)
+        w = (await _wanted_of(session, upcoming.id))[0]
+        assert w.next_search_at is not None
+        assert w.next_search_at.date() == _TODAY + timedelta(days=30) + MOVIE_RELEASE_GRACE
+        assert w.priority > 0  # 与剧集追新同语义：被动匹配为主，到点漏抓兜底
+        assert w.air_date is None
+
+        fresh = await service.create(MediaKind.MOVIE, 102)
+        w = (await _wanted_of(session, fresh.id))[0]
+        assert w.next_search_at is not None
+        assert w.next_search_at > now  # 刚上映（宽限内）：不立即白搜
+        assert w.next_search_at.date() == _TODAY - timedelta(days=3) + MOVIE_RELEASE_GRACE
+
+        undated = await service.create(MediaKind.MOVIE, 103)
+        w = (await _wanted_of(session, undated.id))[0]
+        assert w.next_search_at is None  # 明确未上映且未定档：等定档回填
+        assert undated.status == SubscriptionStatus.ACTIVE
 
 
 async def test_tv_selected_seasons_full_domain_with_schedule_classes(db) -> None:
@@ -607,6 +713,31 @@ async def test_redownload_missing_units_creates_and_resets(db) -> None:
         assert requeued3 == 0
 
 
+async def test_redownload_forces_movie_past_release_deferral(db) -> None:
+    """重新下载与「立即搜索」同为用户强制：文件曾经存在说明资源可得，
+    电影的"未上映/未定档缓搜"在这条路径上必须让位、立即排队。"""
+    async with db.session() as session:
+        service = _service(session)
+
+        # 无订阅 → 按缺失单元新建：未上映电影不能被缓搜排到未来
+        item, _, _ = await service.prepare(MediaKind.MOVIE, 101)
+        sub, _ = await service.redownload_missing_units(MediaKind.MOVIE, item, {(0, 0)})
+        w = (await _wanted_of(session, sub.id))[0]
+        assert w.next_search_at is not None
+        assert w.next_search_at <= utcnow()
+
+        # 已有订阅、工单未定档（NULL 不可调度）→ 重下同样强制排队
+        undated = await service.create(MediaKind.MOVIE, 103)
+        w = (await _wanted_of(session, undated.id))[0]
+        assert w.next_search_at is None
+        item, _, _ = await service.prepare(MediaKind.MOVIE, 103)
+        _, requeued = await service.redownload_missing_units(MediaKind.MOVIE, item, {(0, 0)})
+        assert requeued == 1
+        w = (await _wanted_of(session, undated.id))[0]
+        assert w.next_search_at is not None
+        assert w.next_search_at <= utcnow()
+
+
 # ---------------------------------------------------------------------------
 # 即时搜索触发收口在 service 层（任何入口共用，不依赖路由自觉）
 # ---------------------------------------------------------------------------
@@ -639,3 +770,87 @@ async def test_write_paths_kick_instant_search(db, monkeypatch) -> None:
         _, requeued = await service.redownload_missing_units(MediaKind.MOVIE, item, {(0, 0)})
         assert requeued == 1
         assert len(kicks) == 3  # 缺失重下同样即时发车
+
+
+# ---------------------------------------------------------------------------
+# 首页预告（today_arrivals）：今天优先 + 一周内回退，永远回答"下一次是什么时候"
+# ---------------------------------------------------------------------------
+
+
+async def test_today_arrivals_falls_back_to_nearest_upcoming_day(db) -> None:
+    """今天没有安排时回退到窗口内最近的一天；窗口外的远期集不参与预告。
+
+    回归背景：订阅少的用户几乎天天看到空栏目，既没信息也让人怀疑功能坏了。
+    """
+    async with db.session() as session:
+        service = _service(session)
+        await service.create(MediaKind.TV, 202, selected_seasons=[1])
+        # 200 的 S2E2 在十天后播出，落在一周窗口之外，不该被拉进预告
+        await service.create(MediaKind.TV, 200, selected_seasons=[2])
+
+        arrivals = await service.today_arrivals()
+
+    assert [row.media.title for row in arrivals] == ["本周更新剧集"]
+    assert arrivals[0].days_ahead == 3
+    assert arrivals[0].expected_day == _SITE_TODAY + timedelta(days=3)
+
+
+async def test_today_arrivals_prefers_today_over_upcoming(db) -> None:
+    """今天有安排就只讲今天——首页不退化成一张七天流水账。"""
+    async with db.session() as session:
+        service = _service(session)
+        await service.create(MediaKind.TV, 202, selected_seasons=[1])
+        await service.create(MediaKind.TV, 203, selected_seasons=[1])
+
+        arrivals = await service.today_arrivals()
+
+    assert [row.media.title for row in arrivals] == ["今日更新剧集"]
+    assert arrivals[0].days_ahead == 0
+
+
+async def test_today_arrivals_includes_movie_only_inside_pipeline(db) -> None:
+    """电影没有播出日：还在找资源时不占预告位，已投递则和剧集一样报"下载中"。"""
+    async with db.session() as session:
+        service = _service(session)
+        sub = await service.create(MediaKind.MOVIE, 100)
+
+        assert await service.today_arrivals() == []
+
+        wanted = (await _wanted_of(session, sub.id))[0]
+        wanted.info_hash = "a" * 40
+        await _mark(session, wanted, WantedStatus.GRABBED)
+
+        arrivals = await service.today_arrivals()
+
+    assert [row.media.title for row in arrivals] == ["测试电影"]
+    assert arrivals[0].days_ahead == 0  # 管道内的内容随时可能落地，归入今天
+
+
+async def test_today_arrivals_keeps_focus_day_per_media_kind(db) -> None:
+    """电影今天在下载，不能顶掉剧集三天后的更新——首页分区是按类型切的。
+
+    回归背景：焦点日曾经跨类型只算一次，用户切到剧集分区会看到一句并不成立的
+    "接下来一周没有更新"，而实际上三天后就有。
+    """
+    async with db.session() as session:
+        service = _service(session)
+        movie = await service.create(MediaKind.MOVIE, 100)
+        await service.create(MediaKind.TV, 202, selected_seasons=[1])
+
+        wanted = (await _wanted_of(session, movie.id))[0]
+        wanted.info_hash = "b" * 40
+        await _mark(session, wanted, WantedStatus.GRABBED)
+
+        arrivals = await service.today_arrivals()
+
+    by_title = {row.media.title: row.days_ahead for row in arrivals}
+    assert by_title == {"测试电影": 0, "本周更新剧集": 3}
+
+
+async def test_today_arrivals_ignores_overdue_episodes(db) -> None:
+    """早该播出却没抓到的旧集属于详情页的缺口清单，不该当成未来安排预告。"""
+    async with db.session() as session:
+        service = _service(session)
+        await service.create(MediaKind.TV, 200, selected_seasons=[1])
+
+        assert await service.today_arrivals() == []

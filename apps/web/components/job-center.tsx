@@ -87,18 +87,18 @@ const LANGUAGE_LABELS: Record<string, string> = {
 
 const STATUS_STYLE: Record<JobStatus, { dot: string; border?: string }> = {
   queued: { dot: "bg-white/40" },
-  running: { dot: "animate-pulse bg-[#7dd3fc]" },
-  retry_wait: { dot: "bg-[#fcd34d]" },
-  cancelling: { dot: "bg-[#fcd34d]" },
+  running: { dot: "animate-pulse bg-[var(--info)]" },
+  retry_wait: { dot: "bg-[var(--warn)]" },
+  cancelling: { dot: "bg-[var(--warn)]" },
   waiting: { dot: "bg-white/40" },
   blocked: {
-    dot: "bg-[#fca5a5]",
-    border: "border-[#fca5a5]/20",
+    dot: "bg-[var(--danger)]",
+    border: "border-[var(--danger)]/20",
   },
-  succeeded: { dot: "bg-[#86efac]" },
+  succeeded: { dot: "bg-[var(--ok)]" },
   failed: {
-    dot: "bg-[#fca5a5]",
-    border: "border-[#fca5a5]/20",
+    dot: "bg-[var(--danger)]",
+    border: "border-[var(--danger)]/20",
   },
   cancelled: { dot: "bg-white/30" },
 };
@@ -390,12 +390,12 @@ export function JobCard({ job, onNavigate }: { job: JobView; onNavigate: () => v
     statusStyle.border ?? (hasDomainAlert ? "border-amber-300/15" : "border-white/[0.08]");
   const progressAccent =
     job.status === "succeeded"
-      ? "bg-[#86efac]"
+      ? "bg-[var(--ok)]"
       : job.status === "failed" || job.status === "blocked"
-        ? "bg-[#fca5a5]"
+        ? "bg-[var(--danger)]"
         : job.status === "retry_wait" || job.status === "cancelling"
-          ? "bg-[#fcd34d]"
-          : "bg-[#7dd3fc]";
+          ? "bg-[var(--warn)]"
+          : "bg-[var(--info)]";
   const amount = progressAmount(job);
   const phase = JOB_PHASE_LABELS[job.progress.phase] ?? job.progress.phase;
   const phaseStep =
@@ -519,7 +519,7 @@ export function JobCard({ job, onNavigate }: { job: JobView; onNavigate: () => v
         <div
           className={`${compact ? "mt-1 text-caption leading-5" : "mt-2.5 text-sub leading-5"} ${
             attention
-              ? "rounded-xl border border-[#fca5a5]/15 bg-[#fca5a5]/[0.06] px-3 py-2.5 text-[#fecaca]"
+              ? "rounded-xl border border-[var(--danger)]/15 bg-[var(--danger)]/[0.06] px-3 py-2.5 text-[var(--danger)]"
               : compact
                 ? "text-white/50"
                 : "text-white/60"
@@ -723,14 +723,14 @@ export function JobCenter({ collapsed, active = false }: { collapsed: boolean; a
       <span className="relative shrink-0">
         <ClockIcon className="size-[18px] max-md:size-[22px]" />
         {activeCount > 0 && (
-          <span className="absolute -right-1 -top-1 size-2 rounded-full bg-[#7dd3fc]" />
+          <span className="absolute -right-1 -top-1 size-2 rounded-full bg-[var(--info)]" />
         )}
       </span>
       {!collapsed && (
         <>
           <span className="flex-1 text-ui font-medium">任务中心</span>
           {activeCount > 0 && (
-            <span className="rounded-full bg-[#7dd3fc]/20 px-1.5 py-0.5 text-[11px] font-semibold leading-none text-[#b9e8ff]">
+            <span className="rounded-full bg-[var(--info)]/20 px-1.5 py-0.5 text-[11px] font-semibold leading-none text-[var(--info)]">
               {activeCount}
             </span>
           )}

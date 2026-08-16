@@ -341,14 +341,18 @@ async def list_subscriptions(
 @router.get(
     "/today-arrivals",
     response_model=ApiResponse[list[TodayArrivalView]],
-    summary="列出今天可能入库的订阅剧集",
+    summary="列出最近一次可能入库的订阅内容",
     operation_id="subscriptions.list-today-arrivals",
 )
 async def list_today_arrivals(
     principal: Principal = Depends(require_login),
     session: AsyncSession = Depends(get_session),
 ) -> ApiResponse[list[TodayArrivalView]]:
-    """首页专用聚合：成员沿用“自己发起 + 自己关注”的订阅可见边界。"""
+    """首页专用聚合：成员沿用“自己发起 + 自己关注”的订阅可见边界。
+
+    今天没有安排时自动回退到一周内最近的那一天（``days_ahead`` > 0），
+    因此返回空数组只意味着一周内确实无事可预告。
+    """
     candidates = await _service(session).today_arrivals(
         member_id=None if principal.is_admin else principal.member_id
     )
@@ -361,6 +365,8 @@ async def list_today_arrivals(
                 next_probe_at=candidate.next_probe_at,
                 release_to_import_minutes=candidate.release_to_import_minutes,
                 download_to_import_minutes=candidate.download_to_import_minutes,
+                expected_day=candidate.expected_day,
+                days_ahead=candidate.days_ahead,
             )
             for candidate in candidates
         ]
@@ -507,7 +513,8 @@ async def search_subscription_now(
     principal: Principal = Depends(require_subscribe_capability),
     session: AsyncSession = Depends(get_session),
 ) -> ApiResponse[SearchNowView]:
-    """只重置"本来就能搜"的缺口（未定档/待播出/在途的不碰）；订阅暂停中、
+    """剧集只重置"本来就能搜"的缺口（未定档/待播出/在途的不碰）；电影是
+    用户强制——未上映/未定档也搜，搜完自动恢复上映档期调度。订阅暂停中、
     或没有可搜缺口时给可读中文错误。"""
     service = _service(session)
     await service.assert_can_manage(

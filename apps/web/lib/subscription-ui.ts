@@ -132,6 +132,8 @@ export interface TodayArrivalGroup {
   episodeLabel: string;
   episodeCount: number;
   firstWantedId: number;
+  /** 距今天几天（0=今天）；后端已把整批候选收敛到同一天。 */
+  daysAhead: number;
   presentation: TodayArrivalPresentation;
 }
 
@@ -157,8 +159,12 @@ function episodeRanges(episodes: number[]): string {
     .join("、");
 }
 
-/** 同一订阅同日更新的集数合并成一条紧凑的季集范围。 */
+/**
+ * 同一订阅同日更新的集数合并成一条紧凑的季集范围。
+ * 电影的工单是 (0,0) 哨兵，季集号对用户没有意义，直接标“电影”。
+ */
 function groupedEpisodeLabel(rows: PresentedTodayArrival[]): string {
+  if (rows[0].arrival.media_kind === "movie") return "电影";
   const bySeason = new Map<number, number[]>();
   for (const { arrival } of rows) {
     const episodes = bySeason.get(arrival.season_number) ?? [];
@@ -210,6 +216,7 @@ export function groupTodayArrivals(rows: PresentedTodayArrival[]): TodayArrivalG
     episodeLabel: groupedEpisodeLabel(group),
     episodeCount: group.length,
     firstWantedId: Math.min(...group.map(({ arrival }) => arrival.wanted_id)),
+    daysAhead: group[0].arrival.days_ahead,
     presentation: blockingPresentation(group),
   }));
 }
@@ -224,14 +231,27 @@ function localDayKey(value: Date): string {
   return `${value.getFullYear()}-${value.getMonth()}-${value.getDate()}`;
 }
 
-/** 首页只展示一个结果时间：同日写时刻，跨到次日时明确标注“明日”。 */
-function formatEstimatedArrival(timestamp: number, now: Date): string {
-  const value = new Date(timestamp);
-  const clock = new Intl.DateTimeFormat("zh-CN", {
+function formatClock(value: Date): string {
+  return new Intl.DateTimeFormat("zh-CN", {
     hour: "2-digit",
     minute: "2-digit",
     hour12: false,
   }).format(value);
+}
+
+/**
+ * 站点日历日（YYYY-MM-DD）转“M月D日”。按字段切分而不是 Date.parse——
+ * 后者把纯日期当 UTC 零点解析，负时区浏览器会整整早显示一天。
+ */
+function formatCalendarDay(day: string): string | null {
+  const [, month, date] = day.split("-").map(Number);
+  return Number.isFinite(month) && Number.isFinite(date) ? `${month}月${date}日` : null;
+}
+
+/** 首页只展示一个结果时间：同日写时刻，跨到次日时明确标注“明日”。 */
+function formatEstimatedArrival(timestamp: number, now: Date): string {
+  const value = new Date(timestamp);
+  const clock = formatClock(value);
   if (localDayKey(value) === localDayKey(now)) return `约 ${clock}`;
   const tomorrow = new Date(now);
   tomorrow.setDate(tomorrow.getDate() + 1);
@@ -292,7 +312,27 @@ export function todayArrivalPresentation(
       : estimatedWantedArrival(arrival, predictedAt, now);
   return {
     statusLabel: predictedAt != null && predictedAt <= now.getTime() ? "等待资源" : "预计入库",
-    timeLabel: estimatedAt == null ? "时间待更新" : formatEstimatedArrival(estimatedAt, now),
+    timeLabel:
+      estimatedAt == null
+        ? pendingTimeLabel(arrival)
+        : formatEstimatedArrival(estimatedAt, now),
     estimatedAt,
   };
+}
+
+/**
+ * 还给不出入库时刻时的兜底文案，尽量比一句“时间待更新”多说一点。
+ *
+ * 隔天的预告只到“日”这个粒度：探测时刻只有时分，写在几天后的行上会被当成
+ * 今天的时刻误读，所以未来行先给日期；今天的行才用探测时刻，让用户看到
+ * 系统仍在按计划轮询，而不是停了。
+ */
+function pendingTimeLabel(arrival: TodaySubscriptionArrival): string {
+  if (arrival.days_ahead > 0) {
+    const day = formatCalendarDay(arrival.expected_day);
+    if (day) return `${day} 播出`;
+  }
+  const nextProbeAt = parsedTime(arrival.next_probe_at);
+  if (nextProbeAt != null) return `${formatClock(new Date(nextProbeAt))} 探测`;
+  return "时间待更新";
 }

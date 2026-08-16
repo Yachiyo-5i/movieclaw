@@ -90,7 +90,7 @@ export function LlmSetupNotice({
 }: LlmSetupNoticeProps) {
   const className =
     variant === "inline"
-      ? "inline-flex flex-wrap items-center gap-x-1 rounded-md border border-[#f5c451]/30 bg-[#f5c451]/10 px-2 py-0.5 text-caption leading-5 text-[#f5c451]"
+      ? "inline-flex flex-wrap items-center gap-x-1 rounded-md border border-[var(--warn)]/30 bg-[var(--warn)]/10 px-2 py-0.5 text-caption leading-5 text-[var(--warn)]"
       : "notice-surface mt-3 rounded-xl border border-[var(--line)] px-3.5 py-2.5 text-ui leading-5 text-[var(--text-muted)]";
   return (
     <p role="status" className={className}>

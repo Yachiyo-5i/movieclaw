@@ -31,10 +31,10 @@ import { formatRelativeTime } from "@/lib/time";
 
 const POLL_MS = 30_000;
 
-/** 严重度圆点颜色：error 用全站危险色，warning 用琥珀 */
+/** 严重度圆点颜色：直接取全站状态色，不另立色值 */
 const DOT_COLOR: Record<string, string> = {
   error: "var(--danger)",
-  warning: "#f5a623",
+  warning: "var(--warn)",
 };
 
 export function NoticeCenter({ collapsed }: { collapsed: boolean }) {
@@ -100,7 +100,7 @@ function NoticeCenterInner({ collapsed }: { collapsed: boolean }) {
         {!collapsed && (
           <>
             <span className="flex-1 text-ui font-medium">待处理</span>
-            <span className="rounded-full bg-[var(--danger)] px-1.5 py-0.5 text-[11px] font-semibold leading-none text-white">
+            <span className="rounded-full bg-[var(--danger-solid)] px-1.5 py-0.5 text-[11px] font-semibold leading-none text-white">
               {notices.length}
             </span>
           </>
