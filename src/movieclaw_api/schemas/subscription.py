@@ -372,10 +372,15 @@ class TodayArrivalView(BaseModel):
     subscription_id: int
     wanted_id: int
     media_title: str
+    media_kind: Literal["movie", "tv"]
     season_number: int
     episode_number: int
     status: Literal["wanted", "grabbed", "downloaded"]
     air_date: date | None
+    expected_day: date = Field(description="预计入库/播出的站点日历日，用于展示日期")
+    days_ahead: int = Field(
+        description="expected_day 距今天几天（0=今天）；站点日历口径，前端据此切换今日/预告文案"
+    )
     release_forecast: dict | None
     next_probe_at: datetime | None = Field(
         description="按站点游标与礼貌间隔换算后的下一次有效预测探测时间"
@@ -404,15 +409,20 @@ class TodayArrivalView(BaseModel):
         next_probe_at: datetime | None,
         release_to_import_minutes: int,
         download_to_import_minutes: int,
+        expected_day: date,
+        days_ahead: int,
     ) -> TodayArrivalView:
         return cls(
             subscription_id=sub.id,  # type: ignore[arg-type]
             wanted_id=wanted.id,  # type: ignore[arg-type]
             media_title=item.title,
+            media_kind=item.kind,  # type: ignore[arg-type]
             season_number=wanted.season_number,
             episode_number=wanted.episode_number,
             status=wanted.status,  # type: ignore[arg-type]
             air_date=wanted.air_date,
+            expected_day=expected_day,
+            days_ahead=days_ahead,
             release_forecast=wanted.release_forecast,
             next_probe_at=next_probe_at,
             info_hash=wanted.info_hash,

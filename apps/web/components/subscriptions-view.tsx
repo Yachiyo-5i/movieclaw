@@ -135,10 +135,8 @@ export function SubscriptionsView() {
     reload();
   }, [reload]);
 
-  const todayArrivalsEnabled =
-    mediaType !== "movie" &&
-    subscriptions !== null &&
-    subscriptions.some((sub) => sub.media.kind === "tv");
+  // 只要有订阅就取预告：电影在下载/整理阶段同样进这块，切到电影分区也要有内容。
+  const todayArrivalsEnabled = subscriptions !== null && subscriptions.length > 0;
   const refreshTodayArrivals = useCallback(() => {
     if (!todayArrivalsEnabled) return;
     const requestId = ++todayArrivalsRequestRef.current;
@@ -160,8 +158,8 @@ export function SubscriptionsView() {
       });
   }, [todayArrivalsEnabled]);
 
-  // 今日区域属于“全部”和“剧集”视图。首次进入与订阅清单变化时立即读取，
-  // 停留期间每 10 秒静默同步；后台标签页暂停，恢复可见时补一次。已有快照
+  // 首次进入与订阅清单变化时立即读取，停留期间每 10 秒静默同步；
+  // 后台标签页暂停，恢复可见时补一次。已有快照
   // 遇到瞬时请求失败继续保留，避免时间轨道闪成错误态或重新出现加载文案。
   useEffect(() => {
     if (!todayArrivalsEnabled) {
@@ -296,17 +294,17 @@ export function SubscriptionsView() {
         </Link>
       )}
 
-      {mediaType !== "movie" &&
-        subscriptions !== null &&
-        !failed &&
-        tvSubscriptions.length > 0 && (
-          <TodayArrivalsSection
-            arrivals={todayArrivals}
-            failed={todayArrivalsFailed}
-            downloadTasks={downloadTasks}
-            canOpenTasks={isAdmin}
-          />
-        )}
+      {subscriptions !== null && !failed && visible.length > 0 && (
+        <TodayArrivalsSection
+          arrivals={todayArrivals}
+          failed={todayArrivalsFailed}
+          downloadTasks={downloadTasks}
+          canOpenTasks={isAdmin}
+          mediaType={mediaType}
+          trackingCount={visible.filter((sub) => sub.status === "active").length}
+          canSubscribe={canSubscribe}
+        />
+      )}
 
       {subscriptions === null && !failed && (
         <div className="mt-16 flex items-center justify-center gap-2.5 text-ui text-[var(--text-muted)]">
@@ -478,19 +476,30 @@ function SubscriptionSection({
 }
 
 /**
- * 首页首屏的今日待入库摘要。这里刻意不放海报与下载百分比：标题负责识别，
+ * 首页首屏的待入库摘要。这里刻意不放海报与下载百分比：标题负责识别，
  * “下载中”深链到任务中心查看完整下载细节，避免和下方订阅海报墙重复。
+ *
+ * 这块的目标是回答一个问题：“我下一次能看到新东西是什么时候”。因此它永远
+ * 有话说——今天有安排讲今天，没有就讲后端回退给出的最近一天（``daysAhead`` > 0），
+ * 一周内都没有则说明订阅仍在追踪。空着不说话会让用户以为功能坏了。
  */
 function TodayArrivalsSection({
   arrivals,
   failed,
   downloadTasks,
   canOpenTasks,
+  mediaType,
+  trackingCount,
+  canSubscribe,
 }: {
   arrivals: TodaySubscriptionArrival[] | null;
   failed: boolean;
   downloadTasks: DownloadTask[];
   canOpenTasks: boolean;
+  mediaType: SubscriptionFilter;
+  /** 当前分区里仍在追踪的订阅数，用于空态说明“系统还在盯着”。 */
+  trackingCount: number;
+  canSubscribe: boolean;
 }) {
   const [now, setNow] = useState(() => new Date());
   useEffect(() => {
@@ -503,7 +512,9 @@ function TodayArrivalsSection({
     [downloadTasks],
   );
   const rows = useMemo(() => {
+    // 预告跟随当前分区：切到电影就只看电影，避免和下方海报墙讲不同的事。
     const presented = (arrivals ?? [])
+      .filter((arrival) => mediaType === "all" || arrival.media_kind === mediaType)
       .map((arrival) => {
         const task = arrival.info_hash
           ? taskByHash.get(arrival.info_hash.toLowerCase())
@@ -519,7 +530,11 @@ function TodayArrivalsSection({
       if (leftTime !== rightTime) return leftTime - rightTime;
       return left.firstWantedId - right.firstWantedId;
     });
-  }, [arrivals, now, taskByHash]);
+  }, [arrivals, mediaType, now, taskByHash]);
+
+  // 后端已把整批候选收敛到同一天，取首行即可判断这次讲的是今天还是预告。
+  const daysAhead = rows[0]?.daysAhead ?? 0;
+  const isUpcoming = rows.length > 0 && daysAhead > 0;
 
   return (
     <section
@@ -542,16 +557,23 @@ function TodayArrivalsSection({
             </span>
             <div className="min-w-0">
               <h3 id="today-arrivals-title" className="text-ui font-semibold text-white/92">
-                今日可能入库
+                {isUpcoming ? "即将入库" : "今日可能入库"}
               </h3>
               <p className="mt-0.5 truncate text-caption text-white/38">
-                播出、出种与下载状态动态估算
+                {isUpcoming
+                  ? "今天没有更新，这是接下来最近的一次"
+                  : "播出、出种与下载状态动态估算"}
               </p>
             </div>
           </div>
-          {arrivals !== null && !failed && (
+          {/* 空态不显示“0 部 · 0 集”——那看着像报错，而不是“今天没安排”。 */}
+          {arrivals !== null && !failed && rows.length > 0 && (
             <span className="tnum shrink-0 rounded-full border border-white/[0.075] bg-white/[0.045] px-2.5 py-1 text-caption text-white/48 shadow-[inset_0_1px_0_rgba(255,255,255,0.035)]">
-              {rows.length} 部 · {rows.reduce((total, row) => total + row.episodeCount, 0)} 集
+              {isUpcoming
+                ? daysAhead === 1
+                  ? "明天"
+                  : `${daysAhead} 天后`
+                : `${rows.length} 部 · ${rows.reduce((total, row) => total + row.episodeCount, 0)} 集`}
             </span>
           )}
         </header>
@@ -566,9 +588,30 @@ function TodayArrivalsSection({
             今日入库信息暂时不可用
           </p>
         )}
+        {/* 一周内确实无事可预告时，也要交代清楚系统的状态和用户的下一步，
+            不能只留一句“暂无”让人怀疑追踪停了。 */}
         {!failed && arrivals !== null && rows.length === 0 && (
-          <p className="relative px-5 py-5 text-sub text-[var(--text-muted)] max-md:px-4">
-            今天暂无可能入库的剧集
+          <p className="relative px-5 py-5 text-sub leading-relaxed text-[var(--text-muted)] max-md:px-4">
+            {trackingCount > 0 ? (
+              `接下来 7 天没有已定档的更新；${trackingCount} 部订阅仍在追踪，定档或出种后会自动开抓`
+            ) : (
+              <>
+                订阅都已收齐或暂停了
+                {canSubscribe && (
+                  <>
+                    {" · "}
+                    <Link
+                      href={
+                        `/discover/${mediaType === "movie" ? "movie" : "tv"}` as Route
+                      }
+                      className="text-violet-200/90 underline-offset-4 transition-colors hover:text-violet-100 hover:underline"
+                    >
+                      去发现页添加新的追踪目标 →
+                    </Link>
+                  </>
+                )}
+              </>
+            )}
           </p>
         )}
         {!failed && rows.length > 0 && (

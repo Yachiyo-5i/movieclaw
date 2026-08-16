@@ -19,6 +19,7 @@ from movieclaw_api.exceptions import BadRequestException, ConflictException
 from movieclaw_api.services.media_library import MediaLibraryService
 from movieclaw_api.services.rule_sets import RuleSetService
 from movieclaw_api.services.subscription import FUTURE_GRACE, SubscriptionService
+from movieclaw_api.services.subscription.matching import publish_calendar_date
 from movieclaw_db.engine import dispose_db, get_database, init_db
 from movieclaw_db.migrations import run_migrations
 from movieclaw_db.models import (
@@ -41,6 +42,12 @@ _AIRED = (_TODAY - timedelta(days=10)).isoformat()
 _YESTERDAY = (_TODAY - timedelta(days=1)).isoformat()
 _FUTURE_DATE = _TODAY + timedelta(days=10)
 _FUTURE = _FUTURE_DATE.isoformat()
+
+# 首页预告按站点业务日历（Asia/Shanghai）判断"今天"，UTC 凌晨会差一天，
+# 因此预告相关夹具统一用站点日历日构造，避免测试在特定时段假红。
+_SITE_TODAY = publish_calendar_date(utcnow())
+_SITE_TODAY_ISO = _SITE_TODAY.isoformat()
+_IN_WINDOW = (_SITE_TODAY + timedelta(days=3)).isoformat()
 
 _ROUTES = {
     "/3/movie/100": {
@@ -80,6 +87,39 @@ _ROUTES = {
             {"episode_number": 2, "name": "E2", "air_date": _FUTURE},
             {"episode_number": 3, "name": "E3", "air_date": None},
         ],
+    },
+    # 首页预告夹具：202 = 三天后播（窗口内）、203 = 今天播
+    "/3/tv/202": {
+        "id": 202,
+        "name": "本周更新剧集",
+        "original_name": "This Week Show",
+        "first_air_date": _IN_WINDOW,
+        "status": "Returning Series",
+        "external_ids": {},
+        "alternative_titles": {"results": []},
+        "translations": {"translations": []},
+        "seasons": [{"season_number": 1}],
+    },
+    "/3/tv/202/season/1": {
+        "name": "第 1 季",
+        "air_date": _IN_WINDOW,
+        "episodes": [{"episode_number": 1, "name": "E1", "air_date": _IN_WINDOW}],
+    },
+    "/3/tv/203": {
+        "id": 203,
+        "name": "今日更新剧集",
+        "original_name": "Today Show",
+        "first_air_date": _SITE_TODAY_ISO,
+        "status": "Returning Series",
+        "external_ids": {},
+        "alternative_titles": {"results": []},
+        "translations": {"translations": []},
+        "seasons": [{"season_number": 1}],
+    },
+    "/3/tv/203/season/1": {
+        "name": "第 1 季",
+        "air_date": _SITE_TODAY_ISO,
+        "episodes": [{"episode_number": 1, "name": "E1", "air_date": _SITE_TODAY_ISO}],
     },
 }
 
@@ -639,3 +679,66 @@ async def test_write_paths_kick_instant_search(db, monkeypatch) -> None:
         _, requeued = await service.redownload_missing_units(MediaKind.MOVIE, item, {(0, 0)})
         assert requeued == 1
         assert len(kicks) == 3  # 缺失重下同样即时发车
+
+
+# ---------------------------------------------------------------------------
+# 首页预告（today_arrivals）：今天优先 + 一周内回退，永远回答"下一次是什么时候"
+# ---------------------------------------------------------------------------
+
+
+async def test_today_arrivals_falls_back_to_nearest_upcoming_day(db) -> None:
+    """今天没有安排时回退到窗口内最近的一天；窗口外的远期集不参与预告。
+
+    回归背景：订阅少的用户几乎天天看到空栏目，既没信息也让人怀疑功能坏了。
+    """
+    async with db.session() as session:
+        service = _service(session)
+        await service.create(MediaKind.TV, 202, selected_seasons=[1])
+        # 200 的 S2E2 在十天后播出，落在一周窗口之外，不该被拉进预告
+        await service.create(MediaKind.TV, 200, selected_seasons=[2])
+
+        arrivals = await service.today_arrivals()
+
+    assert [row.media.title for row in arrivals] == ["本周更新剧集"]
+    assert arrivals[0].days_ahead == 3
+    assert arrivals[0].expected_day == _SITE_TODAY + timedelta(days=3)
+
+
+async def test_today_arrivals_prefers_today_over_upcoming(db) -> None:
+    """今天有安排就只讲今天——首页不退化成一张七天流水账。"""
+    async with db.session() as session:
+        service = _service(session)
+        await service.create(MediaKind.TV, 202, selected_seasons=[1])
+        await service.create(MediaKind.TV, 203, selected_seasons=[1])
+
+        arrivals = await service.today_arrivals()
+
+    assert [row.media.title for row in arrivals] == ["今日更新剧集"]
+    assert arrivals[0].days_ahead == 0
+
+
+async def test_today_arrivals_includes_movie_only_inside_pipeline(db) -> None:
+    """电影没有播出日：还在找资源时不占预告位，已投递则和剧集一样报"下载中"。"""
+    async with db.session() as session:
+        service = _service(session)
+        sub = await service.create(MediaKind.MOVIE, 100)
+
+        assert await service.today_arrivals() == []
+
+        wanted = (await _wanted_of(session, sub.id))[0]
+        wanted.info_hash = "a" * 40
+        await _mark(session, wanted, WantedStatus.GRABBED)
+
+        arrivals = await service.today_arrivals()
+
+    assert [row.media.title for row in arrivals] == ["测试电影"]
+    assert arrivals[0].days_ahead == 0  # 管道内的内容随时可能落地，归入今天
+
+
+async def test_today_arrivals_ignores_overdue_episodes(db) -> None:
+    """早该播出却没抓到的旧集属于详情页的缺口清单，不该当成未来安排预告。"""
+    async with db.session() as session:
+        service = _service(session)
+        await service.create(MediaKind.TV, 200, selected_seasons=[1])
+
+        assert await service.today_arrivals() == []
