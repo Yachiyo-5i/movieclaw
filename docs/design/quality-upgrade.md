@@ -1,0 +1,478 @@
+# 洗版功能设计方案
+
+> 状态：设计稿（P6）。前置调研见 `quality-upgrade-research.md`（Sonarr/Radarr/
+> MoviePilot/nas-tools 的机制拆解与真实用户反馈），本文不重复论据，只引用结论。
+> 行文沿用 `subscription.md` 的惯例：每节先给结论（决策），再给理由与被否掉的
+> 备选，方便回看时知道"为什么不是另一种"。
+
+## 0. 目标与反目标
+
+**产品目标**（按优先级）：
+
+1. **零新概念**：不给用户引入"打分 / Custom Format / cutoff 分数"等任何新词。
+   用户已经认识的概念只有：订阅、规则组、分辨率、片源（WEB-DL/蓝光/Remux）。
+   洗版设定必须完全落在这些既有概念里。
+2. **三层用户，渐进披露**：
+   - 默认层：什么都不配，行为正确（默认不洗版，收齐即止）；
+   - 简单层：想洗版的用户做**一次选择**（"洗到哪一档"），之后无人值守；
+   - 高级层：深度用户用规则组既有的全部维度（制作组白名单、HDR、体积……）
+     组合出精细玩法，不需要任何洗版专属的高级机制。
+3. **全程可解释**：当前版本是什么档、目标是什么档、差几档、为什么某个候选
+   没有被拿来洗，用户在详情页一眼看懂。
+
+**架构目标**（吸取调研教训，编号对应 research §5.1）：
+
+| # | 教训 | 本设计的对策 |
+|---|---|---|
+| 1 | arr 双轨 cutoff 语义分裂是最大共性痛点 | 洗版只有**一条档位阶梯、一条停止线**（§2） |
+| 2 | 微小分差触发重下（arr 补 Increment 才治好） | 用**离散档位**代替连续分数，档位不升不洗，天然免疫抖动（§2.3） |
+| 3 | 抓取打分与入库打分不同源 → 无限循环 | 比较永远对着**落库的质量快照**，不对文件二次解析（§4） |
+| 4 | "为什么抓/不抓/又抓"是两边社区高频求助 | 复用活动时间线 + 单元级"当前档→目标档"派生展示（§8.4） |
+| 5 | 策略外包给 TRaSH 生态的代价 | 洗版目标就是 3 个内置档位选项，**没有需要抄的配置**（§8.2） |
+| 6 | 洗版烧 ratio / 断种被封号 | 旧任务清理**复用换源的所有权/H&R 保护状态机**（§7.2） |
+
+**反目标（第一版明确不做）**：
+
+- 不做同档位内的"更好版本"替换（同为 1080p Remux 换官组）——这是 arr
+  Custom Format 的深水区，需要组偏好序与组内打分，复杂度与收益不成比例。
+  制作组白名单作为硬过滤依然生效（想只要官组：白名单 + 洗版目标即可组合出
+  "洗到官组 Remux 为止"）；
+- 不做 Proper/Repack 追新；
+- 不做 HDR/DV/编码维度的档位升级（作为硬过滤继续生效：`hdr=require` 的规则组
+  从第一次下载起就只接受 HDR，不存在"先 SDR 后洗 HDR"的路径，见 §11 开放问题）；
+- 不做 per-订阅的洗版参数覆盖（理由见 §3.1）；
+- 不做电影多版本长期共存的收藏家模式（`library_file` 天然支持多行，留给未来）。
+
+---
+
+## 1. 一句话设计
+
+**洗版 = 规则组里的一个字段（"洗到哪一档为止"）。** 订阅收齐后，若规则组配了
+洗版目标且某单元的当前版本档位低于目标，被动匹配和低频主动搜索会继续为它找
+**严格更高档位**的候选；新版本走既有投递→下载→入库管线，入库成功后旧版本进
+回收站、旧下载任务按换源同款规则安全清理；单元到达目标档位后自然安静。
+订阅的"已收齐"语义不变。
+
+数据流总览（只标注新增/改造点，其余全部复用现状）：
+
+```
+规则组 spec ──── upgrade_source / cutoff_resolution（新字段，§3.2）
+                     │
+被动匹配（主通道）    │         主动搜索 worker（低频兜底）
+evaluate_and_dispatch ┴─ 缺口单元：现有逻辑不变
+                      └─ 洗版单元（新）：imported ∧ in_scope ∧ 快照档位 < 目标档位
+                              │
+                    规则组硬过滤（复用 evaluate_rules）
+                              │
+                    档位比较 compare_upgrade（新纯函数，§5）
+                       candidate.rank > snapshot.rank ？
+                              │ 是
+                    dispatch 投递（复用，attempt 标记洗版语义，§6.2）
+                              │
+                    下载完成 → 监听导入 → 库存对账（改造点，§6.3）
+                       新文件档位确认提升 → 刷新 wanted.quality 快照
+                       → 写 UPGRADED 活动 → 旧版本清理（§7）
+```
+
+---
+
+## 2. 核心概念：档位阶梯（唯一的序，唯一的停止线）
+
+### 2.1 结论
+
+洗版比较使用一条**二元组字典序**的档位阶梯：
+
+```
+rank = (分辨率位次, 片源档)          # 字典序比较，分辨率严格优先
+
+分辨率位次：规则组 resolutions 列表的偏好顺序（第一位最高）；
+           未配置时用内置默认序 2160p > 1080p > 720p
+           （与 rules._DEFAULT_RESOLUTION_SCORE 同源）
+
+片源档（source tier，内置固定，不暴露配置）：
+  T5  Remux            （attrs.remux=True）
+  T4  Blu-ray 重编码    （Blu-ray / UHD Blu-ray，remux=False）
+  T3  WEB-DL
+  T2  Rip 类           （WEBRip / BDRip / HDRip / DVDRip）
+  T1  TV 录制类        （HDTV / TVRip / DVD）
+  ——  未知             （不可比，见 2.4）
+```
+
+**升级判定**：`rank(候选) > rank(当前快照)` 严格成立才算升级。
+**停止判定**：`rank(当前快照) ≥ rank(洗版目标)` 即到顶，不再调度。
+洗版目标 = `(cutoff_resolution 或 resolutions 首选, upgrade_source)`，见 §3.2。
+
+### 2.2 为什么是"分辨率 × 片源"二元组，而不是别的
+
+- 这两个维度是**用户讨论"版本好坏"时实际使用的语言**（"1080p WEB-DL"、
+  "4K 原盘"），也是种子侧（enrich）与文件侧（probe/enrich）都能可靠拿到的字段
+  （两侧字段对齐度分析见 §4.2）；
+- 分辨率位次取自规则组已有的 `resolutions` 偏好序，**复用了用户已经表达过的
+  偏好**——想"1080p 优先于 2160p"的用户（省空间党）调整既有列表顺序即可，
+  洗版自动跟随，不需要 arr 那种 merge-quality hack；
+- 字典序 = 单一全序 = 每次比较可以用一句中文解释（"候选是 1080p WEB-DL（T3），
+  当前已是 1080p 蓝光（T4），不构成升级"）。
+
+**被否备选：连续打分 + 分数 cutoff（arr 式）。** 打分的表达力上限更高，但调研
+显示它是复杂度和不可解释性的主要来源（用户看不懂 1001 分为什么洗 1000 分），
+还需要 Increment 字段打补丁。movieclaw 的评分公式（free/做种/分辨率）继续只做
+**候选间选优**，不参与"是否构成升级"的判定——促销和做种数是"现在下谁划算"，
+不是"这个版本更好"，两件事分开。
+
+**被否备选：把 HDR/编码纳入阶梯（三元组、四元组）。** 每加一维，"为什么不
+洗"的解释难度翻倍，且文件侧与种子侧的 HDR/编码字段命名空间不一致（§4.2），
+第一版先不背。HDR 用户用 `hdr=require` 硬过滤从源头保证。
+
+### 2.3 离散档位天然免疫抖动
+
+arr 的 "+1 分洗整部" 问题根源是连续分数上任何正差值都算升级。档位阶梯下，
+同档位内的任何差异（不同制作组、不同体积、免费与否）都**不触发**洗版，
+不需要"最小提升步长"这类补丁概念。
+
+### 2.4 未知不可比（沿用三态铁律）
+
+沿用 `matcher/rules.py` 的三态原则与换源 `quality_not_lower` 的既有立场
+（"未知不是最低品质"）：
+
+- **候选**分辨率或片源未知 → 不参与洗版（拒绝码 `upgrade_not_comparable`）；
+- **当前快照**缺失或关键维度未知 → 该单元不参与洗版，详情页如实标注
+  "无法识别当前版本，洗版未启动"（而不是把未知当最低档乱洗）。
+
+---
+
+## 3. 配置模型：洗版设定住在规则组里
+
+### 3.1 结论：规则组是洗版策略的唯一家，订阅不加开关
+
+- 规则组 spec 新增洗版目标字段（§3.2）；**目标为空 = 不洗版**，即默认行为；
+- 订阅通过 `rule_set_id` 继承洗版设定，**不新增任何订阅级字段**；
+- 想给某部剧单独的洗法 → 换/复制规则组（既有哲学："想微调就复制一个规则组"，
+  `rule-sets-panel.tsx` 文件头注释明示；换组弹窗 `RuleSetSwitchDialog` 已存在）。
+
+理由：
+
+1. 规则组的职责边界（`rule_set.py` docstring）本来就是"什么可接受 + 谁更好，
+   预留洗版 cutoff"——"好到什么程度为止"是同一职责域的自然延伸；
+2. 全局默认 + 订阅覆盖的诉求（MoviePilot 的批量配置痛点）被规则组机制**原地
+   解决**：改默认规则组 = 改全局默认，换组 = 单订阅覆盖，零新机制；
+3. 避免"策略有两个家"（arr 的 Upgrades Allowed 开关在 profile、Propers 开关在
+   Media Management、体积上限在 Quality Definitions，用户找不到北）。
+
+**被否备选：订阅详情页"更多"菜单加洗版开关（与"自动续订"并列）。** 语义上
+诱人（都是订阅的可选延长阶段），但它会制造第二个策略家：开关在订阅、目标在
+规则组，用户要在两处拼出完整心智。且 MoviePilot 的教训恰恰是逐订阅开关带来
+批量操作冗余。订阅详情页只做**展示与解释**，不做配置（§8.3）。
+
+### 3.2 `RuleSetSpec` 字段（`src/movieclaw_matcher/models.py`）
+
+```python
+# 洗版（P6 启用；两个字段都缺省 = 不洗版）
+upgrade_source: str | None = None
+    # 洗版目标片源档："web-dl" / "blu-ray" / "remux"
+    # None = 不洗版。这是用户在 UI 上做的那"一次选择"。
+cutoff_resolution: str | None = None
+    # 洗版目标分辨率（已预留字段，正式启用）。
+    # None = 取 resolutions 列表首选；resolutions 也为空时取 "1080p"
+    # （保守缺省：不因洗版把用户从 1080p 意外带进 4K 的磁盘占用，
+    #   对应调研里 44GB Forrest Gump 的教训）。
+sites: list[str]        # 维持预留，本期不动
+```
+
+校验：`upgrade_source` 只接受三个枚举值；`cutoff_resolution` 必须出现在
+`resolutions`（若后者非空）——洗版目标不能是规则组自己都不接受的分辨率。
+
+**修改不追溯已 grabbed** 的既有约定继续适用；修改规则组的洗版目标对"洗版中"
+单元的影响是幂等重算：目标降低/清空 → 已达标单元自然停止调度；目标升高 →
+下个调度周期继续洗。无需任何迁移动作。
+
+---
+
+## 4. 质量快照：同源比较，杜绝升级循环
+
+### 4.1 结论：`wanted_item` 新增 `quality` 快照列，比较只对快照
+
+```python
+# wanted_item 新增列
+quality: dict | None    # 满足该单元的当前版本质量快照（QualitySnapshot）
+                        # NULL = 未满足或无法识别；洗版比较的唯一基线
+```
+
+`QualitySnapshot` 是归一化后的最小结构（全部采用**种子侧 enrich 词表**的值域）：
+
+```python
+{"resolution": "1080p", "media_source": "WEB-DL", "remux": false,
+ "release_group": "FLUX", "hdr": ["HDR10"]}     # hdr/group 仅展示用，不参与档位
+```
+
+**写入时机与来源优先级**（在库存对账 `close_fulfilled_wanted` 关闭工单时落库）：
+
+1. 首选 `subscription_download_attempt.quality`——投递时对候选 `TorrentAttrs`
+   的快照（`dispatch.py` 已在写），与候选是**同一命名空间、同一次解析**，
+   零归一成本；
+2. 无 attempt（手工入库/扫描收编的文件）→ 对文件名跑一次 enrich 解析
+   （resolution/media_source/remux/release_group 都来自文件名，与种子侧同一套
+   词表与解析器），probe 的 `resolution` 作为 enrich 解析不出时的兜底；
+3. 都拿不到 → 快照置 NULL，该单元不参与洗版（§2.4）。
+
+### 4.2 为什么不直接对 `library_file` 的探测结果比较
+
+摸底确认两侧字段有三处对不上：`hdr`（`"DV"` vs `"Dolby Vision"`、list vs 标量）、
+`video_codec`（enrich 词表 vs ffprobe `codec_name` 原值）、`remux`（文件侧无此列）。
+更根本的是，**arr 系至今未根治的升级死循环（Radarr #11422）正是"抓取按种子名
+打分、导入按文件名重新打分"两次解析不一致造成的**。本设计的对策：
+
+- 判定"是否构成升级"**只对落库那一刻固化的快照**，同一单元的快照在下次成功
+  洗版前不变——同一个候选第二次出现时比较结果必然相同，循环在结构上不可能；
+- ffprobe 探测结果（bit_depth/bit_rate/色彩空间…）继续服务媒体库展示与
+  probe 兜底，**不进入洗版判定**；
+- 洗版成功后快照刷新为新 attempt 的 `quality`（又回到来源 1），闭环。
+
+### 4.3 存量回填
+
+规则组首次配置洗版目标时，引用它的订阅存在 `quality IS NULL` 的 imported 单元
+→ 排入一次性回填任务（按 §4.1 来源优先级补快照）。回填放在后台 tick 里逐批做，
+不阻塞规则组保存。
+
+---
+
+## 5. 决策引擎：`decision.py` 终于有了正文
+
+新增纯函数（延续 matcher 无 IO、表驱动单测的约定）：
+
+```python
+# movieclaw_matcher/decision.py
+
+def upgrade_rank(snapshot_or_attrs, spec) -> tuple[int, int] | None:
+    """算档位 rank=(分辨率位次, 片源档)；关键维度未知返回 None（不可比）。"""
+
+def compare_upgrade(candidate, snapshot, spec) -> UpgradeVerdict:
+    """洗版判定。三个否定出口 + 一个肯定出口，reason_text 为完整中文句：
+       - upgrade_not_comparable   候选/快照关键维度无法识别
+       - upgrade_at_cutoff        当前版本已达洗版目标
+       - upgrade_not_better       候选档位不高于当前版本
+       - accepted                 构成升级（附 from/to 档位中文标签）
+    """
+```
+
+片源档映射表放在 matcher 内（值域对齐 `movieclaw_enrich/vocab.py` 的
+`MEDIA_SOURCE`），**补全换源 `_SOURCE_RANK` 缺失的 BDRip/HDRip/DVD 档**；换源的
+`quality_not_lower` 后续可迁移到这张表上（见 §10 Phase 5），消除两套片源序。
+
+接线（`services/subscription/matching.py`）：
+
+- `load_match_context` 除缺口外，加载"洗版单元"：
+  `status=imported ∧ in_scope ∧ quality 非空 ∧ rank(quality) < rank(目标)`
+  ∧ 该单元当前没有在途的洗版 attempt（§6.2 去重）；
+- `evaluate_and_dispatch` 第一遍对洗版单元的判定链：
+  身份匹配 → `evaluate_rules`（硬过滤照旧，免费/做种/体积/黑白名单全部生效）
+  → `compare_upgrade`（新增一级）；
+- 第二遍选优不变：同一单元多个合格升级候选，按既有 `(is_pack, score, seeders)`
+  排序——评分公式在这里发挥作用（同为升级候选时优先免费、做种多的），
+  与"是否构成升级"的判定完全解耦；
+- **整季包对洗版单元沿用 Sonarr 的铁律**：包覆盖的每个单元都必须"缺失 或
+  构成合法升级"，任何一个单元判否即拒绝整包（`covered_units` 后逐单元判定），
+  杜绝"为洗 3 集重下整季"。
+
+**拒绝记录的噪音控制**（沿用"身份不匹配不记录"的既有粒度决策）：
+`upgrade_not_better` / `upgrade_at_cutoff` 是常态而非异常——热门剧每个新种子
+都会对洗版单元比较一遍——**不写活动**。可解释性由详情页的派生展示承担
+（"当前 1080p WEB-DL → 目标 1080p Remux，已搜 3 次"，§8.4）；`upgrade_not_comparable`
+按 MATCH_REJECTED 既有去重规则记录（这是用户需要知道的数据质量问题）。
+
+---
+
+## 6. 管线：状态机不动，洗版活在 attempt 层
+
+### 6.1 结论：不重开工单，`wanted_item.status` 保持单调
+
+`wanted_item` 的四个状态"每一步对应不可逆的现实事件"，且 imported 由库存对账
+推导。若洗版把 imported 退回 wanted，对账会立刻看见旧文件在位又把它关回
+imported——**状态机与真相源直接打架**。因此：
+
+- 洗版单元的 `status` 始终是 `imported`；
+- 洗版在途状态完全由 `subscription_download_attempt` 表达（该表按
+  `(subscription_id, info_hash)` 建模，天然支持一个单元同时存在旧主源与洗版
+  新源两条 attempt——换源已经验证过这个形态）；
+- `in_scope` 语义不变，出范围的单元同时退出洗版。
+
+**被否备选：新建 `upgrade_item` 表。** 与 wanted 单元 1:1 冗余，两张表同步
+in_scope/调度字段，纯增熵。
+
+### 6.2 投递与在途去重
+
+- dispatch 复用现状；attempt 新增一列 `purpose: str`（`"download"` 缺省 /
+  `"upgrade"`），用于：① 洗版在途去重（同单元至多一个洗版 attempt）；
+  ② 活动与通知文案分流（写 `UPGRADE_GRABBED` 而非 `GRABBED`）；
+  ③ 旧版本清理时定位被替换的旧 attempt；
+- 洗版 attempt 的下载观察（心跳/死种/换源救援）**零修改复用**——洗版源死了
+  同样走 replacement 救援，救援比较基线 `quality_not_lower` 用的正是 attempt
+  自己的 quality 快照，语义自洽。
+
+### 6.3 入库与完成判定
+
+监听导入/扫描发现新文件 → 库存对账扩展一个分支：
+
+```
+(条目,季,集) 命中的 wanted 已是 imported：
+  新文件质量快照 rank > 现有 quality 快照 rank
+    → 刷新 wanted.quality 为新快照
+    → 写 UPGRADED 活动（"S01E03 已洗版：1080p WEB-DL → 1080p Remux"）
+    → 触发旧版本清理（§7）
+    → IM 推送复用 imported 通道（event="upgraded"）
+  否则 → 仅作为多版本文件收编，不动快照（防止手工塞入的低版本把快照拉低）
+```
+
+**订阅 `completed` 语义不变**（收齐即"已收齐"）——洗版不计入
+`recompute_subscription_status` 的开放条件。理由：目标版本（如 Remux）可能
+永远不发布，若"到顶才算完成"（nas-tools 模式），订阅会无限期停在未完成态，
+违背"内容收齐了"的用户心智。前端在 completed 且存在洗版单元时显示
+"已收齐 · 洗版中"的复合态（§8.3），洗版全部到顶后自然回到纯净的"已收齐"。
+
+### 6.4 调度：被动为主，主动极低频
+
+- **被动匹配是洗版主通道**（对应 arr 的 RSS 比对模式）：新种子入库即评估，
+  零额外站点成本——这决定了洗版的时效性天然够用，主动搜索只是兜底；
+- 主动搜索复用 wanted worker 与 `next_search_at` 调度字段（imported 态下这组
+  字段已闲置，语义文档化为"洗版搜索调度"）：
+  - `priority = -10`（低于补旧 0 与追新 10，永远排在缺口后面）；
+  - 专属退避曲线：`7d → 14d → 30d 封顶`（洗版不急，对 PT 站克制是铁律）；
+  - 触发排期的时机：规则组配置/修改洗版目标（回填任务顺带排期，首搜分散在
+    24h 内错峰）、订阅换到带洗版目标的组、单元完成首次入库且未达目标；
+  - "立即搜索"按钮的语义扩展为同时覆盖缺口与洗版单元（不新增端点）。
+
+---
+
+## 7. 文件替换与做种保护
+
+### 7.1 旧库文件：回收站兜底
+
+新版本确认入库（§6.3）后，旧版本的 `library_file` 行与物理文件处理：
+
+- 物理文件移入 `data/trash/`（遵循"运行期数据全部落 `data/`"约定），
+  保留 7 天后由既有清理 tick 删除；`library_file` 行标记删除原因后移除
+  （不复用 `missing_since`——那是"意外消失"，这是"主动替换"）；
+- 第一版**不暴露**"永久删除/保留并存"配置项，回收站是无条件的安全网
+  （对应调研教训：误洗回退是刚需，arr 的 Recycling Bin 是唯一保险）；
+- 库详情页多版本视图（`library_file` 多行天然支持）保留手动删除入口。
+
+### 7.2 旧下载任务：复用换源清理状态机
+
+洗版成功后，被替换的旧 attempt 进入换源既有的清理通道
+（`cleanup_pending → superseded / retained`）：
+
+- `owned_by_movieclaw ∧ 无 H&R 风险 ∧ 做种达标` → 删除下载任务；
+- 否则 `retained` 保留做种（**洗版绝不制造 H&R**——这是对 PT 场景最重要的
+  承诺，也是 arr 至今没有原生方案的缺口）；
+- 下载目录与库文件是同一物理文件的部署（inplace 模式）：旧库文件**不进
+  回收站**，保留至旧 attempt 满足清理条件时一并处理（具体判据见 §11）。
+
+---
+
+## 8. UX 设计
+
+### 8.1 概念账本
+
+用户视角新增的概念**只有一个**："洗版目标"（规则组里的一行 chips）。
+新增术语对齐既有术语表：UI 用「洗版」（该词在 UI 中尚未被占用；
+内部命名用 `upgrade`，**避开 `replacement`**——已被死种换源占用）。
+
+### 8.2 规则组编辑器（唯一配置点）
+
+`RuleSetEditorDialog` 新增一个 Field（复用既有 `Field`/`ToggleChip` 积木）：
+
+```
+洗版
+  [ 不洗版 ] [ 洗到 WEB-DL ] [ 洗到蓝光 ] [ 洗到 Remux ]
+  副文案：收齐后继续追更高版本，直到达到目标档位。新版本入库后
+         旧版本进回收站保留 7 天，做种中的任务不受影响。
+  （选中非"不洗版"时追加一行小字：目标分辨率 2160p——取上方
+    分辨率偏好的第一位，可在高级里单独调整）
+```
+
+- 三个档位选项**就是内置预设**——不存在需要照抄的社区配置（教训 #5）；
+- 副文案把后果讲在操作之前（回收站、做种安全），沿用既有文案风格；
+- 高级层：`cutoff_resolution` 作为洗版 Field 展开后的次级选择（默认跟随
+  分辨率偏好首选，绝大多数用户不需要碰）；
+- `specSummary()` 新增芯片：`洗到 2160p Remux`——订阅创建弹层、换组弹窗、
+  规则组清单**自动**获得洗版可见性，这是"让用户自然学会"的主路径：
+  用户在任何看到规则组摘要的地方都会遇到这枚芯片。
+
+**订阅创建弹层零改动**（维持"一次点击完成订阅，复杂度沉到默认值"的戒律，
+弹层已有 5 个概念，不再+1）。
+
+### 8.3 订阅详情页（只展示，不配置）
+
+- Hero 摘要卡：规则组 fact 带出洗版目标（"规则组：4K 精选 · 洗到 Remux"）；
+  状态文案在 completed ∧ 存在洗版单元时显示**"已收齐 · 洗版中"**；
+- 追踪明细 `WantedRow`：imported 且洗版中的单元，徽标从「已入库」变为
+  「洗版中」（青色系），说明行显示
+  `当前 1080p WEB-DL → 目标 1080p Remux · 已搜 3 次`；到顶后回到「已入库」；
+- 「更多」菜单不加洗版项；想改洗法走既有「更换规则组…」。
+
+### 8.4 可解释性通道
+
+- 新增 `ActivityType`：`upgrade_grabbed`（"S01E03 发现更高版本，已提交下载：
+  1080p Remux-FLUX，来自 xx 站"）、`upgraded`（"S01E03 已洗版：
+  1080p WEB-DL → 1080p Remux，旧版本已移入回收站"）——message 照旧由后端
+  写完整中文句，前端 `activityColor()` 各加一个 case（绿系）；
+- 常态否定（`upgrade_not_better`/`upgrade_at_cutoff`）不进活动流（§5），
+  解释责任由单元行的派生展示承担；
+- 库详情页：多版本文件各自显示档位徽标（`1080p WEB-DL` / `1080p Remux`），
+  回收站内旧版本可见可恢复（7 天内）。
+
+### 8.5 自然学习路径（对照产品目标 2）
+
+1. 新用户：默认规则组不洗版，全程零感知；
+2. 用户在规则组摘要芯片/编辑器里**看见**"洗版"字段与一句人话副文案——
+   认识这个功能只需要读一行字；
+3. 已收齐的订阅详情显示每个单元的当前版本档位——用户对"我库里是什么档"
+   建立感知，产生"想要更好"的动机时，答案（规则组里那行 chips）已经见过；
+4. 深度用户：分辨率偏好序 + 制作组黑白名单 + `cutoff_resolution` + 免费/体积
+   约束的组合已经覆盖"官组洗版""省流洗版""只在 free 时洗"等高级玩法——
+   **高级能力来自既有维度的组合，而非洗版专属配置**。
+
+---
+
+## 9. API 契约
+
+沿用统一信封与 snake_case，不新增端点：
+
+| 面 | 变更 |
+|---|---|
+| `PUT /rule-sets/{id}` | spec 接受 `upgrade_source` / `cutoff_resolution`（Pydantic 校验见 §3.2） |
+| `GET /subscriptions/{id}` | `wanted[]` 元素新增 `upgrade` 派生对象：`{active: bool, current_label: str, target_label: str, search_attempts: int} \| null`；`progress` 新增 `upgrading` 计数 |
+| `GET /subscriptions/{id}/activities` | 新增两个 `type` 值（见 §8.4） |
+| `POST /subscriptions/{id}/missing-resource-searches` | 语义扩展覆盖洗版单元，契约不变 |
+
+前端 TS（`apps/web/lib/api/subscriptions.ts`）：`RuleSetSpec` 补
+`upgrade_source?` / `cutoff_resolution?`（**顺带补齐现状缺失的 `sites?`，
+消除前后端 spec 类型漂移**）；`WantedItem` 补 `upgrade?`；
+`SubscriptionActivity["type"]` 联合补两个值。每处按约定写中文 JSDoc 并注明
+对应后端 schema。
+
+---
+
+## 10. 落地顺序（每步可独立验证）
+
+| Phase | 内容 | 验证 |
+|---|---|---|
+| 1 | matcher 纯函数：片源档映射表、`upgrade_rank`、`compare_upgrade`、`QualitySnapshot` 归一（含文件名 enrich 兜底路径） | 表驱动单测：真实种子名/文件名样本集，覆盖未知维度、整季包、档位边界 |
+| 2 | 模型迁移：`wanted_item.quality`、`attempt.purpose`、`RuleSetSpec` 新字段（向前兼容，旧 spec 读出即"不洗版"） | 迁移可前滚；旧数据行为零变化 |
+| 3 | 快照写入与回填：`close_fulfilled_wanted` 落快照；存量回填任务 | 新入库单元快照命中率；回填后 NULL 率可观测 |
+| 4 | 决策接线：`load_match_context` 洗版单元、`evaluate_and_dispatch` 判定链、整季包逐单元判定、调度排期与退避 | 端到端 dry-run（`SUBSCRIPTION_DISPATCH_DRY_RUN`）：造一个 WEB-DL 已入库的订阅，投放 Remux 种子进缓存，观察判定与活动 |
+| 5 | 入库对账扩展 + 旧版本清理（回收站 + attempt 清理通道）+ 活动/推送 | 端到端真投递：洗版完成后旧文件在 trash、旧任务 retained/superseded 正确 |
+| 6 | 前端：规则组 Field 与摘要芯片、详情页派生展示、TS 契约 | 交互走查三层用户路径（§8.5） |
+| 7 | 收尾：换源 `_SOURCE_RANK` 迁移到统一片源档表；文档 | 换源行为回归（`quality_not_lower` 等价性单测） |
+
+---
+
+## 11. 开放问题（P6 实现期决策）
+
+- [ ] inplace 模式下旧库文件与旧 attempt 联动清理的精确判据（做种达标信号
+      取下载器 seed goal 还是站点 H&R 规则，倾向前者）；
+- [ ] 回收站保留天数是否提升为全局设置（当前立场：写死 7 天，等真实反馈）；
+- [ ] HDR/DV 是否作为第三档位维度加入阶梯（当前立场：不加；若加，方案是
+      "同分辨率同片源下 HDR 视为高半档"，且仅在规则组 `hdr=any` 时生效——
+      `require/forbid` 用户已经从源头锁定了 HDR 属性）；
+- [ ] 电影收藏家的多版本共存模式（1080p 与 2160p 并存不清理）是否值得做——
+      `library_file` 多行与 `purpose` 字段已为它留好位置，等需求浮现。
