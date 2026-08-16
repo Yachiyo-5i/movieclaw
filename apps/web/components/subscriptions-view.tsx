@@ -441,18 +441,12 @@ function SubscriptionSection({
       {title && (
         <header className="sticky top-2 z-20 mb-4 px-6 max-md:px-4">
           <div className="flex items-center justify-between rounded-2xl border border-white/[0.09] bg-[linear-gradient(145deg,rgba(18,21,30,0.88),rgba(10,12,18,0.82))] px-4 py-2.5 shadow-[0_10px_28px_rgba(0,0,0,0.24),inset_0_1px_0_rgba(255,255,255,0.04)] backdrop-blur-xl">
+            {/* 只留标题：分组名已经说清是剧集还是电影，再加一个彩色圆点既没有
+                信息量，还会和海报上表示“追更中 / 在库”的绿点撞语义。 */}
             <h3
               id={`${kind}-subscriptions-title`}
-              className="flex items-center gap-2.5 text-ui font-semibold tracking-[-0.01em] text-white/90"
+              className="text-ui font-semibold tracking-[-0.01em] text-white/90"
             >
-              <span
-                aria-hidden="true"
-                className={`size-2 rounded-full ${
-                  kind === "tv"
-                    ? "bg-emerald-400 shadow-[0_0_10px_rgba(52,211,153,0.42)]"
-                    : "bg-violet-400 shadow-[0_0_10px_rgba(167,139,250,0.42)]"
-                }`}
-              />
               {title}
             </h3>
             <span className="tnum rounded-full border border-white/[0.07] bg-white/[0.04] px-2.5 py-0.5 text-caption text-[var(--text-muted)]">
