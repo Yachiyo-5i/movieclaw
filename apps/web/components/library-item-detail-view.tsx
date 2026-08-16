@@ -415,8 +415,8 @@ export function LibraryItemDetailView({
           {/* 刮削进行中的状态条：与库页的整库刷新面板同一套语言（阶段文案
               也同源），状态在服务端——离开页面/刷新浏览器回来照样看得到 */}
           {scrapingNow && (
-            <div className="mt-4 flex max-w-2xl items-center gap-2 rounded-xl border border-[#7dd3fc]/25 bg-[#7dd3fc]/[0.07] px-4 py-2.5 text-sub font-medium text-[#7dd3fc]">
-              <span className="size-3 shrink-0 animate-spin rounded-full border-[1.5px] border-[#7dd3fc]/30 border-t-[#7dd3fc]" />
+            <div className="mt-4 flex max-w-2xl items-center gap-2 rounded-xl border border-[var(--info)]/25 bg-[var(--info)]/[0.07] px-4 py-2.5 text-sub font-medium text-[var(--info)]">
+              <span className="size-3 shrink-0 animate-spin rounded-full border-[1.5px] border-[var(--info)]/30 border-t-[var(--info)]" />
               <span className="truncate">
                 正在刷新元数据
                 {detail.scraping_phase ? ` · ${detail.scraping_phase}` : ""}
@@ -639,7 +639,7 @@ function ItemActionsMenu({
           <MoreIcon className="size-[18px] max-md:size-[22px]" />
           {/* 任务在跑时给触发键点一个小点：菜单收起后也知道后台还在忙 */}
           {running && (
-            <span className="absolute right-1 top-1 size-1.5 animate-pulse rounded-full bg-[#7dd3fc]" />
+            <span className="absolute right-1 top-1 size-1.5 animate-pulse rounded-full bg-[var(--info)]" />
           )}
         </button>
       </DropdownMenu.Trigger>
@@ -1818,8 +1818,8 @@ function TransferDialog({
       {/* —— 底栏：进行中只留进度，不给"取消"（搬到一半停不下来）—— */}
       <div className="flex items-center gap-3 border-t border-white/[0.07] px-6 py-4">
         {running && (
-          <span className="flex min-w-0 flex-1 items-center gap-2 text-sub text-[#7dd3fc]">
-            <span className="size-3.5 shrink-0 animate-spin rounded-full border-2 border-[#7dd3fc]/30 border-t-[#7dd3fc]" />
+          <span className="flex min-w-0 flex-1 items-center gap-2 text-sub text-[var(--info)]">
+            <span className="size-3.5 shrink-0 animate-spin rounded-full border-2 border-[var(--info)]/30 border-t-[var(--info)]" />
             <span className="truncate">
               正在转移
               {status && status.total > 0 ? ` · ${status.processed}/${status.total}` : ""}

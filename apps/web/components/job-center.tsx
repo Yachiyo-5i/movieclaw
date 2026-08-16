@@ -87,7 +87,7 @@ const LANGUAGE_LABELS: Record<string, string> = {
 
 const STATUS_STYLE: Record<JobStatus, { dot: string; border?: string }> = {
   queued: { dot: "bg-white/40" },
-  running: { dot: "animate-pulse bg-[#7dd3fc]" },
+  running: { dot: "animate-pulse bg-[var(--info)]" },
   retry_wait: { dot: "bg-[#fcd34d]" },
   cancelling: { dot: "bg-[#fcd34d]" },
   waiting: { dot: "bg-white/40" },
@@ -395,7 +395,7 @@ export function JobCard({ job, onNavigate }: { job: JobView; onNavigate: () => v
         ? "bg-[#fca5a5]"
         : job.status === "retry_wait" || job.status === "cancelling"
           ? "bg-[#fcd34d]"
-          : "bg-[#7dd3fc]";
+          : "bg-[var(--info)]";
   const amount = progressAmount(job);
   const phase = JOB_PHASE_LABELS[job.progress.phase] ?? job.progress.phase;
   const phaseStep =
@@ -723,14 +723,14 @@ export function JobCenter({ collapsed, active = false }: { collapsed: boolean; a
       <span className="relative shrink-0">
         <ClockIcon className="size-[18px] max-md:size-[22px]" />
         {activeCount > 0 && (
-          <span className="absolute -right-1 -top-1 size-2 rounded-full bg-[#7dd3fc]" />
+          <span className="absolute -right-1 -top-1 size-2 rounded-full bg-[var(--info)]" />
         )}
       </span>
       {!collapsed && (
         <>
           <span className="flex-1 text-ui font-medium">任务中心</span>
           {activeCount > 0 && (
-            <span className="rounded-full bg-[#7dd3fc]/20 px-1.5 py-0.5 text-[11px] font-semibold leading-none text-[#b9e8ff]">
+            <span className="rounded-full bg-[var(--info)]/20 px-1.5 py-0.5 text-[11px] font-semibold leading-none text-[var(--info)]">
               {activeCount}
             </span>
           )}

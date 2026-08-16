@@ -235,7 +235,7 @@ export function TaskCenterView({
         <header>
           <div>
             <div className="flex items-center gap-2.5">
-              <ClockIcon className="size-6 text-[#b9e8ff]" />
+              <ClockIcon className="size-6 text-[var(--info)]" />
               <h1 className="text-on-image text-[26px] font-bold leading-tight tracking-[-0.02em] text-white max-md:text-[21px]">
                 任务中心
               </h1>
@@ -257,7 +257,7 @@ export function TaskCenterView({
                 failedSources.length > 0 || error
                   ? "bg-[#fcd34d]"
                   : loading && refreshedAt == null
-                    ? "animate-pulse bg-[#7dd3fc]"
+                    ? "animate-pulse bg-[var(--info)]"
                     : "bg-[#86efac]"
               }`}
             />
@@ -566,7 +566,7 @@ function TaskTimelineItem({
         ? "bg-[#86efac] text-[#07120b] ring-[#86efac]/20"
         : tone === "cancelled"
           ? "bg-white/20 text-white/60 ring-white/10"
-          : "bg-[#7dd3fc] ring-[#7dd3fc]/30";
+          : "bg-[var(--info)] ring-[var(--info)]/30";
   return (
     <div className="grid grid-cols-[3.75rem_1.5rem_minmax(0,1fr)] gap-x-2 last:[&_[data-timeline-line]]:hidden max-md:grid-cols-[1.25rem_minmax(0,1fr)] max-md:gap-x-2.5">
       <span
@@ -761,7 +761,7 @@ function ActiveJobFeedItem({
       {(percent != null || job.status === "running") && (
         <div className="mt-2.5 h-1.5 overflow-hidden rounded-full bg-white/[0.07]">
           <div
-            className={`h-full rounded-full bg-[#7dd3fc] transition-[width] duration-700 ${
+            className={`h-full rounded-full bg-[var(--info)] transition-[width] duration-700 ${
               percent == null ? "w-1/3 animate-pulse opacity-65" : ""
             }`}
             style={
@@ -929,6 +929,17 @@ function TaskHistorySection({
   );
 }
 
+/**
+ * 一个任务状态的展示三件套。``color`` 走内联样式（进度条与状态文字共用），
+ * ``dot`` 是状态点的 class。
+ *
+ * 取色只从 globals.css 的状态四档里挑（--ok / --info / --warn / --danger），
+ * 「没有 / 不会发生」不占状态色，用本表既有的中性灰。判断口径见 globals.css：
+ * 颜色说的是「系统状态」还是「你该做什么」，只有后者用 --danger。
+ *
+ * 同一档里的多个状态长得一样是刻意的——「下载中」和「校验中」都是正在进行，
+ * 区别由 label 承担；用色相去暗示它们是两类不同的东西，只会稀释颜色的信号。
+ */
 interface TaskStateMeta {
   label: string;
   color: string;
@@ -938,8 +949,8 @@ interface TaskStateMeta {
 const DOWNLOAD_STATE_META: Record<DownloadTask["state"], TaskStateMeta> = {
   downloading: {
     label: "下载中",
-    color: "#7dd3fc",
-    dot: "animate-pulse bg-[#7dd3fc]",
+    color: "var(--info)",
+    dot: "animate-pulse bg-[var(--info)]",
   },
   stalled: {
     label: "等待连接",
@@ -948,8 +959,8 @@ const DOWNLOAD_STATE_META: Record<DownloadTask["state"], TaskStateMeta> = {
   },
   paused: {
     label: "已暂停",
-    color: "#c4b5fd",
-    dot: "bg-[#c4b5fd]",
+    color: "var(--warn)",
+    dot: "bg-[var(--warn)]",
   },
   queued: {
     label: "排队中",
@@ -958,8 +969,8 @@ const DOWNLOAD_STATE_META: Record<DownloadTask["state"], TaskStateMeta> = {
   },
   checking: {
     label: "校验中",
-    color: "#c4b5fd",
-    dot: "animate-pulse bg-[#c4b5fd]",
+    color: "var(--info)",
+    dot: "animate-pulse bg-[var(--info)]",
   },
   completed: {
     label: "等待入库",
@@ -992,7 +1003,9 @@ const INGEST_STATE_META: Record<JobStatus, TaskStateMeta> = {
   blocked: { label: "入库待处理", color: "#fca5a5", dot: "bg-[#fca5a5]" },
   succeeded: { label: "入库完成", color: "#86efac", dot: "bg-[#86efac]" },
   failed: { label: "入库待处理", color: "#fca5a5", dot: "bg-[#fca5a5]" },
-  cancelled: { label: "入库已取消", color: "#c4b5fd", dot: "bg-[#c4b5fd]" },
+  // 已取消是终态，不会再有进展：归到本表的中性灰，和「等待入库 / 等待条件」
+  // 一样不占状态色——它们的区别本来就该由 label 说清楚。
+  cancelled: { label: "入库已取消", color: "#cbd5e1", dot: "bg-white/40" },
 };
 
 interface DownloadTaskGroup {
@@ -1078,7 +1091,7 @@ function DownloadTaskGroupFeed({
         <div className="mb-2 flex min-w-0 items-start justify-between gap-3">
           <div className="min-w-0 flex-1">
             <h3 className="flex min-w-0 items-center gap-2 text-ui font-semibold leading-5 text-white/90">
-              <span className="shrink-0 rounded-full border border-[#7dd3fc]/25 bg-[#7dd3fc]/[0.12] px-1.5 py-0.5 text-[11px] font-semibold leading-none text-[#b9e8ff]">
+              <span className="shrink-0 rounded-full border border-[var(--info)]/25 bg-[var(--info)]/[0.12] px-1.5 py-0.5 text-[11px] font-semibold leading-none text-[var(--info)]">
                 实时
               </span>
               <OverflowText className="flex-1">{group.title}</OverflowText>
@@ -1171,7 +1184,7 @@ function DownloadTaskFeedItem({
             } font-semibold leading-5 text-white/88`}
           >
             {!grouped && (
-              <span className="shrink-0 rounded-full border border-[#7dd3fc]/25 bg-[#7dd3fc]/[0.12] px-1.5 py-0.5 text-[11px] font-semibold leading-none text-[#b9e8ff]">
+              <span className="shrink-0 rounded-full border border-[var(--info)]/25 bg-[var(--info)]/[0.12] px-1.5 py-0.5 text-[11px] font-semibold leading-none text-[var(--info)]">
                 实时
               </span>
             )}
@@ -1534,7 +1547,7 @@ interface LifecycleStep {
 
 const LIFECYCLE_DOT_STYLE: Record<LifecycleTone, string> = {
   done: "bg-[#86efac]",
-  current: "animate-pulse bg-[#7dd3fc] ring-2 ring-[#7dd3fc]/15",
+  current: "animate-pulse bg-[var(--info)] ring-2 ring-[var(--info)]/15",
   waiting: "bg-[#fcd34d] ring-2 ring-[#fcd34d]/10",
   attention: "bg-[#fca5a5] ring-2 ring-[#fca5a5]/15",
   future: "border border-white/25",
@@ -1542,7 +1555,7 @@ const LIFECYCLE_DOT_STYLE: Record<LifecycleTone, string> = {
 
 const LIFECYCLE_LABEL_STYLE: Record<LifecycleTone, string> = {
   done: "text-white/60",
-  current: "text-[#b9e8ff]",
+  current: "text-[var(--info)]",
   waiting: "text-amber-100/70",
   attention: "text-[#fecaca]",
   future: "text-white/30",
@@ -1779,7 +1792,7 @@ function EpisodeUnitsLabel({
     <details className="group min-w-0 max-w-full open:basis-full open:w-full">
       <summary
         aria-label={`覆盖 ${summary.episodeCount} 集：${summary.fullLabel}。展开查看全部集号`}
-        className="flex w-fit max-w-full cursor-pointer list-none items-center gap-1.5 rounded-md border border-[#7dd3fc]/20 bg-[#7dd3fc]/[0.07] px-2 py-1 text-[#b9e8ff] transition-colors hover:bg-[#7dd3fc]/[0.11] [&::-webkit-details-marker]:hidden"
+        className="flex w-fit max-w-full cursor-pointer list-none items-center gap-1.5 rounded-md border border-[var(--info)]/20 bg-[var(--info)]/[0.07] px-2 py-1 text-[var(--info)] transition-colors hover:bg-[var(--info)]/[0.11] [&::-webkit-details-marker]:hidden"
       >
         <OverflowText
           focusable={false}

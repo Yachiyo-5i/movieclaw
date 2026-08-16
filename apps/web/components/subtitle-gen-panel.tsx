@@ -77,7 +77,7 @@ const AI_BADGE_BASE =
 // 生成入口是真实操作按钮，使用主按钮银色与普通字幕类型标签拉开层级。
 const AI_BADGE_SILVER = "btn-accent";
 const AI_BADGE_RUNNING =
-  "bg-[#7dd3fc]/[0.14] text-[#b9e8ff] hover:bg-[#7dd3fc]/[0.21] hover:shadow-[0_4px_12px_rgba(0,0,0,0.16)]";
+  "bg-[var(--info)]/[0.14] text-[var(--info)] hover:bg-[var(--info)]/[0.21] hover:shadow-[0_4px_12px_rgba(0,0,0,0.16)]";
 const AI_BADGE_FAILED =
   "bg-[#ff9f9f]/[0.08] text-[#ffb4b4] hover:bg-[#ff9f9f]/[0.14] hover:shadow-[0_4px_12px_rgba(0,0,0,0.16)]";
 const CANCEL_BUTTON =
@@ -87,8 +87,8 @@ const CONFIRM_BUTTON =
   "rounded-lg bg-[#8fdcff] px-4 py-2 text-ui font-semibold text-[#071018] transition " +
   "hover:bg-[#b4e9ff] disabled:pointer-events-none disabled:opacity-40";
 const AGENT_BUTTON =
-  "rounded-lg border border-[#7dd3fc]/35 bg-[#7dd3fc]/[0.08] px-4 py-2 text-ui " +
-  "font-medium text-[#b9e8ff] transition hover:bg-[#7dd3fc]/[0.14] " +
+  "rounded-lg border border-[var(--info)]/35 bg-[var(--info)]/[0.08] px-4 py-2 text-ui " +
+  "font-medium text-[var(--info)] transition hover:bg-[var(--info)]/[0.14] " +
   "disabled:pointer-events-none disabled:opacity-40";
 
 function errorMessage(error: unknown): string {
@@ -314,12 +314,12 @@ function ProgressDetails({
   return (
     <div className={compact ? "space-y-2.5" : "space-y-3.5"}>
       <div className="flex items-start justify-between gap-3">
-        <p className="font-semibold text-[#b9e8ff]">{progress.message || "正在准备生成任务"}</p>
-        {percent !== null && <span className="tnum shrink-0 font-semibold text-[#b9e8ff]">{percent}%</span>}
+        <p className="font-semibold text-[var(--info)]">{progress.message || "正在准备生成任务"}</p>
+        {percent !== null && <span className="tnum shrink-0 font-semibold text-[var(--info)]">{percent}%</span>}
       </div>
       <div className="h-1.5 overflow-hidden rounded-full bg-white/[0.08]">
         <div
-          className={`h-full rounded-full bg-[#7dd3fc] transition-all ${percent === null ? "w-1/3 animate-pulse" : ""}`}
+          className={`h-full rounded-full bg-[var(--info)] transition-all ${percent === null ? "w-1/3 animate-pulse" : ""}`}
           style={percent === null ? undefined : { width: `${percent}%` }}
         />
       </div>
@@ -338,7 +338,7 @@ function ProgressDetails({
         <span className="tnum">已用时 {formatElapsed(progress.elapsed_seconds ?? 0)}</span>
       </div>
       {activeBlocks.length > 0 && (
-        <p className="text-caption text-[#b9e8ff]/85">
+        <p className="text-caption text-[var(--info)]/85">
           {progress.parallelism > 1 ? `并发上限 ${progress.parallelism} 路 · ` : ""}
           正在处理第 {activeBlocks.join("、")} 块
           {progress.oldest_active_seconds > 0
@@ -366,7 +366,7 @@ function ProgressDetails({
               key={stage.label}
               className={`flex items-center gap-2 text-caption ${
                 current
-                  ? "font-medium text-[#b9e8ff]"
+                  ? "font-medium text-[var(--info)]"
                   : completed
                     ? "text-white/70"
                     : "text-white/35"
@@ -375,7 +375,7 @@ function ProgressDetails({
               <span
                 className={`flex size-4 shrink-0 items-center justify-center rounded-full border text-[9px] ${
                   current
-                    ? "border-[#7dd3fc] bg-[#7dd3fc]/15"
+                    ? "border-[var(--info)] bg-[var(--info)]/15"
                     : completed
                       ? "border-[#4ade80]/60 bg-[#4ade80]/10 text-[#7cf0a4]"
                       : "border-white/15"
@@ -650,7 +650,7 @@ export function SubtitleGenPanel({
       >
         <div className="p-5 max-md:p-4">
           <div className="flex items-start gap-3">
-            <span className="flex size-9 shrink-0 items-center justify-center rounded-lg border border-[#7dd3fc]/30 bg-[#7dd3fc]/[0.12] text-caption font-bold text-[#a9e2ff]">
+            <span className="flex size-9 shrink-0 items-center justify-center rounded-lg border border-[var(--info)]/30 bg-[var(--info)]/[0.12] text-caption font-bold text-[#a9e2ff]">
               AI
             </span>
             <div>
@@ -675,7 +675,7 @@ export function SubtitleGenPanel({
             <div className="mt-6 space-y-4">
               {running && progress ? (
                 <>
-                  <div className="rounded-xl border border-[#7dd3fc]/25 bg-[#7dd3fc]/[0.07] p-4">
+                  <div className="rounded-xl border border-[var(--info)]/25 bg-[var(--info)]/[0.07] p-4">
                     <ProgressDetails progress={progress} />
                   </div>
                   {requestError && (
@@ -769,7 +769,7 @@ export function SubtitleGenPanel({
                         setSecondaryLanguage(secondary);
                         void loadPreview(target, bilingual ? secondary : null);
                       }}
-                      className="w-full rounded-lg border border-white/10 bg-[#151820] px-3 py-2 text-ui text-white outline-none focus:border-[#7dd3fc]/60 disabled:opacity-50"
+                      className="w-full rounded-lg border border-white/10 bg-[#151820] px-3 py-2 text-ui text-white outline-none focus:border-[var(--info)]/60 disabled:opacity-50"
                     >
                       {OUTPUT_LANGUAGES.map((language) => (
                         <option key={language.token} value={language.token}>
@@ -792,7 +792,7 @@ export function SubtitleGenPanel({
                           setSecondaryLanguage(secondary);
                           void loadPreview(targetLanguage, secondary);
                         }}
-                        className="w-full rounded-lg border border-white/10 bg-[#151820] px-3 py-2 text-ui text-white outline-none focus:border-[#7dd3fc]/60 disabled:opacity-50"
+                        className="w-full rounded-lg border border-white/10 bg-[#151820] px-3 py-2 text-ui text-white outline-none focus:border-[var(--info)]/60 disabled:opacity-50"
                       >
                         {OUTPUT_LANGUAGES.map((language) => (
                           <option
@@ -819,7 +819,7 @@ export function SubtitleGenPanel({
                       setSecondaryLanguage(secondary);
                       void loadPreview(targetLanguage, enabled ? secondary : null);
                     }}
-                    className="size-4 accent-[#7dd3fc]"
+                    className="size-4 accent-[var(--info)]"
                   />
                   生成双语字幕
                 </label>
@@ -832,7 +832,7 @@ export function SubtitleGenPanel({
 
               {previewing && (
                 <div className="flex items-center gap-3 rounded-xl border border-white/[0.08] bg-white/[0.04] px-4 py-4">
-                  <span className="size-4 animate-spin rounded-full border-2 border-white/20 border-t-[#7dd3fc]" />
+                  <span className="size-4 animate-spin rounded-full border-2 border-white/20 border-t-[var(--info)]" />
                   <p className="text-ui font-medium text-white">正在检查参考字幕，不会调用 AI…</p>
                 </div>
               )}
@@ -853,7 +853,7 @@ export function SubtitleGenPanel({
                           event.target.value || null,
                         )
                       }
-                      className="w-full rounded-lg border border-white/10 bg-[#151820] px-3 py-2 text-ui text-white outline-none focus:border-[#7dd3fc]/60 disabled:opacity-50"
+                      className="w-full rounded-lg border border-white/10 bg-[#151820] px-3 py-2 text-ui text-white outline-none focus:border-[var(--info)]/60 disabled:opacity-50"
                     >
                       {!sourceCandidateKey && <option value="">没有可用的参考字幕</option>}
                       {preview.candidates.map((candidate) => (
@@ -906,7 +906,7 @@ export function SubtitleGenPanel({
                         <select
                           value={pgsOcrLanguage}
                           onChange={(event) => setPgsOcrLanguage(event.target.value)}
-                          className="w-full rounded-lg border border-white/10 bg-[#151820] px-3 py-2 text-ui text-white outline-none focus:border-[#7dd3fc]/60"
+                          className="w-full rounded-lg border border-white/10 bg-[#151820] px-3 py-2 text-ui text-white outline-none focus:border-[var(--info)]/60"
                         >
                           <option value="">请选择字幕语言</option>
                           {pgsConversion.language_options.map((option) => (
@@ -972,7 +972,7 @@ export function SubtitleGenPanel({
                     <div className="flex flex-wrap items-center gap-2 text-ui font-semibold text-white">
                       <span>{candidateLabel(chosen)}</span>
                       <span className="text-[var(--text-faint)]">→</span>
-                      <span className="text-[#b9e8ff]">
+                      <span className="text-[var(--info)]">
                         {outputLabel(targetLanguage, bilingual ? secondaryLanguage : null)}
                       </span>
                     </div>

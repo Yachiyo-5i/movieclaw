@@ -710,8 +710,8 @@ export function LibraryDetailView({ libraryId }: { libraryId: number }) {
           busy) && (
           <div className="mt-2.5 flex flex-wrap items-center gap-2">
             {busy && (
-              <span className="flex items-center gap-1.5 rounded-full border border-[#7dd3fc]/35 bg-[#7dd3fc]/[0.12] px-3 py-1 text-sub font-semibold text-[#7dd3fc]">
-                <span className="size-3 animate-spin rounded-full border-[1.5px] border-[#7dd3fc]/30 border-t-[#7dd3fc]" />
+              <span className="flex items-center gap-1.5 rounded-full border border-[var(--info)]/35 bg-[var(--info)]/[0.12] px-3 py-1 text-sub font-semibold text-[var(--info)]">
+                <span className="size-3 animate-spin rounded-full border-[1.5px] border-[var(--info)]/30 border-t-[var(--info)]" />
                 {busyText(
                   library.scanning ? library.scan_progress : library.organize_progress,
                 )}
@@ -720,14 +720,14 @@ export function LibraryDetailView({ libraryId }: { libraryId: number }) {
             {/* 刷新元数据的按钮已收进 ⋯ 菜单；它是全量重刷、耗时长，
                 进度另用下方的面板完整展示（到哪部了、在做什么） */}
             {importing > 0 && (
-              <span className="flex items-center gap-1.5 rounded-full border border-[#7dd3fc]/35 bg-[#7dd3fc]/[0.12] px-3 py-1 text-sub font-semibold text-[#7dd3fc]">
-                <span className="size-1.5 animate-pulse rounded-full bg-[#7dd3fc]" />
+              <span className="flex items-center gap-1.5 rounded-full border border-[var(--info)]/35 bg-[var(--info)]/[0.12] px-3 py-1 text-sub font-semibold text-[var(--info)]">
+                <span className="size-1.5 animate-pulse rounded-full bg-[var(--info)]" />
                 已发现 {importing} 个新文件 · 写入完成后自动入库
               </span>
             )}
             {libraryJobs.length > 0 && (
-              <span className="flex items-center gap-1.5 rounded-full border border-[#7dd3fc]/35 bg-[#7dd3fc]/[0.12] px-3 py-1 text-sub font-semibold text-[#7dd3fc]">
-                <span className="size-1.5 animate-pulse rounded-full bg-[#7dd3fc]" />
+              <span className="flex items-center gap-1.5 rounded-full border border-[var(--info)]/35 bg-[var(--info)]/[0.12] px-3 py-1 text-sub font-semibold text-[var(--info)]">
+                <span className="size-1.5 animate-pulse rounded-full bg-[var(--info)]" />
                 {libraryJobs.length} 个后台任务正在处理库内影片
               </span>
             )}
@@ -962,7 +962,7 @@ function LibraryActionsMenu({
           <MoreIcon className="size-[18px] max-md:size-[22px]" />
           {/* 收起的长任务在跑：触发按钮点一个小点，不至于被菜单藏住 */}
           {running && (
-            <span className="absolute right-1 top-1 size-1.5 animate-pulse rounded-full bg-[#7dd3fc]" />
+            <span className="absolute right-1 top-1 size-1.5 animate-pulse rounded-full bg-[var(--info)]" />
           )}
         </button>
       </DropdownMenu.Trigger>
@@ -1025,10 +1025,10 @@ function MetadataRefreshPanel({
   const percent =
     state.total > 0 ? Math.min(100, Math.round((state.processed / state.total) * 100)) : 0;
   return (
-    <div className="mt-3 rounded-xl border border-[#7dd3fc]/25 bg-[#7dd3fc]/[0.07] px-4 py-3">
+    <div className="mt-3 rounded-xl border border-[var(--info)]/25 bg-[var(--info)]/[0.07] px-4 py-3">
       <div className="flex items-center justify-between gap-3">
-        <div className="flex min-w-0 items-center gap-2 text-sub font-semibold text-[#7dd3fc]">
-          <span className="size-3 shrink-0 animate-spin rounded-full border-[1.5px] border-[#7dd3fc]/30 border-t-[#7dd3fc]" />
+        <div className="flex min-w-0 items-center gap-2 text-sub font-semibold text-[var(--info)]">
+          <span className="size-3 shrink-0 animate-spin rounded-full border-[1.5px] border-[var(--info)]/30 border-t-[var(--info)]" />
           <span className="truncate">
             {state.stopping ? "正在停止刷新" : "正在刷新元数据"}
             {state.total > 0 ? ` ${state.processed}/${state.total}` : ""}
@@ -1047,7 +1047,7 @@ function MetadataRefreshPanel({
       {/* 进度条：全量刷新常以分钟计，一条能看出"在动"的进度很重要 */}
       <div className="mt-2 h-1 overflow-hidden rounded-full bg-white/[0.08]">
         <div
-          className="h-full rounded-full bg-[#7dd3fc] transition-[width] duration-500"
+          className="h-full rounded-full bg-[var(--info)] transition-[width] duration-500"
           style={{ width: `${percent}%` }}
         />
       </div>
@@ -1132,10 +1132,10 @@ const InventoryCell = memo(function InventoryCell({
         </div>
         {workingLabel && (
           <>
-            <span className="pointer-events-none absolute inset-0 rounded-xl ring-2 ring-[#7dd3fc] ring-offset-0" />
+            <span className="pointer-events-none absolute inset-0 rounded-xl ring-2 ring-[var(--info)] ring-offset-0" />
             {/* 不用 backdrop-blur：海报墙每格一个模糊合成层会放大滚动时的 GPU 压力，底色加实即可 */}
-            <span className="pointer-events-none absolute inset-x-0 bottom-0 flex items-center gap-1.5 rounded-b-xl bg-[rgba(7,12,20,0.92)] px-2 py-1.5 text-micro font-medium text-[#7dd3fc]">
-              <span className="size-2.5 shrink-0 animate-spin rounded-full border-[1.5px] border-[#7dd3fc]/30 border-t-[#7dd3fc]" />
+            <span className="pointer-events-none absolute inset-x-0 bottom-0 flex items-center gap-1.5 rounded-b-xl bg-[rgba(7,12,20,0.92)] px-2 py-1.5 text-micro font-medium text-[var(--info)]">
+              <span className="size-2.5 shrink-0 animate-spin rounded-full border-[1.5px] border-[var(--info)]/30 border-t-[var(--info)]" />
               <span className="truncate">{workingLabel}</span>
             </span>
           </>
