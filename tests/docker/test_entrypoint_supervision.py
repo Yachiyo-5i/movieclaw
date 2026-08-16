@@ -27,8 +27,22 @@ def _write_executable(path: Path, source: str) -> None:
     path.chmod(0o755)
 
 
+# http.server.HTTPServer.server_bind 会对绑定地址做一次 socket.getfqdn()
+# 反向解析。在部分网络环境下（DNS 不可达、VPN、有网络挂载的开发机）这一步
+# 会阻塞数十秒——实测某台开发机上 getfqdn("127.0.0.1") 要 35 秒，远超本组
+# 测试给进程替身的就绪窗口，于是「验证启动顺序」的用例全部退化成超时失败。
+# 替身只服务回环地址，server_name 没有任何实际用途，直接跳过这次解析。
+_NO_FQDN_SERVER = """
+class FakeServer(ThreadingHTTPServer):
+    def server_bind(self):
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
+"""
+
+
 _FAKE_API = """#!{python}
 import os
+import socketserver
 import sys
 import threading
 import time
@@ -90,12 +104,14 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
 
-ThreadingHTTPServer(("127.0.0.1", 8000), Handler).serve_forever()
+{no_fqdn_server}
+FakeServer(("127.0.0.1", 8000), Handler).serve_forever()
 """
 
 
 _FAKE_WEB = """#!{python}
 import os
+import socketserver
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -127,7 +143,8 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
 
-ThreadingHTTPServer(("127.0.0.1", 3000), Handler).serve_forever()
+{no_fqdn_server}
+FakeServer(("127.0.0.1", 3000), Handler).serve_forever()
 """
 
 
@@ -146,11 +163,11 @@ def entrypoint_env(tmp_path: Path) -> dict[str, str]:
     bin_dir.mkdir()
     _write_executable(
         bin_dir / "fake-api",
-        _FAKE_API.format(python=sys.executable),
+        _FAKE_API.format(python=sys.executable, no_fqdn_server=_NO_FQDN_SERVER),
     )
     _write_executable(
         bin_dir / "node",
-        _FAKE_WEB.format(python=sys.executable),
+        _FAKE_WEB.format(python=sys.executable, no_fqdn_server=_NO_FQDN_SERVER),
     )
 
     return {

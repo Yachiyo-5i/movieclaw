@@ -5,6 +5,7 @@ from __future__ import annotations
 import sqlite3
 
 from alembic import command
+from alembic.script import ScriptDirectory
 
 from movieclaw_api.core.config import get_settings
 from movieclaw_db.migrations import _build_config
@@ -30,5 +31,6 @@ def test_repair_migration_restores_missing_episode_count(tmp_path, monkeypatch) 
         columns = {row[1] for row in connection.execute("PRAGMA table_info(library)")}
         revision = connection.execute("SELECT version_num FROM alembic_version").fetchone()[0]
     assert "stats_episode_count" in columns
-    assert revision == "a5c8d1e3f679"
+    # 断言"已走到 head"，而不是写死某个修订号——否则每加一条迁移这里都会失效。
+    assert revision == ScriptDirectory.from_config(config).get_current_head()
     get_settings.cache_clear()

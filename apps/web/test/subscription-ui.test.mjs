@@ -15,6 +15,7 @@ function subscription({
   grabbed = 0,
   downloaded = 0,
   imported = 0,
+  upgrading = 0,
   status = "active",
   mediaStatus = "Returning Series",
   selectedSeasons = [],
@@ -32,6 +33,7 @@ function subscription({
       grabbed,
       downloaded,
       imported,
+      upgrading,
     },
   };
 }
@@ -70,7 +72,7 @@ test("在播剧只展示最新一季的低密度收录进度", () => {
       seasons: [season(1, 10, 10, 10), season(2, 7, 5, 5)],
     }),
   );
-  assert.deepEqual(result, { label: "第 2 季", value: "5 / 7", tracking: true });
+  assert.deepEqual(result, { label: "第 2 季", value: "5 / 7", tracking: true, upgrading: false });
 });
 
 test("完结多季已收齐时聚合为季数和总集数", () => {
@@ -86,7 +88,7 @@ test("完结多季已收齐时聚合为季数和总集数", () => {
       seasons,
     }),
   );
-  assert.deepEqual(result, { label: "共 8 季", value: "73 集全", tracking: false });
+  assert.deepEqual(result, { label: "共 8 季", value: "73 集全", tracking: false, upgrading: false });
 });
 
 test("完结剧补旧时聚合显示已收录和总集数", () => {
@@ -102,7 +104,7 @@ test("完结剧补旧时聚合显示已收录和总集数", () => {
       ],
     }),
   );
-  assert.deepEqual(result, { label: "共 3 季", value: "24 / 30", tracking: false });
+  assert.deepEqual(result, { label: "共 3 季", value: "24 / 30", tracking: false, upgrading: false });
 });
 
 test("最新一季尚未播出时不展示零进度", () => {
@@ -112,7 +114,20 @@ test("最新一季尚未播出时不展示零进度", () => {
       seasons: [season(3, 10, 0, 0)],
     }),
   );
-  assert.deepEqual(result, { label: "第 3 季", value: "待播出", tracking: true });
+  assert.deepEqual(result, { label: "第 3 季", value: "待播出", tracking: true, upgrading: false });
+});
+
+test("洗版中的订阅亮青点，暂停后不亮", () => {
+  const seasons = [season(1, 10, 10, 10)];
+  const upgrading = subscriptionCollectionMeta(
+    subscription({ selectedSeasons: [1], seasons, upgrading: 1 }),
+  );
+  assert.equal(upgrading.upgrading, true);
+
+  const paused = subscriptionCollectionMeta(
+    subscription({ selectedSeasons: [1], seasons, upgrading: 1, status: "paused" }),
+  );
+  assert.equal(paused.upgrading, false);
 });
 
 test("追更绿点只由未完结订阅的 active 状态控制", () => {
