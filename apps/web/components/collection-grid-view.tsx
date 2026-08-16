@@ -25,7 +25,6 @@ const MAX_COLLECTION_SNAPSHOTS = 32;
 interface CollectionGridSnapshot {
   items: MediaItem[];
   title: string;
-  isRanked: boolean;
   nextPage: number;
   totalResults: number;
   hasMore: boolean;
@@ -65,7 +64,6 @@ export function CollectionGridView({
   const scrollRef = useScrollRestoration(`collection:${collectionRef}`);
   const [items, setItems] = useState<MediaItem[] | null>(() => initialSnapshot?.items ?? null);
   const [title, setTitle] = useState(() => initialSnapshot?.title ?? "影视片单");
-  const [isRanked, setIsRanked] = useState(() => initialSnapshot?.isRanked ?? false);
   const [query, setQuery] = useState("");
   const [selectedGenres, setSelectedGenres] = useState<string[]>([]);
   const [nextPage, setNextPage] = useState(() => initialSnapshot?.nextPage ?? 2);
@@ -85,12 +83,11 @@ export function CollectionGridView({
     rememberCollectionGridSnapshot(collectionRef, {
       items,
       title,
-      isRanked,
       nextPage,
       totalResults,
       hasMore,
     });
-  }, [collectionRef, hasMore, isRanked, items, nextPage, title, totalResults]);
+  }, [collectionRef, hasMore, items, nextPage, title, totalResults]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -106,7 +103,6 @@ export function CollectionGridView({
     if (cached) {
       setItems(cached.items);
       setTitle(cached.title);
-      setIsRanked(cached.isRanked);
       setNextPage(cached.nextPage);
       setTotalResults(cached.totalResults);
       setHasMore(cached.hasMore);
@@ -121,7 +117,6 @@ export function CollectionGridView({
     // 避免新请求完成前短暂显示旧榜单，或失败后把旧数据误当成新结果。
     setItems(null);
     setTitle("影视片单");
-    setIsRanked(false);
     setLoadingMore(false);
     setNextPage(2);
     setTotalResults(0);
@@ -136,7 +131,6 @@ export function CollectionGridView({
         if (controller.signal.aborted) return;
         setItems(collection.items);
         setTitle(collection.name);
-        setIsRanked(collection.isRanked);
         setTotalResults(collection.totalResults);
         setHasMore(provider === "tmdb" && collection.hasMore);
         setNextPage(collection.page + 1);
@@ -202,13 +196,6 @@ export function CollectionGridView({
     }
     return [...counts].sort((a, b) => b[1] - a[1]);
   }, [items]);
-
-  // 排名查表：渲染时用 items.indexOf 是每格 O(n) 的线性扫描，数百格一轮渲染
-  // 就是数万次比较；榜单加载后排名固定，建一次 Map 终身使用
-  const rankById = useMemo(
-    () => new Map((items ?? []).map((item, index) => [item.id, index + 1])),
-    [items],
-  );
 
   // 搜索输入用延迟值参与过滤：连续敲字时先渲染输入框本身，网格的全量
   // 过滤与重渲染放到浏览器空闲时批量跟上，输入不再一字一卡
@@ -374,21 +361,11 @@ export function CollectionGridView({
             </div>
           ) : (
             <div className="grid grid-cols-2 gap-x-4 gap-y-7 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 2xl:grid-cols-8">
-              {filtered.map((item) => {
-                const rank = rankById.get(item.id) ?? 0;
-                return (
-                  <div key={item.id} className="group/rank relative min-w-0">
-                    <PosterCard item={item} />
-                    {/* 名次牌覆盖层与海报同为 2:3，才能把名次钉在海报右下角
-                        （左上角已归「已入库」斜标）；不拦指针事件，整卡仍可点。 */}
-                    {isRanked && (
-                      <div className="pointer-events-none absolute inset-x-0 top-0 aspect-[2/3]">
-                        <RankBadge rank={rank} />
-                      </div>
-                    )}
-                  </div>
-                );
-              })}
+              {filtered.map((item) => (
+                <div key={item.id} className="min-w-0">
+                  <PosterCard item={item} />
+                </div>
+              ))}
             </div>
           )}
 
@@ -418,29 +395,6 @@ export function CollectionGridView({
         </main>
       )}
     </div>
-  );
-}
-
-/**
- * 榜单名次牌。原本钉在海报左上角外沿，与全站统一的「已入库」左上角斜标撞位
- * （名次盖住斜标文案，两个信号互相削弱），改钉海报右下角：那里只在 hover
- * 信息层升起时才有内容，所以 hover 时淡出让位，静态时名次与斜标各占一角。
- */
-function RankBadge({ rank }: { rank: number }) {
-  const tone =
-    rank === 1
-      ? "bg-[#d8ad50] text-[#211704]"
-      : rank === 2
-        ? "bg-[#b9c1cc] text-[#171a20]"
-        : rank === 3
-          ? "bg-[#b9794c] text-[#211108]"
-          : "bg-black/70 text-white";
-  return (
-    <span
-      className={`tnum absolute bottom-2 right-2 z-10 min-w-8 rounded-lg px-2 py-1 text-center text-sub font-black shadow-lg ring-1 ring-white/15 transition-opacity duration-200 group-hover/rank:opacity-0 ${tone}`}
-    >
-      {rank}
-    </span>
   );
 }
 
