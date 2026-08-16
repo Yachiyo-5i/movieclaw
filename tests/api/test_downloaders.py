@@ -200,8 +200,10 @@ def test_task_center_aggregates_live_downloads_and_subscription_context(client) 
         DownloadAttemptStatus,
         MediaItem,
         RuleSet,
+        SiteTorrent,
         Subscription,
         SubscriptionDownloadAttempt,
+        TorrentSource,
         WantedItem,
         WantedStatus,
         utcnow,
@@ -295,6 +297,8 @@ def test_task_center_aggregates_live_downloads_and_subscription_context(client) 
                     subscription_id=subscription.id,
                     downloader_id=downloader_id,
                     info_hash=missing_hash,
+                    site_id="pt-demo",
+                    torrent_id="4321",
                     torrent_title="Missing.Show.S01E02",
                     units=[[1, 2]],
                     quality={"resolution": "1080p", "media_source": "WEB-DL"},
@@ -302,6 +306,16 @@ def test_task_center_aggregates_live_downloads_and_subscription_context(client) 
                     hit_and_run=False,
                     status=DownloadAttemptStatus.ACTIVE,
                     last_progress_at=utcnow() - timedelta(minutes=16),
+                )
+            )
+            # 站点快照索引里存有该种子的详情页，任务中心据此提供"打开种子页"
+            session.add(
+                SiteTorrent(
+                    site_id="pt-demo",
+                    torrent_id="4321",
+                    title="Missing.Show.S01E02",
+                    detail_url="https://pt.example.com/details.php?id=4321",
+                    source=TorrentSource.LIST,
                 )
             )
             await session.commit()
@@ -329,6 +343,14 @@ def test_task_center_aggregates_live_downloads_and_subscription_context(client) 
     assert by_hash[external_hash]["progress"] == 0.42
     assert by_hash[missing_hash]["state"] == "missing"
     assert by_hash[missing_hash]["downloader_id"] == downloader_id
+    # 投递台账带回站点身份、详情页与质量快照；外部任务没有这些信息
+    assert by_hash[missing_hash]["site_id"] == "pt-demo"
+    assert by_hash[missing_hash]["site_name"] == "pt-demo"
+    assert by_hash[missing_hash]["page_url"] == "https://pt.example.com/details.php?id=4321"
+    assert by_hash[missing_hash]["resolution"] == "1080p"
+    assert by_hash[missing_hash]["media_source"] == "WEB-DL"
+    assert by_hash[external_hash]["site_id"] is None
+    assert by_hash[external_hash]["page_url"] is None
     assert by_hash[missing_hash]["can_replace"] is True
     assert by_hash[missing_hash]["no_progress_seconds"] >= 15 * 60
     assert "立即换种" in by_hash[missing_hash]["rescue_message"]

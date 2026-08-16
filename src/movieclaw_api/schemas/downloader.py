@@ -133,6 +133,15 @@ class DownloadTaskView(BaseModel):
         "unknown",
     ]
     source: Literal["subscription", "manual", "external"]
+    # -- 种子来源与规格（movieclaw 投递的任务才有）：站点身份、详情页入口
+    # 与投递时的质量快照，供任务中心展示"这个种子从哪来、什么规格"。
+    site_id: str | None = None
+    site_name: str | None = Field(default=None, description="来源站点显示名；未知站点回落 site_id")
+    page_url: str | None = Field(
+        default=None, description="站点种子详情页 URL；能定位到站内种子时提供"
+    )
+    resolution: str | None = Field(default=None, description="投递时快照的分辨率，如 2160p")
+    media_source: str | None = Field(default=None, description="投递时快照的片源，如 WEB-DL")
     media_item_id: int | None = None
     media_title: str | None = None
     media_kind: str | None = None

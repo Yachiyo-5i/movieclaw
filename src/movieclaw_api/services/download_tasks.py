@@ -16,6 +16,7 @@ from datetime import UTC, datetime
 from pathlib import PurePosixPath
 from typing import Any
 
+from sqlalchemy import and_, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
@@ -29,6 +30,7 @@ from movieclaw_db.models import (
     LibraryFile,
     ManualDownloadIntent,
     MediaItem,
+    SiteTorrent,
     Subscription,
     SubscriptionDownloadAttempt,
     WantedItem,
@@ -47,6 +49,19 @@ from movieclaw_downloader import (
 logger = logging.getLogger("movieclaw_api.download_tasks")
 
 _IN_FLIGHT = (WantedStatus.GRABBED, WantedStatus.DOWNLOADED)
+
+
+def _site_display_name(site_id: str | None) -> str | None:
+    """把站点 ID 换成用户可读的站点名；站点配置已被移除时回落原 ID。"""
+    if not site_id:
+        return None
+    from movieclaw_tracker.exceptions import SiteNotFoundError
+    from movieclaw_tracker.registry import get_site_config
+
+    try:
+        return get_site_config(site_id).display_name
+    except SiteNotFoundError:
+        return site_id
 
 
 def _poster_url(item: MediaItem) -> str | None:
@@ -178,6 +193,9 @@ async def _relations(
         }
         subscription_meta[key] = {
             **base_meta,
+            "_site_id": attempt.site_id,
+            "_torrent_id": attempt.torrent_id,
+            "_quality": attempt.quality,
             "_attempt_status": attempt.status,
             "_attempt_downloader_id": attempt.downloader_id,
             "_last_progress_at": attempt.last_progress_at,
@@ -192,6 +210,34 @@ async def _relations(
                 DownloadAttemptStatus.COMPLETED,
             ),
         }
+
+    # 反查站点种子详情页：投递台账记了 site_id + torrent_id，站点快照索引里
+    # 存有面向浏览器的 detail_url。查不到（快照被淘汰/旧数据）就不给链接。
+    site_pairs = {
+        (meta["_site_id"], meta["_torrent_id"])
+        for meta in subscription_meta.values()
+        if meta.get("_site_id") and meta.get("_torrent_id")
+    }
+    page_urls: dict[tuple[str, str], str] = {}
+    if site_pairs:
+        rows = await session.execute(
+            select(SiteTorrent.site_id, SiteTorrent.torrent_id, SiteTorrent.detail_url).where(
+                or_(
+                    *(
+                        and_(SiteTorrent.site_id == site_id, SiteTorrent.torrent_id == torrent_id)
+                        for site_id, torrent_id in site_pairs
+                    )
+                )
+            )
+        )
+        page_urls = {
+            (site_id, torrent_id): detail_url
+            for site_id, torrent_id, detail_url in rows
+            if detail_url
+        }
+    for meta in subscription_meta.values():
+        if meta.get("_site_id") and meta.get("_torrent_id"):
+            meta["_page_url"] = page_urls.get((meta["_site_id"], meta["_torrent_id"]))
 
     subscriptions: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for key, meta in subscription_meta.items():
@@ -218,6 +264,7 @@ async def _relations(
             "intent_id": intent.id,
             "intent_created_at": intent.created_at,
             "library_id": intent.library_id,
+            "site_id": intent.site_id,
             "media_item_id": media.id,
             "media_title": media.title,
             "media_kind": media.kind,
@@ -385,6 +432,13 @@ def _task_dict(
     )
     completed = bool(torrent and torrent.completed)
     state = absent_state if torrent is None else "completed" if completed else torrent.state
+    # 站点/质量信息取自投递台账（订阅任务）或手动身份锚；外部任务两者皆无
+    site_id = next(
+        (entry["_site_id"] for entry in subscriptions if entry.get("_site_id")), None
+    ) or (manual or {}).get("site_id")
+    quality = next(
+        (entry["_quality"] for entry in subscriptions if entry.get("_quality")), None
+    ) or {}
     no_progress_seconds = None
     if rescue is not None and rescue.get("_last_progress_at") is not None:
         last_progress = rescue["_last_progress_at"]
@@ -425,6 +479,13 @@ def _task_dict(
         "eta_seconds": torrent.eta_seconds if torrent is not None else None,
         "state": state,
         "source": source,
+        "site_id": site_id,
+        "site_name": _site_display_name(site_id),
+        "page_url": next(
+            (entry["_page_url"] for entry in subscriptions if entry.get("_page_url")), None
+        ),
+        "resolution": quality.get("resolution"),
+        "media_source": quality.get("media_source"),
         "media_item_id": (media or {}).get("media_item_id"),
         "media_title": (media or {}).get("media_title"),
         "media_kind": (media or {}).get("media_kind"),
