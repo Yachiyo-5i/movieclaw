@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import os
+
 import pytest
 import pytest_asyncio
 from sqlmodel import select
@@ -28,6 +30,19 @@ from movieclaw_db.models import (
     utcnow,
 )
 from movieclaw_db.repositories.library_repo import LibraryRepository
+
+
+def _write_seeded(path, data: bytes) -> None:
+    """写测试文件并挂一个硬链接副本，模拟推荐的硬链入库形态（st_nlink ≥ 2）。
+
+    做种保护上线后（§7.1：唯一硬链接绝不改名），回收站相关断言都以
+    硬链形态为前提；单链接（原地下载/复制导入）的行为由专门用例覆盖。
+    """
+    path.write_bytes(data)
+    seed_dir = path.parent / ".seed-copies"
+    seed_dir.mkdir(exist_ok=True)
+    os.link(path, seed_dir / f"{len(list(seed_dir.iterdir()))}-{path.name}")
+
 
 _WEBDL = {"resolution": "1080p", "media_source": "WEB-DL"}
 _REMUX_ATTRS = {
@@ -56,7 +71,7 @@ async def _seed(db, tmp_path, *, spec=None, quality=_WEBDL, old_hash="old1"):
     root = tmp_path / "tv"
     root.mkdir(exist_ok=True)
     old_file = root / "Testshow.S01E01.1080p.WEB-DL.mkv"
-    old_file.write_bytes(b"old")
+    _write_seeded(old_file, b"old")
     async with db.session() as session:
         library = await LibraryRepository(session).create(
             name="剧集库", kind="tv", root_paths=[str(root)]
@@ -162,7 +177,7 @@ async def test_manual_grab_no_gap_without_target_gives_guidance(db, tmp_path):
 async def _add_manual_delivery(db, sub_id, item_id, library_id, root, *, claimed, probed):
     """模拟手选洗版 attempt + 其下载文件已入库。"""
     new_file = root / "Testshow.S01E01.manual.mkv"
-    new_file.write_bytes(b"new-version")
+    _write_seeded(new_file, b"new-version")
     async with db.session() as session:
         session.add(
             SubscriptionDownloadAttempt(

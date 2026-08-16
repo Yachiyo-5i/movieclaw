@@ -515,15 +515,31 @@ def _move_file_to_trash(file: LibraryFile, root_paths: list[str]) -> tuple[bool,
 
     - 源文件已不存在 → (True, None)：行可删（现实里文件早没了）；
     - 移动成功 → (True, 路径)；
-    - 移动失败 → **(False, None)**：行必须保留——删了行而文件还在，
+    - 移动失败/做种保护 → **(False, None)**：行必须保留——删了行而文件还在，
       库扫描会把它当新文件重新收编，证伪文件甚至可能借文件名"重生"。
     同名冲突加时间戳前缀。同文件系统内是 rename，瞬时完成。
+
+    **做种保护（唯一硬链接绝不改名）**：推荐的硬链入库流程里，库文件与
+    下载器做种的原始文件是同一 inode 的两个目录项，改名库内这份不影响
+    做种（st_nlink ≥ 2）。但原地下载（直下库根）或复制导入的库文件是
+    唯一副本（st_nlink == 1）——它可能正是下载器做种的原始文件，改名会
+    立刻打断做种（PT 站 H&R 风险），一律保留原位：下载器侧任务交给旧任务
+    的证据链清理，库内这份可在库详情手动删除。
     """
     import shutil
 
     src = Path(file.file_path)
     if not src.exists():
         return True, None
+    try:
+        if src.stat().st_nlink <= 1:
+            logger.info(
+                "旧版本文件保留原位（唯一硬链接，可能是下载器做种的原始文件）：%s", src
+            )
+            return False, None
+    except OSError:
+        logger.warning("读取旧版本文件硬链接数失败，按保守策略保留原位：%s", src)
+        return False, None
     trash_dir = _trash_root_for(file, root_paths)
     try:
         trash_dir.mkdir(parents=True, exist_ok=True)
@@ -851,7 +867,9 @@ async def _verify_upgrades_locked(session: AsyncSession, media_item_id: int) -> 
                                 "保留做种，可在任务中心手动清理"
                             )
                         old_attempt.updated_at = now
-            # 旧版本文件进回收站、台账行移除（quality-upgrade.md §7.1）
+            # 旧版本文件进回收站、台账行移除（quality-upgrade.md §7.1）；
+            # 唯一硬链接的文件受做种保护，保留原位（台账行同步保留）
+            kept_in_place = 0
             for file in unit_files:
                 if file.id == best_file.id:
                     continue
@@ -860,8 +878,10 @@ async def _verify_upgrades_locked(session: AsyncSession, media_item_id: int) -> 
                     trash_paths.append(trashed)
                 if removable:
                     await session.delete(file)
-                # 移动失败时保留台账行：行删了而文件还在，扫描会把它当新
-                # 文件重新收编（台账必须与磁盘一致）
+                else:
+                    # 移动失败/做种保护时保留台账行：行删了而文件还在，
+                    # 扫描会把它当新文件重新收编（台账必须与磁盘一致）
+                    kept_in_place += 1
             await session.commit()
             await repo.add_activity(
                 SubscriptionActivity(
@@ -871,11 +891,18 @@ async def _verify_upgrades_locked(session: AsyncSession, media_item_id: int) -> 
                     message=(
                         f"{_unit_text(wanted)}已洗版：{old_label} → {new_label}"
                         + ("，旧版本已移入回收站（保留 7 天）" if trash_paths else "")
+                        + (
+                            "；旧版本文件可能仍在做种，已保留原位——"
+                            "旧任务安全清理后可在库详情删除"
+                            if kept_in_place
+                            else ""
+                        )
                     ),
                     payload={
                         "from": old_label,
                         "to": new_label,
                         "trash_paths": trash_paths,
+                        "kept_in_place": kept_in_place,
                         "units": [[wanted.season_number, wanted.episode_number]],
                     },
                 )
