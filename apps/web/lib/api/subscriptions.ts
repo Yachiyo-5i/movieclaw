@@ -463,6 +463,43 @@ export function searchMissingSubscriptionResources(
   );
 }
 
+/** 一轮洗版体检里单个单元的结论（见 schemas.subscription.UpgradeRunUnitView）。 */
+export interface UpgradeRunUnit {
+  season_number: number;
+  episode_number: number;
+  /** upgradable=已排入立即搜索 / at_cutoff=已达目标 / in_flight=已在洗 /
+   *  not_comparable=无法识别当前版本 / missing=缺失（照常走缺口下载） */
+  state: "upgradable" | "at_cutoff" | "in_flight" | "not_comparable" | "missing";
+  current_label: string | null;
+  target_label: string;
+}
+
+/** 一轮洗版的体检报告（见 schemas.subscription.UpgradeRunView）。 */
+export interface UpgradeRunReport {
+  target_label: string;
+  rule_set_id: number;
+  /** 中文整句摘要，直接展示 */
+  summary: string;
+  counts: Record<UpgradeRunUnit["state"], number>;
+  units: UpgradeRunUnit[];
+}
+
+/**
+ * 触发一轮洗版：可选先换规则组（组必须配置洗版目标），随后物化存量工单、
+ * 逐集体检并把可洗单元排入立即搜索。暂停中的订阅后端报可读错误。
+ */
+export function runSubscriptionUpgradeRound(
+  id: number,
+  ruleSetId?: number | null,
+): Promise<UpgradeRunReport> {
+  return unwrap(
+    request<ApiEnvelope<UpgradeRunReport>>(`/subscriptions/${id}/upgrade-runs`, {
+      method: "POST",
+      body: JSON.stringify(ruleSetId != null ? { rule_set_id: ruleSetId } : {}),
+    }),
+  );
+}
+
 /** 手动选种的种子字段（搜索结果行原样回传，attrs 即搜索链路的服务端解析）。 */
 export interface GrabPayload {
   site_id: string;

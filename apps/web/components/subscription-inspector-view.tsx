@@ -22,6 +22,7 @@ import { PosterImage } from "@/components/poster-image";
 import { specSummary, upgradeTargetLabel } from "@/components/rule-sets-panel";
 import { useSubscribeEntry } from "@/components/subscribe-entry";
 import { SubscriptionAdjustDialog } from "@/components/subscription-adjust-dialog";
+import { UpgradeRunDialog } from "@/components/upgrade-run-dialog";
 import {
   deleteSubscriptionPermanently,
   getSubscription,
@@ -63,7 +64,14 @@ import { usePermissions } from "@/lib/permissions";
  *      - 活动记录：竖轨时间线，后端每个动作的中文流水全宽展示
  *        （创建 / 搜索 / 匹配 / 拒绝原因 / 投递 / 入库），长句不再折行成豆腐块。
  */
-export function SubscriptionInspectorView({ id }: { id: number }) {
+export function SubscriptionInspectorView({
+  id,
+  autoOpenUpgradeRun = false,
+}: {
+  id: number;
+  /** 进入即打开「洗一轮版」弹层（库详情洗版入口跳转并轨到既有订阅，§13.4） */
+  autoOpenUpgradeRun?: boolean;
+}) {
   const router = useRouter();
   const confirm = useConfirm();
   // 暂停/取消订阅会改变全站订阅状态（海报卡片的「已订阅」徽标），操作后同步刷新
@@ -76,6 +84,7 @@ export function SubscriptionInspectorView({ id }: { id: number }) {
   const [busy, setBusy] = useState(false);
   const [switchingRule, setSwitchingRule] = useState(false);
   const [adjusting, setAdjusting] = useState(false);
+  const [upgradeRunning, setUpgradeRunning] = useState(autoOpenUpgradeRun);
   const [managing, setManaging] = useState(false);
   const [tab, setTab] = useState<"wanted" | "activity">("wanted");
   const toast = useToast();
@@ -99,6 +108,14 @@ export function SubscriptionInspectorView({ id }: { id: number }) {
   useEffect(() => {
     reload();
   }, [reload]);
+
+  // 消费掉 ?upgrade-run=1：弹层已按初始态打开，把参数从地址栏摘掉，
+  // 避免关闭弹层后刷新页面又弹一次
+  useEffect(() => {
+    if (autoOpenUpgradeRun) {
+      router.replace(`/subscriptions/${id}` as Route, { scroll: false });
+    }
+  }, [autoOpenUpgradeRun, id, router]);
 
   // 有在途投递（已提交下载/已下载待入库）时才轮询：
   // - 5s 拉一次实时进度（速度/ETA，纯读快照）；
@@ -424,6 +441,7 @@ export function SubscriptionInspectorView({ id }: { id: number }) {
                       canManageSubscriptions={canManageSubscriptions}
                       followFuture={isMovie ? null : detail.follow_future}
                       onAdjust={() => setAdjusting(true)}
+                      onUpgradeRun={() => setUpgradeRunning(true)}
                       onToggleFollowFuture={() => void toggleFollowFuture()}
                       onSwitchRule={() => setSwitchingRule(true)}
                       onTogglePause={() => void togglePause()}
@@ -490,6 +508,10 @@ export function SubscriptionInspectorView({ id }: { id: number }) {
             setManaging(false);
             setAdjusting(true);
           }}
+          onUpgradeRun={() => {
+            setManaging(false);
+            setUpgradeRunning(true);
+          }}
           onToggleFollowFuture={() => {
             setManaging(false);
             void toggleFollowFuture();
@@ -521,6 +543,18 @@ export function SubscriptionInspectorView({ id }: { id: number }) {
         />
       )}
 
+      {canSubscribe && upgradeRunning && (
+        <UpgradeRunDialog
+          detail={detail}
+          onClose={() => setUpgradeRunning(false)}
+          onFinished={() => {
+            setUpgradeRunning(false);
+            reload();
+            refreshSubscriptions();
+          }}
+        />
+      )}
+
       {canManageSubscriptions && switchingRule && (
         <RuleSetSwitchDialog
           ruleSets={ruleSets}
@@ -546,6 +580,8 @@ interface SubscriptionManageActionsProps {
   /** null 表示电影订阅，不展示没有业务语义的自动续订动作。 */
   followFuture: boolean | null;
   onAdjust: () => void;
+  /** 打开「洗一轮版」弹层（quality-upgrade.md §13.5 的订阅详情入口） */
+  onUpgradeRun: () => void;
   onToggleFollowFuture: () => void;
   onSwitchRule: () => void;
   onTogglePause: () => void;
@@ -562,6 +598,7 @@ function SubscriptionManageMenu({
   canManageSubscriptions,
   followFuture,
   onAdjust,
+  onUpgradeRun,
   onToggleFollowFuture,
   onSwitchRule,
   onTogglePause,
@@ -594,6 +631,11 @@ function SubscriptionManageMenu({
           {canSubscribe && (
             <DropdownMenu.Item onSelect={onAdjust} className={itemClass}>
               调整订阅…
+            </DropdownMenu.Item>
+          )}
+          {canSubscribe && (
+            <DropdownMenu.Item onSelect={onUpgradeRun} disabled={busy} className={itemClass}>
+              洗一轮版…
             </DropdownMenu.Item>
           )}
           {canSubscribe && followFuture !== null && (
@@ -647,6 +689,7 @@ function SubscriptionManageSheet({
   followFuture,
   onClose,
   onAdjust,
+  onUpgradeRun,
   onToggleFollowFuture,
   onSwitchRule,
   onTogglePause,
@@ -665,6 +708,12 @@ function SubscriptionManageSheet({
           {canSubscribe && (
             <button type="button" onClick={onAdjust} className={rowClass}>
               <span>调整订阅</span>
+              <span aria-hidden className="text-white/35">›</span>
+            </button>
+          )}
+          {canSubscribe && (
+            <button type="button" disabled={busy} onClick={onUpgradeRun} className={rowClass}>
+              <span>洗一轮版</span>
               <span aria-hidden className="text-white/35">›</span>
             </button>
           )}

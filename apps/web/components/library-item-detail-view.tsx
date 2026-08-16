@@ -46,6 +46,7 @@ import {
   refreshItemMetadata,
   transferLibraryItem,
 } from "@/lib/api/libraries";
+import { useSubscribeEntry } from "@/components/subscribe-entry";
 import { SubtitleGenPanel } from "@/components/subtitle-gen-panel";
 import { SubtitlePreviewDialog } from "@/components/subtitle-preview-dialog";
 import { getDiscoveryReturnPath } from "@/lib/discovery-return-path";
@@ -100,6 +101,9 @@ export function LibraryItemDetailView({
   initialEpisode?: number;
 }) {
   const { canManageLibraries } = usePermissions();
+  // 洗版入口（quality-upgrade.md §13.3/§13.5）：有订阅并入既有订阅，无订阅走
+  // 订阅弹层的洗版变体（库存季预填、建完自动接一轮洗版）
+  const { canSubscribe, subscriptionOf, open: openSubscribe } = useSubscribeEntry();
   const router = useRouter();
   const discoveryReturnPath = getDiscoveryReturnPath(returnTo);
   const confirm = useConfirm();
@@ -339,8 +343,9 @@ export function LibraryItemDetailView({
         title={detail.title}
         fallback={navFallback}
         actions={
-          canManageLibraries ? (
+          canManageLibraries || (canSubscribe && detail.tmdb_id > 0) ? (
             <ItemActionsMenu
+              canManage={canManageLibraries}
               scraping={scrapingNow}
               searchHref={`/search?q=${encodeURIComponent(detail.title)}` as Route}
               onReidentify={() => setReidentifyOpen(true)}
@@ -348,6 +353,35 @@ export function LibraryItemDetailView({
               onChangeArtwork={() => setArtworkOpen(true)}
               onTransfer={() => setTransferOpen(true)}
               onDelete={() => setDeleteOpen(true)}
+              // 未识别条目（tmdb_id=0）没有订阅锚点，不给洗版入口
+              onUpgrade={
+                canSubscribe && detail.tmdb_id > 0
+                  ? () => {
+                      const existing = subscriptionOf({
+                        id: String(detail.tmdb_id),
+                        type: detail.kind,
+                      });
+                      if (existing) {
+                        // 一部影片只有一个订阅：并入既有订阅，跳详情直接开弹层
+                        router.push(
+                          `/subscriptions/${existing.id}?upgrade-run=1` as Route,
+                        );
+                        return;
+                      }
+                      void openSubscribe(
+                        {
+                          id: String(detail.tmdb_id),
+                          title: detail.title,
+                          rating: 0,
+                          posterUrl: detail.poster_url ?? "",
+                          type: detail.kind,
+                          year: detail.year ?? undefined,
+                        },
+                        { upgradeIntent: true },
+                      );
+                    }
+                  : undefined
+              }
             />
           ) : null
         }
@@ -604,6 +638,7 @@ export function LibraryItemDetailView({
  * 摆出结论让人选），不是点下去就改身份的一次性动作。
  */
 function ItemActionsMenu({
+  canManage,
   scraping,
   searchHref,
   onReidentify,
@@ -611,7 +646,10 @@ function ItemActionsMenu({
   onChangeArtwork,
   onTransfer,
   onDelete,
+  onUpgrade,
 }: {
+  /** 媒体库管理权限：识别/刮削/图片/转移/删除这些条目管理项按它显隐 */
+  canManage: boolean;
   scraping: boolean;
   /** 站点资源搜索直达（预填片名）：手动补版本/换版本的入口 */
   searchHref: Route;
@@ -620,6 +658,8 @@ function ItemActionsMenu({
   onChangeArtwork: () => void;
   onTransfer: () => void;
   onDelete: () => void;
+  /** 洗版入口（quality-upgrade.md §13.5）；无订阅权限或条目未识别时不传 */
+  onUpgrade?: () => void;
 }) {
   const router = useRouter();
   const itemClass =
@@ -650,36 +690,47 @@ function ItemActionsMenu({
           collisionPadding={12}
           className="menu-surface z-50 min-w-[11rem] !rounded-xl p-1"
         >
-          <DropdownMenu.Item
-            onSelect={() => router.push(searchHref)}
-            className={itemClass}
-          >
-            搜索资源
-          </DropdownMenu.Item>
-          <DropdownMenu.Separator className="my-1 h-px bg-white/[0.07]" />
-          <DropdownMenu.Item onSelect={onReidentify} className={itemClass}>
-            修正识别结果…
-          </DropdownMenu.Item>
-          <DropdownMenu.Item
-            onSelect={onRefreshMetadata}
-            disabled={scraping}
-            className={itemClass}
-          >
-            {scraping ? "正在刷新元数据…" : "刷新元数据"}
-          </DropdownMenu.Item>
-          <DropdownMenu.Item onSelect={onChangeArtwork} className={itemClass}>
-            更换图片…
-          </DropdownMenu.Item>
-          <DropdownMenu.Item onSelect={onTransfer} className={itemClass}>
-            转移到其他库…
-          </DropdownMenu.Item>
-          <DropdownMenu.Separator className="my-1 h-px bg-white/[0.07]" />
-          <DropdownMenu.Item
-            onSelect={onDelete}
-            className={`${itemClass} !text-[#ff9f9f] data-[highlighted]:!bg-[rgba(255,90,90,0.16)] data-[highlighted]:!text-[#ffb4b4]`}
-          >
-            删除影片
-          </DropdownMenu.Item>
+          {canManage && (
+            <DropdownMenu.Item
+              onSelect={() => router.push(searchHref)}
+              className={itemClass}
+            >
+              搜索资源
+            </DropdownMenu.Item>
+          )}
+          {onUpgrade && (
+            <DropdownMenu.Item onSelect={onUpgrade} className={itemClass}>
+              洗版…
+            </DropdownMenu.Item>
+          )}
+          {canManage && (
+            <>
+              <DropdownMenu.Separator className="my-1 h-px bg-white/[0.07]" />
+              <DropdownMenu.Item onSelect={onReidentify} className={itemClass}>
+                修正识别结果…
+              </DropdownMenu.Item>
+              <DropdownMenu.Item
+                onSelect={onRefreshMetadata}
+                disabled={scraping}
+                className={itemClass}
+              >
+                {scraping ? "正在刷新元数据…" : "刷新元数据"}
+              </DropdownMenu.Item>
+              <DropdownMenu.Item onSelect={onChangeArtwork} className={itemClass}>
+                更换图片…
+              </DropdownMenu.Item>
+              <DropdownMenu.Item onSelect={onTransfer} className={itemClass}>
+                转移到其他库…
+              </DropdownMenu.Item>
+              <DropdownMenu.Separator className="my-1 h-px bg-white/[0.07]" />
+              <DropdownMenu.Item
+                onSelect={onDelete}
+                className={`${itemClass} !text-[#ff9f9f] data-[highlighted]:!bg-[rgba(255,90,90,0.16)] data-[highlighted]:!text-[#ffb4b4]`}
+              >
+                删除影片
+              </DropdownMenu.Item>
+            </>
+          )}
         </DropdownMenu.Content>
       </DropdownMenu.Portal>
     </DropdownMenu.Root>
