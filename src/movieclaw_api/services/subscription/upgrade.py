@@ -19,6 +19,7 @@ media_source/remux/release_group 优先取投递时的 attempt.quality（种子�
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import timedelta
 from pathlib import Path
@@ -55,6 +56,10 @@ _BACKFILL_TICK_SECONDS = 900
 
 # 排期补挂的全表轮转游标（进程内状态；重启丢失只是从头再扫一轮）
 _pending_arm_cursor = 0
+
+# 入库验证互斥：监听导入与库扫描可能并发触发同一条目的对账，双重确认会
+# 对同一批旧文件重复走回收站/删行（第二个会话删已删行会抛错）
+_verify_lock = asyncio.Lock()
 
 # 选"最优文件"用的中性偏好（内置默认分辨率序）：快照本身与规则组无关，
 # 只有多版本并存时需要一个稳定的挑选顺序
@@ -293,6 +298,11 @@ async def verify_upgrades(session: AsyncSession, media_item_id: int) -> None:
       attempt 置 FAILED 进排除清单、熔断计数 +1，连续达阈值转入长冷却
       并出 system_notice 提示人工介入。
     """
+    async with _verify_lock:
+        await _verify_upgrades_locked(session, media_item_id)
+
+
+async def _verify_upgrades_locked(session: AsyncSession, media_item_id: int) -> None:
     from movieclaw_api.services.subscription.matching import (
         UPGRADE_FUSE_COOLDOWN,
         UPGRADE_FUSE_LIMIT,
@@ -500,14 +510,36 @@ async def verify_upgrades(session: AsyncSession, media_item_id: int) -> None:
             wanted.quality = best_snapshot.model_dump(exclude_defaults=True)
             wanted.upgrade_verify_failures = 0
             wanted.updated_at = now
+            # 该单元此前若因连续证伪出过熔断提示，升级成功即问题消失
+            from movieclaw_api.services.system_notice import resolve_notices
+
+            await resolve_notices(
+                session,
+                prefix=(
+                    f"subscription.upgrade:{wanted.subscription_id}:"
+                    f"{wanted.season_number}:{wanted.episode_number}"
+                ),
+            )
             trash_paths: list[str] = []
             if attempt is not None and _file_from_attempt(best_file, attempt):
                 wanted.info_hash = attempt.info_hash
                 attempt.status = DownloadAttemptStatus.IMPORTED
                 attempt.cleanup_note = "洗版完成：新版本已入库"
                 attempt.updated_at = now
-                # 旧任务交给换源清理状态机（H&R/所有权/文件重叠证据齐备才删）
-                if old_hash and old_hash != attempt.info_hash:
+                # 旧任务交给换源清理状态机（H&R/所有权/文件重叠证据齐备才删）。
+                # 前置硬条件：旧 attempt 必须**不再服务任何其他单元**——旧
+                # S01 整季包提供了 E01–E10 而本次只洗 E01 时，把整包送进清理
+                # 会杀掉其余 9 集的做种（真实风险场景，绝不允许）
+                still_serving = (
+                    await session.execute(
+                        select(WantedItem.id).where(
+                            WantedItem.subscription_id == wanted.subscription_id,
+                            WantedItem.info_hash == old_hash,
+                            WantedItem.id != wanted.id,
+                        )
+                    )
+                ).first()
+                if old_hash and old_hash != attempt.info_hash and still_serving is None:
                     old_attempt = (
                         await session.execute(
                             select(SubscriptionDownloadAttempt).where(

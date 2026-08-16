@@ -272,6 +272,15 @@ async def dispatch(
                     values["quality"] = existing_attempt.quality
                 if existing_attempt.hit_and_run is not None:
                     values["hit_and_run"] = existing_attempt.hit_and_run
+                # 证伪过的洗版内容可能以同一 info_hash 在别的站点再现
+                # （排除清单按 site/torrent 记，拦不住跨站同种）：实测已经
+                # 证明它不构成升级，绝不复活为在途任务
+                if (
+                    existing_attempt.purpose == "upgrade"
+                    and existing_attempt.status == DownloadAttemptStatus.FAILED
+                ):
+                    values["status"] = DownloadAttemptStatus.FAILED
+                    values["purpose"] = "upgrade"
                 for key, value in values.items():
                     setattr(existing_attempt, key, value)
                 session.add(existing_attempt)

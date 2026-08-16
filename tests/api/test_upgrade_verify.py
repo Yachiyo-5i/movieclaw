@@ -634,3 +634,72 @@ async def test_refuted_residue_file_quarantined_not_reborn(db, tmp_path):
         assert wanted.quality == _WEBDL  # 基线纹丝不动
         assert not residue.exists()  # 残留文件被隔离进回收站
         assert old_file.exists()
+
+
+@pytest.mark.asyncio
+async def test_old_pack_attempt_kept_while_serving_other_units(db, tmp_path):
+    """旧整季包 attempt 仍服务其他单元（E02 还指着它）时，只洗 E01 绝不把
+    整包送进清理通道——否则会杀掉其余集的做种。"""
+    library, item_id, sub_id, _w1, root, _old1 = await _seed(db, tmp_path, old_hash="packold")
+    # E02 也来自同一个旧整季包（info_hash 同为 packold），不参与本次洗版
+    old_file2 = root / "Testshow.S01E02.1080p.WEB-DL.mkv"
+    old_file2.write_bytes(b"old2")
+    async with db.session() as session:
+        session.add(
+            WantedItem(
+                subscription_id=sub_id,
+                media_item_id=item_id,
+                season_number=1,
+                episode_number=2,
+                status=WantedStatus.IMPORTED,
+                quality={"resolution": "1080p", "media_source": "Blu-ray", "remux": True},
+                info_hash="packold",  # 已到顶，但仍靠旧包做种
+                imported_at=utcnow(),
+            )
+        )
+        session.add(
+            LibraryFile(
+                library_id=library.id,
+                media_item_id=item_id,
+                season_number=1,
+                episode_number=2,
+                file_path=str(old_file2),
+                size_bytes=4,
+                source=FileSource.IMPORTED,
+                resolution="1080p",
+                bit_rate=30_000_000,
+            )
+        )
+        old_pack = (
+            await session.execute(
+                select(SubscriptionDownloadAttempt).where(
+                    SubscriptionDownloadAttempt.info_hash == "packold"
+                )
+            )
+        ).scalar_one()
+        old_pack.units = [[1, 1], [1, 2]]
+        await session.commit()
+    await _add_upgrade_delivery(
+        db, sub_id, item_id, library.id, root,
+        claimed_quality={"resolution": "1080p", "media_source": "Blu-ray", "remux": True},
+        probed={"resolution": "1080p", "bit_rate": 30_000_000},
+    )
+    async with db.session() as session:
+        await close_fulfilled_wanted(session, item_id)
+        wanted = (
+            await session.execute(
+                select(WantedItem).where(
+                    WantedItem.season_number == 1, WantedItem.episode_number == 1
+                )
+            )
+        ).scalar_one()
+        assert wanted.info_hash == "new1"  # E01 升级确认
+        old_pack = (
+            await session.execute(
+                select(SubscriptionDownloadAttempt).where(
+                    SubscriptionDownloadAttempt.info_hash == "packold"
+                )
+            )
+        ).scalar_one()
+        # E02 仍指着旧包 → 旧包保持原状态，不进清理通道
+        assert old_pack.status == DownloadAttemptStatus.COMPLETED
