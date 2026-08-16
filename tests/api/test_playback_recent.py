@@ -19,6 +19,7 @@ from movieclaw_db.models import (
     PlaybackState,
 )
 from movieclaw_db.repositories.library_repo import LibraryRepository
+from movieclaw_playback.state import get_states
 
 
 @pytest_asyncio.fixture
@@ -95,7 +96,7 @@ async def test_recent_watch_is_member_scoped_and_keeps_latest_episode(db) -> Non
             [
                 _file(tv_library.id, show.id, 1, 1),
                 _file(tv_library.id, show.id, 1, 2),
-                # S01E03 在最近播放之后第一次进入本库；多版本只能算一集。
+                # S01E03 尚未观看；同一集的多个版本只能算一集。
                 _file(
                     tv_library.id,
                     show.id,
@@ -111,7 +112,7 @@ async def test_recent_watch_is_member_scoped_and_keeps_latest_episode(db) -> Non
                     added_at=datetime(2026, 8, 15, 22, 0),
                     variant="-2160p",
                 ),
-                # 新入库后已经全部缺失的集不再提醒。
+                # 文件已经全部缺失的集不计入未看提醒。
                 _file(
                     tv_library.id,
                     show.id,
@@ -203,7 +204,7 @@ async def test_recent_watch_is_member_scoped_and_keeps_latest_episode(db) -> Non
         assert episode.episode_title == "第二集"
         assert episode.duration_ms == 2_400_000
         assert episode.progress_percent == 50
-        assert episode.new_episode_count == 1
+        assert episode.unwatched_ahead_count == 1
         assert episode.poster_url == "https://image.tmdb.org/t/p/w500/show.jpg"
         assert episode.episode_still_url == ("https://image.tmdb.org/t/p/w500/episode-2.jpg")
 
@@ -211,11 +212,11 @@ async def test_recent_watch_is_member_scoped_and_keeps_latest_episode(db) -> Non
         assert completed.played is True
         assert completed.duration_ms == 7_200_000
         assert completed.progress_percent is None
-        assert completed.new_episode_count == 0
+        assert completed.unwatched_ahead_count == 0
         assert completed.backdrop_url == ("https://image.tmdb.org/t/p/w780/movie-backdrop.jpg")
         assert completed.episode_still_url is None
 
-        # 一旦开始播放新集，最近观看锚点推进到 S01E03，这次提醒随之清零。
+        # 一旦开始播放 S01E03，锚点推进且该集算已看，未看提醒随之清零。
         session.add(
             PlaybackState(
                 member_id=7,
@@ -235,7 +236,110 @@ async def test_recent_watch_is_member_scoped_and_keeps_latest_episode(db) -> Non
             limit=20,
         )
         assert (refreshed[0].season_number, refreshed[0].episode_number) == (1, 3)
-        assert refreshed[0].new_episode_count == 0
+        assert refreshed[0].unwatched_ahead_count == 0
+
+
+async def test_unwatched_ahead_ignores_watched_episodes_and_refreshed_added_time(db) -> None:
+    """未看提醒只数“锚点之后 + 从未看过”的在位集：洗版刷新入库时间不误报，全看完归零。"""
+    async with db.session() as session:
+        library = await LibraryRepository(session).create(
+            name="剧集库", kind="tv", root_paths=["/tv"]
+        )
+        show = MediaItem(kind="tv", tmdb_id=301, title="完结剧", original_title="Finished")
+        session.add(show)
+        await session.flush()
+        assert library.id and show.id
+
+        # 全部分集的入库时间都晚于播放时间：模拟洗版把旧版本台账行删掉后
+        # 重新落行（旧口径会把整季都误报成“新入库”）。
+        rewritten = datetime(2026, 8, 20, 3, 0)
+        session.add_all(
+            [
+                _file(library.id, show.id, 1, episode, added_at=rewritten)
+                for episode in (1, 2, 3, 4, 5)
+            ]
+        )
+        session.add_all(
+            [
+                # 锚点是 S01E02：E01 更早看过，E04 是跳着看过的更后面的集。
+                PlaybackState(
+                    member_id=5,
+                    media_item_id=show.id,
+                    season_number=1,
+                    episode_number=1,
+                    played=True,
+                    play_count=1,
+                    last_played_at=datetime(2026, 8, 10),
+                ),
+                PlaybackState(
+                    member_id=5,
+                    media_item_id=show.id,
+                    season_number=1,
+                    episode_number=2,
+                    played=True,
+                    play_count=1,
+                    last_played_at=datetime(2026, 8, 12),
+                ),
+                PlaybackState(
+                    member_id=5,
+                    media_item_id=show.id,
+                    season_number=1,
+                    episode_number=4,
+                    played=True,
+                    play_count=1,
+                    last_played_at=datetime(2026, 8, 11),
+                ),
+                # 只收藏、从未播放的集仍然算“未看”。
+                PlaybackState(
+                    member_id=5,
+                    media_item_id=show.id,
+                    season_number=1,
+                    episode_number=5,
+                    is_favorite=True,
+                ),
+                # 别人看过不影响本成员的未看数。
+                PlaybackState(
+                    member_id=6,
+                    media_item_id=show.id,
+                    season_number=1,
+                    episode_number=3,
+                    played=True,
+                    play_count=1,
+                    last_played_at=datetime(2026, 8, 13),
+                ),
+            ]
+        )
+        await session.commit()
+
+        rows = await recent_watch_items(session, member_id=5, visible_library_ids=None, limit=20)
+        assert (rows[0].season_number, rows[0].episode_number) == (1, 2)
+        # 锚点之后只剩 E03、E05 没看；E01/E02 在锚点之前，E04 已经看过。
+        assert rows[0].unwatched_ahead_count == 2
+
+        # 把剩下两集也看完：整部剧看完后角标彻底消失，不再被入库时间惊动。
+        # E03 建新行，E05 沿用那条收藏行标记已看（唯一键上每人每单元只有一行）。
+        session.add(
+            PlaybackState(
+                member_id=5,
+                media_item_id=show.id,
+                season_number=1,
+                episode_number=3,
+                played=True,
+                play_count=1,
+                last_played_at=datetime(2026, 8, 11, 12),
+            )
+        )
+        favorite = (await get_states(session, [show.id], member_id=5))[(show.id, 1, 5)]
+        favorite.played = True
+        favorite.play_count = 1
+        favorite.last_played_at = datetime(2026, 8, 11, 13)
+        await session.commit()
+
+        finished = await recent_watch_items(
+            session, member_id=5, visible_library_ids=None, limit=20
+        )
+        assert (finished[0].season_number, finished[0].episode_number) == (1, 2)
+        assert finished[0].unwatched_ahead_count == 0
 
 
 async def test_recent_watch_honors_limit_and_empty_visibility(db) -> None:
