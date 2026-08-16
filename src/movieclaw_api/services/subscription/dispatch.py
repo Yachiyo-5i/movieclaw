@@ -54,23 +54,34 @@ async def dispatch(
     candidate: TorrentCandidate,
     verdict: RuleVerdict,
     source: str,
+    upgrade_rows: list[WantedItem] | None = None,
+    upgrade_labels: tuple[str, str] | None = None,
 ) -> bool:
-    """把候选投递给下载器，满足给定的一批工单。返回是否有实际投递发生。"""
+    """把候选投递给下载器，满足给定的一批工单。返回是否有实际投递发生。
+
+    洗版（quality-upgrade.md §6.2）：``upgrade_rows`` 是候选要洗版的已入库
+    单元——**不认领、不改 status、不动 info_hash**（保持 imported、指向旧
+    版本，直到入库验证确认升级），只进 attempt 的 units 台账；attempt 标记
+    ``purpose="upgrade"`` 供在途去重与旧版清理定位。``upgrade_labels`` 是
+    (当前档位, 候选档位) 的展示标签，进活动文案。
+    """
     from movieclaw_api.services.subscription.core import recompute_subscription_status
     from movieclaw_api.services.subscription.matching import (
         DISPATCH_RETRY_DELAY,
         units_text,
     )
 
+    upgrade_rows = upgrade_rows or []
     claimed = await _claim(session, wanted_rows)
-    if not claimed:
+    if not claimed and not upgrade_rows:
         return False  # 全部被另一条路径抢先，本候选无事可做
 
     repo = SubscriptionRepository(session)
     assert subscription.id is not None
     dry_run = get_settings().subscription_dispatch_dry_run
     submitted_info_hash: str | None = None
-    units_label = units_text(claimed)
+    all_targets = claimed + upgrade_rows
+    units_label = units_text(all_targets)
     spec_text = _describe(candidate)
 
     # 入库目标：订阅指定的库（缺省该类型默认库）→ 投递目录三级兜底走全仓
@@ -125,7 +136,7 @@ async def dispatch(
             await repo.add_activity(
                 SubscriptionActivity(
                     subscription_id=subscription.id,
-                    wanted_item_id=claimed[0].id,
+                    wanted_item_id=all_targets[0].id,
                     type=ActivityType.DISPATCH_FAILED,
                     message=(
                         f"{units_label}投递失败：{reason}；已退回队列，"
@@ -164,6 +175,7 @@ async def dispatch(
                 )
             # 网络提交期间用户可能刚好取消季订阅。infohash 仍要写入以保存真实
             # 投递历史，但只有仍在范围内的目标才能让尝试保持 active。
+            # 洗版单元不写 info_hash（保持指向旧版本），其在途性由 attempt 表达。
             active_targets = list(
                 (
                     await session.execute(
@@ -180,6 +192,7 @@ async def dispatch(
                 .scalars()
                 .all()
             )
+            attempt_alive = bool(active_targets) or any(w.in_scope for w in upgrade_rows)
             existing_attempt = (
                 await session.execute(
                     select(SubscriptionDownloadAttempt).where(
@@ -193,13 +206,20 @@ async def dispatch(
                 "site_id": candidate.site_id,
                 "torrent_id": candidate.torrent_id,
                 "torrent_title": candidate.title,
-                "units": [[w.season_number, w.episode_number] for w in claimed],
+                "units": [[w.season_number, w.episode_number] for w in all_targets],
                 "quality": candidate.attrs.model_dump(exclude_defaults=True),
                 "hit_and_run": candidate.hit_and_run,
                 "owned_by_movieclaw": not submit_result.already_exists,
+                # 一旦承担过洗版语义就保持 upgrade（入库验证与旧版清理据此定位）
+                "purpose": (
+                    "upgrade"
+                    if upgrade_rows
+                    or (existing_attempt is not None and existing_attempt.purpose == "upgrade")
+                    else "download"
+                ),
                 "status": (
                     DownloadAttemptStatus.ACTIVE
-                    if active_targets
+                    if attempt_alive
                     else DownloadAttemptStatus.CANCELLED
                 ),
                 "baseline_completed_bytes": 0 if not submit_result.already_exists else None,
@@ -212,7 +232,7 @@ async def dispatch(
                 "next_search_at": None,
                 "cleanup_note": (
                     None
-                    if active_targets
+                    if attempt_alive
                     else "网络投递完成前关联单元已退出订阅范围；保留下载器任务"
                 ),
                 "updated_at": now,
@@ -232,7 +252,7 @@ async def dispatch(
                     if isinstance(unit, list) and len(unit) == 2
                 }
                 existing_units.update(
-                    (wanted.season_number, wanted.episode_number) for wanted in claimed
+                    (wanted.season_number, wanted.episode_number) for wanted in all_targets
                 )
                 values["units"] = [[season, episode] for season, episode in sorted(existing_units)]
                 # 同一 hash 是同一份内容的续用，不抹掉首次投递时已经证明的
@@ -281,17 +301,36 @@ async def dispatch(
         candidate.title[:80],
         spec_text,
     )
+    # 洗版投递用专属活动类型与"从 X 洗到 Y"文案；混合投递（缺口+洗版）
+    # 仍是 GRABBED，文案附注洗版单元数
+    if upgrade_rows and not claimed:
+        activity_type = ActivityType.UPGRADE_GRABBED
+        label_text = (
+            f"{upgrade_labels[1]}（当前 {upgrade_labels[0]}）"
+            if upgrade_labels
+            else spec_text
+        )
+        message = (
+            f"{units_label}发现更高版本，已提交洗版下载：来自 {candidate.site_id} 的"
+            f"「{candidate.title[:60]}」（{label_text}）"
+            + target_text
+            + ("——模拟投递，未真实提交下载器" if dry_run else "")
+        )
+    else:
+        activity_type = ActivityType.GRABBED
+        message = (
+            f"已投递{units_label}：来自 {candidate.site_id} 的"
+            f"「{candidate.title[:60]}」（{spec_text}）"
+            + (f"；其中 {units_text(upgrade_rows)}为洗版" if upgrade_rows else "")
+            + target_text
+            + ("——模拟投递，未真实提交下载器" if dry_run else "")
+        )
     await repo.add_activity(
         SubscriptionActivity(
             subscription_id=subscription.id,
-            wanted_item_id=claimed[0].id,
-            type=ActivityType.GRABBED,
-            message=(
-                f"已投递{units_label}：来自 {candidate.site_id} 的"
-                f"「{candidate.title[:60]}」（{spec_text}）"
-                + target_text
-                + ("——模拟投递，未真实提交下载器" if dry_run else "")
-            ),
+            wanted_item_id=all_targets[0].id,
+            type=activity_type,
+            message=message,
             payload={
                 "site_id": candidate.site_id,
                 "torrent_id": candidate.torrent_id,
@@ -300,6 +339,9 @@ async def dispatch(
                 "dry_run": dry_run,
                 "info_hash": submitted_info_hash,
                 "units": [[w.season_number, w.episode_number] for w in claimed],
+                "upgrade_units": [
+                    [w.season_number, w.episode_number] for w in upgrade_rows
+                ],
                 "resource_publish_time": _utc_text(resource_publish_time),
                 "resource_first_seen_at": _utc_text(resource_first_seen_at),
                 "submitted_at": _utc_text(submitted_at),
@@ -317,8 +359,9 @@ async def dispatch(
         from movieclaw_api.services.channel_push import notify_channels, tmdb_push_image_url
 
         year_text = f"({item.year}) " if item.year else ""
+        push_verb = "开始洗版下载" if upgrade_rows and not claimed else "开始下载"
         notify_channels(
-            f"📥 开始下载:《{item.title}》{year_text}{units_label}\n"
+            f"📥 {push_verb}:《{item.title}》{year_text}{units_label}\n"
             f"来自 {candidate.site_id} 的「{candidate.title[:60]}」\n"
             f"{spec_text}",
             event="dispatch",
@@ -332,7 +375,7 @@ async def dispatch(
             [
                 build_download_started_event(
                     item,
-                    [(w.season_number, w.episode_number) for w in claimed],
+                    [(w.season_number, w.episode_number) for w in all_targets],
                     site_id=candidate.site_id,
                     torrent_title=candidate.title,
                     spec=spec_text,

@@ -50,6 +50,10 @@ class ActivityType(StrEnum):
     REPLACEMENT_TRIAL = "replacement_trial"
     REPLACEMENT_PROMOTED = "replacement_promoted"
     REPLACEMENT_CLEANUP = "replacement_cleanup"
+    # 洗版（docs/design/quality-upgrade.md §8.4）
+    UPGRADE_GRABBED = "upgrade_grabbed"  # 发现更高版本并提交下载
+    UPGRADED = "upgraded"  # 洗版完成：新版本入库、旧版本清理
+    UPGRADE_VERIFY_FAILED = "upgrade_verify_failed"  # 洗版候选实测证伪，已排除
 
 
 class SubscriptionActivity(TimestampMixin, table=True):
