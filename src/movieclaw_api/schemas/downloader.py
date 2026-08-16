@@ -87,14 +87,25 @@ class DownloaderView(BaseModel):
 
 
 class DownloadTaskUnitView(BaseModel):
-    """订阅下载覆盖的一个追踪单元；电影沿用 0/0 哨兵。"""
+    """订阅下载覆盖的一个追踪单元；电影沿用 0/0 哨兵。
+
+    ``status`` 直接透传工单状态机（wanted/grabbed/downloaded/imported）。分批
+    入库时同一个种子里各集进度不同，只有逐集状态才能让任务中心说清"覆盖 10
+    集、已入库 2 集"——入库 Job 在两批之间并不存活，不能拿它当状态源。
+    """
 
     season_number: int
     episode_number: int
+    status: Literal["wanted", "grabbed", "downloaded", "imported"] = "grabbed"
 
 
 class DownloadTaskSubscriptionView(BaseModel):
-    """下载器任务关联的订阅摘要，供任务中心回到业务上下文。"""
+    """下载器任务关联的订阅摘要，供任务中心回到业务上下文。
+
+    ``units`` 是**种子声明覆盖的全集**（含已入库的集），不是"还欠哪些集"。
+    早期这里按在途工单过滤，导致列表随入库推进不断缩水、末集入库后变成空，
+    "覆盖剧集"标签下却少了已入库的集（真实教训）。
+    """
 
     id: int
     media_item_id: int

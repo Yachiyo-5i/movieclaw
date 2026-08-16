@@ -1007,6 +1007,52 @@ const INGEST_STATE_META: Record<JobStatus, TaskStateMeta> = {
   cancelled: { label: "入库已取消", color: "#cbd5e1", dot: "bg-white/40" },
 };
 
+/**
+ * 一个下载任务有两条独立进度轴：下载轴的事实源永远是下载器，入库轴的事实源
+ * 是逐集工单状态。入库 Job 只是「此刻正在搬」的瞬时装饰——边下边入库时，两
+ * 批搬运之间没有任何 Job 存活，用「有没有 Job」当状态源会把「整季只下了
+ * 19%、其中先入库 1 集」显示成「下载完成 + 入库完成 100%」（真实事故）。
+ *
+ * 因此只有两种情况允许入库轴接管卡片主状态：整包已下完（入库确实是此刻唯一
+ * 在推进的事），或入库受阻需要人处理（必须顶到最前，不能被下载进度盖住）。
+ */
+function ingestOwnsTaskState(task: DownloadTask, ingestJob: JobView | null): boolean {
+  if (ingestJob == null || ingestJob.status === "cancelled") return false;
+  if (ATTENTION_JOB_STATUSES.has(ingestJob.status)) return true;
+  return task.state === "completed";
+}
+
+/** 按逐集工单状态汇总入库进度；没有订阅上下文（手动/外部任务）时为 null。 */
+function ingestUnitSummary(task: DownloadTask): { imported: number; total: number } | null {
+  const subscription = task.subscriptions[0];
+  if (!subscription || subscription.units.length === 0) return null;
+  return {
+    imported: subscription.units.filter((unit) => unit.status === "imported").length,
+    total: subscription.units.length,
+  };
+}
+
+/** 多集资源分批入库时的「已入库 N/M 集」；单集与电影没有分批语义，返回 null。 */
+function partialIngestLabel(task: DownloadTask): string | null {
+  const summary = ingestUnitSummary(task);
+  if (summary == null || summary.total <= 1) return null;
+  return `已入库 ${summary.imported}/${summary.total} 集`;
+}
+
+/**
+ * 「覆盖剧集」列的是种子声明覆盖的全集，本徽标补上其中已经进库的比例——两者
+ * 分开表达，覆盖范围才不会随入库推进而缩水。
+ */
+function ImportedUnitsBadge({ task }: { task: DownloadTask }) {
+  const summary = ingestUnitSummary(task);
+  if (summary == null || summary.total <= 1 || summary.imported === 0) return null;
+  return (
+    <span className="tnum shrink-0 rounded-md border border-[var(--ok)]/20 bg-[var(--ok)]/[0.07] px-2 py-1 text-[var(--ok)]">
+      已入库 {summary.imported}/{summary.total}
+    </span>
+  );
+}
+
 interface DownloadTaskGroup {
   key: string;
   mediaItemId: number | null;
@@ -1152,14 +1198,18 @@ function DownloadTaskFeedItem({
   onDelete: (task: DownloadTask) => void;
   onReplace: (task: DownloadTask) => void;
 }) {
-  const ingestOwnsState = ingestJob != null && ingestJob.status !== "cancelled";
-  const meta = ingestOwnsState ? INGEST_STATE_META[ingestJob.status] : DOWNLOAD_STATE_META[task.state];
+  const ingestOwnsState = ingestOwnsTaskState(task, ingestJob);
+  const meta =
+    ingestOwnsState && ingestJob
+      ? INGEST_STATE_META[ingestJob.status]
+      : DOWNLOAD_STATE_META[task.state];
   const downloadPercent = task.progress == null ? null : Math.floor(task.progress * 100);
-  const percent = ingestOwnsState
-    ? ingestJob.progress.percent == null
-      ? null
-      : Math.floor(ingestJob.progress.percent)
-    : downloadPercent;
+  const percent =
+    ingestOwnsState && ingestJob
+      ? ingestJob.progress.percent == null
+        ? null
+        : Math.floor(ingestJob.progress.percent)
+      : downloadPercent;
   const title = grouped
     ? task.name || task.media_title || task.info_hash
     : task.media_title || task.name || task.info_hash;
@@ -1255,6 +1305,7 @@ function DownloadTaskFeedItem({
             {firstSubscription.media_kind === "tv" ? "覆盖剧集" : "下载内容"}
           </span>
           <EpisodeUnitsLabel units={firstSubscription.units} />
+          <ImportedUnitsBadge task={task} />
         </div>
       )}
       <DownloadLifecycle task={task} ingestJob={ingestJob} variant="feed" />
@@ -1378,10 +1429,11 @@ function DownloadTaskCard({
 }) {
   const ingestNeedsAttention =
     ingestJob !== null && ["blocked", "failed"].includes(ingestJob.status);
-  const ingestOwnsCardState = ingestJob !== null && ingestJob.status !== "cancelled";
-  const meta = ingestOwnsCardState
-    ? INGEST_STATE_META[ingestJob.status]
-    : DOWNLOAD_STATE_META[task.state];
+  const ingestOwnsCardState = ingestOwnsTaskState(task, ingestJob);
+  const meta =
+    ingestOwnsCardState && ingestJob
+      ? INGEST_STATE_META[ingestJob.status]
+      : DOWNLOAD_STATE_META[task.state];
   const title = grouped
     ? task.name || task.media_title || task.info_hash
     : task.media_title || task.name || task.info_hash;
@@ -1478,6 +1530,7 @@ function DownloadTaskCard({
               {firstSubscription.media_kind === "tv" ? "覆盖剧集" : "下载内容"}
             </span>
             <EpisodeUnitsLabel units={firstSubscription.units} />
+            <ImportedUnitsBadge task={task} />
           </div>
         )}
         <div className="mt-2.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-caption text-white/40">
@@ -1590,7 +1643,9 @@ function DownloadLifecycle({
   ingestJob: JobView | null;
   variant?: "card" | "feed";
 }) {
-  const downloaded = task.state === "completed" || ingestJob != null;
+  // 下载轴只认下载器：存在入库 Job 不等于下载完成——边下边入库会在 19% 时就
+  // 搬走已完整落盘的那一集
+  const downloaded = task.state === "completed";
   const downloadAttention = task.state === "error" || task.state === "missing";
   const downloadWaiting = ["stalled", "paused", "queued", "unknown"].includes(task.state);
   const percent = task.progress == null ? null : Math.floor(task.progress * 100);
@@ -1616,6 +1671,13 @@ function DownloadLifecycle({
     };
   }
 
+  // 入库进度来自工单而非 Job：分批入库的两批之间没有 Job，但「已入库 2/10
+  // 集」依然成立，这一步不能因为 Job 消失就退回「等待入库」
+  const partialLabel = partialIngestLabel(task);
+  const summary = ingestUnitSummary(task);
+  // 拿不到工单上下文（手动/外部任务）时不做分批判断，沿用 Job 的结论
+  const fullyImported = summary == null || summary.imported >= summary.total;
+
   let ingestStep: LifecycleStep;
   if (ingestJob && ATTENTION_JOB_STATUSES.has(ingestJob.status)) {
     ingestStep = {
@@ -1635,11 +1697,15 @@ function DownloadLifecycle({
       detail: ingestJob.progress.message,
       tone: "waiting",
     };
-  } else if (ingestJob?.status === "succeeded") {
+  } else if (ingestJob?.status === "succeeded" || (summary != null && summary.imported > 0)) {
+    // 整包下完且全部入库才算走完；分批入库期间如实说明还差几集
+    const done = downloaded && fullyImported;
     ingestStep = {
-      label: "入库完成",
-      detail: ingestJob.progress.message,
-      tone: "done",
+      label: done ? "入库完成" : "部分入库",
+      detail: done
+        ? (ingestJob?.progress.message ?? "已全部入库")
+        : `${partialLabel ?? "已入库"}，其余等待下载完成`,
+      tone: done ? "done" : "waiting",
     };
   } else if (ingestJob?.status === "cancelled") {
     ingestStep = {
@@ -1754,6 +1820,13 @@ function downloadTaskNote(
   ingestJob: JobView | null,
 ): string | null {
   if (ingestJob?.status === "succeeded") {
+    // 边下边入库：这一批搬完不代表整个种子搬完，剩下的集会在各自下完后
+    // 自动接着入库——不能笼统说「入库已完成」
+    const summary = ingestUnitSummary(task);
+    if (summary != null && summary.imported < summary.total) {
+      return `已入库 ${summary.imported}/${summary.total} 集，其余等待下载完成后自动入库`;
+    }
+    if (task.state !== "completed") return "已完成的部分已入库，其余等待下载完成";
     return "入库已完成，等待任务中心同步收尾";
   }
   if (ingestJob?.status === "cancelled") {
