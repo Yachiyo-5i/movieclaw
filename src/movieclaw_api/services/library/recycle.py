@@ -94,6 +94,21 @@ async def recycle_file(
 
     context = {"reason": reason, "trigger": trigger, "note": note}
 
+    def _keep_in_place(why: str) -> RecycleOutcome:
+        file.state = FileState.TRASHED
+        file.trashed_at = now
+        file.trash_original_path = None  # 原地形态：file_path 即原位置
+        file.purge_after = None if purge_after is _AUTO else purge_after
+        file.trash_context = context
+        file.updated_at = now
+        logger.info("文件原地待回收（%s）：%s", why, src)
+        return "kept_in_place"
+
+    if src.is_dir():
+        # 原盘目录（BDMV/VIDEO_TS）：目录的 st_nlink 天然 ≥2，硬链接判据
+        # 失效；做种任务引用的是目录路径，改名必断种——一律原地待回收
+        return _keep_in_place("原盘目录，改名会打断做种")
+
     seeding_guard = True
     try:
         seeding_guard = src.stat().st_nlink <= 1
@@ -101,14 +116,7 @@ async def recycle_file(
         logger.warning("读取文件硬链接数失败，按保守策略原地待回收：%s", src)
 
     if seeding_guard:
-        file.state = FileState.TRASHED
-        file.trashed_at = now
-        file.trash_original_path = None  # 原地形态：file_path 即原位置
-        file.purge_after = None if purge_after is _AUTO else purge_after
-        file.trash_context = context
-        file.updated_at = now
-        logger.info("文件原地待回收（唯一硬链接，可能仍在做种）：%s", src)
-        return "kept_in_place"
+        return _keep_in_place("唯一硬链接，可能仍在做种")
 
     try:
         trash_dir = _trash_dir_for(src, await _library_roots(session, file.library_id))
@@ -122,13 +130,7 @@ async def recycle_file(
         # 保留（行删了而文件还在，扫描会把它当新文件重新收编），文件去留
         # 交给「恢复/立即清理」或故障修复后的下一轮触发
         logger.exception("移入回收站失败，降级为原地待回收：%s", src)
-        file.state = FileState.TRASHED
-        file.trashed_at = now
-        file.trash_original_path = None
-        file.purge_after = None
-        file.trash_context = context
-        file.updated_at = now
-        return "kept_in_place"
+        return _keep_in_place("移动失败降级")
     file.trash_original_path = file.file_path
     file.file_path = str(target)
     file.state = FileState.TRASHED
@@ -151,12 +153,13 @@ async def restore_file(session: AsyncSession, file: LibraryFile) -> bool:
         if target.exists():
             logger.warning("恢复失败：原路径已有同名文件 %s", target)
             return False
-        if src.exists():
-            target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(src), str(target))
-        elif not target.exists():
+        if not src.exists():
             return False  # 文件哪儿都不在——留给清理任务收敛
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(src), str(target))
         file.file_path = str(target)
+    elif not Path(file.file_path).exists():
+        return False  # 原地形态文件已消失——留给清理任务收敛，不造在位幽灵
     file.state = FileState.IN_PLACE
     file.trashed_at = None
     file.trash_original_path = None
@@ -172,7 +175,9 @@ async def purge_file(session: AsyncSession, file: LibraryFile) -> bool:
         return False
     path = Path(file.file_path)
     try:
-        if path.exists():
+        if path.is_dir():
+            shutil.rmtree(path)  # 原盘目录形态
+        elif path.exists():
             path.unlink()
     except OSError:
         logger.exception("清理待回收文件失败：%s", path)

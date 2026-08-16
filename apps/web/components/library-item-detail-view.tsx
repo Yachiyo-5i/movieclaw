@@ -281,7 +281,8 @@ export function LibraryItemDetailView({
   const trackFiles = isMovie
     ? detail.files
     : (selectedSeriesEpisode?.files ?? []);
-  const availableTrackFiles = trackFiles.filter((file) => !file.missing);
+  // 音轨/规格只认在位文件：缺失与待回收的版本都不该被当作可播内容展示
+  const availableTrackFiles = trackFiles.filter((file) => file.state === "in_place");
   const selectedTrackFile =
     availableTrackFiles.find((file) => file.id === selectedTrackFileId) ??
     availableTrackFiles[0] ??
@@ -290,7 +291,7 @@ export function LibraryItemDetailView({
   // 帧率、编码、文件大小等技术细节留在文件区。电影概览全部在位版本，
   // 剧集只显示当前集当前文件的画面规格，并随文件选择器同步变化。
   const resolutionSources = isMovie
-    ? detail.files.filter((file) => !file.missing)
+    ? detail.files.filter((file) => file.state === "in_place")
     : selectedTrackFile
       ? [selectedTrackFile]
       : [];
@@ -1070,7 +1071,8 @@ function MediaTrackRows({
   onSelectedFileIdChange: (fileId: number) => void;
   onChanged?: () => void;
 }) {
-  const availableFiles = files.filter((file) => !file.missing);
+  // 只认在位文件：缺失与待回收的版本都不该出现在音轨/字幕选择器里
+  const availableFiles = files.filter((file) => file.state === "in_place");
   const [previewTarget, setPreviewTarget] = useState<{
     file: LibraryItemFile;
     stream: SubtitleStream;

@@ -298,3 +298,38 @@ async def test_item_delete_removes_trash_file_but_keeps_trash_dir(db, tmp_path):
     assert (trash_dir / "别的条目的回收文件.mkv").exists()  # 别人的文件没被卷走
     async with db.session() as session:
         assert await session.get(LibraryFile, old_id) is None
+
+
+@pytest.mark.asyncio
+async def test_recycle_keeps_disc_dir_in_place_and_purge_removes_it(db, tmp_path):
+    """原盘目录（BDMV/VIDEO_TS）：目录 st_nlink 天然 ≥2、硬链接判据失效，
+    且做种引用的是目录路径——一律原地待回收；立即清理能删整个目录。"""
+    root = tmp_path / "movies"
+    disc = root / "某电影 (2020)" / "BDMV"
+    (disc / "STREAM").mkdir(parents=True)
+    (disc / "STREAM" / "00000.m2ts").write_bytes(b"disc")
+    async with db.session() as session:
+        library = await LibraryRepository(session).create(
+            name="电影库-原盘", kind="movie", root_paths=[str(root)]
+        )
+        row = LibraryFile(
+            library_id=library.id,
+            file_path=str(disc),
+            size_bytes=4,
+            source=FileSource.SCANNED,
+            container="bluray",
+        )
+        session.add(row)
+        await session.commit()
+        await session.refresh(row)
+
+        outcome = await recycle_file(
+            session, row, reason="upgrade_replaced", trigger=_TRIGGER, note="洗版替换"
+        )
+        assert outcome == "kept_in_place"  # 目录绝不改名
+        assert disc.is_dir()
+        assert row.purge_after is None
+
+        assert await purge_file(session, row) is True  # 立即清理支持目录
+        await session.commit()
+    assert not disc.exists()
