@@ -82,11 +82,12 @@ export interface PosterVisualItem {
   genres?: string[];
   extent?: string;
   badges?: string[];
-  /** 海报角上的斜向常显标签（如「自动续订」「已入库」「已订阅」）。 */
+  /** 海报角上的斜向常显标签（如「自动续订」「已订阅」）；
+   *  「已入库」不必显式传，由 libraryStatus 自动派生（见 resolveRibbon）。 */
   ribbon?: string;
   /** 人物作品页使用更小的左上角斜标；缺省保持订阅墙现有样式。 */
   ribbonVariant?: "compact-left";
-  /** 人物作品页斜标的语义色：已入库为绿色，已订阅为蓝色。 */
+  /** 斜标的语义色：已入库为绿色，已订阅为蓝色。 */
   ribbonTone?: "owned" | "subscribed";
   /** 海报底部常显的一行左右信息；订阅墙用来承载剧集范围与收录进度。 */
   posterFooter?: { label: string; value: string; tracking?: boolean };
@@ -96,6 +97,28 @@ export interface PosterVisualItem {
   overlayDetails?: MediaOverlayDetails;
   overview?: string;
   libraryStatus?: MediaLibraryStatus | null;
+}
+
+/**
+ * 海报角标的最终形态（无角标返回 null）。
+ *
+ * 「已入库」曾有两套表达：人物作品页在海报左上角打绿色斜标，其余发现页只在
+ * 海报下方的年份后面缀一枚绿点。绿点小且混在灰色元信息里，扫墙时几乎看不见，
+ * 现全站统一到斜标——凡是带 libraryStatus 的海报都自动打「已入库」绿斜标。
+ * 调用方显式传 ribbon（订阅墙的「自动续订」、人物作品页的「已订阅」）时以调用方为准。
+ */
+function resolveRibbon(
+  item: PosterVisualItem,
+): { label: string; compactLeft: boolean; tone: "owned" | "subscribed" } | null {
+  if (item.ribbon) {
+    return {
+      label: item.ribbon,
+      compactLeft: item.ribbonVariant === "compact-left",
+      tone: item.ribbonTone ?? "subscribed",
+    };
+  }
+  if (item.libraryStatus) return { label: "已入库", compactLeft: true, tone: "owned" };
+  return null;
 }
 
 export function PosterCard({ item, action, href, revealInfoOnTouch }: PosterCardProps) {
@@ -208,7 +231,7 @@ export function PosterCardVisual({
     "group/card block w-full cursor-pointer rounded-2xl text-left outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent-ring)]";
   if (href) {
     const accessibilityDetails = [
-      item.ribbon,
+      resolveRibbon(item)?.label,
       item.posterFooter ? `${item.posterFooter.label}，收录 ${item.posterFooter.value}` : undefined,
       item.overlayDetails?.primary,
       item.overlayDetails?.secondary,
@@ -261,9 +284,9 @@ function PosterCardContent({
   const overlaySecondary = item.overlayDetails?.secondary?.trim() ?? "";
   const overlayMeta = item.overlayMeta?.trim() ?? "";
   const overview = item.overview ?? "";
-  const compactLeftRibbon = item.ribbonVariant === "compact-left";
+  const ribbon = resolveRibbon(item);
   const compactRibbonTone =
-    item.ribbonTone === "owned"
+    ribbon?.tone === "owned"
       ? "from-emerald-500 via-green-500 to-teal-500 shadow-[0_2px_8px_rgba(16,185,129,0.38)]"
       : "from-sky-500 via-blue-500 to-indigo-500 shadow-[0_2px_8px_rgba(59,130,246,0.38)]";
   return (
@@ -286,22 +309,22 @@ function PosterCardContent({
         )}
         {/* 作品状态用紧凑左上斜标，宽度随海报缩放且不遮评分；其余调用方
             沿用右侧规格。无状态不渲染，避免海报墙过吵。 */}
-        {item.ribbon && (
+        {ribbon && (
           <span
-            aria-label={item.ribbon}
+            aria-label={ribbon.label}
             className={
-              compactLeftRibbon
+              ribbon.compactLeft
                 ? `pointer-events-none absolute -left-[18%] top-2 z-10 w-[62%] -rotate-45 border-y border-white/20 bg-gradient-to-r py-0.5 text-center text-[9px] font-bold leading-[11px] tracking-[0.08em] text-white ${compactRibbonTone}`
                 : "pointer-events-none absolute -right-8 top-4 z-10 w-28 rotate-45 border-y border-white/25 bg-gradient-to-r from-cyan-500 via-sky-500 to-violet-500 py-1 text-center text-[10px] font-bold tracking-[0.12em] text-white shadow-[0_3px_14px_rgba(14,165,233,0.45)]"
             }
           >
-            {item.ribbon}
+            {ribbon.label}
           </span>
         )}
         {/* 右上：评分徽章（暂无评分时不渲染，避免展示 0.0） */}
         {item.rating > 0 && (
           <span
-            className={`tnum absolute right-2 flex items-center gap-1 rounded-md bg-black/70 px-1.5 py-0.5 text-caption font-semibold text-white ${item.ribbon && !compactLeftRibbon ? "top-12" : "top-2"}`}
+            className={`tnum absolute right-2 flex items-center gap-1 rounded-md bg-black/70 px-1.5 py-0.5 text-caption font-semibold text-white ${ribbon && !ribbon.compactLeft ? "top-12" : "top-2"}`}
           >
             <StarIcon className="size-3 text-[var(--warn)]" />
             {item.rating.toFixed(1)}
@@ -380,17 +403,12 @@ function PosterCardContent({
         <p className="text-on-image truncate text-ui font-semibold text-[var(--text)]">
           {item.title}
         </p>
-        {/* 始终保留一行元信息，避免在库状态或缺失年份让同一海报墙的卡片高低跳动。 */}
+        {/* 始终保留一行元信息，避免缺失年份让同一海报墙的卡片高低跳动。
+            在库与否不在这里表达——它已由海报左上角的「已入库」斜标承担。 */}
         <p className="text-on-image tnum mt-0.5 flex min-h-4 items-center gap-1.5 truncate text-caption text-[var(--text-muted)]">
           {!!item.year && <span>{item.year}</span>}
           {!!item.year && item.extent && <span>·</span>}
           {item.extent && <span>{item.extent}</span>}
-          {item.libraryStatus && (
-            <span className="flex shrink-0 items-center gap-1.5 text-emerald-300/90">
-              <span className="size-1.5 rounded-full bg-[var(--ok)]" />
-              在库
-            </span>
-          )}
         </p>
       </div>
     </>
@@ -423,7 +441,7 @@ function PosterCardActionButton({
   const tapGuard = useTapGuard(trigger);
 
   if (!subscribeMeta) {
-    // 在库标识：非交互，与库存格下方的绿点语言一致。
+    // 在库标识：非交互，绿点沿用全站「在库」的语义色（var(--ok)）。
     return (
       <span className="flex h-7 items-center gap-1.5 rounded-full bg-white/[0.18] px-3 text-caption font-semibold text-white/90">
         <span className="size-1.5 rounded-full bg-[var(--ok)]" />

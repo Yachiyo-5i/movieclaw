@@ -166,18 +166,16 @@ function CreditCard({
   subscribed: boolean;
   onOpen: (item: MediaItem) => void;
 }) {
+  // 「已入库」的绿斜标由 PosterCardVisual 依 libraryStatus 全站统一渲染，这里只补订阅态；
   // 两种状态同时存在时优先“已入库”：它表达作品已经可用，比追踪关系更直接。
-  const ribbon = item.libraryStatus ? "已入库" : subscribed ? "已订阅" : undefined;
-  const ribbonTone = item.libraryStatus ? "owned" : subscribed ? "subscribed" : undefined;
+  const subscribedOnly = !item.libraryStatus && subscribed;
   return (
     <PosterCardVisual
-      item={{
-        ...item,
-        libraryStatus: null,
-        ribbon,
-        ribbonVariant: "compact-left",
-        ribbonTone,
-      }}
+      item={
+        subscribedOnly
+          ? { ...item, ribbon: "已订阅", ribbonVariant: "compact-left", ribbonTone: "subscribed" }
+          : item
+      }
       action="none"
       onClick={() => onOpen(item)}
     />
