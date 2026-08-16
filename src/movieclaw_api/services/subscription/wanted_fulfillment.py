@@ -34,6 +34,12 @@ logger = logging.getLogger("movieclaw_api.wanted_fulfillment")
 
 async def close_fulfilled_wanted(session: AsyncSession, media_item_id: int) -> int:
     """把某条目已在库的单元对应的开放工单标记为已入库。返回关闭数。"""
+    # 洗版入库验证先行（quality-upgrade.md §6.3）：已 imported 的单元出现
+    # 新文件不会产生可关闭工单，但需要在同一钩子点做实测裁决（确认/证伪）
+    from movieclaw_api.services.subscription.upgrade import verify_upgrades
+
+    await verify_upgrades(session, media_item_id)
+
     owned = await LibraryFileRepository(session).owned_units(media_item_id)
     if not owned:
         return 0

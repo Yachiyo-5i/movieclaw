@@ -163,6 +163,392 @@ async def fill_snapshots(
 
 
 # ---------------------------------------------------------------------------
+# 入库验证：实测说了算（quality-upgrade.md §6.3）
+# ---------------------------------------------------------------------------
+
+# 回收站目录名：放在**媒体库根目录内**（与文件同一文件系统，重命名即完成，
+# 避免跨盘搬 40GB 文件）；保留期满由回填 tick 顺带清理
+_TRASH_DIR_NAME = ".movieclaw-trash"
+_TRASH_RETENTION_DAYS = 7
+
+
+def _trash_root_for(file: LibraryFile, root_paths: list[str]) -> Path:
+    """选文件所属的库根作为回收站落点（前缀匹配）；都不匹配时用文件父目录。"""
+    file_path = Path(file.file_path)
+    for root in root_paths:
+        try:
+            file_path.relative_to(root)
+        except ValueError:
+            continue
+        return Path(root) / _TRASH_DIR_NAME
+    return file_path.parent / _TRASH_DIR_NAME
+
+
+def _move_file_to_trash(file: LibraryFile, root_paths: list[str]) -> str | None:
+    """把库文件移入回收站；返回回收站内路径，源文件不存在/失败返回 None。
+
+    同名冲突加时间戳前缀。同文件系统内是 rename，瞬时完成。
+    """
+    import shutil
+
+    src = Path(file.file_path)
+    if not src.exists():
+        return None
+    trash_dir = _trash_root_for(file, root_paths)
+    try:
+        trash_dir.mkdir(parents=True, exist_ok=True)
+        target = trash_dir / src.name
+        if target.exists():
+            target = trash_dir / f"{utcnow().strftime('%Y%m%d%H%M%S')}-{src.name}"
+        shutil.move(str(src), str(target))
+        return str(target)
+    except OSError:
+        logger.exception("洗版旧版本移入回收站失败：%s", src)
+        return None
+
+
+def cleanup_trash_dirs(root_paths: list[str]) -> int:
+    """清理回收站中超过保留期的文件，返回清理数（同步，调用方放线程池可选）。"""
+    removed = 0
+    horizon = utcnow().timestamp() - _TRASH_RETENTION_DAYS * 86400
+    for root in root_paths:
+        trash_dir = Path(root) / _TRASH_DIR_NAME
+        if not trash_dir.is_dir():
+            continue
+        for entry in trash_dir.iterdir():
+            try:
+                if entry.stat().st_mtime < horizon:
+                    entry.unlink() if entry.is_file() else __import__("shutil").rmtree(entry)
+                    removed += 1
+            except OSError:
+                logger.warning("清理回收站条目失败：%s", entry, exc_info=True)
+    return removed
+
+
+def _file_from_attempt(file: LibraryFile, attempt: SubscriptionDownloadAttempt) -> bool:
+    """该库文件是否来自这次洗版投递。
+
+    首选入库来源精确匹配（监听导入会带 site/torrent）；扫描收编的文件没有
+    来源信息，退而按时间关联（attempt 创建之后才出现的文件）。
+    """
+    if file.site_id and attempt.site_id:
+        return file.site_id == attempt.site_id and file.torrent_id == attempt.torrent_id
+    return file.created_at is not None and attempt.created_at is not None and (
+        file.created_at >= attempt.created_at
+    )
+
+
+async def verify_upgrades(session: AsyncSession, media_item_id: int) -> None:
+    """洗版入库验证：对该条目在途洗版单元，用实测新快照裁决确认/证伪。
+
+    在库存对账的同一钩子点运行（任何入库路径都会触发），实测说了算：
+    - **确认**（新最优文件档位严格高于基线）：刷新快照与 info_hash 关联、
+      旧版本文件进回收站、旧任务交给换源清理状态机（CLEANUP_PENDING，
+      由 download_progress 巡检以 H&R/所有权/文件重叠证据安全清理）、
+      写 UPGRADED 活动并推送；手工塞入的更优文件同样确认（无 attempt 记账）。
+    - **证伪**（洗版投递的文件实测不构成升级）：新文件移入回收站、
+      attempt 置 FAILED 进排除清单、熔断计数 +1，连续达阈值转入长冷却
+      并出 system_notice 提示人工介入。
+    """
+    from movieclaw_api.services.subscription.matching import (
+        UPGRADE_FUSE_COOLDOWN,
+        UPGRADE_FUSE_LIMIT,
+    )
+    from movieclaw_db.models import (
+        DownloadAttemptStatus,
+        MediaItem,
+        SubscriptionActivity,
+    )
+    from movieclaw_db.models.library import Library
+    from movieclaw_db.models.subscription_activity import ActivityType
+    from movieclaw_db.repositories import SubscriptionRepository
+    from movieclaw_matcher import quality_label
+
+    # 该条目所有"已入库且有基线"的单元
+    rows = list(
+        (
+            await session.execute(
+                select(WantedItem).where(
+                    WantedItem.media_item_id == media_item_id,
+                    WantedItem.status == WantedStatus.IMPORTED,  # type: ignore[arg-type]
+                    WantedItem.in_scope.is_(True),  # type: ignore[attr-defined]
+                    WantedItem.quality.isnot(None),  # type: ignore[union-attr]
+                )
+            )
+        ).scalars()
+    )
+    rows = [w for w in rows if w.quality]  # 排除 {} 哨兵
+    if not rows:
+        return
+    specs = await _specs_for_subscriptions(session, {w.subscription_id for w in rows})
+
+    # 在途洗版 attempt：{(sub_id, unit) -> attempt}
+    attempts = list(
+        (
+            await session.execute(
+                select(SubscriptionDownloadAttempt).where(
+                    SubscriptionDownloadAttempt.subscription_id.in_(  # type: ignore[union-attr]
+                        {w.subscription_id for w in rows}
+                    ),
+                    SubscriptionDownloadAttempt.purpose == "upgrade",
+                    SubscriptionDownloadAttempt.status.in_(  # type: ignore[attr-defined]
+                        (
+                            DownloadAttemptStatus.ACTIVE,
+                            DownloadAttemptStatus.REPLACEMENT_PENDING,
+                            DownloadAttemptStatus.TRIAL,
+                            DownloadAttemptStatus.COMPLETED,
+                        )
+                    ),
+                )
+            )
+        ).scalars()
+    )
+    attempt_by_unit: dict[tuple[int, tuple[int, int]], SubscriptionDownloadAttempt] = {}
+    for attempt in attempts:
+        for u in attempt.units:
+            if isinstance(u, list) and len(u) == 2:
+                attempt_by_unit[(attempt.subscription_id, (int(u[0]), int(u[1])))] = attempt
+
+    files = list(
+        (
+            await session.execute(
+                select(LibraryFile).where(
+                    LibraryFile.media_item_id == media_item_id,
+                    LibraryFile.missing_since.is_(None),  # type: ignore[union-attr]
+                )
+            )
+        ).scalars()
+    )
+    files_by_unit: dict[tuple[int, int], list[LibraryFile]] = {}
+    for file in files:
+        files_by_unit.setdefault((file.season_number, file.episode_number), []).append(file)
+
+    from movieclaw_matcher import QualitySnapshot
+
+    item = await session.get(MediaItem, media_item_id)
+    repo = SubscriptionRepository(session)
+    root_paths_cache: dict[int, list[str]] = {}
+
+    async def _roots(library_id: int | None) -> list[str]:
+        if library_id is None:
+            return []
+        if library_id not in root_paths_cache:
+            row = await session.get(Library, library_id)
+            root_paths_cache[library_id] = list(row.root_paths) if row else []
+        return root_paths_cache[library_id]
+
+    for wanted in rows:
+        unit = (wanted.season_number, wanted.episode_number)
+        unit_files = files_by_unit.get(unit) or []
+        if len(unit_files) < 2 and (wanted.subscription_id, unit) not in attempt_by_unit:
+            continue  # 单版本且无在途洗版：没有可裁决的事
+        baseline = QualitySnapshot.model_validate(wanted.quality)
+        spec = specs.get(wanted.subscription_id)
+        attempt = attempt_by_unit.get((wanted.subscription_id, unit))
+
+        # 逐文件算快照，按**快照**找最优（名称来源：来自洗版投递的文件用
+        # attempt.quality——文件行本身可能还没有片源信息）
+        from movieclaw_matcher.decision import resolution_rank, source_tier
+
+        best_file: LibraryFile | None = None
+        best_snapshot: QualitySnapshot | None = None
+        best_key: tuple[int, int, int] = (-1, -1, -1)
+        for file in unit_files:
+            name_attrs = None
+            if attempt is not None and attempt.quality and _file_from_attempt(file, attempt):
+                name_attrs = QualitySnapshot.model_validate(attempt.quality)
+            snapshot = snapshot_from_file(file, name_attrs)
+            key = (
+                resolution_rank(snapshot.resolution, _NEUTRAL_SPEC) or 0,
+                source_tier(snapshot.media_source, snapshot.remux) or 0,
+                file.id or 0,
+            )
+            if key > best_key:
+                best_file, best_snapshot, best_key = file, snapshot, key
+
+        if best_file is None or best_snapshot is None or spec is None:
+            continue
+
+        # 验证是不设停止线的纯序比较：实测新快照严格优于基线即确认——
+        # 手工塞入超过洗版目标的版本同样是合法升级（quality-upgrade.md §6.3）
+        if _better(best_snapshot, baseline, spec):
+            # ---- 确认升级 ----
+            now = utcnow()
+            old_hash = wanted.info_hash
+            new_label = quality_label(best_snapshot)
+            old_label = quality_label(baseline)
+            wanted.quality = best_snapshot.model_dump(exclude_defaults=True)
+            wanted.upgrade_verify_failures = 0
+            wanted.updated_at = now
+            trash_paths: list[str] = []
+            if attempt is not None and _file_from_attempt(best_file, attempt):
+                wanted.info_hash = attempt.info_hash
+                attempt.status = DownloadAttemptStatus.IMPORTED
+                attempt.cleanup_note = "洗版完成：新版本已入库"
+                attempt.updated_at = now
+                # 旧任务交给换源清理状态机（H&R/所有权/文件重叠证据齐备才删）
+                if old_hash and old_hash != attempt.info_hash:
+                    old_attempt = (
+                        await session.execute(
+                            select(SubscriptionDownloadAttempt).where(
+                                SubscriptionDownloadAttempt.subscription_id
+                                == wanted.subscription_id,
+                                SubscriptionDownloadAttempt.info_hash == old_hash,
+                            )
+                        )
+                    ).scalar_one_or_none()
+                    if old_attempt is not None and old_attempt.status not in (
+                        DownloadAttemptStatus.SUPERSEDED,
+                        DownloadAttemptStatus.RETAINED,
+                        DownloadAttemptStatus.CANCELLED,
+                    ):
+                        attempt.replaces_attempt_id = old_attempt.id
+                        old_attempt.status = DownloadAttemptStatus.CLEANUP_PENDING
+                        old_attempt.updated_at = now
+            # 旧版本文件进回收站、台账行移除（quality-upgrade.md §7.1）
+            for file in unit_files:
+                if file.id == best_file.id:
+                    continue
+                trashed = _move_file_to_trash(file, await _roots(file.library_id))
+                if trashed:
+                    trash_paths.append(trashed)
+                await session.delete(file)
+            await session.commit()
+            await repo.add_activity(
+                SubscriptionActivity(
+                    subscription_id=wanted.subscription_id,
+                    wanted_item_id=wanted.id,
+                    type=ActivityType.UPGRADED,
+                    message=(
+                        f"{_unit_text(wanted)}已洗版：{old_label} → {new_label}"
+                        + ("，旧版本已移入回收站（保留 7 天）" if trash_paths else "")
+                    ),
+                    payload={
+                        "from": old_label,
+                        "to": new_label,
+                        "trash_paths": trash_paths,
+                        "units": [[wanted.season_number, wanted.episode_number]],
+                    },
+                )
+            )
+            if item is not None:
+                from movieclaw_api.services.channel_push import (
+                    notify_channels,
+                    tmdb_push_image_url,
+                )
+
+                notify_channels(
+                    f"✨ 已洗版:《{item.title}》{_unit_text(wanted)}\n{old_label} → {new_label}",
+                    event="upgraded",
+                    image_url=tmdb_push_image_url(item.backdrop_path, item.poster_path),
+                )
+            logger.info(
+                "洗版完成：条目 #%s %s %s → %s",
+                media_item_id,
+                _unit_text(wanted),
+                old_label,
+                new_label,
+            )
+        elif attempt is not None and any(
+            _file_from_attempt(f, attempt) for f in unit_files
+        ):
+            # ---- 证伪：洗版投递的文件已入库但实测不构成升级 ----
+            now = utcnow()
+            trash_paths = []
+            from_attempt = [f for f in unit_files if _file_from_attempt(f, attempt)]
+            others = [f for f in unit_files if not _file_from_attempt(f, attempt)]
+            # 防御：旧版本文件必须还在位才移走证伪文件（宁可留下劣质版本，
+            # 也绝不把单元清空）
+            if others:
+                for file in from_attempt:
+                    trashed = _move_file_to_trash(file, await _roots(file.library_id))
+                    if trashed:
+                        trash_paths.append(trashed)
+                    await session.delete(file)
+            attempt.status = DownloadAttemptStatus.FAILED
+            attempt.cleanup_note = "洗版证伪：实测档位不高于当前版本，候选已排除"
+            attempt.updated_at = now
+            wanted.upgrade_verify_failures += 1
+            fused = wanted.upgrade_verify_failures >= UPGRADE_FUSE_LIMIT
+            if fused:
+                wanted.next_search_at = now + UPGRADE_FUSE_COOLDOWN
+            wanted.updated_at = now
+            await session.commit()
+            await repo.add_activity(
+                SubscriptionActivity(
+                    subscription_id=wanted.subscription_id,
+                    wanted_item_id=wanted.id,
+                    type=ActivityType.UPGRADE_VERIFY_FAILED,
+                    message=(
+                        f"{_unit_text(wanted)}洗版候选证伪：标称 "
+                        f"{quality_label(QualitySnapshot.model_validate(attempt.quality or {}))}，"
+                        f"实测为 {quality_label(best_snapshot)}，已排除该资源"
+                        + (
+                            f"；连续 {wanted.upgrade_verify_failures} 次证伪，"
+                            "该单元洗版转入 30 天冷却"
+                            if fused
+                            else ""
+                        )
+                    ),
+                    payload={
+                        "site_id": attempt.site_id,
+                        "torrent_id": attempt.torrent_id,
+                        "claimed": attempt.quality,
+                        "measured": best_snapshot.model_dump(exclude_defaults=True),
+                        "verify_failures": wanted.upgrade_verify_failures,
+                    },
+                )
+            )
+            if fused:
+                from movieclaw_db.models.system_notice import NoticeSeverity
+
+                from movieclaw_api.services.system_notice import upsert_notice
+
+                await upsert_notice(
+                    session,
+                    dedupe_key=(
+                        f"subscription.upgrade:{wanted.subscription_id}:"
+                        f"{wanted.season_number}:{wanted.episode_number}"
+                    ),
+                    severity=NoticeSeverity.WARNING,
+                    source="subscription",
+                    title="洗版连续证伪，已暂停该单元",
+                    message=(
+                        f"《{item.title if item else '未知条目'}》{_unit_text(wanted)}"
+                        f"连续 {wanted.upgrade_verify_failures} 次抓到标称与实测不符的资源，"
+                        "洗版已转入 30 天冷却。可在订阅详情检查候选质量或调整规则组。"
+                    ),
+                )
+            logger.warning(
+                "洗版证伪：条目 #%s %s 标称与实测不符（连续 %d 次）",
+                media_item_id,
+                _unit_text(wanted),
+                wanted.upgrade_verify_failures,
+            )
+
+
+def _better(snapshot, baseline, spec) -> bool:
+    """实测快照是否严格优于基线（不设停止线的纯序比较，供确认路径复用）。"""
+    from movieclaw_matcher.decision import resolution_rank, source_tier
+
+    s_res = resolution_rank(snapshot.resolution, spec)
+    b_res = resolution_rank(baseline.resolution, spec)
+    if s_res is None or b_res is None:
+        return False
+    if s_res != b_res:
+        return s_res > b_res
+    s_tier = source_tier(snapshot.media_source, snapshot.remux)
+    b_tier = source_tier(baseline.media_source, baseline.remux)
+    return s_tier is not None and b_tier is not None and s_tier > b_tier
+
+
+def _unit_text(wanted: WantedItem) -> str:
+    if wanted.season_number == 0 and wanted.episode_number == 0:
+        return "正片"
+    return f"S{wanted.season_number:02d}E{wanted.episode_number:02d}"
+
+
+# ---------------------------------------------------------------------------
 # 洗版搜索调度（quality-upgrade.md §6.4：被动为主，主动极低频）
 # ---------------------------------------------------------------------------
 
@@ -396,3 +782,14 @@ async def backfill_upgrade_snapshots() -> None:
             if armed_late:
                 await session.commit()
                 logger.info("洗版排期补挂：%d 个已有快照的单元进入洗版排期", armed_late)
+
+        # 顺带清理各库回收站中超保留期的旧版本文件
+        from movieclaw_db.models.library import Library
+
+        roots: list[str] = []
+        for row in (await session.execute(select(Library))).scalars():
+            roots.extend(row.root_paths or [])
+        if roots:
+            removed = cleanup_trash_dirs(roots)
+            if removed:
+                logger.info("回收站清理：移除 %d 个超过 %d 天的旧版本文件", removed, _TRASH_RETENTION_DAYS)
