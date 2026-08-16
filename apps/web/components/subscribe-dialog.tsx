@@ -2,10 +2,14 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 
+import type { Route } from "next";
+import { useRouter } from "next/navigation";
+
 import { CheckIcon } from "@/components/icons";
 import { Modal } from "@/components/modal";
 import { PosterImage } from "@/components/poster-image";
-import { RuleSetEditorDialog, specSummary } from "@/components/rule-sets-panel";
+import { RuleSetEditorDialog, specSummary, upgradeTargetLabel } from "@/components/rule-sets-panel";
+import { UpgradeRunReportView } from "@/components/upgrade-run-dialog";
 import { listLibraries, type MediaLibrary } from "@/lib/api/libraries";
 import {
   createSubscription,
@@ -13,12 +17,14 @@ import {
   listRuleSets,
   previewSubscriptionDownloadRouting,
   previewSubscriptionTitle,
+  runSubscriptionUpgradeRound,
   unsubscribeFromSubscription,
   type DispatchPreview,
   type PrepareResult,
   type ResolveCandidate,
   type RuleSet,
   type SeasonOverview,
+  type UpgradeRunReport,
 } from "@/lib/api/subscriptions";
 import { cachedImageUrl } from "@/lib/image-proxy";
 import type { MediaType } from "@/lib/media-types";
@@ -32,6 +38,12 @@ export interface SubscribeTarget {
   kind: MediaType;
   title: string;
   year?: number;
+  /**
+   * 洗版变体（quality-upgrade.md §13.3，库详情「洗版」入口）：季勾选按媒体库
+   * 库存预填、规则组只列带洗版目标的组、自动续订默认关；创建成功后自动触发
+   * 一轮洗版并展示体检报告。
+   */
+  upgradeIntent?: boolean;
 }
 
 /**
@@ -56,7 +68,11 @@ export function SubscribeDialog({
   onChanged?: () => void;
 }) {
   const { canManageSubscriptions, isAdmin } = usePermissions();
+  const router = useRouter();
+  const upgradeMode = !!target?.upgradeIntent;
   const [prepared, setPrepared] = useState<PrepareResult | null>(null);
+  // 洗版变体：创建成功后自动触发的一轮洗版报告（非空即进入报告段）
+  const [upgradeReport, setUpgradeReport] = useState<UpgradeRunReport | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [ruleSets, setRuleSets] = useState<RuleSet[]>([]);
   const [libraries, setLibraries] = useState<MediaLibrary[]>([]);
@@ -100,17 +116,30 @@ export function SubscribeDialog({
       setSelectedTitleRef(t.titleRef);
       setPrepared(null);
       setError(null);
+      setUpgradeReport(null);
       try {
+        // 洗版变体成员也要选「洗到哪一档」（换组由 upgrade-runs 按订阅归属
+        // 者权限执行，与后端口径一致），故规则列表不再只对管理员拉取
         const [result, rules] = await Promise.all([
           previewSubscriptionTitle({ title_ref: t.titleRef }),
-          canManageSubscriptions ? listRuleSets() : Promise.resolve([]),
+          canManageSubscriptions || t.upgradeIntent
+            ? listRuleSets()
+            : Promise.resolve([]),
         ]);
         // 豆瓣条目可能没有可靠的前端类型；媒体库和投递路由必须以后端
         // 收敛后的 canonical kind 为准，避免电影/剧集选到错误的库。
         const resolvedKind = result.media?.kind ?? t.kind;
         const libs = canManageSubscriptions ? await listLibraries(resolvedKind) : [];
         setRuleSets(rules);
-        setRuleSetId(rules.find((r) => r.is_default)?.id ?? rules[0]?.id ?? null);
+        if (t.upgradeIntent) {
+          // 洗版变体：只在带洗版目标的组里选默认（默认组带目标则优先它）
+          const candidates = rules.filter((r) => upgradeTargetLabel(r.spec));
+          setRuleSetId(
+            (candidates.find((r) => r.is_default) ?? candidates[0])?.id ?? null,
+          );
+        } else {
+          setRuleSetId(rules.find((r) => r.is_default)?.id ?? rules[0]?.id ?? null);
+        }
         setLibraries(libs);
         // 默认库 = 收藏范围路由的结论（按作品的类型/区域自动选库，带中文理由）；
         // 预检失败或没有路由结论时回落该类型默认库
@@ -130,13 +159,19 @@ export function SubscribeDialog({
         }
         setLibraryId(pickedId);
         setPrepared(result);
-        // 默认勾选全部已播出的正季；在播剧默认开启自动续订
-        const airedSeasons = result.seasons
-          .filter((s) => s.season_number > 0 && s.aired_count > 0)
-          .map((s) => s.season_number);
-        setSelectedSeasons(new Set(airedSeasons));
+        // 默认勾选全部已播出的正季；在播剧默认开启自动续订。
+        // 洗版变体（§13.3）：改按媒体库库存预填（用户意图是洗手里有的），
+        // 自动续订默认关（洗版场景不追新，可自行打开）
+        const defaultSeasons = t.upgradeIntent
+          ? result.seasons.filter((s) => s.owned_count > 0).map((s) => s.season_number)
+          : result.seasons
+              .filter((s) => s.season_number > 0 && s.aired_count > 0)
+              .map((s) => s.season_number);
+        setSelectedSeasons(new Set(defaultSeasons));
         setFollowFuture(
-          resolvedKind === "tv" && result.media?.status === "Returning Series",
+          !t.upgradeIntent &&
+            resolvedKind === "tv" &&
+            result.media?.status === "Returning Series",
         );
       } catch (e) {
         setError(e instanceof Error ? e.message : "预检失败，请稍后重试");
@@ -167,7 +202,7 @@ export function SubscribeDialog({
     setBusy(true);
     setError(null);
     try {
-      await createSubscription({
+      const created = await createSubscription({
         title_ref: selectedTitleRef || target.titleRef,
         source_title_ref:
           target.titleRef.startsWith("douban:") && selectedTitleRef !== target.titleRef
@@ -179,6 +214,24 @@ export function SubscribeDialog({
         library_id: canManageSubscriptions ? libraryId : null,
       });
       onChanged?.();
+      if (upgradeMode) {
+        // 洗版变体：创建成功即自动接一轮洗版，弹层切到体检报告段（§13.3）。
+        // 规则组显式带给 upgrade-runs：管理员创建时已选中（后端跳过同组切换），
+        // 成员创建时后端忽略选组、订阅落在默认组，靠这里的归属者换组生效。
+        // 触发失败时订阅已建好——报错留在弹层里，用户可去订阅详情重试
+        try {
+          setUpgradeReport(
+            await runSubscriptionUpgradeRound(created.id, ruleSetId ?? undefined),
+          );
+        } catch (e) {
+          setError(
+            `订阅已创建，但触发洗版失败：${
+              e instanceof Error ? e.message : "请稍后到订阅详情里重试"
+            }`,
+          );
+        }
+        return;
+      }
       onClose();
     } catch (e) {
       setError(e instanceof Error ? e.message : "订阅失败，请稍后重试");
@@ -205,24 +258,62 @@ export function SubscribeDialog({
     }
   };
 
+  // 洗版变体的规则组候选：只列带洗版目标的组（洗版目标住在规则组上）
+  const selectableRules = useMemo(
+    () => (upgradeMode ? ruleSets.filter((r) => upgradeTargetLabel(r.spec)) : ruleSets),
+    [upgradeMode, ruleSets],
+  );
+
   const canSubmit = useMemo(() => {
     if (!prepared?.media || busy) return false;
+    // 洗版变体必须选中一个带洗版目标的组，否则触发一轮洗版会被后端拒绝
+    if (upgradeMode && !selectableRules.some((r) => r.id === ruleSetId)) {
+      return false;
+    }
     if (prepared.media.kind === "movie") return true;
     return selectedSeasons.size > 0 || followFuture;
-  }, [prepared, busy, selectedSeasons, followFuture]);
+  }, [
+    prepared,
+    busy,
+    selectedSeasons,
+    followFuture,
+    upgradeMode,
+    selectableRules,
+    ruleSetId,
+  ]);
 
   if (!target) return null;
+
+  if (upgradeReport) {
+    return (
+      <Modal open onClose={onClose} label={`订阅《${target.title}》`} width="lg">
+        <div className="scroll-thin max-h-[76dvh] overflow-y-auto p-6 max-md:p-5">
+          <UpgradeRunReportView
+            title={target.title}
+            isMovie={(prepared?.media?.kind ?? target.kind) === "movie"}
+            report={upgradeReport}
+            onClose={onClose}
+          />
+        </div>
+      </Modal>
+    );
+  }
 
   return (
     <Modal open onClose={onClose} label={`订阅《${target.title}》`} width="lg">
       <div className="scroll-thin max-h-[76dvh] overflow-y-auto p-6 max-md:p-5">
           <h2 className="text-title font-bold text-white">
-            订阅追踪
+            {upgradeMode ? "订阅并洗版" : "订阅追踪"}
             <span className="ml-2 text-ui font-normal text-[var(--text-muted)]">
               {target.title}
               {target.year ? ` (${target.year})` : ""}
             </span>
           </h2>
+          {upgradeMode && (
+            <p className="mt-1 text-sub leading-6 text-[var(--text-muted)]">
+              洗版通过订阅持续追踪更好的版本：确认后建立订阅并立即体检库里已有的每一集。
+            </p>
+          )}
 
           {/* —— 加载 / 错误 —— */}
           {!prepared && !error && (
@@ -292,6 +383,20 @@ export function SubscribeDialog({
                 >
                   好的
                 </button>
+                {/* 洗版入口进到已有订阅：并入既有订阅（§13.4），去详情触发一轮 */}
+                {upgradeMode && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const id = prepared.existing_subscription_id;
+                      onClose();
+                      router.push(`/subscriptions/${id}?upgrade-run=1` as Route);
+                    }}
+                    className="btn-accent h-9 rounded-full px-4 text-ui font-semibold"
+                  >
+                    去洗一轮版
+                  </button>
+                )}
                 <button
                   type="button"
                   disabled={busy}
@@ -310,7 +415,9 @@ export function SubscribeDialog({
               {prepared.movie_owned && (
                 <p className="flex items-center gap-2 rounded-xl border border-[var(--ok)]/25 bg-[var(--ok)]/10 px-3.5 py-2.5 text-sub text-[var(--ok)]">
                   <CheckIcon className="size-4 shrink-0" />
-                  媒体库里已有这部电影，订阅后不会重复下载
+                  {upgradeMode
+                    ? "媒体库里已有这部电影，将体检现有版本并按需洗版"
+                    : "媒体库里已有这部电影，订阅后不会重复下载"}
                 </p>
               )}
               {prepared.media?.kind === "tv" && (
@@ -351,33 +458,51 @@ export function SubscribeDialog({
                 </section>
               )}
 
-              {canManageSubscriptions && ruleSets.length > 0 && (
+              {(upgradeMode || (canManageSubscriptions && ruleSets.length > 0)) && (
                 <section>
                   <div className="mb-2 flex items-center justify-between">
-                    <h3 className="text-ui font-semibold text-white/85">资源规则</h3>
-                    <button
-                      type="button"
-                      onClick={() => setCreatingRuleSet(true)}
-                      className="text-sub font-medium text-[var(--accent)] hover:underline"
-                    >
-                      + 新建规则组
-                    </button>
+                    <h3 className="text-ui font-semibold text-white/85">
+                      {upgradeMode ? "洗版规则" : "资源规则"}
+                      {upgradeMode && (
+                        <span className="ml-2 font-normal text-[var(--text-faint)]">
+                          只列出配置了洗版目标的组
+                        </span>
+                      )}
+                    </h3>
+                    {canManageSubscriptions && (
+                      <button
+                        type="button"
+                        onClick={() => setCreatingRuleSet(true)}
+                        className="text-sub font-medium text-[var(--accent)] hover:underline"
+                      >
+                        + 新建规则组
+                      </button>
+                    )}
                   </div>
+                  {upgradeMode && selectableRules.length === 0 ? (
+                    <p className="rounded-xl border border-white/[0.08] bg-white/[0.03] px-4 py-3 text-sub leading-6 text-[var(--text-muted)]">
+                      {canManageSubscriptions
+                        ? "还没有配置洗版目标的规则组——点右上角「+ 新建规则组」，在编辑器里选择「洗到哪一档」即可。"
+                        : "还没有配置洗版目标的规则组，请联系管理员在「设置 → 订阅 → 规则组」中配置「洗到哪一档」。"}
+                    </p>
+                  ) : (
                   <select
                     value={ruleSetId ?? undefined}
                     onChange={(e) => setRuleSetId(Number(e.target.value))}
                     className="w-full rounded-xl border border-white/[0.08] bg-white/[0.04] px-3.5 py-2.5 text-ui text-white/90 outline-none focus:border-white/25 [&>option]:bg-[#181c28]"
                   >
-                    {ruleSets.map((r) => (
+                    {selectableRules.map((r) => (
                       <option key={r.id} value={r.id}>
                         {r.name}
                         {r.is_default ? "（默认）" : ""}
+                        {upgradeMode ? ` · 洗到 ${upgradeTargetLabel(r.spec)}` : ""}
                       </option>
                     ))}
                   </select>
+                  )}
                   {/* 所选组的条件摘要：选规则不再是「盲选」 */}
                   {(() => {
-                    const picked = ruleSets.find((r) => r.id === ruleSetId);
+                    const picked = selectableRules.find((r) => r.id === ruleSetId);
                     if (!picked) return null;
                     const chips = specSummary(picked.spec);
                     return (
@@ -488,7 +613,13 @@ export function SubscribeDialog({
                   onClick={submit}
                   className="btn-accent h-9 rounded-full px-5 text-ui font-semibold disabled:opacity-50"
                 >
-                  {busy ? "正在订阅…" : "确认订阅"}
+                  {busy
+                    ? upgradeMode
+                      ? "正在订阅并体检…"
+                      : "正在订阅…"
+                    : upgradeMode
+                      ? "订阅并开始洗版"
+                      : "确认订阅"}
                 </button>
               </div>
             </div>
@@ -502,7 +633,8 @@ export function SubscribeDialog({
           onSaved={(saved) => {
             setCreatingRuleSet(false);
             setRuleSets((prev) => [...prev, saved]);
-            setRuleSetId(saved.id);
+            // 洗版变体只接受带洗版目标的组；新组没配目标就不抢选中
+            if (!upgradeMode || upgradeTargetLabel(saved.spec)) setRuleSetId(saved.id);
           }}
         />
       )}

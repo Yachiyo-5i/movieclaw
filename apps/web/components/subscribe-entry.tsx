@@ -37,8 +37,9 @@ import { usePermissions } from "@/lib/permissions";
 interface SubscribeEntryValue {
   /** 当前身份能否创建、调整或取消订阅；页面据此直接隐藏操作入口。 */
   canSubscribe: boolean;
-  /** 打开订阅弹层；豆瓣来源缺 type 时先补拉详情识别类型，故为异步 */
-  open: (item: PosterVisualItem) => Promise<void>;
+  /** 打开订阅弹层；豆瓣来源缺 type 时先补拉详情识别类型，故为异步。
+   *  opts.upgradeIntent 打开洗版变体（库存季预填 + 建订阅后自动接一轮洗版）。 */
+  open: (item: PosterVisualItem, opts?: { upgradeIntent?: boolean }) => Promise<void>;
   /** 查找该影片已存在的订阅；未订阅（或列表尚未加载完成）返回 undefined */
   subscriptionOf: (item: SubscriptionLookupKey) => Subscription | undefined;
   /** 全站订阅列表；null = 首次拉取尚未完成（订阅页据此渲染加载态） */
@@ -84,23 +85,27 @@ export function SubscribeEntryProvider({ children }: { children: ReactNode }) {
     void refresh();
   }, [refresh]);
 
-  const open = useCallback(async (item: PosterVisualItem) => {
-    if (!canSubscribe) return;
-    const source = item.source ?? "tmdb";
-    const reference = item.titleRef ?? titleRef(source, item.type ?? "movie", item.id);
-    let kind = item.type;
-    if (!kind && source === "douban") {
-      kind = await fetchDiscoveredTitleDetails(reference)
-        .then((detail) => detail.item.type)
-        .catch(() => undefined);
-    }
-    setTarget({
-      titleRef: reference,
-      kind: kind ?? "movie",
-      title: item.title,
-      year: item.year,
-    });
-  }, [canSubscribe]);
+  const open = useCallback(
+    async (item: PosterVisualItem, opts?: { upgradeIntent?: boolean }) => {
+      if (!canSubscribe) return;
+      const source = item.source ?? "tmdb";
+      const reference = item.titleRef ?? titleRef(source, item.type ?? "movie", item.id);
+      let kind = item.type;
+      if (!kind && source === "douban") {
+        kind = await fetchDiscoveredTitleDetails(reference)
+          .then((detail) => detail.item.type)
+          .catch(() => undefined);
+      }
+      setTarget({
+        titleRef: reference,
+        kind: kind ?? "movie",
+        title: item.title,
+        year: item.year,
+        upgradeIntent: opts?.upgradeIntent,
+      });
+    },
+    [canSubscribe],
+  );
 
   // 查表索引：subscriptionOf 在海报墙的每张卡片渲染时都会被调用，线性查找
   // 是 O(卡片数 × 订阅数)；列表变化时建一次索引，单次查询 O(1)，同键保留首条。

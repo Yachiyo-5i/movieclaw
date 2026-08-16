@@ -19,9 +19,10 @@ import { Modal } from "@/components/modal";
 import { PageNav } from "@/components/page-nav";
 import { usePageTitle } from "@/lib/use-page-title";
 import { PosterImage } from "@/components/poster-image";
-import { specSummary } from "@/components/rule-sets-panel";
+import { specSummary, upgradeTargetLabel } from "@/components/rule-sets-panel";
 import { useSubscribeEntry } from "@/components/subscribe-entry";
 import { SubscriptionAdjustDialog } from "@/components/subscription-adjust-dialog";
+import { UpgradeRunDialog } from "@/components/upgrade-run-dialog";
 import {
   deleteSubscriptionPermanently,
   getSubscription,
@@ -63,7 +64,14 @@ import { usePermissions } from "@/lib/permissions";
  *      - 活动记录：竖轨时间线，后端每个动作的中文流水全宽展示
  *        （创建 / 搜索 / 匹配 / 拒绝原因 / 投递 / 入库），长句不再折行成豆腐块。
  */
-export function SubscriptionInspectorView({ id }: { id: number }) {
+export function SubscriptionInspectorView({
+  id,
+  autoOpenUpgradeRun = false,
+}: {
+  id: number;
+  /** 进入即打开「洗一轮版」弹层（库详情洗版入口跳转并轨到既有订阅，§13.4） */
+  autoOpenUpgradeRun?: boolean;
+}) {
   const router = useRouter();
   const confirm = useConfirm();
   // 暂停/取消订阅会改变全站订阅状态（海报卡片的「已订阅」徽标），操作后同步刷新
@@ -76,6 +84,7 @@ export function SubscriptionInspectorView({ id }: { id: number }) {
   const [busy, setBusy] = useState(false);
   const [switchingRule, setSwitchingRule] = useState(false);
   const [adjusting, setAdjusting] = useState(false);
+  const [upgradeRunning, setUpgradeRunning] = useState(autoOpenUpgradeRun);
   const [managing, setManaging] = useState(false);
   const [tab, setTab] = useState<"wanted" | "activity">("wanted");
   const toast = useToast();
@@ -99,6 +108,14 @@ export function SubscriptionInspectorView({ id }: { id: number }) {
   useEffect(() => {
     reload();
   }, [reload]);
+
+  // 消费掉 ?upgrade-run=1：弹层已按初始态打开，把参数从地址栏摘掉，
+  // 避免关闭弹层后刷新页面又弹一次
+  useEffect(() => {
+    if (autoOpenUpgradeRun) {
+      router.replace(`/subscriptions/${id}` as Route, { scroll: false });
+    }
+  }, [autoOpenUpgradeRun, id, router]);
 
   // 有在途投递（已提交下载/已下载待入库）时才轮询：
   // - 5s 拉一次实时进度（速度/ETA，纯读快照）；
@@ -132,10 +149,13 @@ export function SubscriptionInspectorView({ id }: { id: number }) {
     return map;
   }, [downloads]);
 
-  const ruleSetName = useMemo(
-    () => ruleSets.find((r) => r.id === detail?.rule_set_id)?.name ?? `#${detail?.rule_set_id}`,
-    [ruleSets, detail],
-  );
+  const ruleSetName = useMemo(() => {
+    const rs = ruleSets.find((r) => r.id === detail?.rule_set_id);
+    if (!rs) return `#${detail?.rule_set_id}`;
+    // 规则组配了洗版目标时在 fact 里带出（quality-upgrade.md §8.3）
+    const target = upgradeTargetLabel(rs.spec);
+    return target ? `${rs.name} · 洗到 ${target}` : rs.name;
+  }, [ruleSets, detail]);
   usePageTitle(detail?.media.title);
 
   // 兜底态（加载中/失败）也渲染 PageNav（片名未知，末项留空）：向外壳登记
@@ -174,6 +194,18 @@ export function SubscriptionInspectorView({ id }: { id: number }) {
   }
 
   const meta = subscriptionStatusMeta[detail.status];
+  // 复合态（quality-upgrade.md §8.3）：内容收齐了但还有单元在洗更高版本。
+  // 「已收齐」语义不变（洗版不影响完成判定），只在文案上如实补一句
+  const upgradingCount = detail.progress.upgrading ?? 0;
+  // 电影只有一个单元，「洗版中（1）」读着别扭——单单元不带计数
+  const upgradingText =
+    detail.progress.total > 1 ? `洗版中（${upgradingCount}）` : "洗版中";
+  const statusLabel =
+    detail.status === "completed" && upgradingCount > 0
+      ? `已收齐 · ${upgradingText}`
+      : detail.status === "active" && upgradingCount > 0 && detail.progress.wanted === 0
+        ? `${meta.label} · ${upgradingText}`
+        : meta.label;
   const isMovie = detail.media.kind === "movie";
   const poster = detail.media.poster_url ? cachedImageUrl(detail.media.poster_url) : null;
 
@@ -299,7 +331,7 @@ export function SubscriptionInspectorView({ id }: { id: number }) {
               className="size-1.5 rounded-full shadow-[0_0_0_4px_rgba(255,255,255,0.05)]"
               style={{ backgroundColor: meta.color }}
             />
-            {meta.label}
+            {statusLabel}
           </span>
         </div>
 
@@ -386,13 +418,16 @@ export function SubscriptionInspectorView({ id }: { id: number }) {
                   <span className="whitespace-nowrap">立即搜索</span>
                 </button>
               )}
-              {canSubscribe && canSearch && detail.progress.wanted > 0 && (
+              {/* 有缺口，或配了洗版目标且有已入库单元（手选换版本，§13.8）时展示 */}
+              {canSubscribe &&
+                canSearch &&
+                (detail.progress.wanted > 0 || detail.wanted.some((w) => w.upgrade)) && (
                 <Link
                   href={
                     `/search?q=${encodeURIComponent(detail.media.title)}&for_sub=${detail.id}` as Route
                   }
                   className="btn-glass inline-flex h-10 min-w-0 items-center justify-center gap-1.5 border border-white/10 bg-white/[0.05] px-4 text-sub font-medium backdrop-blur-md max-md:h-11 max-md:px-2"
-                  title="到站点资源搜索里挑一条种子，直接投给本订阅（跳过规则组限制）"
+                  title="到站点资源搜索里挑一条种子，直接投给本订阅（跳过规则组限制；替换已入库版本时按入库实测裁决，证明更优才替换）"
                 >
                   <SearchIcon className="size-4 shrink-0" />
                   <span className="whitespace-nowrap">手动选种</span>
@@ -409,6 +444,7 @@ export function SubscriptionInspectorView({ id }: { id: number }) {
                       canManageSubscriptions={canManageSubscriptions}
                       followFuture={isMovie ? null : detail.follow_future}
                       onAdjust={() => setAdjusting(true)}
+                      onUpgradeRun={() => setUpgradeRunning(true)}
                       onToggleFollowFuture={() => void toggleFollowFuture()}
                       onSwitchRule={() => setSwitchingRule(true)}
                       onTogglePause={() => void togglePause()}
@@ -475,6 +511,10 @@ export function SubscriptionInspectorView({ id }: { id: number }) {
             setManaging(false);
             setAdjusting(true);
           }}
+          onUpgradeRun={() => {
+            setManaging(false);
+            setUpgradeRunning(true);
+          }}
           onToggleFollowFuture={() => {
             setManaging(false);
             void toggleFollowFuture();
@@ -506,6 +546,18 @@ export function SubscriptionInspectorView({ id }: { id: number }) {
         />
       )}
 
+      {canSubscribe && upgradeRunning && (
+        <UpgradeRunDialog
+          detail={detail}
+          onClose={() => setUpgradeRunning(false)}
+          onFinished={() => {
+            setUpgradeRunning(false);
+            reload();
+            refreshSubscriptions();
+          }}
+        />
+      )}
+
       {canManageSubscriptions && switchingRule && (
         <RuleSetSwitchDialog
           ruleSets={ruleSets}
@@ -531,6 +583,8 @@ interface SubscriptionManageActionsProps {
   /** null 表示电影订阅，不展示没有业务语义的自动续订动作。 */
   followFuture: boolean | null;
   onAdjust: () => void;
+  /** 打开「洗一轮版」弹层（quality-upgrade.md §13.5 的订阅详情入口） */
+  onUpgradeRun: () => void;
   onToggleFollowFuture: () => void;
   onSwitchRule: () => void;
   onTogglePause: () => void;
@@ -547,6 +601,7 @@ function SubscriptionManageMenu({
   canManageSubscriptions,
   followFuture,
   onAdjust,
+  onUpgradeRun,
   onToggleFollowFuture,
   onSwitchRule,
   onTogglePause,
@@ -579,6 +634,11 @@ function SubscriptionManageMenu({
           {canSubscribe && (
             <DropdownMenu.Item onSelect={onAdjust} className={itemClass}>
               调整订阅…
+            </DropdownMenu.Item>
+          )}
+          {canSubscribe && (
+            <DropdownMenu.Item onSelect={onUpgradeRun} disabled={busy} className={itemClass}>
+              洗一轮版…
             </DropdownMenu.Item>
           )}
           {canSubscribe && followFuture !== null && (
@@ -632,6 +692,7 @@ function SubscriptionManageSheet({
   followFuture,
   onClose,
   onAdjust,
+  onUpgradeRun,
   onToggleFollowFuture,
   onSwitchRule,
   onTogglePause,
@@ -650,6 +711,12 @@ function SubscriptionManageSheet({
           {canSubscribe && (
             <button type="button" onClick={onAdjust} className={rowClass}>
               <span>调整订阅</span>
+              <span aria-hidden className="text-white/35">›</span>
+            </button>
+          )}
+          {canSubscribe && (
+            <button type="button" disabled={busy} onClick={onUpgradeRun} className={rowClass}>
+              <span>洗一轮版</span>
               <span aria-hidden className="text-white/35">›</span>
             </button>
           )}
@@ -828,6 +895,10 @@ function ProgressStrip({
   const { total, wanted, grabbed, downloaded, imported } = progress;
   const denom = Math.max(total, 1);
   const inPipeline = grabbed + downloaded;
+  // 洗版中 ⊆ 已入库：内容在手（计入分子），但版本还在向目标档位洗——
+  // 条带里用青色从绿色里分出来，图例给数字，不让色觉成为唯一通道
+  const upgrading = progress.upgrading ?? 0;
+  const importedSettled = Math.max(imported - upgrading, 0);
   return (
     <div className="mt-4 max-md:col-span-2 max-md:mt-1">
       <div className="flex items-center justify-between gap-4 text-sub">
@@ -838,12 +909,20 @@ function ProgressStrip({
       </div>
       <div
         role="img"
-        aria-label={`共 ${total} ${unitLabel}，已入库 ${imported}，下载中 ${inPipeline}，缺失 ${wanted}`}
+        aria-label={
+          `共 ${total} ${unitLabel}，已入库 ${imported}` +
+          (upgrading > 0 ? `（其中洗版中 ${upgrading}）` : "") +
+          `，下载中 ${inPipeline}，缺失 ${wanted}`
+        }
         className="mt-2 flex h-1.5 w-full overflow-hidden rounded-full bg-white/[0.12]"
       >
         <div
           className="bg-[var(--ok)]"
-          style={{ width: `${(imported / denom) * 100}%` }}
+          style={{ width: `${(importedSettled / denom) * 100}%` }}
+        />
+        <div
+          className="bg-[#2dd4bf]"
+          style={{ width: `${(upgrading / denom) * 100}%` }}
         />
         <div
           className="bg-[#6aa7ff]"
@@ -851,7 +930,8 @@ function ProgressStrip({
         />
       </div>
       <div className="tnum mt-2 flex flex-wrap items-center gap-x-4 gap-y-1.5 text-caption text-white/45">
-        <ProgressLegend color="var(--ok)" label={`已入库 ${imported}`} />
+        <ProgressLegend color="var(--ok)" label={`已入库 ${importedSettled}`} />
+        {upgrading > 0 && <ProgressLegend color="#2dd4bf" label={`洗版中 ${upgrading}`} />}
         <ProgressLegend color="var(--info)" label={`下载中 ${inPipeline}`} />
         <ProgressLegend color="rgba(255,255,255,0.2)" label={`缺失 ${wanted}`} />
       </div>
@@ -909,12 +989,16 @@ function activityColor(type: SubscriptionActivity["type"]): string {
     case "imported":
     case "replacement_promoted":
       return "var(--ok)";
+    case "upgrade_grabbed":
+    case "upgraded":
+      return "#2dd4bf"; // 洗版专属青色，与「洗版中」徽标/进度条分段同源
     case "match_rejected":
     case "dispatch_failed":
     case "import_failed":
       return "var(--danger)";
     case "paused":
     case "download_stalled":
+    case "upgrade_verify_failed":
       return "var(--warn)";
     default:
       return "var(--info)";
@@ -1009,6 +1093,11 @@ function WantedBreakdown({
                 <span className="ml-2 font-normal text-[var(--text-faint)]">
                   {items.filter((w) => w.status !== "wanted").length}/{items.length} 已安排
                 </span>
+                {items.some((w) => w.upgrade?.active) && (
+                  <span className="ml-2 font-normal text-[#2dd4bf]/80">
+                    洗版中 {items.filter((w) => w.upgrade?.active).length}
+                  </span>
+                )}
               </p>
             )}
             <ul className="divide-y divide-white/[0.05]">
@@ -1143,6 +1232,34 @@ function resourceTimingNote(timing: ResourceTiming | null, previous: boolean): s
 
 function wantedPresentation(w: WantedItem): { label: string; color: string; note: string } {
   if (w.status === "imported") {
+    // 洗版中（quality-upgrade.md §8.3）：已入库但规则组的洗版目标还没达到。
+    // 标签与差距文案由后端统一生成（当前档 → 目标档），前端零拼接
+    if (w.upgrade?.active) {
+      // 搜索次数不进说明行——行尾已有统一的「已搜索 n 次」元素，重复即噪音
+      return {
+        label: "洗版中",
+        color: "#2dd4bf",
+        note: `当前 ${w.upgrade.current_label} → 目标 ${w.upgrade.target_label}`,
+      };
+    }
+    if (w.upgrade?.indeterminate) {
+      // 无法确认档位（§13.8）：不参与自动洗版——如实说明并给出人工出路，
+      // 否则这类单元与档位健康的单元毫无区别，用户以为它在洗版盘子里
+      return {
+        label: "已入库",
+        color: "var(--ok)",
+        note: `${w.upgrade.current_label} · 无法确认是否低于洗版目标，不自动洗；可手动选种替换`,
+      };
+    }
+    if (w.upgrade) {
+      // 规则组开了洗版但该单元已到顶/暂休：带出当前档位，让「库里是什么
+      // 版本」始终可见（自然学习路径，quality-upgrade.md §8.5）
+      return {
+        label: "已入库",
+        color: "var(--ok)",
+        note: `${w.upgrade.current_label} · 入库于 ${formatDateTime(w.imported_at)}`,
+      };
+    }
     return { label: "已入库", color: "var(--ok)", note: `入库于 ${formatDateTime(w.imported_at)}` };
   }
   if (w.status === "downloaded") {

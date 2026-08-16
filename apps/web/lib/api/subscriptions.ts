@@ -74,6 +74,22 @@ export interface SubscriptionProgress {
   downloaded: number;
   /** 已整理入库（终态） */
   imported: number;
+  /** 已入库但仍在洗版中的单元数（详情接口计算；列表接口恒为 0） */
+  upgrading: number;
+}
+
+/** 单元的洗版派生状态（见 movieclaw_api WantedUpgradeView）；标签由后端生成。 */
+export interface WantedUpgrade {
+  /** 是否洗版中（可证明低于目标且未熔断） */
+  active: boolean;
+  /** 当前版本档位标签（如「1080p WEB-DL」） */
+  current_label: string;
+  /** 洗版目标档位标签（如「1080p Remux」） */
+  target_label: string;
+  /** 已洗版搜索次数 */
+  search_attempts: number;
+  /** 无法确认档位（证明不了低于目标也证明不了达标）：不参与自动洗版，可手动选种替换 */
+  indeterminate: boolean;
 }
 
 export interface Subscription {
@@ -180,6 +196,8 @@ export interface WantedItem {
   imported_at: string | null;
   /** 在途工单锚定的种子 hash；据此与 listActiveSubscriptionDownloads 的进度组对上 */
   info_hash: string | null;
+  /** 洗版派生状态；规则组未配洗版目标或单元未入库时为 null */
+  upgrade: WantedUpgrade | null;
 }
 
 export interface SubscriptionDetail extends Subscription {
@@ -208,6 +226,12 @@ export interface RuleSetSpec {
   subtitle_languages_require?: string[];
   /** 要求的音轨语言（cmn=国语、yue=粤语…）；空=不限 */
   audio_languages_require?: string[];
+  /** 洗版目标片源档；缺省=不洗版（docs/design/quality-upgrade.md §3.2） */
+  upgrade_source?: "web-dl" | "blu-ray" | "remux" | null;
+  /** 洗版目标分辨率；缺省=分辨率偏好首选（都缺省则 1080p），须在 resolutions 内 */
+  cutoff_resolution?: string | null;
+  /** [预留] 站点白名单；空=全部启用站点 */
+  sites?: string[];
 }
 
 export interface RuleSet {
@@ -449,6 +473,43 @@ export function searchMissingSubscriptionResources(
   );
 }
 
+/** 一轮洗版体检里单个单元的结论（见 schemas.subscription.UpgradeRunUnitView）。 */
+export interface UpgradeRunUnit {
+  season_number: number;
+  episode_number: number;
+  /** upgradable=已排入立即搜索 / at_cutoff=已达目标 / in_flight=已在洗 /
+   *  not_comparable=无法识别当前版本 / missing=缺失（照常走缺口下载） */
+  state: "upgradable" | "at_cutoff" | "in_flight" | "not_comparable" | "missing";
+  current_label: string | null;
+  target_label: string;
+}
+
+/** 一轮洗版的体检报告（见 schemas.subscription.UpgradeRunView）。 */
+export interface UpgradeRunReport {
+  target_label: string;
+  rule_set_id: number;
+  /** 中文整句摘要，直接展示 */
+  summary: string;
+  counts: Record<UpgradeRunUnit["state"], number>;
+  units: UpgradeRunUnit[];
+}
+
+/**
+ * 触发一轮洗版：可选先换规则组（组必须配置洗版目标），随后物化存量工单、
+ * 逐集体检并把可洗单元排入立即搜索。暂停中的订阅后端报可读错误。
+ */
+export function runSubscriptionUpgradeRound(
+  id: number,
+  ruleSetId?: number | null,
+): Promise<UpgradeRunReport> {
+  return unwrap(
+    request<ApiEnvelope<UpgradeRunReport>>(`/subscriptions/${id}/upgrade-runs`, {
+      method: "POST",
+      body: JSON.stringify(ruleSetId != null ? { rule_set_id: ruleSetId } : {}),
+    }),
+  );
+}
+
 /** 手动选种的种子字段（搜索结果行原样回传，attrs 即搜索链路的服务端解析）。 */
 export interface GrabPayload {
   site_id: string;
@@ -574,7 +635,10 @@ export interface SubscriptionActivity {
     | "replacement_searched"
     | "replacement_trial"
     | "replacement_promoted"
-    | "replacement_cleanup";
+    | "replacement_cleanup"
+    | "upgrade_grabbed"
+    | "upgraded"
+    | "upgrade_verify_failed";
   message: string;
   payload: Record<string, unknown>;
   created_at: string;

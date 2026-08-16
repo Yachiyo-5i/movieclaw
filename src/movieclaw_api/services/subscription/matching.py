@@ -38,6 +38,7 @@ from movieclaw_enrich.models import TorrentAttrs
 from movieclaw_matcher import (
     IdentityMatch,
     MediaIdentity,
+    QualitySnapshot,
     RuleSetSpec,
     RuleVerdict,
     TorrentCandidate,
@@ -65,6 +66,19 @@ SEARCH_FAILURE_RETRY = timedelta(minutes=15)  # 搜索本身失败（非无结�
 DISPATCH_RETRY_DELAY = timedelta(minutes=30)  # 投递失败后经调度通道重试
 MATCH_BATCH_SIZE = 500  # 被动匹配每批处理的种子行数
 REFRESH_PER_TICK = 5  # F3 每 tick 刷新的条目数
+
+# -- 洗版调度参数（docs/design/quality-upgrade.md §6.4）------------------------
+# 被动匹配是洗版主通道，主动搜索只是极低频兜底：洗版不急，对 PT 站克制是铁律
+UPGRADE_BACKOFF = (timedelta(days=7), timedelta(days=14), timedelta(days=30))
+UPGRADE_PRIORITY = -10  # 永远排在补旧(0)与追新(10)后面
+UPGRADE_FUSE_LIMIT = 3  # 连续证伪熔断阈值（§6.3）
+UPGRADE_FUSE_COOLDOWN = timedelta(days=30)  # 熔断后的长冷却
+UPGRADE_FIRST_SEARCH_SPREAD_HOURS = 24  # 首搜在 24h 内错峰，避免瞬时搜索风暴
+
+
+def upgrade_backoff_delay(attempts: int) -> timedelta:
+    """洗版搜索退避档位（7d → 14d → 30d 封顶）。"""
+    return UPGRADE_BACKOFF[min(attempts, len(UPGRADE_BACKOFF) - 1)]
 
 _SITE_CALENDAR_TIMEZONE = ZoneInfo(DEFAULT_SITE_TIMEZONE)
 
@@ -96,13 +110,26 @@ def backoff_delay(attempts: int) -> timedelta:
 
 @dataclass
 class MediaContext:
-    """单个媒体条目的匹配上下文：身份 + 该条目的未满足工单与规则。"""
+    """单个媒体条目的匹配上下文：身份 + 该条目的未满足工单与规则。
+
+    洗版（quality-upgrade.md §5/§6）：``upgrade_wanted`` 是"已入库但可证明
+    低于洗版目标、且当前无在途洗版投递"的单元；``upgrade_snapshots`` 是
+    这些单元的当前版本质量快照（比较基线）；``upgrade_excluded`` 是该订阅
+    既往证伪候选的 (site_id, torrent_id) 排除清单。
+    """
 
     item: MediaItem
     identity: MediaIdentity
     subscription: Subscription
     spec: RuleSetSpec
     open_wanted: dict[tuple[int, int], WantedItem]
+    upgrade_wanted: dict[tuple[int, int], WantedItem] = field(default_factory=dict)
+    upgrade_snapshots: dict[tuple[int, int], QualitySnapshot] = field(default_factory=dict)
+    upgrade_excluded: frozenset[tuple[str, str]] = frozenset()
+    # 已入库但**不可洗**的单元（到顶/快照不可比/熔断冷却/洗版在途）：
+    # 整季包铁律的另一半——包覆盖到任何一个这样的单元就整体放弃洗版维度，
+    # 否则"为洗一部分重下整季"会把已到顶的集也重新下一遍
+    upgrade_blocked: dict[tuple[int, int], WantedItem] = field(default_factory=dict)
 
 
 @dataclass
@@ -116,12 +143,97 @@ class MatchSummary:
     dispatched_torrents: list[str] = field(default_factory=list)
 
 
+async def _load_specs(session: AsyncSession) -> dict[int, RuleSetSpec | None]:
+    """一次载入全部规则组并解析 spec。
+
+    None = spec 解析失败的坏规则组（如版本回退后 JSON 里有当前版本不认识的
+    枚举值）：跳过引用它的订阅并大声报错，绝不让一条脏配置拖垮整轮匹配，
+    也不静默降级为"全不限"（那会乱抓资源）。
+    """
+    specs: dict[int, RuleSetSpec | None] = {}
+    for rule_set in (await session.execute(select(RuleSet))).scalars():
+        if rule_set.id is None:
+            continue
+        try:
+            specs[rule_set.id] = RuleSetSpec.model_validate(rule_set.spec or {})
+        except ValueError:
+            specs[rule_set.id] = None
+            logger.exception(
+                "规则组「%s」(id=%s) 的过滤参数无法解析，引用它的订阅本轮"
+                "跳过匹配。常见原因：应用回退到旧版本后规则组包含新版本"
+                "字段值，请在规则组页面重新保存修正",
+                rule_set.name,
+                rule_set.id,
+            )
+    return specs
+
+
+async def _ensure_context(
+    session: AsyncSession,
+    contexts: dict[int, MediaContext],
+    media_item_id: int,
+    subscription: Subscription,
+    spec: RuleSetSpec,
+) -> MediaContext | None:
+    """按需创建条目上下文（缺口与洗版两条加载路径共用）。"""
+    ctx = contexts.get(media_item_id)
+    if ctx is not None:
+        return ctx
+    item = await session.get(MediaItem, media_item_id)
+    if item is None:  # 外键保证下理论不可达
+        return None
+    ctx = MediaContext(
+        item=item,
+        identity=MediaIdentity(
+            kind=item.kind,
+            year=item.year,
+            aliases=tuple(item.aliases),
+            imdb_id=item.imdb_id,
+            douban_id=item.douban_id,
+            season_numbers=(),  # 先占位，收集完工单后统一回填
+        ),
+        subscription=subscription,
+        spec=spec,
+        open_wanted={},
+    )
+    contexts[media_item_id] = ctx
+    return ctx
+
+
+def upgrade_ready(wanted: WantedItem, spec: RuleSetSpec, *, now: datetime) -> bool:
+    """该单元当下是否可参与洗版（quality-upgrade.md §2.4/§6.3 的调度口径）。
+
+    - 快照必须能证明"低于洗版目标"（证明不了的安静，不打扰站点）；
+    - 证伪熔断中的单元（连续证伪达阈值且长冷却**未到期**）不参与。
+      冷却到期即恢复（计数由 postpone_upgrade_wanted 在恢复后清零重新观察）；
+      next_search_at 为 None 不算熔断中——排期缺失不能变成永久停摆。
+    """
+    from movieclaw_matcher import provably_below_cutoff
+
+    if not wanted.quality:  # NULL 未回填 / {} 无法识别哨兵
+        return False
+    snapshot = QualitySnapshot.model_validate(wanted.quality)
+    if not provably_below_cutoff(snapshot, spec):
+        return False
+    fused = (  # 熔断冷却中
+        wanted.upgrade_verify_failures >= UPGRADE_FUSE_LIMIT
+        and wanted.next_search_at is not None
+        and wanted.next_search_at > now
+    )
+    return not fused
+
+
 async def load_match_context(session: AsyncSession) -> dict[int, MediaContext]:
-    """加载"有未满足工单且订阅活跃"的条目上下文：{media_item_id: MediaContext}。
+    """加载匹配上下文：缺口单元 + 洗版单元，{media_item_id: MediaContext}。
 
     活跃订阅通常只有几十个，整体载入进程内、逐种子比对是可承受的；
-    返回空 dict 表示当下没有任何缺口，调用方应快速返回。
+    返回空 dict 表示当下既没有缺口也没有洗版目标，调用方应快速返回。
     """
+    from movieclaw_matcher import QualitySnapshot
+
+    specs = await _load_specs(session)
+
+    contexts: dict[int, MediaContext] = {}
     result = await session.execute(
         select(WantedItem, Subscription)
         .join(Subscription, WantedItem.subscription_id == Subscription.id)  # type: ignore[arg-type]
@@ -131,59 +243,112 @@ async def load_match_context(session: AsyncSession) -> dict[int, MediaContext]:
             Subscription.status == SubscriptionStatus.ACTIVE,
         )
     )
-    rows = result.all()
-    if not rows:
-        return {}
-
-    contexts: dict[int, MediaContext] = {}
-    # None = spec 解析失败的坏规则组（如版本回退后 JSON 里有当前版本不认识的
-    # 枚举值）：跳过引用它的订阅并大声报错，绝不让一条脏配置拖垮整轮匹配，
-    # 也不静默降级为"全不限"（那会乱抓资源）。
-    specs: dict[int, RuleSetSpec | None] = {}
-    for wanted, subscription in rows:
-        ctx = contexts.get(wanted.media_item_id)
+    for wanted, subscription in result.all():
+        spec = specs.get(subscription.rule_set_id, RuleSetSpec())
+        if spec is None:
+            continue  # 坏规则组，_load_specs 已报错
+        ctx = await _ensure_context(session, contexts, wanted.media_item_id, subscription, spec)
         if ctx is None:
-            item = await session.get(MediaItem, wanted.media_item_id)
-            if item is None:  # 外键保证下理论不可达
-                continue
-            if subscription.rule_set_id not in specs:
-                rule_set = await session.get(RuleSet, subscription.rule_set_id)
-                try:
-                    specs[subscription.rule_set_id] = RuleSetSpec.model_validate(
-                        rule_set.spec if rule_set else {}
-                    )
-                except ValueError:
-                    specs[subscription.rule_set_id] = None
-                    logger.exception(
-                        "规则组「%s」(id=%s) 的过滤参数无法解析，引用它的订阅本轮"
-                        "跳过匹配。常见原因：应用回退到旧版本后规则组包含新版本"
-                        "字段值，请在规则组页面重新保存修正",
-                        rule_set.name if rule_set else "已删除",
-                        subscription.rule_set_id,
-                    )
-            spec = specs[subscription.rule_set_id]
+            continue
+        ctx.open_wanted[(wanted.season_number, wanted.episode_number)] = wanted
+
+    # -- 洗版单元（quality-upgrade.md §5）------------------------------------
+    upgrade_rule_ids = {
+        rid for rid, spec in specs.items() if spec is not None and spec.upgrade_source is not None
+    }
+    if upgrade_rule_ids:
+        now = utcnow()
+        # 拿全部 imported 单元（含 quality NULL 的）：可洗的进 upgrade_wanted，
+        # 其余进 upgrade_blocked——铁律需要知道"包会不会碰到不该重下的集"
+        result = await session.execute(
+            select(WantedItem, Subscription)
+            .join(Subscription, WantedItem.subscription_id == Subscription.id)  # type: ignore[arg-type]
+            .where(
+                WantedItem.status == WantedStatus.IMPORTED,
+                WantedItem.in_scope.is_(True),  # type: ignore[attr-defined]
+                # 洗版的主场景恰恰是"已收齐"（completed）的订阅——只有
+                # 用户显式暂停才停（quality-upgrade.md §6.3）
+                Subscription.status != SubscriptionStatus.PAUSED,  # type: ignore[arg-type]
+                Subscription.rule_set_id.in_(upgrade_rule_ids),  # type: ignore[union-attr]
+            )
+        )
+        upgrade_subs: set[int] = set()
+        for wanted, subscription in result.all():
+            spec = specs.get(subscription.rule_set_id)
             if spec is None:
                 continue
-            ctx = MediaContext(
-                item=item,
-                identity=MediaIdentity(
-                    kind=item.kind,
-                    year=item.year,
-                    aliases=tuple(item.aliases),
-                    imdb_id=item.imdb_id,
-                    douban_id=item.douban_id,
-                    season_numbers=(),  # 先占位，收集完工单后统一回填
-                ),
-                subscription=subscription,
-                spec=spec,
-                open_wanted={},
+            ctx = await _ensure_context(
+                session, contexts, wanted.media_item_id, subscription, spec
             )
-            contexts[wanted.media_item_id] = ctx
-        ctx.open_wanted[(wanted.season_number, wanted.episode_number)] = wanted
+            if ctx is None:
+                continue
+            unit = (wanted.season_number, wanted.episode_number)
+            if wanted.quality and upgrade_ready(wanted, spec, now=now):
+                ctx.upgrade_wanted[unit] = wanted
+                ctx.upgrade_snapshots[unit] = QualitySnapshot.model_validate(wanted.quality)
+                if subscription.id is not None:
+                    upgrade_subs.add(subscription.id)
+            else:
+                ctx.upgrade_blocked[unit] = wanted
+
+        if upgrade_subs:
+            # 在途去重与证伪排除：一次载入相关订阅的洗版 attempt 历史
+            from movieclaw_db.models import DownloadAttemptStatus, SubscriptionDownloadAttempt
+
+            attempts = (
+                await session.execute(
+                    select(SubscriptionDownloadAttempt).where(
+                        SubscriptionDownloadAttempt.subscription_id.in_(upgrade_subs),  # type: ignore[union-attr]
+                        SubscriptionDownloadAttempt.purpose == "upgrade",
+                    )
+                )
+            ).scalars()
+            in_flight: dict[int, set[tuple[int, int]]] = {}
+            excluded: dict[int, set[tuple[str, str]]] = {}
+            terminal = {
+                DownloadAttemptStatus.SUPERSEDED,
+                DownloadAttemptStatus.RETAINED,
+                DownloadAttemptStatus.IMPORTED,
+                DownloadAttemptStatus.FAILED,
+                DownloadAttemptStatus.CANCELLED,
+            }
+            for attempt in attempts:
+                units = {
+                    (int(u[0]), int(u[1]))
+                    for u in attempt.units
+                    if isinstance(u, list) and len(u) == 2
+                }
+                if attempt.status == DownloadAttemptStatus.FAILED:
+                    # 证伪的候选进排除清单（§4.3），同一假资源不抓第二次
+                    if attempt.site_id and attempt.torrent_id:
+                        excluded.setdefault(attempt.subscription_id, set()).add(
+                            (attempt.site_id, attempt.torrent_id)
+                        )
+                elif attempt.status not in terminal:
+                    in_flight.setdefault(attempt.subscription_id, set()).update(units)
+            for ctx in contexts.values():
+                sub_id = ctx.subscription.id
+                if sub_id is None or not ctx.upgrade_wanted:
+                    continue
+                for unit in in_flight.get(sub_id, ()):  # 在途单元本轮不再比，转入铁律阻挡集
+                    moved = ctx.upgrade_wanted.pop(unit, None)
+                    ctx.upgrade_snapshots.pop(unit, None)
+                    if moved is not None:
+                        ctx.upgrade_blocked[unit] = moved
+                ctx.upgrade_excluded = frozenset(excluded.get(sub_id, set()))
+
+    # 空上下文（缺口与洗版都为零）没有比对价值，剔除以便调用方快速返回
+    contexts = {
+        media_id: ctx
+        for media_id, ctx in contexts.items()
+        if ctx.open_wanted or ctx.upgrade_wanted
+    }
 
     # 回填已知季号（"无季号单集"的安全推断依赖它；从工单推导即覆盖订阅关心的季）
     for ctx in contexts.values():
-        seasons = tuple(sorted({s for s, _ in ctx.open_wanted}))
+        seasons = tuple(
+            sorted({s for s, _ in ctx.open_wanted} | {s for s, _ in ctx.upgrade_wanted})
+        )
         ctx.identity = MediaIdentity(
             kind=ctx.identity.kind,
             year=ctx.identity.year,
@@ -277,6 +442,56 @@ def covered_units(
     return result
 
 
+async def _resolve_upgrade(
+    repo: SubscriptionRepository,
+    ctx: MediaContext,
+    candidate: TorrentCandidate,
+    match: IdentityMatch,
+    units: dict[tuple[int, int], WantedItem],
+    published,
+    source: str,
+    *,
+    quiet: bool = False,
+) -> tuple[list[WantedItem], tuple[str, str] | None]:
+    """候选对洗版单元的判定（quality-upgrade.md §5）。
+
+    整季包铁律：候选覆盖的**每个**洗版单元都必须构成合法升级，任一判否即
+    整体放弃洗版维度（缺口维度不受影响）——杜绝"为洗 3 集重下整季"。
+
+    噪音控制：``upgrade_not_better`` / ``upgrade_at_cutoff`` 是常态不记活动；
+    ``upgrade_not_comparable`` 是用户该知道的数据质量问题，按 MATCH_REJECTED
+    既有去重规则记录（第二遍 ``quiet=True`` 不重复记）。
+
+    返回 (可洗单元列表, (当前档位, 候选档位) 标签)——标签供投递活动文案。
+    """
+    from movieclaw_matcher import compare_upgrade
+
+    if not units:
+        return [], None
+    if (candidate.site_id, candidate.torrent_id) in ctx.upgrade_excluded:
+        return [], None  # 既往证伪的候选（§4.3），不抓第二次
+    covered = covered_units(match, units, published=published)
+    if not covered:
+        return [], None
+    # 铁律的另一半：包还覆盖了不可洗的已入库单元（到顶/不可比/在途）→
+    # 抓它就是为洗一部分重下整季，整体放弃洗版维度
+    if ctx.upgrade_blocked and covered_units(match, ctx.upgrade_blocked, published=published):
+        return [], None
+    labels: tuple[str, str] | None = None
+    for wanted in covered:
+        snapshot = ctx.upgrade_snapshots.get((wanted.season_number, wanted.episode_number))
+        if snapshot is None:  # 理论不可达：快照与单元同步维护
+            return [], None
+        upgrade_verdict = compare_upgrade(candidate, snapshot, ctx.spec)
+        if not upgrade_verdict.accepted:
+            if upgrade_verdict.reason_code == "upgrade_not_comparable" and not quiet:
+                await _log_rejection(repo, ctx, candidate, covered, upgrade_verdict, source)
+            return [], None
+        if labels is None and upgrade_verdict.current_label and upgrade_verdict.candidate_label:
+            labels = (upgrade_verdict.current_label, upgrade_verdict.candidate_label)
+    return covered, labels
+
+
 async def evaluate_and_dispatch(
     session: AsyncSession, torrents: list[SiteTorrent], *, source: str
 ) -> MatchSummary:
@@ -305,27 +520,36 @@ async def evaluate_and_dispatch(
             if match is None:
                 continue
             covered = covered_units(match, ctx.open_wanted, published=published)
-            if not covered:
-                continue  # 身份命中但没有可满足的缺口（都已安排），无需任何动作
+            upgrade_covered, _ = await _resolve_upgrade(
+                repo, ctx, candidate, match, ctx.upgrade_wanted, published, source
+            )
+            if not covered and not upgrade_covered:
+                continue  # 身份命中但既无缺口也无可洗单元，无需任何动作
             summary.identity_hits += 1
-            pack_units = len(match.episodes) or len(covered)
+            pack_units = len(match.episodes) or (len(covered) + len(upgrade_covered))
             verdict = evaluate_rules(candidate, ctx.spec, pack_episode_count=pack_units)
             if not verdict.accepted:
                 summary.rejected += 1
-                await _log_rejection(repo, ctx, candidate, covered, verdict, source)
+                await _log_rejection(
+                    repo, ctx, candidate, covered or upgrade_covered, verdict, source
+                )
                 continue
             accepted.setdefault(media_id, []).append((candidate, match, verdict))
 
     # 第二遍：按条目选优投递。整季包优先（已确认决策）；一个候选投出后，
-    # 它覆盖的单元从缺口里划掉，剩余缺口继续由次优候选补
+    # 它覆盖的单元从缺口/洗版清单里划掉，剩余单元继续由次优候选补
     for media_id, entries in accepted.items():
         ctx = contexts[media_id]
         entries.sort(key=lambda e: (e[1].is_pack, e[2].score, e[0].seeders or 0), reverse=True)
         remaining = dict(ctx.open_wanted)
+        remaining_upgrade = dict(ctx.upgrade_wanted)
         for candidate, match, verdict in entries:
             published = publish_calendar_date(candidate.publish_time)
             targets = covered_units(match, remaining, published=published)
-            if not targets:
+            upgrade_targets, upgrade_labels = await _resolve_upgrade(
+                repo, ctx, candidate, match, remaining_upgrade, published, source, quiet=True
+            )
+            if not targets and not upgrade_targets:
                 continue
             done = await dispatch(
                 session,
@@ -335,12 +559,16 @@ async def evaluate_and_dispatch(
                 candidate=candidate,
                 verdict=verdict,
                 source=source,
+                upgrade_rows=upgrade_targets,
+                upgrade_labels=upgrade_labels,
             )
             if done:
-                summary.dispatched_units += len(targets)
+                summary.dispatched_units += len(targets) + len(upgrade_targets)
                 summary.dispatched_torrents.append(f"{candidate.site_id}/{candidate.torrent_id}")
                 for w in targets:
                     remaining.pop((w.season_number, w.episode_number), None)
+                for w in upgrade_targets:
+                    remaining_upgrade.pop((w.season_number, w.episode_number), None)
 
     if summary.identity_hits:
         logger.info(

@@ -240,6 +240,31 @@ const AUDIO_LANG_OPTIONS: [string, string][] = [
 ];
 
 /**
+ * 洗版目标片源档的三个选项就是全部预设（docs/design/quality-upgrade.md §8.2）
+ * ——没有需要照抄的社区配置。目标分辨率缺省取分辨率偏好的第一位。
+ */
+const UPGRADE_OPTIONS: [
+  NonNullable<RuleSetSpec["upgrade_source"]> & string,
+  string,
+][] = [
+  ["web-dl", "洗到 WEB-DL"],
+  ["blu-ray", "洗到蓝光"],
+  ["remux", "洗到 Remux"],
+];
+const UPGRADE_SOURCE_LABEL: Record<string, string> = {
+  "web-dl": "WEB-DL",
+  "blu-ray": "蓝光",
+  remux: "Remux",
+};
+
+/** 洗版目标的人话标签（摘要芯片 / 订阅详情页规则组 fact 复用）。 */
+export function upgradeTargetLabel(spec: RuleSetSpec): string | null {
+  if (!spec.upgrade_source) return null;
+  const resolution = spec.cutoff_resolution || spec.resolutions?.[0] || "1080p";
+  return `${resolution} ${UPGRADE_SOURCE_LABEL[spec.upgrade_source] ?? spec.upgrade_source}`;
+}
+
+/**
  * 编码按"家族"选择：词表把 x265 / H.265 / HEVC 归一成不同值，而用户想表达的
  * 是"要 H.265 这一族"——UI 选一族即把全部等价写法写进白名单，避免因发布组
  * 写法不同而漏掉资源。
@@ -254,6 +279,8 @@ const CODEC_FAMILIES: { label: string; values: string[] }[] = [
 export function specSummary(spec: RuleSetSpec): string[] {
   const chips: string[] = [];
   if (spec.resolutions?.length) chips.push(spec.resolutions.join(" > "));
+  const upgradeTarget = upgradeTargetLabel(spec);
+  if (upgradeTarget) chips.push(`洗到 ${upgradeTarget}`);
   if (spec.video_codecs?.length) {
     const rest = new Set(spec.video_codecs);
     const labels: string[] = [];
@@ -346,6 +373,11 @@ export function RuleSetEditorDialog({
   const [sizeMax, setSizeMax] = useState(spec.size_max_mb?.toString() ?? "");
   const [groupsAllow, setGroupsAllow] = useState((spec.release_groups_allow ?? []).join(", "));
   const [groupsBlock, setGroupsBlock] = useState((spec.release_groups_block ?? []).join(", "));
+  // 洗版目标：""=不洗版（唯一的洗版配置点，docs/design/quality-upgrade.md §8.2）
+  const [upgradeSource, setUpgradeSource] = useState<string>(spec.upgrade_source ?? "");
+  const [cutoffResolution, setCutoffResolution] = useState<string>(
+    spec.cutoff_resolution ?? "",
+  );
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -412,6 +444,20 @@ export function RuleSetEditorDialog({
     const block = parseGroups(groupsBlock);
     if (allow.length) next.release_groups_allow = allow;
     if (block.length) next.release_groups_block = block;
+    if (upgradeSource) {
+      next.upgrade_source = upgradeSource as RuleSetSpec["upgrade_source"];
+      // 目标分辨率仅在偏离缺省（分辨率偏好首选）时写入；限定了分辨率时
+      // 目标必须落在允许范围内（后端同样校验）
+      if (cutoffResolution && cutoffResolution !== (resolutions[0] ?? "")) {
+        if (resolutions.length && !resolutions.includes(cutoffResolution)) {
+          setError("洗版目标分辨率必须在允许的分辨率范围内");
+          return;
+        }
+        next.cutoff_resolution = cutoffResolution;
+      }
+    }
+    // API 写入的预留字段（站点白名单）编辑时原样保留，不因 UI 保存而丢失
+    if (spec.sites?.length) next.sites = spec.sites;
 
     setBusy(true);
     setError(null);
@@ -484,6 +530,54 @@ export function RuleSetEditorDialog({
                 );
               })}
             </div>
+          </Field>
+
+          <Field
+            label="洗版"
+            hint="收齐后继续追更高版本，直到达到目标档位为止。新版本入库后旧版本进回收站保留 7 天，做种中的任务不受影响；不开启 = 下到即止"
+          >
+            <div className="flex flex-wrap gap-1.5">
+              <ToggleChip active={upgradeSource === ""} onClick={() => setUpgradeSource("")}>
+                不洗版
+              </ToggleChip>
+              {UPGRADE_OPTIONS.map(([value, label]) => (
+                <ToggleChip
+                  key={value}
+                  active={upgradeSource === value}
+                  onClick={() => setUpgradeSource(value)}
+                >
+                  {label}
+                </ToggleChip>
+              ))}
+            </div>
+            {upgradeSource !== "" && (
+              <div className="mt-2 rounded-xl bg-white/[0.03] px-4 py-2.5">
+                <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-1.5">
+                  <span className="text-sub text-[var(--text-muted)]">目标分辨率</span>
+                  <div className="flex flex-wrap gap-1.5">
+                    {(resolutions.length ? resolutions : RESOLUTION_OPTIONS).map((option) => {
+                      const effective = cutoffResolution || resolutions[0] || "1080p";
+                      return (
+                        <ToggleChip
+                          key={option}
+                          active={effective === option}
+                          onClick={() =>
+                            setCutoffResolution(option === (resolutions[0] ?? "") ? "" : option)
+                          }
+                        >
+                          {option}
+                        </ToggleChip>
+                      );
+                    })}
+                  </div>
+                </div>
+                <p className="mt-1.5 text-caption text-[var(--text-faint)]">
+                  {resolutions.length > 0
+                    ? "缺省跟随上方分辨率偏好的第一位"
+                    : "未限定分辨率时缺省洗到 1080p（避免意外进入 4K 的磁盘占用）"}
+                </p>
+              </div>
+            )}
           </Field>
 
           <Field label="视频编码" hint="按家族选择，等价写法（如 x265 / HEVC）一并计入；不选 = 不限">

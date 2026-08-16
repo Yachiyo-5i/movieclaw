@@ -37,6 +37,7 @@ from movieclaw_api.services.subscription.matching import (
     evaluate_and_dispatch,
     load_match_context,
     units_text,
+    upgrade_ready,
 )
 from movieclaw_api.services.subscription.release_forecast import (
     FORECAST_MIN_INTERVAL,
@@ -55,6 +56,10 @@ from movieclaw_api.services.subscription.replacement import (
     request_replacement,
     run_replacement_search,
     try_replacement_candidates,
+)
+from movieclaw_api.services.subscription.upgrade import (
+    run_upgrade_round,
+    upgrade_attempt_wanted_rows,
 )
 from movieclaw_api.services.subscription.wanted_fulfillment import close_fulfilled_wanted
 from movieclaw_api.services.subscription.wanted_search import kick_search_soon, search_wanted
@@ -84,6 +89,9 @@ __all__ = [
     "promote_trial",
     "quality_not_lower",
     "reconcile_pending_cleanup",
+    "run_upgrade_round",
+    "upgrade_attempt_wanted_rows",
+    "upgrade_ready",
     "replacement_backoff",
     "recompute_subscription_status",
     "refresh_release_forecasts",

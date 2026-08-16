@@ -852,13 +852,23 @@ class SubscriptionService:
             w.next_search_at = now
             self._session.add(w)
             reset += 1
+        # 洗版半边：已入库但未到洗版目标的单元一并重置（规则组未配洗版时为 0）
+        from movieclaw_api.services.subscription.upgrade import reset_upgrade_search_now
+
+        upgrade_reset = await reset_upgrade_search_now(self._session, subscription_id)
+        reset += upgrade_reset
         if reset == 0:
             raise BadRequestException("当前没有可立即搜索的缺口（在途/未定档/待播出的项无需触发）")
         await self._log(
             subscription,
             ActivityType.ADJUSTED,
-            f"用户触发立即搜索：{reset} 个缺口跳过冷却、重新排队",
-            payload={"reset_count": reset, "reason": "search_now"},
+            f"用户触发立即搜索：{reset} 个缺口跳过冷却、重新排队"
+            + (f"（含 {upgrade_reset} 个洗版单元）" if upgrade_reset else ""),
+            payload={
+                "reset_count": reset,
+                "upgrade_reset_count": upgrade_reset,
+                "reason": "search_now",
+            },
         )
         self._kick_search()
         return reset

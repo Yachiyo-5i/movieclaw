@@ -128,17 +128,31 @@ async def search_wanted() -> None:
 
 
 async def _due_media_groups(session: AsyncSession) -> list[int]:
-    """到期工单按 (priority, next_search_at) 排序后取前 N 个不同条目。"""
+    """到期工单按 (priority, next_search_at) 排序后取前 N 个不同条目。
+
+    洗版单元（imported 且已排期）与缺口同队列：priority=-10 保证永远排在
+    补旧(0)/追新(10)后面，洗版搜索绝不挤占缺口配额（quality-upgrade.md §6.4）。
+    """
+    from sqlalchemy import and_, or_
+
     now = utcnow()
     result = await session.execute(
         select(WantedItem.media_item_id)
         .join(Subscription, WantedItem.subscription_id == Subscription.id)  # type: ignore[arg-type]
         .where(
-            WantedItem.status == WantedStatus.WANTED,
+            or_(
+                WantedItem.status == WantedStatus.WANTED,  # type: ignore[arg-type]
+                and_(
+                    WantedItem.status == WantedStatus.IMPORTED,  # type: ignore[arg-type]
+                    WantedItem.quality.isnot(None),  # type: ignore[union-attr]
+                ),
+            ),
             WantedItem.in_scope.is_(True),  # type: ignore[attr-defined]
             WantedItem.next_search_at.isnot(None),  # type: ignore[union-attr]
             WantedItem.next_search_at <= now,  # type: ignore[operator]
-            Subscription.status == SubscriptionStatus.ACTIVE,
+            # != PAUSED 而非 == ACTIVE：洗版单元挂在已收齐（completed）的
+            # 订阅上；缺口行的订阅必然 active，对它语义不变
+            Subscription.status != SubscriptionStatus.PAUSED,  # type: ignore[arg-type]
         )
         .order_by(WantedItem.priority.desc(), WantedItem.next_search_at)  # type: ignore[attr-defined]
     )
@@ -204,10 +218,15 @@ async def _search_one_media(media_id: int) -> None:
         repo = SubscriptionRepository(session)
         assert subscription.id is not None
 
+        from movieclaw_api.services.subscription.upgrade import postpone_upgrade_wanted
+
         if sites_ok == 0:
             # 搜索本身失败（无可用站点/全站报错）：短冷却重试，不计入退避档
             reason = "；".join(site_errors) if site_errors else "当前没有可用的已验证站点"
             await _postpone_open_wanted(
+                session, media_id, delay=SEARCH_FAILURE_RETRY, count_attempt=False
+            )
+            await postpone_upgrade_wanted(
                 session, media_id, delay=SEARCH_FAILURE_RETRY, count_attempt=False
             )
             await repo.add_activity(
@@ -231,9 +250,11 @@ async def _search_one_media(media_id: int) -> None:
         await refresh_release_forecasts(session, media_item_ids={media_id})
 
         # 仍未满足的到期工单：计一次尝试并按退避曲线排下次
+        # （洗版单元走独立的 7d/14d/30d 慢退避，见 upgrade.py）
         postponed = await _postpone_open_wanted(
             session, media_id, delay=None, count_attempt=True, movie_plan=movie_plan
         )
+        await postpone_upgrade_wanted(session, media_id, delay=None, count_attempt=True)
 
         await repo.add_activity(
             SubscriptionActivity(

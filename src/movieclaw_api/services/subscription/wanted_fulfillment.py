@@ -34,6 +34,12 @@ logger = logging.getLogger("movieclaw_api.wanted_fulfillment")
 
 async def close_fulfilled_wanted(session: AsyncSession, media_item_id: int) -> int:
     """把某条目已在库的单元对应的开放工单标记为已入库。返回关闭数。"""
+    # 洗版入库验证先行（quality-upgrade.md §6.3）：已 imported 的单元出现
+    # 新文件不会产生可关闭工单，但需要在同一钩子点做实测裁决（确认/证伪）
+    from movieclaw_api.services.subscription.upgrade import verify_upgrades
+
+    await verify_upgrades(session, media_item_id)
+
     owned = await LibraryFileRepository(session).owned_units(media_item_id)
     if not owned:
         return 0
@@ -58,8 +64,22 @@ async def close_fulfilled_wanted(session: AsyncSession, media_item_id: int) -> i
     for wanted in fulfilled:
         wanted.status = WantedStatus.IMPORTED
         wanted.imported_at = now
+        # 缺口时代的搜索排期就此作废——不清掉的话，imported 单元会带着旧的
+        # next_search_at 进入洗版搜索队列，触发无谓的站点搜索（洗版排期由
+        # arm_upgrade_candidates 按需重挂）
+        wanted.next_search_at = None
         wanted.updated_at = now
         by_subscription.setdefault(wanted.subscription_id, []).append(wanted)
+    # 洗版基线：入库即落质量快照（与规则组是否开洗版无关——数据此刻最热，
+    # 规则组日后开洗版时立即可用）；规则组已配洗版目标且未到顶的单元顺带
+    # 进入洗版搜索排期（见 services/subscription/upgrade.py）
+    from movieclaw_api.services.subscription.upgrade import (
+        arm_upgrade_candidates,
+        fill_snapshots,
+    )
+
+    await fill_snapshots(session, media_item_id, fulfilled)
+    await arm_upgrade_candidates(session, fulfilled)
     await session.commit()
 
     # 时间线与派生状态：逐订阅补记（对账可能一次关闭多个订阅的工单）

@@ -311,6 +311,8 @@ class ProgressView(BaseModel):
     grabbed: int
     downloaded: int
     imported: int
+    # 已入库但仍在洗版中的单元数（详情视图计算；列表视图恒为 0，前端不消费）
+    upgrading: int = 0
 
 
 class SubscriptionView(BaseModel):
@@ -484,6 +486,55 @@ class ResourceTimingView(BaseModel):
         )
 
 
+class UpgradeRunPayload(BaseModel):
+    """「一轮洗版」请求（docs/design/quality-upgrade.md §13.2）。"""
+
+    rule_set_id: int | None = Field(
+        default=None,
+        description="可选：先换用该规则组再触发（组必须已配置洗版目标）；缺省用当前组",
+    )
+
+
+class UpgradeRunUnitView(BaseModel):
+    """一轮洗版的逐集体检结果。"""
+
+    season_number: int
+    episode_number: int
+    state: Literal["upgradable", "at_cutoff", "in_flight", "not_comparable", "missing"] = Field(
+        description="可洗已排期 / 已达目标 / 洗版在途 / 无法识别当前版本 / 缺失走补缺"
+    )
+    current_label: str | None = Field(description="当前版本档位标签；未入库/无法识别为 null")
+    target_label: str = Field(description="洗版目标档位标签")
+
+
+class UpgradeRunView(BaseModel):
+    """一轮洗版的体检报告（同步返回的一次性快照，不落库）。"""
+
+    target_label: str
+    rule_set_id: int = Field(description="本轮实际生效的规则组（换组后为新组）")
+    summary: str = Field(description="中文摘要句，前端直接展示")
+    counts: dict[str, int]
+    units: list[UpgradeRunUnitView]
+
+
+class WantedUpgradeView(BaseModel):
+    """单元的洗版派生状态（docs/design/quality-upgrade.md §8.3/§9）。
+
+    只在"已入库且规则组配置了洗版目标"的单元上出现；标签由后端用统一的
+    档位阶梯生成，前端零拼接直接展示。
+    """
+
+    active: bool = Field(description="是否洗版中（可证明低于目标且未熔断）")
+    current_label: str = Field(description="当前版本档位标签（如「1080p WEB-DL」）")
+    target_label: str = Field(description="洗版目标档位标签（如「1080p Remux」）")
+    search_attempts: int = Field(description="已洗版搜索次数")
+    indeterminate: bool = Field(
+        default=False,
+        description="无法确认档位：证明不了低于目标也证明不了已达标——"
+        "不参与自动洗版，可手动选种替换（§13.8）",
+    )
+
+
 class WantedView(BaseModel):
     id: int
     season_number: int
@@ -503,6 +554,8 @@ class WantedView(BaseModel):
     grabbed_at: datetime | None
     downloaded_at: datetime | None
     imported_at: datetime | None
+    # 洗版派生状态；规则组未配洗版目标或单元未入库时为 null
+    upgrade: WantedUpgradeView | None = None
 
     @field_serializer(
         "next_search_at", "last_search_at", "grabbed_at", "downloaded_at", "imported_at"
@@ -547,12 +600,14 @@ class SubscriptionDetailView(SubscriptionView):
         item: MediaItem,
         wanted_rows: list[WantedItem],
         resource_timings: dict[tuple[int, int], dict[str, object]] | None = None,
+        rule_spec: object | None = None,
     ) -> SubscriptionDetailView:
         counts: dict[str, int] = {}
         for w in wanted_rows:
             counts[w.status] = counts.get(w.status, 0) + 1
         base = SubscriptionView.from_model(sub, item, counts)
-        return cls(
+        upgrades = _wanted_upgrades(wanted_rows, rule_spec)
+        view = cls(
             **base.model_dump(),
             wanted=[
                 WantedView.from_model(
@@ -562,6 +617,64 @@ class SubscriptionDetailView(SubscriptionView):
                 for w in wanted_rows
             ],
         )
+        for row in view.wanted:
+            row.upgrade = upgrades.get((row.season_number, row.episode_number))
+        view.progress.upgrading = sum(
+            1 for u in upgrades.values() if u is not None and u.active
+        )
+        return view
+
+
+def _wanted_upgrades(
+    wanted_rows: list[WantedItem], rule_spec: object | None
+) -> dict[tuple[int, int], WantedUpgradeView | None]:
+    """按规则组 spec 派生每个已入库单元的洗版状态（后端统一生成标签）。
+
+    规则组未配洗版目标 / spec 无法解析 → 全部 None（前端不显示洗版信息）。
+    """
+    from movieclaw_matcher import (
+        QualitySnapshot,
+        RuleSetSpec,
+        provably_at_cutoff,
+        provably_below_cutoff,
+        quality_label,
+        upgrade_target_label,
+    )
+
+    if not isinstance(rule_spec, RuleSetSpec) or rule_spec.upgrade_source is None:
+        return {}
+    # upgrade_ready 与调度口径同源（含熔断冷却）——否则详情页显示"洗版中"
+    # 的同时 system_notice 却说该单元已暂停，两处互相打架
+    from movieclaw_api.services.subscription import upgrade_ready
+    from movieclaw_db.models import utcnow
+
+    now = utcnow()
+    target = upgrade_target_label(rule_spec) or ""
+    result: dict[tuple[int, int], WantedUpgradeView | None] = {}
+    for w in wanted_rows:
+        if w.status != "imported" or w.quality is None:
+            continue  # NULL=快照未回填（转瞬态），不展示半截结论
+        if not w.quality:
+            # {} 哨兵：完全无法识别。常驻如实展示（§13.8）——否则这类单元
+            # 在追踪明细里与档位健康的单元毫无区别，用户以为它在洗版盘子里
+            result[(w.season_number, w.episode_number)] = WantedUpgradeView(
+                active=False,
+                current_label="版本未识别",
+                target_label=target,
+                search_attempts=w.search_attempts,
+                indeterminate=True,
+            )
+            continue
+        snapshot = QualitySnapshot.model_validate(w.quality)
+        result[(w.season_number, w.episode_number)] = WantedUpgradeView(
+            active=w.in_scope and upgrade_ready(w, rule_spec, now=now),
+            current_label=quality_label(snapshot),
+            target_label=target,
+            search_attempts=w.search_attempts,
+            indeterminate=not provably_below_cutoff(snapshot, rule_spec)
+            and not provably_at_cutoff(snapshot, rule_spec),
+        )
+    return result
 
 
 class SubscriptionCreateView(BaseModel):
@@ -639,7 +752,10 @@ class RuleSetPayload(BaseModel):
             "未填写的条件均不限制。\n\n"
             "subtitle_languages_require：要求的字幕语言（BCP 47，任一命中即通过）。\n\n"
             "audio_languages_require：要求的音轨语言（BCP 47，任一命中即通过）。\n\n"
-            '示例：{"resolutions":["2160p"],"free_only":true}'
+            "upgrade_source 洗版目标片源档（web-dl/blu-ray/remux，缺省=不洗版）、"
+            "cutoff_resolution 洗版目标分辨率（缺省=resolutions 首选，"
+            "必须在 resolutions 允许范围内）。\n\n"
+            '示例：{"resolutions":["2160p"],"free_only":true,"upgrade_source":"remux"}'
         ),
     )
 
