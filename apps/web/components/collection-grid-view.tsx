@@ -377,9 +377,15 @@ export function CollectionGridView({
               {filtered.map((item) => {
                 const rank = rankById.get(item.id) ?? 0;
                 return (
-                  <div key={item.id} className="relative min-w-0">
-                    {isRanked && <RankBadge rank={rank} />}
+                  <div key={item.id} className="group/rank relative min-w-0">
                     <PosterCard item={item} />
+                    {/* 名次牌覆盖层与海报同为 2:3，才能把名次钉在海报右下角
+                        （左上角已归「已入库」斜标）；不拦指针事件，整卡仍可点。 */}
+                    {isRanked && (
+                      <div className="pointer-events-none absolute inset-x-0 top-0 aspect-[2/3]">
+                        <RankBadge rank={rank} />
+                      </div>
+                    )}
                   </div>
                 );
               })}
@@ -415,6 +421,11 @@ export function CollectionGridView({
   );
 }
 
+/**
+ * 榜单名次牌。原本钉在海报左上角外沿，与全站统一的「已入库」左上角斜标撞位
+ * （名次盖住斜标文案，两个信号互相削弱），改钉海报右下角：那里只在 hover
+ * 信息层升起时才有内容，所以 hover 时淡出让位，静态时名次与斜标各占一角。
+ */
 function RankBadge({ rank }: { rank: number }) {
   const tone =
     rank === 1
@@ -426,7 +437,7 @@ function RankBadge({ rank }: { rank: number }) {
           : "bg-black/70 text-white";
   return (
     <span
-      className={`tnum absolute -left-1.5 -top-1.5 z-10 min-w-8 rounded-lg px-2 py-1 text-center text-sub font-black shadow-lg ring-1 ring-white/15 ${tone}`}
+      className={`tnum absolute bottom-2 right-2 z-10 min-w-8 rounded-lg px-2 py-1 text-center text-sub font-black shadow-lg ring-1 ring-white/15 transition-opacity duration-200 group-hover/rank:opacity-0 ${tone}`}
     >
       {rank}
     </span>
