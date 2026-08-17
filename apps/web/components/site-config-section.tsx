@@ -4,7 +4,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
 
-import { useConfirm } from "@/components/feedback";
+import { useConfirm, usePrompt } from "@/components/feedback";
 import { ChevronDownIcon, MoreIcon, PlusIcon, ServerIcon } from "@/components/icons";
 import { ExtensionCard } from "@/components/extension-settings";
 import { SearchSection } from "@/components/search-settings";
@@ -307,6 +307,7 @@ export function SiteConfigSection() {
                   onToggle={() =>
                     setExpandedSite((cur) => (cur === site.site_id ? null : site.site_id))
                   }
+                  onOpen={() => setExpandedSite(site.site_id)}
                   onChanged={upsertConfigured}
                   onDeleted={(siteId) => {
                     setConfigured((prev) => prev.filter((s) => s.site_id !== siteId));
@@ -455,6 +456,8 @@ interface SiteRowProps {
   boost?: SiteBoostStats;
   expanded: boolean;
   onToggle: () => void;
+  /** 确保展开（不切换）：菜单里的「编辑授权」需要先展开详情再亮出表单 */
+  onOpen: () => void;
   onChanged: (site: ConfiguredSite) => void;
   onDeleted: (siteId: string) => void;
   onError: (message: string) => void;
@@ -467,12 +470,16 @@ function SiteRow({
   boost,
   expanded,
   onToggle,
+  onOpen,
   onChanged,
   onDeleted,
   onError,
 }: SiteRowProps) {
   const confirm = useConfirm();
+  const prompt = usePrompt();
   const [busy, setBusy] = useState(false);
+  // 授权表单的展开态由行持有：菜单点「编辑授权」时行可能还没展开，需要先展开再亮表单
+  const [editingAuth, setEditingAuth] = useState(false);
   const meta = STATUS_META[site.status];
   const failed = site.status === "failed" && !!site.last_error;
 
@@ -485,6 +492,69 @@ function SiteRow({
     } finally {
       setBusy(false);
     }
+  }
+
+  /** 弹预算输入框并解析；返回字节数，取消返回 null，非法输入报错后返回 null。 */
+  async function askBudget(options: {
+    title: string;
+    description: string;
+    confirmLabel: string;
+  }): Promise<number | null> {
+    const raw = await prompt({
+      ...options,
+      initialValue: String(Math.round(site.boost_budget_bytes / GIB)),
+      placeholder: "存储预算（GiB）",
+    });
+    if (raw == null) return null; // 用户取消
+    const gib = Math.round(Number(raw.trim()));
+    if (!Number.isFinite(gib) || gib < 1) {
+      onError("刷流预算必须是不小于 1 的整数（单位 GiB）");
+      return null;
+    }
+    return gib * GIB;
+  }
+
+  /** 开启刷流（含再次开启）：二次确认讲清将发生什么 + 同窗设置预算。 */
+  async function enableBoost() {
+    const budget = await askBudget({
+      title: `开启「${item.display_name}」的自动刷分享率？`,
+      description:
+        "开启后将自动抢该站新发布的免费种子做种以提升分享率；占用空间在下方预算内" +
+        "自动汰换（只有下载完成、入池满 72 小时且上传效率过低的任务才会被连数据删除）；" +
+        "该站的索引同步会提速到约 5 分钟一次。请确认本次刷流的存储预算：",
+      confirmLabel: "开启刷流",
+    });
+    if (budget == null) return;
+    await guard(async () => onChanged(await setSiteRatioBoost(site.site_id, true, budget)));
+  }
+
+  /** 关闭刷流：二次确认讲清后果（不删数据，只停新增）。 */
+  async function disableBoost() {
+    const ok = await confirm({
+      title: `关闭「${item.display_name}」的自动刷分享率？`,
+      bullets: [
+        "停止抢该站新发布的免费种子",
+        "已在做种的刷流任务全部保留，不删除任何数据",
+        "站点索引同步回到正常自适应节奏",
+        "重新开启时会再次确认预算",
+      ],
+      confirmLabel: "关闭刷流",
+    });
+    if (!ok) return;
+    await guard(async () => onChanged(await setSiteRatioBoost(site.site_id, false)));
+  }
+
+  /** 调整刷流预算（仅开启时可见）。 */
+  async function adjustBudget() {
+    const budget = await askBudget({
+      title: `调整「${item.display_name}」的刷流预算`,
+      description:
+        `当前预算 ${formatBytes(site.boost_budget_bytes)}。调小预算不会立刻删种——` +
+        "引擎按汰换规则逐步收敛到新预算，72 小时保留期内的任务绝不会被删除。",
+      confirmLabel: "保存",
+    });
+    if (budget == null || budget === site.boost_budget_bytes) return;
+    await guard(async () => onChanged(await setSiteRatioBoost(site.site_id, true, budget)));
   }
 
   return (
@@ -595,6 +665,13 @@ function SiteRow({
             onSetProtected={(next) =>
               void guard(async () => onChanged(await setSiteProtection(site.site_id, next)))
             }
+            onEnableBoost={() => void enableBoost()}
+            onDisableBoost={() => void disableBoost()}
+            onAdjustBudget={() => void adjustBudget()}
+            onEditAuth={() => {
+              onOpen();
+              setEditingAuth(true);
+            }}
             onReverify={() =>
               void guard(async () => onChanged(await reverifySite(site.site_id)))
             }
@@ -629,6 +706,8 @@ function SiteRow({
           busy={busy}
           guard={guard}
           onChanged={onChanged}
+          editingAuth={editingAuth}
+          onCloseEditAuth={() => setEditingAuth(false)}
         />
       )}
     </div>
@@ -645,92 +724,51 @@ interface SiteDetailProps {
   busy: boolean;
   guard: (fn: () => Promise<void>) => Promise<void>;
   onChanged: (site: ConfiguredSite) => void;
+  /** 授权表单展开态由行持有（菜单「编辑授权」可在未展开时触发） */
+  editingAuth: boolean;
+  onCloseEditAuth: () => void;
 }
 
-function SiteDetail({ item, site, stats, boost, busy, guard, onChanged }: SiteDetailProps) {
-  const [editingAuth, setEditingAuth] = useState(false);
-  // 预算输入（GiB 为单位）：失焦即存；site 变化（别处保存成功）时回同步
-  const [budgetGib, setBudgetGib] = useState(() =>
-    String(Math.round(site.boost_budget_bytes / GIB)),
-  );
-  useEffect(() => {
-    setBudgetGib(String(Math.round(site.boost_budget_bytes / GIB)));
-  }, [site.boost_budget_bytes]);
-
-  function commitBudget() {
-    const gib = Math.round(Number(budgetGib));
-    if (!Number.isFinite(gib) || gib < 1) {
-      setBudgetGib(String(Math.round(site.boost_budget_bytes / GIB)));
-      return;
-    }
-    const bytes = gib * GIB;
-    if (bytes === site.boost_budget_bytes) return;
-    void guard(async () =>
-      onChanged(await setSiteRatioBoost(site.site_id, site.boost_enabled, bytes)),
-    );
-  }
-
+function SiteDetail({
+  item,
+  site,
+  stats,
+  boost,
+  busy,
+  guard,
+  onChanged,
+  editingAuth,
+  onCloseEditAuth,
+}: SiteDetailProps) {
   return (
     <div className="space-y-4 border-t border-white/[0.06] bg-white/[0.02] px-4 py-4">
-      {/* ─ 刷流 ─ */}
-      <DetailSection label="刷流">
-        <div className="flex flex-wrap items-center gap-x-5 gap-y-2">
-          <div className="flex items-center gap-2.5">
-            <FlatSwitch
-              checked={site.boost_enabled}
-              disabled={busy}
-              label={site.boost_enabled ? "关闭自动刷分享率" : "开启自动刷分享率"}
-              onChange={(next) =>
-                void guard(async () => onChanged(await setSiteRatioBoost(site.site_id, next)))
-              }
+      {/* ─ 刷流 ─ 只读运行统计；启停与预算在 ⋯ 菜单（带二次确认与预算弹窗） */}
+      {site.boost_enabled && (
+        <DetailSection label="刷流">
+          <div className="grid grid-cols-2 gap-x-5 gap-y-2 sm:flex sm:flex-wrap sm:gap-x-7">
+            <DetailStat
+              label="已用 / 预算"
+              value={`${formatBytes(boost?.used_bytes ?? 0)} / ${formatBytes(site.boost_budget_bytes)}`}
             />
-            <span className="text-sub text-[var(--text-muted)]">
-              自动抢免费新种做种，预算内汰换低效任务（72 小时保留期内绝不删）
-            </span>
-          </div>
-          {site.boost_enabled && (
-            <div className="flex items-center gap-2">
-              <span className="text-micro text-[var(--text-faint)]">预算</span>
-              <input
-                type="number"
-                min={1}
-                value={budgetGib}
-                disabled={busy}
-                onChange={(e) => setBudgetGib(e.target.value)}
-                onBlur={commitBudget}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter") (e.target as HTMLInputElement).blur();
-                }}
-                className="w-20 rounded-lg border border-white/[0.08] bg-white/[0.04] px-2 py-1 text-right text-ui text-[var(--text)] outline-none focus:border-[var(--accent)]/60"
-              />
-              <span className="text-caption text-[var(--text-muted)]">GiB</span>
-            </div>
-          )}
-        </div>
-        {site.boost_enabled && boost && (
-          <>
-            <div className="grid grid-cols-2 gap-x-5 gap-y-2 sm:flex sm:flex-wrap sm:gap-x-7">
-              <DetailStat
-                label="已用 / 预算"
-                value={`${formatBytes(boost.used_bytes)} / ${formatBytes(boost.budget_bytes)}`}
-              />
-              <DetailStat label="在池做种" value={String(boost.active_count)} />
-              <DetailStat label="累计上传" value={formatBytes(boost.uploaded_bytes_total)} />
-              {boost.evicted_count > 0 && (
-                <DetailStat label="已汰换" value={String(boost.evicted_count)} />
-              )}
-            </div>
-            {boost.avg_used_bytes_24h > 0 && (
-              <p className="text-caption text-[var(--text-muted)]">
-                近 24 小时：{formatBytes(boost.avg_used_bytes_24h)} 在池种子贡献了{" "}
-                {formatBytes(boost.uploaded_bytes_24h)} 上传
-                {boost.avg_used_bytes_7d > 0 &&
-                  ` · 近 7 天：${formatBytes(boost.avg_used_bytes_7d)} 贡献 ${formatBytes(boost.uploaded_bytes_7d)}`}
-              </p>
+            <DetailStat label="在池做种" value={String(boost?.active_count ?? 0)} />
+            <DetailStat
+              label="累计上传"
+              value={formatBytes(boost?.uploaded_bytes_total ?? 0)}
+            />
+            {boost && boost.evicted_count > 0 && (
+              <DetailStat label="已汰换" value={String(boost.evicted_count)} />
             )}
-          </>
-        )}
-      </DetailSection>
+          </div>
+          {boost && boost.avg_used_bytes_24h > 0 && (
+            <p className="text-caption text-[var(--text-muted)]">
+              近 24 小时：{formatBytes(boost.avg_used_bytes_24h)} 在池种子贡献了{" "}
+              {formatBytes(boost.uploaded_bytes_24h)} 上传
+              {boost.avg_used_bytes_7d > 0 &&
+                ` · 近 7 天：${formatBytes(boost.avg_used_bytes_7d)} 贡献 ${formatBytes(boost.uploaded_bytes_7d)}`}
+            </p>
+          )}
+        </DetailSection>
+      )}
 
       {/* ─ 账号 ─ */}
       {site.profile && (
@@ -774,7 +812,7 @@ function SiteDetail({ item, site, stats, boost, busy, guard, onChanged }: SiteDe
         </DetailSection>
       )}
 
-      {/* ─ 授权 ─ */}
+      {/* ─ 授权 ─ 编辑入口在 ⋯ 菜单（编辑授权），这里默认只读展示 */}
       <DetailSection label="授权">
         {editingAuth ? (
           <SiteForm
@@ -784,25 +822,15 @@ function SiteDetail({ item, site, stats, boost, busy, guard, onChanged }: SiteDe
             onSubmit={(payload) =>
               guard(async () => {
                 onChanged(await updateSite(item.site_id, payload));
-                setEditingAuth(false);
+                onCloseEditAuth();
               })
             }
           />
         ) : (
-          <div className="flex flex-wrap items-center gap-x-5 gap-y-2">
-            <span className="text-sub text-[var(--text-muted)]">
-              {AUTH_TYPE_LABEL[site.auth_type]} · 上次检查{" "}
-              {formatRelativeTime(site.last_checked_at)}
-            </span>
-            <button
-              type="button"
-              onClick={() => setEditingAuth(true)}
-              disabled={busy}
-              className="btn-glass px-3 py-1 text-sub font-medium"
-            >
-              编辑授权
-            </button>
-          </div>
+          <span className="text-sub text-[var(--text-muted)]">
+            {AUTH_TYPE_LABEL[site.auth_type]} · 上次检查{" "}
+            {formatRelativeTime(site.last_checked_at)}
+          </span>
         )}
       </DetailSection>
     </div>
@@ -835,47 +863,17 @@ function nextSyncLabel(iso: string | null): string {
   return formatRelativeTime(iso);
 }
 
-/* —— 轻量 CSS 开关：配置页刻意不用 WebGL 玻璃开关（移动端性能与稳定优先） —— */
-
-interface FlatSwitchProps {
-  checked: boolean;
-  disabled?: boolean;
-  label: string;
-  onChange: (next: boolean) => void;
-}
-
-function FlatSwitch({ checked, disabled, label, onChange }: FlatSwitchProps) {
-  return (
-    <button
-      type="button"
-      role="switch"
-      aria-checked={checked}
-      aria-label={label}
-      disabled={disabled}
-      onClick={(e) => {
-        e.stopPropagation();
-        onChange(!checked);
-      }}
-      className={`relative h-6 w-11 shrink-0 rounded-full transition-colors disabled:opacity-50 ${
-        checked ? "bg-[var(--ok)]/70" : "bg-white/[0.14]"
-      }`}
-    >
-      <span
-        className={`absolute left-0.5 top-0.5 size-5 rounded-full bg-white shadow transition-transform ${
-          checked ? "translate-x-5" : ""
-        }`}
-      />
-    </button>
-  );
-}
-
-/* —— 站点操作折叠菜单：启停 / 保护 / 重验 / 删除 全部收口于此 —— */
+/* —— 站点操作折叠菜单：启停 / 保护 / 刷流 / 编辑授权 / 重验 / 删除 全部收口于此 —— */
 
 interface SiteActionsMenuProps {
   site: ConfiguredSite;
   busy: boolean;
   onSetEnabled: (enabled: boolean) => void;
   onSetProtected: (next: boolean) => void;
+  onEnableBoost: () => void;
+  onDisableBoost: () => void;
+  onAdjustBudget: () => void;
+  onEditAuth: () => void;
   onReverify: () => void;
   onDelete: () => void;
 }
@@ -885,6 +883,10 @@ function SiteActionsMenu({
   busy,
   onSetEnabled,
   onSetProtected,
+  onEnableBoost,
+  onDisableBoost,
+  onAdjustBudget,
+  onEditAuth,
   onReverify,
   onDelete,
 }: SiteActionsMenuProps) {
@@ -929,6 +931,23 @@ function SiteActionsMenu({
             className={itemClass}
           >
             {site.protected ? "取消保护" : "开启保护"}
+          </DropdownMenu.Item>
+          {/* 刷流启停都带二次确认（开启含预算设置）——onSelect 后弹的是
+              feedback 层的对话框，菜单自身正常关闭即可 */}
+          <DropdownMenu.Item
+            onSelect={site.boost_enabled ? onDisableBoost : onEnableBoost}
+            disabled={busy}
+            className={itemClass}
+          >
+            {site.boost_enabled ? "关闭刷流…" : "开启刷流…"}
+          </DropdownMenu.Item>
+          {site.boost_enabled && (
+            <DropdownMenu.Item onSelect={onAdjustBudget} disabled={busy} className={itemClass}>
+              调整刷流预算…
+            </DropdownMenu.Item>
+          )}
+          <DropdownMenu.Item onSelect={onEditAuth} disabled={busy} className={itemClass}>
+            编辑授权
           </DropdownMenu.Item>
           <DropdownMenu.Item
             onSelect={onReverify}
