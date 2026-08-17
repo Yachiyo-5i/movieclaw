@@ -1361,6 +1361,38 @@ async def _ingest_entry(
     added_batch_id = uuid4().hex
 
     async def conclude(status: IngestStatus, message: str, imported: int = 0) -> IngestEntry:
+        if status is IngestStatus.IMPORTED and not snap.fingerprint.startswith("ready:"):
+            # 整树结论成功 = 条目当前所有文件都已处理：仍挂着的分批 blocked
+            # 作业（白名单钉死、等人工）已被彻底取代，就地收口——否则它们会
+            # 以「需要处理」永远挂在任务中心（升级补偿只唤醒每个条目最新的
+            # 作业，轮不到这些历史批次；NAS 实测滞留 4 条）
+            from movieclaw_db.models import Job
+
+            stale_batches = (
+                (
+                    await session.execute(
+                        select(Job).where(
+                            Job.dedupe_key.startswith(  # type: ignore[union-attr]
+                                f"{_ingest_dedupe_key(str(entry))}:"
+                            ),
+                            Job.status == JobStatus.BLOCKED,
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            for stale in stale_batches:
+                if job_context is not None and stale.id == job_context.job_id:
+                    continue  # 防御：绝不取消当前正在执行的作业
+                await jobs.request_cancel(
+                    session, stale.id, requested_by="system:ingest-superseded"
+                )
+                logger.info(
+                    "整树入库完成，收口被取代的分批挂起作业：%s（job=%s）",
+                    entry.name,
+                    stale.id,
+                )
         if status is IngestStatus.IMPORTED and item is not None and item.id is not None:
             source_hashes = matched_hashes if consumable_hashes is None else consumable_hashes
             hashes = sorted({value.lower() for value in source_hashes or [] if value})

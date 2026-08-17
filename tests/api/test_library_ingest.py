@@ -1487,6 +1487,48 @@ async def test_all_dup_skipped_still_closes_fulfilled_wanted(db, tmp_path, monke
 
 
 @pytest.mark.asyncio
+async def test_full_tree_import_cancels_stale_blocked_batches(db, tmp_path, monkeypatch):
+    """整树入库成功后，同条目滞留的分批 blocked 作业必须收口为 cancelled：
+    升级补偿只唤醒每个条目最新的作业，被新一轮取代的历史批次没人收口，
+    会以「需要处理」永远挂在任务中心（NAS 实测滞留 4 条）。"""
+    root, watch = tmp_path / "tv", tmp_path / "watch"
+    watch.mkdir()
+    library_id = await _make_library(db, kind=MediaKind.TV, root=root)
+    item = await _make_item(db, kind=MediaKind.TV, title="测试剧集", year=2024)
+    _stub_identify(monkeypatch, item)
+    monkeypatch.setattr(ingest_mod, "probe_media", lambda _path: _FAKE_SPEC)
+    monkeypatch.setattr(
+        ingest_mod, "_unit", lambda file, _entry: (1, int(file.stem.removeprefix("ep")))
+    )
+
+    entry = watch / "测试剧集 S01"
+    entry.mkdir()
+    (entry / "ep1.mkv").write_bytes(b"episode-1")
+
+    # 昨天的分批作业因解析失败挂起（白名单钉死 ep1），之后没人收口
+    async with db.session() as session:
+        session.add(
+            Job(
+                id="job_stale_batch",
+                job_type="library.ingest",
+                status=JobStatus.BLOCKED,
+                dedupe_key=ingest_mod._ingest_dedupe_key(str(entry), "ready-old"),
+                input_data={"entry_path": str(entry), "ready_files": [{"path": "ep1.mkv"}]},
+            )
+        )
+        await session.commit()
+
+    await _sweep_twice(db, library_id, watch)
+
+    async with db.session() as session:
+        record = (await session.execute(select(IngestEntry))).scalar_one()
+        stale = await session.get(Job, "job_stale_batch")
+    assert record.status == IngestStatus.IMPORTED
+    assert stale.status == JobStatus.CANCELLED
+    assert stale.cancel_requested_by == "system:ingest-superseded"
+
+
+@pytest.mark.asyncio
 async def test_upgrade_retries_legacy_partial_import_through_job(db, tmp_path, monkeypatch):
     """旧版误标 imported 的部分入库记录在升级补扫后新建 Job，并补齐漏集。"""
     root, watch = tmp_path / "tv", tmp_path / "watch"
