@@ -395,6 +395,21 @@ class TorrentRepository:
             await self._session.refresh(cursor)
         return cursor
 
+    async def expire_cursor(self, site_id: str) -> bool:
+        """把站点游标标记为立即到期（next_sync_at 置 NULL），下一个 tick 即同步。
+
+        供「开启刷流」调用：站点可能正处于小时级的冷站间隔，开刷流的用户
+        期望立刻开始盯免费种，不该等旧排期走完。游标不存在时返回 False
+        （不隐式建游标——t0 语义归 ensure_cursor 管）。
+        """
+        cursor = await self.get_cursor(site_id)
+        if cursor is None:
+            return False
+        cursor.next_sync_at = None
+        cursor.updated_at = utcnow()
+        await self._session.commit()
+        return True
+
     async def delete_site_data(self, site_id: str) -> int:
         """删除某站点的全部快照与同步游标——用户移除站点时调用。
 

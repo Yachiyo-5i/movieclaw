@@ -73,7 +73,12 @@ _BREAKER_THRESHOLD = 10
 
 
 def _adapt_interval(
-    current: int, *, new_count: int, full_page: bool, consecutive_failures: int
+    current: int,
+    *,
+    new_count: int,
+    full_page: bool,
+    consecutive_failures: int,
+    pinned: bool = False,
 ) -> int:
     """依上一轮结果计算下次轮询间隔，夹在 [MIN, MAX]。
 
@@ -83,11 +88,18 @@ def _adapt_interval(
     - 有新增且首页全是新的（可能漏种）：间隔减半——把节奏调密、尽快补上。
     - 完全没有新增：间隔 ×1.5——这个站很冷，放疏省资源。
     - 其余（有新增但没到「满页全新」）：稳态，维持当前间隔。
+
+    ``pinned``（开启刷流的站点）：成功时钉在 MIN 不参与放疏——刷流抢免费
+    新种拼的是发现速度，冷站退避到小时级会错过整个免费窗口；失败退避不受
+    钉住影响（对挂掉的站高频重试没有意义）。关闭刷流后不再钉住，间隔按
+    冷热自然漂回。
     """
     if consecutive_failures > 0:
         if consecutive_failures == 1:
             return current
         return min(_MAX_INTERVAL, current * 2)
+    if pinned:
+        return _MIN_INTERVAL
     if new_count > 0 and full_page:
         nxt = current // 2
     elif new_count == 0:
@@ -378,6 +390,7 @@ async def _sync_one_site(cred: SiteCredential) -> None:
         new_count=new_count,
         full_page=full_page,
         consecutive_failures=failures,
+        pinned=cred.boost_enabled,
     )
     if error is not None and transient:
         # 瞬时故障对用户是「不用管」的：把重试计划写进原因里，安抚而非报警

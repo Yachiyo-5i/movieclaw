@@ -186,6 +186,11 @@ class SiteConfigService:
         )
         if not ok:
             raise NotFoundException(f"站点尚未配置：{site_id}")
+        if enabled:
+            # 立刻生效：游标标记到期，下一个 tick（≤2 分钟）即同步一次索引，
+            # 之后同步节奏被钉在最快档（见 torrent_sync._adapt_interval 的 pinned），
+            # 免费新种的发现延迟收敛到 5 分钟级，而不是等冷站的旧排期走完
+            await self._torrents.expire_cursor(site_id)
         return await self.get_configured(site_id)
 
     async def delete(self, site_id: str) -> None:
