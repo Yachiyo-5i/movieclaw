@@ -85,6 +85,33 @@ class DownloaderInfo(BaseModel):
     version: str
 
 
+class DownloaderLimits(BaseModel):
+    """下载器全局限制的统一视图（get_limits 返回 / set_limits 输入）。
+
+    归一约定：
+    - 限速一律**字节/秒**，``None`` = 不限速。qBittorrent 原生即字节/秒
+      （0=不限）；Transmission 原生是 kB/s（1 kB = 1000 字节）+ 独立开关，
+      适配器负责换算与开关归一。
+    - ``alt_speed_enabled``：备用限速档（qB 的 Alternative Speed Limits /
+      Transmission 的 Turtle Mode）当前是否生效。
+    - 队列上限控制"同时活动的任务数"，超限任务进 queued 排队——这正是刷流
+      大量做种时最容易撞上的墙。``max_active_torrents``（下载+做种总数上限）
+      为 qBittorrent 独有，Transmission 读为 None、写时忽略。
+    - 字段值 ``None`` 在 set_limits 中表示"该项设为不限/不改"，各适配器
+      docstring 说明细节。
+    """
+
+    download_limit_bytes: int | None = None
+    upload_limit_bytes: int | None = None
+    alt_speed_enabled: bool | None = None
+    # 队列机制总开关（qB queueing_enabled；Transmission 读 download_queue_enabled，
+    # 写时同时作用于下载与做种两个队列开关）
+    queue_enabled: bool | None = None
+    max_active_downloads: int | None = None
+    max_active_uploads: int | None = None
+    max_active_torrents: int | None = None
+
+
 class TorrentFile(BaseModel):
     """下载任务内的单个文件（路径是种子内相对路径）。"""
 

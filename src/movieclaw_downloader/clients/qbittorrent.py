@@ -24,6 +24,7 @@ from movieclaw_downloader.exceptions import (
 )
 from movieclaw_downloader.models import (
     DownloaderInfo,
+    DownloaderLimits,
     DownloaderType,
     DownloadRequest,
     SubmitResult,
@@ -282,6 +283,51 @@ class QBittorrentDownloader(BaseDownloader):
             "并删除数据文件" if delete_files else "并保留数据文件",
             info_hash,
         )
+
+    async def get_limits(self) -> DownloaderLimits:
+        return await asyncio.to_thread(self._get_limits_sync)
+
+    def _get_limits_sync(self) -> DownloaderLimits:
+        """限速走 transfer 专用端点（字节/秒，0=不限，语义明确无歧义）；
+        队列上限走 app 偏好（queueing_enabled 及三个 max_active_*）。"""
+        client = self._client()
+        with _translate_errors(self.config.url):
+            dl = int(client.transfer_download_limit() or 0)
+            up = int(client.transfer_upload_limit() or 0)
+            alt = str(client.transfer_speed_limits_mode()) == "1"
+            prefs = client.app_preferences()
+        return DownloaderLimits(
+            download_limit_bytes=dl or None,
+            upload_limit_bytes=up or None,
+            alt_speed_enabled=alt,
+            queue_enabled=bool(prefs.get("queueing_enabled")),
+            max_active_downloads=prefs.get("max_active_downloads"),
+            max_active_uploads=prefs.get("max_active_uploads"),
+            max_active_torrents=prefs.get("max_active_torrents"),
+        )
+
+    async def set_limits(self, limits: DownloaderLimits) -> None:
+        await asyncio.to_thread(self._set_limits_sync, limits)
+
+    def _set_limits_sync(self, limits: DownloaderLimits) -> None:
+        client = self._client()
+        with _translate_errors(self.config.url):
+            client.transfer_set_download_limit(limits.download_limit_bytes or 0)
+            client.transfer_set_upload_limit(limits.upload_limit_bytes or 0)
+            if limits.alt_speed_enabled is not None:
+                client.transfer_set_speed_limits_mode(intended_state=limits.alt_speed_enabled)
+            prefs: dict = {}
+            if limits.queue_enabled is not None:
+                prefs["queueing_enabled"] = limits.queue_enabled
+            if limits.max_active_downloads is not None:
+                prefs["max_active_downloads"] = limits.max_active_downloads
+            if limits.max_active_uploads is not None:
+                prefs["max_active_uploads"] = limits.max_active_uploads
+            if limits.max_active_torrents is not None:
+                prefs["max_active_torrents"] = limits.max_active_torrents
+            if prefs:
+                client.app_set_preferences(prefs=prefs)
+        logger.info("已更新 qBittorrent 全局限制: %s", limits.model_dump(exclude_none=True))
 
     async def set_location(self, info_hash: str, save_path: str) -> None:
         await asyncio.to_thread(self._set_location_sync, info_hash, save_path)

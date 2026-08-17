@@ -32,6 +32,7 @@ from movieclaw_downloader.exceptions import (
 )
 from movieclaw_downloader.models import (
     DownloaderInfo,
+    DownloaderLimits,
     DownloaderType,
     DownloadRequest,
     SubmitResult,
@@ -280,6 +281,66 @@ class TransmissionDownloader(BaseDownloader):
             "并删除数据文件" if delete_files else "并保留数据文件",
             info_hash,
         )
+
+    async def get_limits(self) -> DownloaderLimits:
+        return await asyncio.to_thread(self._get_limits_sync)
+
+    def _get_limits_sync(self) -> DownloaderLimits:
+        """Transmission 限速原生是 kB/s（1 kB=1000 字节）+ 独立开关：开关关 =
+        不限速（归一为 None）。队列读下载队列开关为准；无「活动总数」概念。"""
+        client = self._client()
+        with _translate_errors(self.config.url):
+            session = client.get_session()
+        f = session.fields
+        return DownloaderLimits(
+            download_limit_bytes=(
+                int(f.get("speed-limit-down", 0)) * 1000
+                if f.get("speed-limit-down-enabled")
+                else None
+            ),
+            upload_limit_bytes=(
+                int(f.get("speed-limit-up", 0)) * 1000
+                if f.get("speed-limit-up-enabled")
+                else None
+            ),
+            alt_speed_enabled=bool(f.get("alt-speed-enabled")),
+            queue_enabled=bool(f.get("download-queue-enabled")),
+            max_active_downloads=f.get("download-queue-size"),
+            max_active_uploads=f.get("seed-queue-size"),
+            max_active_torrents=None,  # Transmission 没有下载+做种总数上限
+        )
+
+    async def set_limits(self, limits: DownloaderLimits) -> None:
+        await asyncio.to_thread(self._set_limits_sync, limits)
+
+    def _set_limits_sync(self, limits: DownloaderLimits) -> None:
+        client = self._client()
+        kwargs: dict = {}
+        # 限速：None=取消（关开关），有值=开开关并换算成 kB/s（最小 1）
+        if limits.download_limit_bytes is None:
+            kwargs["speed_limit_down_enabled"] = False
+        else:
+            kwargs["speed_limit_down_enabled"] = True
+            kwargs["speed_limit_down"] = max(1, round(limits.download_limit_bytes / 1000))
+        if limits.upload_limit_bytes is None:
+            kwargs["speed_limit_up_enabled"] = False
+        else:
+            kwargs["speed_limit_up_enabled"] = True
+            kwargs["speed_limit_up"] = max(1, round(limits.upload_limit_bytes / 1000))
+        if limits.alt_speed_enabled is not None:
+            kwargs["alt_speed_enabled"] = limits.alt_speed_enabled
+        # 队列：总开关同时作用于下载与做种两个队列（统一语义）
+        if limits.queue_enabled is not None:
+            kwargs["download_queue_enabled"] = limits.queue_enabled
+            kwargs["seed_queue_enabled"] = limits.queue_enabled
+        if limits.max_active_downloads is not None:
+            kwargs["download_queue_size"] = limits.max_active_downloads
+        if limits.max_active_uploads is not None:
+            kwargs["seed_queue_size"] = limits.max_active_uploads
+        # max_active_torrents：Transmission 不支持，静默忽略
+        with _translate_errors(self.config.url):
+            client.set_session(**kwargs)
+        logger.info("已更新 Transmission 全局限制: %s", limits.model_dump(exclude_none=True))
 
     async def set_location(self, info_hash: str, save_path: str) -> None:
         await asyncio.to_thread(self._set_location_sync, info_hash, save_path)

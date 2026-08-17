@@ -48,6 +48,7 @@ from movieclaw_downloader import (
     TorrentStatus,
     create_downloader,
 )
+from movieclaw_downloader.models import DownloaderLimits
 
 logger = logging.getLogger("movieclaw_api.download_tasks")
 
@@ -739,6 +740,58 @@ def _rescue_message(
     ):
         return "已连续 15 分钟没有下载进度；可立即换种，30 分钟时系统会自动处理"
     return None
+
+
+async def _open_downloader_adapter(session: AsyncSession, downloader_id: int):
+    """按 ID 取下载器配置并构造适配器，返回 (配置行, 适配器)。404 语义统一。"""
+    repository = DownloaderRepository(session)
+    row = await repository.get(downloader_id)
+    if row is None:
+        raise NotFoundException(f"下载器不存在：id={downloader_id}")
+    adapter = create_downloader(
+        DownloaderConfig(
+            type=row.client_type.value,
+            url=row.url,
+            username=row.username,
+            password=repository.decrypted_password(row),
+        )
+    )
+    return row, adapter
+
+
+async def get_downloader_limits(session: AsyncSession, downloader_id: int) -> DownloaderLimits:
+    """读取下载器的全局限速与任务队列上限（实时读下载器，不落库）。
+
+    队列上限对刷流用户尤其重要：做种数撞上「最大活动种子数」后新任务会
+    排队，免费窗口内可能下不完——暴露出来让用户能看到并调整。
+    """
+    row, adapter = await _open_downloader_adapter(session, downloader_id)
+    try:
+        return await adapter.get_limits()
+    except DownloaderException as exc:
+        raise UpstreamServiceException(exc.message) from exc
+    finally:
+        try:
+            await adapter.close()
+        except Exception:  # noqa: BLE001
+            logger.warning("关闭下载器「%s」连接失败", row.name, exc_info=True)
+
+
+async def set_downloader_limits(
+    session: AsyncSession, downloader_id: int, limits: DownloaderLimits
+) -> DownloaderLimits:
+    """写入下载器的全局限制并回读生效值（下载器可能钳制/忽略部分字段）。"""
+    row, adapter = await _open_downloader_adapter(session, downloader_id)
+    try:
+        await adapter.set_limits(limits)
+        return await adapter.get_limits()
+    except DownloaderException as exc:
+        raise UpstreamServiceException(exc.message) from exc
+    finally:
+        try:
+            await adapter.close()
+        except Exception:  # noqa: BLE001
+            logger.warning("关闭下载器「%s」连接失败", row.name, exc_info=True)
 
 
 async def delete_download_task(

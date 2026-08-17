@@ -263,6 +263,36 @@ export function updateDownloader(
   );
 }
 
+/** 下载器全局限制（见 schemas.downloader.DownloaderLimitsView）。
+ *  限速单位字节/秒，null=不限；max_active_torrents 为 qBittorrent 独有。 */
+export interface DownloaderLimits {
+  download_limit_bytes: number | null;
+  upload_limit_bytes: number | null;
+  alt_speed_enabled: boolean | null;
+  queue_enabled: boolean | null;
+  max_active_downloads: number | null;
+  max_active_uploads: number | null;
+  max_active_torrents: number | null;
+}
+
+/** 实时读取下载器的全局限速与任务队列上限。 */
+export function getDownloaderLimits(id: number): Promise<DownloaderLimits> {
+  return unwrap(request<ApiEnvelope<DownloaderLimits>>(`/downloaders/${id}/limits`));
+}
+
+/** 写入下载器全局限制，返回回读的生效值。限速 null=取消；其余 null=不改。 */
+export function setDownloaderLimits(
+  id: number,
+  limits: DownloaderLimits,
+): Promise<DownloaderLimits> {
+  return unwrap(
+    request<ApiEnvelope<DownloaderLimits>>(`/downloaders/${id}/limits`, {
+      method: "PUT",
+      body: JSON.stringify(limits),
+    }),
+  );
+}
+
 /** 启用 / 停用下载器。 */
 export function setDownloaderEnabled(
   id: number,

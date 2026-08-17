@@ -52,9 +52,6 @@ class FakeTrClient:
         self.add_calls.append((torrent, kwargs))
         return SimpleNamespace(name="test.mkv", hash_string=TORRENT_HASH)
 
-    def get_session(self):
-        return SimpleNamespace(version="4.0.5")
-
     def get_torrents(self):
         return list(self.store.values())
 
@@ -64,6 +61,30 @@ class FakeTrClient:
 
     def move_torrent_data(self, torrent_id, *, location):
         self.move_calls.append((torrent_id, location))
+
+    # -- 全局限制（get_limits / set_limits） --
+    def get_session(self):
+        return SimpleNamespace(
+            version="4.0.5",
+            fields=getattr(
+                self,
+                "_session_fields",
+                {
+                    "speed-limit-down": 8000,
+                    "speed-limit-down-enabled": True,
+                    "speed-limit-up": 1000,
+                    "speed-limit-up-enabled": False,
+                    "alt-speed-enabled": False,
+                    "download-queue-enabled": True,
+                    "download-queue-size": 5,
+                    "seed-queue-size": 30,
+                },
+            ),
+        )
+
+    def set_session(self, **kwargs):
+        self.session_calls = getattr(self, "session_calls", [])
+        self.session_calls.append(kwargs)
 
 
 def make_downloader(fake: FakeTrClient) -> TransmissionDownloader:
@@ -170,6 +191,48 @@ class TestConnection:
         )
         with pytest.raises(DownloaderConnectError):
             downloader._client()
+
+
+class TestLimits:
+    async def test_get_limits_converts_kbps_and_flags(self):
+        """kB/s（1000 进制）换算为字节；开关关 = 不限速（None）；
+        Transmission 无「最大活动种子数」概念，恒为 None。"""
+        fake = FakeTrClient()
+
+        limits = await make_downloader(fake).get_limits()
+
+        assert limits.download_limit_bytes == 8000 * 1000
+        assert limits.upload_limit_bytes is None  # 开关关着，数值再大也是不限
+        assert limits.queue_enabled is True
+        assert limits.max_active_downloads == 5
+        assert limits.max_active_uploads == 30
+        assert limits.max_active_torrents is None
+
+    async def test_set_limits_writes_flags_and_kbps(self):
+        """写入：None=关开关；有值=开开关并换算 kB/s；队列总开关同时作用于
+        下载与做种队列；max_active_torrents 被静默忽略。"""
+        from movieclaw_downloader.models import DownloaderLimits
+
+        fake = FakeTrClient()
+
+        await make_downloader(fake).set_limits(
+            DownloaderLimits(
+                download_limit_bytes=2_000_000,
+                upload_limit_bytes=None,
+                queue_enabled=False,
+                max_active_uploads=99,
+                max_active_torrents=123,  # Tr 不支持，应被忽略
+            )
+        )
+
+        kwargs = fake.session_calls[0]
+        assert kwargs["speed_limit_down_enabled"] is True
+        assert kwargs["speed_limit_down"] == 2000
+        assert kwargs["speed_limit_up_enabled"] is False
+        assert kwargs["download_queue_enabled"] is False
+        assert kwargs["seed_queue_enabled"] is False
+        assert kwargs["seed_queue_size"] == 99
+        assert "max_active_torrents" not in kwargs
 
 
 class TestSetLocation:
