@@ -139,6 +139,8 @@ export function SiteConfigSection() {
   const [adding, setAdding] = useState(false);
   // 当前展开详情的站点（单开手风琴）
   const [expandedSite, setExpandedSite] = useState<string | null>(null);
+  // 「新建自定义分类」的触发信号：工具栏按钮每点一次 +1，SearchSection 响应打开编辑器
+  const [createPresetNonce, setCreatePresetNonce] = useState(0);
 
   const catalogMap = useMemo(() => new Map(catalog.map((c) => [c.site_id, c])), [catalog]);
 
@@ -247,7 +249,7 @@ export function SiteConfigSection() {
             </button>
           ))}
         </div>
-        {tab === "sites" && (
+        {tab === "sites" ? (
           <button
             type="button"
             onClick={() => setAdding((v) => !v)}
@@ -257,11 +259,20 @@ export function SiteConfigSection() {
             <PlusIcon className="size-4" />
             添加站点
           </button>
+        ) : (
+          <button
+            type="button"
+            onClick={() => setCreatePresetNonce((n) => n + 1)}
+            className="btn-accent flex shrink-0 items-center gap-1 rounded-full py-1.5 pl-2.5 pr-3.5 text-sub font-semibold"
+          >
+            <PlusIcon className="size-4" />
+            新建自定义分类
+          </button>
         )}
       </div>
 
       {tab === "search" ? (
-        <SearchSection />
+        <SearchSection createRequest={createPresetNonce} />
       ) : (
         <>
           {error && (
