@@ -7,9 +7,11 @@
 
 from __future__ import annotations
 
+import math
 from datetime import datetime, timedelta
 
 from movieclaw_api.services.ratio_boost import (
+    _EMA_WINDOW_SECONDS,
     admission_headroom,
     apply_observation,
     assess_candidate,
@@ -18,6 +20,7 @@ from movieclaw_api.services.ratio_boost import (
     hand_over_if_claimed,
     pick_evictions,
     stop_loss_reason,
+    turnover_seconds,
 )
 from movieclaw_db.models import BoostTaskState, RatioBoostTask, SiteTorrent, TorrentSource
 
@@ -163,14 +166,28 @@ class TestFreeWindow:
 
 class TestApplyObservation:
     def test_first_observation_establishes_rate(self) -> None:
-        """首次观测以 created_at 为基线：上传量从 0 起算，能得出真实速率。"""
+        """首次观测以 created_at 为基线：上传量从 0 起算，能得出真实速率。
+
+        EMA 是时距感知的（等效 24h 窗口）：α = 1 - e^(-dt/W)。
+        """
         task = _task(created_at=_NOW - timedelta(seconds=1000), uploaded_bytes=0)
         task.last_checked_at = None
         apply_observation(task, uploaded_bytes=1_000_000, completed=True, now=_NOW)
-        # rate = 1MB/1000s = 1000 B/s，EMA = 0.3 * 1000 + 0.7 * 0 = 300
+        alpha = 1 - math.exp(-1000 / _EMA_WINDOW_SECONDS)
         assert task.uploaded_bytes == 1_000_000
-        assert task.upload_rate_ema == 300.0
+        assert math.isclose(task.upload_rate_ema, alpha * 1000.0)
         assert task.last_checked_at == _NOW
+
+    def test_daily_burst_survives_quiet_hours(self) -> None:
+        """24h 窗口的意义：昨晚狂传、白天安静的种子不能几小时就被判死。
+
+        旧的 0.3/5min EMA 一小时安静就衰减到 1.4%；24h 窗口下安静 6 小时
+        仍保留约 78% 的效率读数，汰换判断以「天」为尺度。
+        """
+        task = _task(uploaded_bytes=1000, upload_rate_ema=100_000.0)  # 高效历史
+        task.last_checked_at = _NOW - timedelta(hours=6)
+        apply_observation(task, uploaded_bytes=1000, completed=True, now=_NOW)  # 6h 零上传
+        assert task.upload_rate_ema > 100_000.0 * 0.75
 
     def test_none_uploaded_keeps_ema(self) -> None:
         """旧适配器不提供上传量时绝不能当 0 差分（会误汰换）。"""
@@ -203,6 +220,12 @@ class TestApplyObservation:
 
 
 class TestEviction:
+    def test_turnover_is_the_unit(self) -> None:
+        """周转 = 传一遍自己的体积要多久；没人要（EMA=0）= 无穷大。"""
+        task = _task(size_bytes=10 * _GIB, upload_rate_ema=(10 * _GIB) / 86400)
+        assert math.isclose(turnover_seconds(task), 86400)
+        assert math.isinf(turnover_seconds(_task(upload_rate_ema=0.0)))
+
     def test_hold_period_is_inviolable(self) -> None:
         """入池不满 72 小时的任务在任何条件下不可汰换（H&R 安全垫）。"""
         young = _task(created_at=_NOW - timedelta(hours=71), upload_rate_ema=0.0)
@@ -210,17 +233,33 @@ class TestEviction:
         old = _task(created_at=_NOW - timedelta(hours=73), upload_rate_ema=0.0)
         assert evictable(old, _NOW)
 
-    def test_uncompleted_and_hot_are_kept(self) -> None:
+    def test_uncompleted_and_fast_turnover_are_kept(self) -> None:
         assert not evictable(_task(completed=False), _NOW)
-        # 上传 EMA 高于地板（10 KiB/s）= 还在产出，留下
-        assert not evictable(_task(upload_rate_ema=11 * 1024), _NOW)
+        # 周转 5 天（10 天地板以内）= 单位存储仍在产出，留下
+        fast = _task(upload_rate_ema=(10 * _GIB) / (5 * 86400))
+        assert not evictable(fast, _NOW)
 
-    def test_pick_lowest_efficiency_first(self) -> None:
-        slow = _task(torrent_id="slow", upload_rate_ema=10.0, size_bytes=10 * _GIB)
-        slower = _task(torrent_id="slower", upload_rate_ema=1.0, size_bytes=10 * _GIB)
-        picked = pick_evictions([slow, slower], need_bytes=10 * _GIB, now=_NOW)
+    def test_turnover_floor_is_size_relative(self) -> None:
+        """同样的绝对速度，判决取决于体积：效率的单位是 rate/size，不是 rate。
+
+        15 KiB/s 对 5 GiB 是约 4 天周转的好资产；对 100 GiB 是 81 天周转的
+        坏资产——绝对速度地板会把这两个判反。
+        """
+        rate = 15 * 1024.0
+        small = _task(size_bytes=5 * _GIB, upload_rate_ema=rate)
+        big = _task(torrent_id="big", size_bytes=100 * _GIB, upload_rate_ema=rate)
+        assert not evictable(small, _NOW)
+        assert evictable(big, _NOW)
+
+    def test_pick_slowest_turnover_first(self) -> None:
+        """汰换顺序按单位存储产出：大而慢的先走，哪怕它的绝对速度更高。"""
+        # 绝对速度 8 KiB/s 但只有 1 GiB：周转 1.5 天…… 需为可汰换设成慢的
+        dense = _task(torrent_id="dense", size_bytes=10 * _GIB, upload_rate_ema=800.0)
+        sparse = _task(torrent_id="sparse", size_bytes=40 * _GIB, upload_rate_ema=1600.0)
+        # dense 周转 ≈ 155 天，sparse 周转 ≈ 311 天（绝对速度反而更高）
+        picked = pick_evictions([dense, sparse], need_bytes=30 * _GIB, now=_NOW)
         assert picked is not None
-        assert [t.torrent_id for t in picked] == ["slower"]
+        assert [t.torrent_id for t in picked] == ["sparse"]
 
     def test_insufficient_space_returns_none(self) -> None:
         """可汰换的加起来腾不出所需空间 → 返回 None，放弃准入而非删更多。"""

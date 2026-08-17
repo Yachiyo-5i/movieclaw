@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import math
 from datetime import datetime, timedelta
 
 from sqlalchemy import case, func, or_
@@ -71,11 +72,18 @@ _STUCK_AFTER = timedelta(hours=48)
 # 免费窗口安全垫：按保守下载速度估算下载时长，窗口不足即放弃
 _ASSUMED_DL_SPEED = 5 * 1024 * 1024  # 5 MiB/s
 _MIN_FREE_MARGIN = timedelta(hours=2)
-# 汰换三条件：下载完成 + 入池满 72 小时（H&R 安全垫）+ 上传 EMA 低于地板
+# 汰换三条件：下载完成 + 入池满 72 小时（H&R 安全垫）+ 周转太慢（见下）
 _MIN_HOLD = timedelta(hours=72)
-_EVICT_RATE_FLOOR = 10 * 1024  # 10 KiB/s
-# 上传速度 EMA 平滑系数：PT 上传是突发的，偏重历史避免瞬时波动误汰换
-_EMA_ALPHA = 0.3
+# 效率的衡量单位是「周转」= 单位存储的上传速度（rate/size）。预算约束的是
+# 存储×时间，最大化总上传是个背包问题，按密度（rate/size）贪心保留/汰换
+# 即近似最优——绝对速度会留错资产：200 GiB 跑 10 KiB/s（周转 240 天）远差于
+# 2 GiB 跑 8 KiB/s（周转 3 天）。地板：10 天内传不出自己体积一遍的可替换
+_EVICT_TURNOVER_DAYS = 10
+# 上传速度 EMA 的时间窗口：PT 上传以「天」为周期突发（晚高峰猛、白天静），
+# 短窗口会把昨晚狂传的种子在今天下午误判成死种。24 小时窗配合 72 小时
+# 保留期，汰换判断建立在约 3 天的公平测量上。α 按时距计算（1-e^(-dt/W)），
+# tick 间隔漂移也不影响窗口语义
+_EMA_WINDOW_SECONDS = 24 * 3600
 # 单种体积上限 = 预算的 1/4：单种吃掉大半预算会让汰换失去弹性
 _MAX_SIZE_BUDGET_FRACTION = 4
 # 每站每 tick 最多提交数：对站点保持克制
@@ -126,6 +134,12 @@ def assess_candidate(
 
     评分 = leechers / (seeders + 1) × 上传系数：分数高 = 供不应求 =
     上传效率预期高；2x 上传的种子同样的流量记双倍，评分翻倍。
+
+    评分刻意**不除以体积**：每个下载者都要下完整个体积，剩余需求字节
+    ≈ leechers × size，做种者份额 ≈ L×size/(S+1)——除以占用的 size 后，
+    每字节期望回报 ≈ L/(S+1)，体积恰好消掉。小体积的真正优势是敏捷性
+    （下得快、免费窗口风险小、汰换颗粒度细），由准入排序的同分决胜体现
+    （见 _admit_candidates），不在评分里重复计价。
     SQL 侧已做粗筛，这里是完整判据（防御性重复 + 可单测）。
     """
     if row.torrent_id in tracked_torrent_ids:
@@ -177,7 +191,9 @@ def apply_observation(
         delta = uploaded_bytes - task.uploaded_bytes
         if dt > 0 and delta >= 0:
             rate = delta / dt
-            task.upload_rate_ema = _EMA_ALPHA * rate + (1 - _EMA_ALPHA) * task.upload_rate_ema
+            # 时距感知 EMA：等效 24 小时观测窗口（见 _EMA_WINDOW_SECONDS）
+            alpha = 1 - math.exp(-dt / _EMA_WINDOW_SECONDS)
+            task.upload_rate_ema = alpha * rate + (1 - alpha) * task.upload_rate_ema
         task.uploaded_bytes = max(uploaded_bytes, 0)
     task.last_checked_at = now
     task.updated_at = now
@@ -227,8 +243,23 @@ def stop_loss_reason(task: RatioBoostTask, progress: float, now: datetime) -> st
     return None
 
 
+def turnover_seconds(task: RatioBoostTask) -> float:
+    """周转周期：按当前上传 EMA，把自己的体积再上传一遍需要多少秒。
+
+    这是刷流效率的统一度量——「这块存储隔多久为分享率贡献一次自己的大小」。
+    EMA 为 0（完全没人要）时返回无穷大。
+    """
+    if task.upload_rate_ema <= 0:
+        return math.inf
+    return task.size_bytes / task.upload_rate_ema
+
+
 def evictable(task: RatioBoostTask, now: datetime) -> bool:
-    """任务是否可被汰换：下载完成 + 过了最低保留期 + 上传效率低于地板。
+    """任务是否可被汰换：下载完成 + 过了最低保留期 + 周转太慢。
+
+    「周转太慢」= 按当前上传 EMA，10 天都传不出自己体积的一遍（rate/size
+    密度地板）。用周转而非绝对速度：预算约束的是存储×时间，留下的应该是
+    单位存储产出高的资产——大种子必须跑出与体积相称的速度才配占着位置。
 
     72 小时保留期是 H&R 的安全垫（候选虽排除了明确 H&R，但多数站点不提供
     标记），任何预算压力下都不能绕过。
@@ -237,7 +268,7 @@ def evictable(task: RatioBoostTask, now: datetime) -> bool:
         task.state == BoostTaskState.ACTIVE
         and task.completed
         and now - task.created_at >= _MIN_HOLD
-        and task.upload_rate_ema < _EVICT_RATE_FLOOR
+        and turnover_seconds(task) > _EVICT_TURNOVER_DAYS * 86400
     )
 
 
@@ -258,12 +289,13 @@ def admission_headroom(
 def pick_evictions(
     tasks: list[RatioBoostTask], need_bytes: int, now: datetime
 ) -> list[RatioBoostTask] | None:
-    """从可汰换任务里按上传 EMA 从低到高挑出足够腾出 need_bytes 的一批。
+    """从可汰换任务里按周转从慢到快（单位存储产出从低到高）挑出足够腾出
+    need_bytes 的一批。
 
     腾不够返回 None——调用方放弃准入，**绝不提前动保留期内的任务**。
     """
     candidates = sorted(
-        (t for t in tasks if evictable(t, now)), key=lambda t: t.upload_rate_ema
+        (t for t in tasks if evictable(t, now)), key=turnover_seconds, reverse=True
     )
     picked: list[RatioBoostTask] = []
     freed = 0
@@ -405,12 +437,14 @@ async def _evict(pool: _DownloaderPool, task: RatioBoostTask, now: datetime, rea
     task.evicted_at = now
     task.evict_reason = reason
     task.updated_at = now
+    turnover = turnover_seconds(task)
     logger.info(
-        "已汰换刷流任务：%s（%s，占用 %.1f GiB，上传 EMA %.1f KiB/s）",
+        "已汰换刷流任务：%s（%s，占用 %.1f GiB，上传 EMA %.1f KiB/s，周转约 %s）",
         task.title,
         task.site_id,
         task.size_bytes / 1024**3,
         task.upload_rate_ema / 1024,
+        "∞" if math.isinf(turnover) else f"{turnover / 86400:.1f} 天",
     )
     return True
 
@@ -538,7 +572,9 @@ async def _admit_candidates(
         )
         if ok:
             scored.append((score, row))
-    scored.sort(key=lambda pair: pair[0], reverse=True)
+    # 评分降序；同分小体积优先——每字节期望回报与体积近似无关（见
+    # assess_candidate），小的下得快、免费窗口风险小、汰换颗粒度细
+    scored.sort(key=lambda pair: (-pair[0], pair[1].size_bytes or 0))
 
     admitted = 0
     save_path = _boost_save_path(downloader)
@@ -673,9 +709,11 @@ async def run_ratio_boost() -> None:
                 # ② 预算收敛：用户调小预算后逐步退到预算内（绝不动保留期内任务）
                 used = sum(t.size_bytes for t in site_tasks)
                 if used > cred.boost_budget_bytes:
+                    # 周转最慢（单位存储产出最低）的先走
                     for victim in sorted(
                         (t for t in site_tasks if evictable(t, now)),
-                        key=lambda t: t.upload_rate_ema,
+                        key=turnover_seconds,
+                        reverse=True,
                     ):
                         if used <= cred.boost_budget_bytes:
                             break
