@@ -8,18 +8,22 @@ import { DirectoryPicker } from "@/components/directory-picker";
 import { useConfirm } from "@/components/feedback";
 import { DownloadIcon, FolderIcon, MoreIcon, PlusIcon, XIcon } from "@/components/icons";
 import { useBackdrop } from "@/lib/backdrop";
+import { Modal } from "@/components/modal";
 import {
   type ConfiguredDownloader,
   type DownloaderClientType,
+  type DownloaderLimits,
   type DownloaderPayload,
   type DownloaderStatus,
   type PathMapping,
   createDownloader,
   deleteDownloader,
+  getDownloaderLimits,
   listDownloaders,
   reverifyDownloader,
   setDefaultDownloader,
   setDownloaderEnabled,
+  setDownloaderLimits,
   updateDownloader,
 } from "@/lib/api/downloaders";
 import { formatRelativeTime } from "@/lib/time";
@@ -94,6 +98,15 @@ export function DownloaderConfigSection() {
     const target = downloaders.find((d) => d.is_default) ?? downloaders[0];
     setEditing(target.id);
   }, [suggestMapping, loading, downloaders]);
+
+  // 拥堵提示跳转（?limits=<id>，与 suggest_mapping 同款参数惯例）：自动打开
+  // 对应下载器的「限速与队列」弹窗，用户落地即在要调的设置上
+  const [autoLimitsId, setAutoLimitsId] = useState<number | null>(null);
+  useEffect(() => {
+    const raw = new URLSearchParams(window.location.search).get("limits");
+    const id = raw == null ? Number.NaN : Number(raw);
+    if (Number.isFinite(id)) setAutoLimitsId(id);
+  }, []);
 
   // 有下载器处于 pending/verifying 时轮询刷新，直到全部落定（页面隐藏时暂停）
   const hasInProgress = downloaders.some((d) => IN_PROGRESS.includes(d.status));
@@ -198,6 +211,7 @@ export function DownloaderConfigSection() {
               key={downloader.id}
               downloader={downloader}
               suggestMapping={suggestMapping}
+              autoOpenLimits={autoLimitsId === downloader.id}
               expanded={editing === downloader.id}
               onToggleForm={(open) => setEditing(open ? downloader.id : null)}
               onChanged={upsert}
@@ -223,6 +237,8 @@ interface DownloaderCardProps {
   downloader: ConfiguredDownloader;
   /** 体检跳转建议预填的映射本机侧路径（无建议时为 null） */
   suggestMapping: string | null;
+  /** 拥堵提示跳转（?limits=<id>）：挂载后自动打开「限速与队列」弹窗 */
+  autoOpenLimits?: boolean;
   expanded: boolean;
   onToggleForm: (open: boolean) => void;
   onChanged: (downloader: ConfiguredDownloader) => void;
@@ -235,6 +251,7 @@ interface DownloaderCardProps {
 function DownloaderCard({
   downloader,
   suggestMapping,
+  autoOpenLimits = false,
   expanded,
   onToggleForm,
   onChanged,
@@ -245,6 +262,11 @@ function DownloaderCard({
   const { backdrop } = useBackdrop();
   const confirm = useConfirm();
   const [busy, setBusy] = useState(false);
+  const [limitsOpen, setLimitsOpen] = useState(false);
+  // 拥堵提示跳转落地：打开一次即完成使命，之后开合归用户（关了不复弹）
+  useEffect(() => {
+    if (autoOpenLimits) setLimitsOpen(true);
+  }, [autoOpenLimits]);
   const meta = STATUS_META[downloader.status];
 
   async function guard(fn: () => Promise<void>) {
@@ -318,6 +340,7 @@ function DownloaderCard({
             isDefault={downloader.is_default}
             canReverify={!IN_PROGRESS.includes(downloader.status)}
             onEdit={() => onToggleForm(!expanded)}
+            onLimits={() => setLimitsOpen(true)}
             onSetDefault={() =>
               void guard(async () => {
                 await setDefaultDownloader(downloader.id);
@@ -376,6 +399,279 @@ function DownloaderCard({
           />
         </div>
       )}
+
+      <DownloaderLimitsModal
+        open={limitsOpen}
+        downloader={downloader}
+        onClose={() => setLimitsOpen(false)}
+      />
+    </div>
+  );
+}
+
+/* —— 限速与队列弹窗：实时读写下载器的全局限速与任务队列上限 ——
+   队列上限（qB 最大活动种子数 / Tr 下载与做种队列）决定同时活动的任务数，
+   刷流做种多时最容易撞上：任务进 queued 排队、免费窗口内可能下不完。 */
+
+const KIB = 1024;
+
+function DownloaderLimitsModal({
+  open,
+  downloader,
+  onClose,
+}: {
+  open: boolean;
+  downloader: ConfiguredDownloader;
+  onClose: () => void;
+}) {
+  const { backdrop } = useBackdrop();
+  const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  // 表单态：限速以 KiB/s 字符串承载（空 = 不限速）；队列数值空 = 保持现状
+  const [dlKib, setDlKib] = useState("");
+  const [upKib, setUpKib] = useState("");
+  const [altSpeed, setAltSpeed] = useState(false);
+  const [queueEnabled, setQueueEnabled] = useState(false);
+  const [maxDown, setMaxDown] = useState("");
+  const [maxUp, setMaxUp] = useState("");
+  const [maxTotal, setMaxTotal] = useState("");
+  // Transmission 没有「最大活动种子数」概念（读回 null 时隐藏该输入）
+  const [supportsMaxTotal, setSupportsMaxTotal] = useState(true);
+
+  const applyLimits = useCallback((limits: DownloaderLimits) => {
+    setDlKib(
+      limits.download_limit_bytes != null
+        ? String(Math.round(limits.download_limit_bytes / KIB))
+        : "",
+    );
+    setUpKib(
+      limits.upload_limit_bytes != null
+        ? String(Math.round(limits.upload_limit_bytes / KIB))
+        : "",
+    );
+    setAltSpeed(Boolean(limits.alt_speed_enabled));
+    setQueueEnabled(Boolean(limits.queue_enabled));
+    setMaxDown(limits.max_active_downloads != null ? String(limits.max_active_downloads) : "");
+    setMaxUp(limits.max_active_uploads != null ? String(limits.max_active_uploads) : "");
+    setMaxTotal(
+      limits.max_active_torrents != null ? String(limits.max_active_torrents) : "",
+    );
+    setSupportsMaxTotal(limits.max_active_torrents != null);
+  }, []);
+
+  useEffect(() => {
+    if (!open) return;
+    setLoading(true);
+    setError(null);
+    getDownloaderLimits(downloader.id)
+      .then((limits) => applyLimits(limits))
+      .catch((e) => setError((e as Error).message))
+      .finally(() => setLoading(false));
+  }, [open, downloader.id, applyLimits]);
+
+  function parseSpeed(raw: string): number | null {
+    if (!raw.trim()) return null; // 空 = 不限速
+    const kib = Math.round(Number(raw.trim()));
+    return Number.isFinite(kib) && kib > 0 ? kib * KIB : null;
+  }
+
+  function parseCount(raw: string): number | null {
+    if (!raw.trim()) return null; // 空 = 保持现状
+    const value = Math.round(Number(raw.trim()));
+    return Number.isFinite(value) && value >= 0 ? value : null;
+  }
+
+  async function save() {
+    setBusy(true);
+    setError(null);
+    try {
+      const applied = await setDownloaderLimits(downloader.id, {
+        download_limit_bytes: parseSpeed(dlKib),
+        upload_limit_bytes: parseSpeed(upKib),
+        alt_speed_enabled: altSpeed,
+        queue_enabled: queueEnabled,
+        max_active_downloads: parseCount(maxDown),
+        max_active_uploads: parseCount(maxUp),
+        max_active_torrents: supportsMaxTotal ? parseCount(maxTotal) : null,
+      });
+      applyLimits(applied); // 回读生效值（下载器可能钳制），表单即时对齐
+      onClose();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Modal open={open} onClose={onClose} label="限速与队列" width="lg">
+      <div className="space-y-4 p-6">
+        <div>
+          <h2 className="text-title font-bold text-[var(--text)]">
+            限速与队列 · {downloader.name}
+          </h2>
+          <p className="mt-1 text-sub leading-5 text-[var(--text-muted)]">
+            实时读写下载器的全局设置。限速留空 = 不限；队列上限决定同时活动的任务数，
+            开着刷流大量做种时建议调大做种/活动上限，避免新任务排队。
+          </p>
+        </div>
+
+        {error && (
+          <div className="rounded-xl border border-[#ff6b6b]/30 bg-[#ff6b6b]/10 px-4 py-3 text-body text-[#ff6b6b]">
+            {error}
+          </div>
+        )}
+
+        {loading ? (
+          <div className="space-y-2">
+            <div className="h-11 animate-pulse rounded-xl bg-white/[0.04]" />
+            <div className="h-11 animate-pulse rounded-xl bg-white/[0.04]" />
+          </div>
+        ) : (
+          <div className="space-y-4">
+            <div className="grid grid-cols-2 gap-3 max-md:grid-cols-1">
+              <LimitInput
+                label="全局下载限速"
+                value={dlKib}
+                unit="KiB/s"
+                placeholder="不限"
+                disabled={busy}
+                onChange={setDlKib}
+              />
+              <LimitInput
+                label="全局上传限速"
+                value={upKib}
+                unit="KiB/s"
+                placeholder="不限"
+                disabled={busy}
+                onChange={setUpKib}
+              />
+            </div>
+
+            <label className="flex items-center justify-between gap-3">
+              <span className="text-sub text-[var(--text-muted)]">
+                备用限速档（计划任务/手动一键慢速时生效的那组限速）
+              </span>
+              <LiquidGlassButton
+                backgroundImage={backdrop}
+                variant="dark"
+                checked={altSpeed}
+                disabled={busy}
+                aria-label="备用限速档"
+                onCheckedChange={setAltSpeed}
+                className="!min-h-0 !w-auto shrink-0 !gap-0 !bg-transparent !p-0"
+              >
+                <span className="sr-only">备用限速档</span>
+              </LiquidGlassButton>
+            </label>
+
+            <label className="flex items-center justify-between gap-3">
+              <span className="text-sub text-[var(--text-muted)]">
+                任务队列（超出上限的任务排队等待）
+              </span>
+              <LiquidGlassButton
+                backgroundImage={backdrop}
+                variant="dark"
+                checked={queueEnabled}
+                disabled={busy}
+                aria-label="任务队列"
+                onCheckedChange={setQueueEnabled}
+                className="!min-h-0 !w-auto shrink-0 !gap-0 !bg-transparent !p-0"
+              >
+                <span className="sr-only">任务队列</span>
+              </LiquidGlassButton>
+            </label>
+
+            {queueEnabled && (
+              <div className="grid grid-cols-3 gap-3 max-md:grid-cols-1">
+                <LimitInput
+                  label="最大同时下载数"
+                  value={maxDown}
+                  disabled={busy}
+                  onChange={setMaxDown}
+                />
+                <LimitInput
+                  label="最大做种数"
+                  value={maxUp}
+                  disabled={busy}
+                  onChange={setMaxUp}
+                />
+                {supportsMaxTotal && (
+                  <LimitInput
+                    label="最大活动种子数"
+                    value={maxTotal}
+                    disabled={busy}
+                    onChange={setMaxTotal}
+                  />
+                )}
+              </div>
+            )}
+          </div>
+        )}
+
+        <div className="flex justify-end gap-2.5 pt-1">
+          <button
+            type="button"
+            onClick={onClose}
+            disabled={busy}
+            className="btn-glass px-4 py-2 text-sub font-medium"
+          >
+            取消
+          </button>
+          <button
+            type="button"
+            onClick={() => void save()}
+            disabled={busy || loading}
+            className="btn-accent rounded-full px-4 py-2 text-sub font-semibold disabled:opacity-60"
+          >
+            {busy ? "保存中…" : "保存"}
+          </button>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+/** 带单位后缀的数字输入（与 feedback 层 prompt 的单位内嵌设计同款）。 */
+function LimitInput({
+  label,
+  value,
+  unit,
+  placeholder,
+  disabled,
+  onChange,
+}: {
+  label: string;
+  value: string;
+  unit?: string;
+  placeholder?: string;
+  disabled?: boolean;
+  onChange: (value: string) => void;
+}) {
+  return (
+    <div>
+      <label className="mb-1.5 block text-caption font-medium text-[var(--text-muted)]">
+        {label}
+      </label>
+      <div className="relative">
+        <input
+          type="number"
+          min={0}
+          value={value}
+          placeholder={placeholder}
+          disabled={disabled}
+          onChange={(e) => onChange(e.target.value)}
+          className={`w-full rounded-lg border border-white/10 bg-white/[0.06] px-3 py-2 text-ui text-white outline-none transition [appearance:textfield] focus:border-white/25 [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none ${
+            unit ? "pr-14" : ""
+          }`}
+        />
+        {unit && (
+          <span className="pointer-events-none absolute inset-y-0 right-3 flex items-center text-caption font-medium text-[var(--text-faint)]">
+            {unit}
+          </span>
+        )}
+      </div>
     </div>
   );
 }
@@ -398,6 +694,7 @@ interface DownloaderActionsMenuProps {
   isDefault: boolean;
   canReverify: boolean;
   onEdit: () => void;
+  onLimits: () => void;
   onSetDefault: () => void;
   onReverify: () => void;
   onDelete: () => void;
@@ -409,6 +706,7 @@ function DownloaderActionsMenu({
   isDefault,
   canReverify,
   onEdit,
+  onLimits,
   onSetDefault,
   onReverify,
   onDelete,
@@ -438,6 +736,9 @@ function DownloaderActionsMenu({
         >
           <DropdownMenu.Item onSelect={onEdit} className={itemClass}>
             {expanded ? "收起编辑" : "编辑配置"}
+          </DropdownMenu.Item>
+          <DropdownMenu.Item onSelect={onLimits} disabled={busy} className={itemClass}>
+            限速与队列…
           </DropdownMenu.Item>
           <DropdownMenu.Item
             onSelect={onSetDefault}

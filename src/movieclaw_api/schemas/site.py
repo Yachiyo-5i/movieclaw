@@ -108,6 +108,7 @@ class ConfiguredSite(BaseModel):
     )
     boost_enabled: bool = Field(default=False, description="自动刷分享率开关")
     boost_budget_bytes: int = Field(default=0, description="刷流存储预算（字节）")
+    boost_hold_days: int = Field(default=3, description="刷流汰换最低保留天数；0=不保护")
     last_verified_at: datetime | None = Field(default=None, description="最近验证成功时间")
     last_checked_at: datetime | None = Field(default=None, description="最近验证尝试时间")
     last_error: str | None = Field(default=None, description="最近验证失败原因（清晰中文）")
@@ -149,6 +150,7 @@ class ConfiguredSite(BaseModel):
             protected=row.protected,
             boost_enabled=row.boost_enabled,
             boost_budget_bytes=row.boost_budget_bytes,
+            boost_hold_days=row.boost_hold_days,
             last_verified_at=row.last_verified_at,
             last_checked_at=row.last_checked_at,
             last_error=row.last_error,
@@ -258,6 +260,10 @@ class SiteRatioBoostUpdate(BaseModel):
     enabled: bool = Field(description="true=开启自动刷分享率 / false=关闭")
     budget_bytes: int | None = Field(
         default=None, description="刷流存储预算（字节，≥1 GiB）；None=不修改现有预算"
+    )
+    hold_days: int | None = Field(
+        default=None,
+        description="汰换最低保留天数（0～30；0=站点无 H&R、不设保护）；None=不修改",
     )
 
 

@@ -20,8 +20,39 @@
  * 阶段监听并 stopPropagation，本组件的冒泡阶段监听即不会触发。
  */
 
-import { useEffect, type ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
+
+/**
+ * 软键盘对视口底部的遮挡高度（px）。
+ *
+ * iOS（尤其 PWA standalone）弹出键盘时**布局视口不变、可视视口变矮**：
+ * fixed 定位仍按布局视口排，贴底的 bottom sheet 和居中弹窗的输入框会沉到
+ * 键盘底下。VisualViewport API 给出真实可见区域，据此算出底部被遮挡量，
+ * 弹窗容器把 bottom 抬高同样的距离即可始终落在可见区内。
+ * 桌面端与键盘收起时恒为 0，行为不变；不支持该 API 的环境静默退化。
+ */
+function useKeyboardInset(active: boolean): number {
+  const [inset, setInset] = useState(0);
+  useEffect(() => {
+    if (!active) return;
+    const vv = window.visualViewport;
+    if (!vv) return;
+    const update = () => {
+      const occluded = window.innerHeight - vv.height - vv.offsetTop;
+      setInset(Math.max(0, Math.round(occluded)));
+    };
+    update();
+    vv.addEventListener("resize", update);
+    vv.addEventListener("scroll", update);
+    return () => {
+      setInset(0);
+      vv.removeEventListener("resize", update);
+      vv.removeEventListener("scroll", update);
+    };
+  }, [active]);
+  return active ? inset : 0;
+}
 
 /** 面板宽度档位：表单类弹窗 md；内容较多的 lg；预览/清单类 2xl；
  *  full 为沉浸查看类（日志全屏等）铺满视口，高度由调用方经 panelClassName 撑满。 */
@@ -66,6 +97,9 @@ export function Modal({
     return () => window.removeEventListener("keydown", onKey);
   }, [open, onClose]);
 
+  // 软键盘遮挡高度：>0 时把容器 bottom 抬到键盘之上（iOS PWA 输入弹窗的救命绳）
+  const keyboardInset = useKeyboardInset(open);
+
   if (!open || typeof document === "undefined") return null;
 
   return createPortal(
@@ -78,6 +112,9 @@ export function Modal({
     // sheet 也会悬在物理底边上方。面板内容用加大的 pb 留在视口内（见下方）。
     <div
       className={`fixed inset-0 [bottom:calc(-1*var(--vp-overshoot))] ${topmost ? "z-[90]" : raised ? "z-[60]" : "z-50"} flex items-center justify-center p-6 max-md:items-end max-md:p-0`}
+      // 键盘弹出时容器底边抬到键盘上沿（覆盖 className 里的 overshoot 负值）：
+      // bottom sheet 随之整体上移、居中弹窗在剩余可见区内重新居中，输入框不再被遮
+      style={keyboardInset > 0 ? { bottom: keyboardInset } : undefined}
       role="dialog"
       aria-modal="true"
       aria-label={label}

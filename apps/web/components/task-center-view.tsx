@@ -184,7 +184,17 @@ export function TaskCenterView({
     }
     return linked;
   }, [jobs]);
-  const downloadGroups = useMemo(() => groupDownloadTasks(downloadTasks), [downloadTasks]);
+  // 刷流种子先从媒体管线里分流：它们没有入库/救援/流转语义，不进分组时间线
+  // 与关注区，由独立的折叠分组承载（见 BoostTaskSection）
+  const boostTasks = useMemo(
+    () => downloadTasks.filter((task) => task.source === "boost"),
+    [downloadTasks],
+  );
+  const mediaTasks = useMemo(
+    () => downloadTasks.filter((task) => task.source !== "boost"),
+    [downloadTasks],
+  );
+  const downloadGroups = useMemo(() => groupDownloadTasks(mediaTasks), [mediaTasks]);
   const attentionDownloadGroups = useMemo(
     () => downloadGroups.filter((group) => downloadGroupNeedsAttention(group, ingestJobsByHash)),
     [downloadGroups, ingestJobsByHash],
@@ -225,6 +235,7 @@ export function TaskCenterView({
   const visibleCount =
     (showAttention ? attentionTotal : 0) +
     (showActive ? activeTotal : 0) +
+    (showActive && boostTasks.length > 0 ? 1 : 0) +
     (showHistory ? standaloneHistoricalJobs.length : 0);
   const failedSources = sources.filter((source) => source.status !== "active");
   const healthySourceCount = sources.length - failedSources.length;
@@ -371,6 +382,10 @@ export function TaskCenterView({
             ))}
           </TaskTimelineSection>
         )}
+
+        {/* 刷流做种分组：默认折叠，头部常显实时汇总（速度 / 已上传 / 已下载）。
+            这些种子没有入库流转语义，不进时间线，也不参与关注判定 */}
+        {showActive && boostTasks.length > 0 && <BoostTaskSection tasks={boostTasks} />}
 
         {showHistory && standaloneHistoricalJobs.length > 0 && (
           <TaskHistorySection
@@ -880,6 +895,93 @@ function IngestHistoryFiles({ detail }: { detail: IngestHistoryDetail }) {
 }
 
 /** 历史按本地日期拆成轻量 Feed，首组默认展开，避免完成卡片占满纵向空间。 */
+/**
+ * 刷流做种分组：默认折叠的 <details>，头部常显最值得关心的实时汇总——
+ * ↑/↓ 总速度与已上传/已下载总量；展开后逐种子一行（站点 + 名称 + 状态 +
+ * 各自的速度与累计上传）。刷流种子没有媒体身份与入库流转，刻意不渲染
+ * 生命周期，也不提供删除入口（汰换归引擎管，手动删除去下载器按
+ * movieclaw-boost 分类操作）。
+ */
+function BoostTaskSection({ tasks }: { tasks: DownloadTask[] }) {
+  const sum = (pick: (task: DownloadTask) => number | null) =>
+    tasks.reduce((total, task) => total + (pick(task) ?? 0), 0);
+  const upSpeed = sum((t) => t.upspeed_bytes);
+  const downSpeed = sum((t) => t.dlspeed_bytes);
+  const uploaded = sum((t) => t.uploaded_bytes);
+  const downloaded = sum((t) => t.completed_bytes);
+
+  return (
+    <section className="mt-3" aria-label="刷流做种">
+      <details className="group border-b border-white/[0.07] py-3.5 last:border-b-0">
+        <summary className="flex cursor-pointer list-none flex-wrap items-center gap-x-3 gap-y-1 rounded-lg py-1 text-ui transition [&::-webkit-details-marker]:hidden">
+          <span className="font-semibold text-[var(--accent)]">刷流做种</span>
+          <span className="tnum text-caption text-white/30">{tasks.length} 个种子</span>
+          {/* 实时汇总：速度是"现在"，总量是"战果"——都放头部，折叠时也一眼可见 */}
+          <span className="tnum flex flex-wrap items-center gap-x-3 text-caption text-white/45">
+            {upSpeed > 0 && <span>↑ {formatBytes(upSpeed)}/s</span>}
+            {downSpeed > 0 && <span>↓ {formatBytes(downSpeed)}/s</span>}
+            <span>已上传 {formatBytes(uploaded)}</span>
+            <span>已下载 {formatBytes(downloaded)}</span>
+          </span>
+          <span className="ml-auto text-caption text-white/30 group-open:hidden">展开</span>
+          <span className="ml-auto hidden text-caption text-white/30 group-open:inline">收起</span>
+          <ChevronRightIcon className="size-4 text-white/30 transition-transform group-open:rotate-90" />
+        </summary>
+        <div className="mt-2 divide-y divide-white/[0.05]">
+          {tasks.map((task) => (
+            <BoostTaskRow key={task.id} task={task} />
+          ))}
+        </div>
+      </details>
+    </section>
+  );
+}
+
+function BoostTaskRow({ task }: { task: DownloadTask }) {
+  const downloading = task.state === "downloading";
+  const percent = task.progress == null ? null : Math.floor(task.progress * 100);
+  const name = (
+    <OverflowText className="min-w-0 flex-1 text-ui text-white/80">
+      {task.name || task.info_hash}
+    </OverflowText>
+  );
+  return (
+    <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1 py-2">
+      {task.site_name && (
+        <span className="shrink-0 rounded-full bg-white/[0.06] px-2 py-0.5 text-caption font-medium text-white/55">
+          {task.site_name}
+        </span>
+      )}
+      {task.page_url ? (
+        <a
+          href={task.page_url}
+          target="_blank"
+          rel="noreferrer"
+          className="flex min-w-0 flex-1 hover:text-white"
+          title="打开站点种子详情页"
+        >
+          {name}
+        </a>
+      ) : (
+        name
+      )}
+      <span className="tnum flex shrink-0 items-center gap-x-3 text-caption text-white/40">
+        {downloading && percent != null && <span>{percent}%</span>}
+        {downloading && task.dlspeed_bytes != null && task.dlspeed_bytes > 0 && (
+          <span>↓ {formatBytes(task.dlspeed_bytes)}/s</span>
+        )}
+        {task.upspeed_bytes != null && task.upspeed_bytes > 0 && (
+          <span>↑ {formatBytes(task.upspeed_bytes)}/s</span>
+        )}
+        {task.uploaded_bytes != null && task.uploaded_bytes > 0 && (
+          <span>累计 ↑{formatBytes(task.uploaded_bytes)}</span>
+        )}
+        {task.size_bytes != null && <span>{formatBytes(task.size_bytes)}</span>}
+      </span>
+    </div>
+  );
+}
+
 function TaskHistorySection({
   jobs,
   initiallyOpen,

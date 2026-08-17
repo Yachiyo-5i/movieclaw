@@ -5,6 +5,7 @@ import abc
 from movieclaw_downloader.models import (
     DownloaderConfig,
     DownloaderInfo,
+    DownloaderLimits,
     DownloadRequest,
     SubmitResult,
     TorrentBrief,
@@ -69,6 +70,23 @@ class BaseDownloader(abc.ABC):
         site-protection-ratio-boost.md 2.5）。两端实现都由下载器自行搬移
         文件（qB set_location / Transmission move_torrent_data），跨盘时
         是真实拷贝，调用方不应假设瞬间完成。
+        """
+
+    @abc.abstractmethod
+    async def get_limits(self) -> DownloaderLimits:
+        """读取下载器的全局限制：限速、备用限速档与任务队列上限。
+
+        归一口径见 DownloaderLimits 注释。队列上限尤其值得暴露：刷流大量
+        做种时任务会撞上「最大活动种子数」进 queued 排队，用户需要能看到
+        并调整这个值。
+        """
+
+    @abc.abstractmethod
+    async def set_limits(self, limits: DownloaderLimits) -> None:
+        """写入下载器的全局限制（读-改-写语义：调用方传完整期望状态）。
+
+        限速 ``None`` = 取消限速；下载器不支持的字段（如 Transmission 的
+        max_active_torrents）静默忽略。
         """
 
     @abc.abstractmethod

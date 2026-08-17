@@ -67,6 +67,8 @@ export interface ConfiguredSite {
   boost_enabled: boolean;
   /** 刷流存储预算（字节） */
   boost_budget_bytes: number;
+  /** 刷流汰换最低保留天数（H&R 安全垫）；0=不保护，自由汰换 */
+  boost_hold_days: number;
   last_verified_at: string | null;
   last_checked_at: string | null;
   last_error: string | null;

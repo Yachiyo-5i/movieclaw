@@ -6,6 +6,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from movieclaw_api.api.deps import require_login
 from movieclaw_api.exceptions import BadRequestException, ForbiddenException
 from movieclaw_api.schemas.downloader import (
+    DownloaderLimitsUpdate,
+    DownloaderLimitsView,
     DownloaderPayload,
     DownloaderStatusUpdate,
     DownloaderView,
@@ -280,6 +282,51 @@ async def list_download_tasks(
             sources=[DownloadTaskSourceView(**source) for source in snapshot["sources"]],
         )
     )
+
+
+@router.get(
+    "/{downloader_id}/limits",
+    response_model=ApiResponse[DownloaderLimitsView],
+    summary="读取下载器的全局限速与任务队列上限",
+    operation_id="dl.limits",
+)
+async def get_downloader_limits(
+    downloader_id: int,
+    session: AsyncSession = Depends(get_session),
+) -> ApiResponse[DownloaderLimitsView]:
+    """实时读自下载器（限速、备用限速档、队列上限），不在本地落库。
+
+    队列上限（qB 的最大活动种子数 / Transmission 的下载与做种队列）决定
+    同时活动的任务数——刷流做种多时任务会撞上上限进排队，从这里可核对。
+    """
+    from movieclaw_api.services.download_tasks import get_downloader_limits as read_limits
+
+    limits = await read_limits(session, downloader_id)
+    return ok(DownloaderLimitsView(**limits.model_dump()))
+
+
+@router.put(
+    "/{downloader_id}/limits",
+    response_model=ApiResponse[DownloaderLimitsView],
+    summary="设置下载器的全局限速与任务队列上限",
+    operation_id="dl.limits.set",
+)
+async def update_downloader_limits(
+    downloader_id: int,
+    payload: DownloaderLimitsUpdate,
+    session: AsyncSession = Depends(get_session),
+) -> ApiResponse[DownloaderLimitsView]:
+    """写入后回读生效值返回（下载器可能钳制/忽略部分字段）。
+
+    限速传 null 表示取消限速；队列相关字段传 null 表示保持现状。
+    """
+    from movieclaw_api.services.download_tasks import set_downloader_limits
+    from movieclaw_downloader.models import DownloaderLimits
+
+    applied = await set_downloader_limits(
+        session, downloader_id, DownloaderLimits(**payload.model_dump())
+    )
+    return ok(DownloaderLimitsView(**applied.model_dump()), message="下载器限制已更新")
 
 
 @router.post(

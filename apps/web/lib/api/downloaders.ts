@@ -129,9 +129,14 @@ export interface DownloadTask {
   dlspeed_bytes: number | null;
   /** 当前上传速度（字节/秒）；未知为 null */
   upspeed_bytes: number | null;
+  /** 累计上传量（字节）；刷流分组汇总用，未知为 null */
+  uploaded_bytes: number | null;
+  /** 已完成字节；刷流分组汇总用，未知为 null */
+  completed_bytes: number | null;
   eta_seconds: number | null;
   state: DownloadTaskState;
-  source: "subscription" | "manual" | "external";
+  /** boost = 自动刷分享率抢下的种子：无媒体身份与入库流转，折叠为独立分组 */
+  source: "subscription" | "manual" | "boost" | "external";
   /** 来源站点 ID / 显示名；movieclaw 投递的任务才有，外部任务为 null */
   site_id: string | null;
   site_name: string | null;
@@ -254,6 +259,36 @@ export function updateDownloader(
     request<ApiEnvelope<ConfiguredDownloader>>(`/downloaders/${id}`, {
       method: "PUT",
       body: JSON.stringify(payload),
+    }),
+  );
+}
+
+/** 下载器全局限制（见 schemas.downloader.DownloaderLimitsView）。
+ *  限速单位字节/秒，null=不限；max_active_torrents 为 qBittorrent 独有。 */
+export interface DownloaderLimits {
+  download_limit_bytes: number | null;
+  upload_limit_bytes: number | null;
+  alt_speed_enabled: boolean | null;
+  queue_enabled: boolean | null;
+  max_active_downloads: number | null;
+  max_active_uploads: number | null;
+  max_active_torrents: number | null;
+}
+
+/** 实时读取下载器的全局限速与任务队列上限。 */
+export function getDownloaderLimits(id: number): Promise<DownloaderLimits> {
+  return unwrap(request<ApiEnvelope<DownloaderLimits>>(`/downloaders/${id}/limits`));
+}
+
+/** 写入下载器全局限制，返回回读的生效值。限速 null=取消；其余 null=不改。 */
+export function setDownloaderLimits(
+  id: number,
+  limits: DownloaderLimits,
+): Promise<DownloaderLimits> {
+  return unwrap(
+    request<ApiEnvelope<DownloaderLimits>>(`/downloaders/${id}/limits`, {
+      method: "PUT",
+      body: JSON.stringify(limits),
     }),
   );
 }
