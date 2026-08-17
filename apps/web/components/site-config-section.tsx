@@ -5,7 +5,13 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
 
 import { useConfirm, usePrompt } from "@/components/feedback";
-import { ChevronDownIcon, MoreIcon, PlusIcon, ServerIcon } from "@/components/icons";
+import {
+  ChevronDownIcon,
+  MoreIcon,
+  PlusIcon,
+  ServerIcon,
+  ShieldIcon,
+} from "@/components/icons";
 import { ExtensionCard } from "@/components/extension-settings";
 import { SearchSection } from "@/components/search-settings";
 import type { ConfiguredSite, SiteAuthType, SiteStatus } from "@/lib/api/extension";
@@ -578,6 +584,15 @@ function SiteRow({
           <span className="icon-chip size-8 shrink-0 !rounded-lg text-sub font-semibold">
             {item.display_name.charAt(0).toUpperCase()}
           </span>
+          {site.protected && (
+            <span
+              className="flex shrink-0 items-center"
+              title="站点保护中：订阅不会自动从该站拉种（下载量归零），手动搜索和下载不受影响"
+              aria-label="站点保护中"
+            >
+              <ShieldIcon className="size-4 text-[var(--info)]" />
+            </span>
+          )}
           {item.base_url ? (
             <a
               href={item.base_url}
@@ -611,42 +626,29 @@ function SiteRow({
           )}
         </div>
 
-        {/* P1：条件徽章（异常时错误原因吃掉徽章位——那一刻没有比它更重要的信息） */}
+        {/* P1：条件徽章（异常时错误原因吃掉徽章位——那一刻没有比它更重要的信息）。
+            保护状态不占徽章位——站点名前的护盾图标已承担（更紧凑，移动端友好） */}
         {failed ? (
           <p className="order-3 basis-full truncate text-caption text-[var(--danger)] sm:order-none sm:basis-auto sm:max-w-[45%]">
             {site.last_error}
           </p>
         ) : (
-          (site.protected || site.boost_enabled) && (
+          site.boost_enabled && (
             <div className="order-3 flex basis-full flex-wrap items-center gap-1.5 sm:order-none sm:basis-auto">
-              {site.protected && (
-                <span
-                  className="rounded-full px-2 py-0.5 text-caption font-medium"
-                  style={{
-                    background: "color-mix(in oklab, var(--info) 12%, transparent)",
-                    color: "var(--info)",
-                  }}
-                  title="订阅不会自动从该站拉种，手动搜索下载不受影响"
-                >
-                  保护中
-                </span>
-              )}
-              {site.boost_enabled && (
-                <span
-                  className="rounded-full px-2 py-0.5 text-caption font-medium"
-                  style={{
-                    background: "color-mix(in oklab, var(--ok) 12%, transparent)",
-                    color: "var(--ok)",
-                  }}
-                  title="自动刷分享率运行中：已用/预算 · 近 24 小时上传"
-                >
-                  刷流 {boost ? formatBytes(boost.used_bytes) : "0"}/
-                  {formatBytes(site.boost_budget_bytes)}
-                  {boost && boost.uploaded_bytes_24h > 0 && (
-                    <> · 24h ↑{formatBytes(boost.uploaded_bytes_24h)}</>
-                  )}
-                </span>
-              )}
+              <span
+                className="rounded-full px-2 py-0.5 text-caption font-medium"
+                style={{
+                  background: "color-mix(in oklab, var(--ok) 12%, transparent)",
+                  color: "var(--ok)",
+                }}
+                title="自动刷分享率运行中：已用/预算 · 近 24 小时上传"
+              >
+                刷流 {boost ? formatBytes(boost.used_bytes) : "0"}/
+                {formatBytes(site.boost_budget_bytes)}
+                {boost && boost.uploaded_bytes_24h > 0 && (
+                  <> · 24h ↑{formatBytes(boost.uploaded_bytes_24h)}</>
+                )}
+              </span>
             </div>
           )
         )}
@@ -777,7 +779,7 @@ function SiteDetail({
             className="grid grid-cols-2 gap-x-5 gap-y-2 sm:flex sm:flex-wrap sm:gap-x-7"
             title={`资料更新于 ${formatRelativeTime(site.profile.fetched_at)}`}
           >
-            <DetailStat label="账号" value={site.profile.username} />
+            <DetailStat label="用户名" value={site.profile.username} />
             {site.profile.user_class && (
               <DetailStat label="等级" value={site.profile.user_class} />
             )}
