@@ -4,7 +4,8 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
 
-import { useConfirm, usePrompt } from "@/components/feedback";
+import { useConfirm } from "@/components/feedback";
+import { Modal } from "@/components/modal";
 import {
   ChevronDownIcon,
   MoreIcon,
@@ -509,10 +510,11 @@ function SiteRow({
   onError,
 }: SiteRowProps) {
   const confirm = useConfirm();
-  const prompt = usePrompt();
   const [busy, setBusy] = useState(false);
   // 授权表单的展开态由行持有：菜单点「编辑授权」时行可能还没展开，需要先展开再亮表单
   const [editingAuth, setEditingAuth] = useState(false);
+  // 刷流设置弹窗（预算 + 保留期同窗）：enable=开启前确认，adjust=运行中调整
+  const [boostModal, setBoostModal] = useState<"enable" | "adjust" | null>(null);
   const meta = STATUS_META[site.status];
   const failed = site.status === "failed" && !!site.last_error;
 
@@ -527,44 +529,6 @@ function SiteRow({
     }
   }
 
-  /** 弹预算输入框并解析；返回字节数，取消返回 null，非法输入报错后返回 null。 */
-  async function askBudget(options: {
-    title: string;
-    description: string;
-    confirmLabel: string;
-  }): Promise<number | null> {
-    const raw = await prompt({
-      ...options,
-      initialValue: String(Math.round(site.boost_budget_bytes / GIB)),
-      placeholder: "存储预算",
-      kind: "number",
-      min: 1,
-      unit: "GiB",
-    });
-    if (raw == null) return null; // 用户取消
-    const gib = Math.round(Number(raw.trim()));
-    if (!Number.isFinite(gib) || gib < 1) {
-      onError("刷流预算必须是不小于 1 的整数（单位 GiB）");
-      return null;
-    }
-    return gib * GIB;
-  }
-
-  /** 开启刷流（含再次开启）：二次确认讲清将发生什么 + 同窗设置预算。 */
-  async function enableBoost() {
-    const budget = await askBudget({
-      title: `开启「${item.display_name}」的自动刷分享率？`,
-      description:
-        "开启后将自动抢该站新发布的免费种子做种以提升分享率；占用空间在下方预算内" +
-        `自动汰换（下载完成、入池满保留期（当前 ${site.boost_hold_days} 天，菜单可调）` +
-        "且上传效率过低的任务才会被连数据删除）；该站的索引同步会提速到约 5 分钟一次。" +
-        "请确认本次刷流的存储预算：",
-      confirmLabel: "开启刷流",
-    });
-    if (budget == null) return;
-    await guard(async () => onChanged(await setSiteRatioBoost(site.site_id, true, budget)));
-  }
-
   /** 关闭刷流：二次确认讲清后果（不删数据，只停新增）。 */
   async function disableBoost() {
     const ok = await confirm({
@@ -573,52 +537,12 @@ function SiteRow({
         "停止抢该站新发布的免费种子",
         "已在做种的刷流任务全部保留，不删除任何数据",
         "站点索引同步回到正常自适应节奏",
-        "重新开启时会再次确认预算",
+        "重新开启时会再次确认预算与保留期",
       ],
       confirmLabel: "关闭刷流",
     });
     if (!ok) return;
     await guard(async () => onChanged(await setSiteRatioBoost(site.site_id, false)));
-  }
-
-  /** 调整刷流预算（仅开启时可见）。 */
-  async function adjustBudget() {
-    const budget = await askBudget({
-      title: `调整「${item.display_name}」的刷流预算`,
-      description:
-        `当前预算 ${formatBytes(site.boost_budget_bytes)}。调小预算不会立刻删种——` +
-        "引擎按汰换规则逐步收敛到新预算，保留期内的任务绝不会被删除。",
-      confirmLabel: "保存",
-    });
-    if (budget == null || budget === site.boost_budget_bytes) return;
-    await guard(async () => onChanged(await setSiteRatioBoost(site.site_id, true, budget)));
-  }
-
-  /** 调整汰换保留期（仅开启时可见）：H&R 安全垫，无考核的站可调 0。 */
-  async function adjustHold() {
-    const raw = await prompt({
-      title: `调整「${item.display_name}」的汰换保留期`,
-      description:
-        `当前 ${site.boost_hold_days} 天。刷流任务入池满该天数才可被汰换——这是 H&R ` +
-        "考核的安全垫，有考核的站点务必不小于考核要求的做种时长。该站没有 H&R 时" +
-        "可调为 0：不设保护、自由汰换（引擎仍会避免误杀刚下完还没测出效率的种子）。",
-      initialValue: String(site.boost_hold_days),
-      placeholder: "保留天数",
-      kind: "number",
-      min: 0,
-      unit: "天",
-      confirmLabel: "保存",
-    });
-    if (raw == null) return;
-    const days = Math.round(Number(raw.trim()));
-    if (!Number.isFinite(days) || days < 0 || days > 30) {
-      onError("汰换保留期须是 0～30 之间的整数（天）");
-      return;
-    }
-    if (days === site.boost_hold_days) return;
-    await guard(async () =>
-      onChanged(await setSiteRatioBoost(site.site_id, true, undefined, days)),
-    );
   }
 
   return (
@@ -710,10 +634,9 @@ function SiteRow({
             onSetProtected={(next) =>
               void guard(async () => onChanged(await setSiteProtection(site.site_id, next)))
             }
-            onEnableBoost={() => void enableBoost()}
+            onEnableBoost={() => setBoostModal("enable")}
             onDisableBoost={() => void disableBoost()}
-            onAdjustBudget={() => void adjustBudget()}
-            onAdjustHold={() => void adjustHold()}
+            onBoostSettings={() => setBoostModal("adjust")}
             onEditAuth={() => {
               onOpen();
               setEditingAuth(true);
@@ -741,6 +664,16 @@ function SiteRow({
           />
         </div>
       </div>
+
+      {/* 刷流设置弹窗：开启确认与运行中调整共用（预算 + 保留期同窗） */}
+      <BoostSettingsModal
+        open={boostModal !== null}
+        mode={boostModal ?? "adjust"}
+        siteName={item.display_name}
+        site={site}
+        onClose={() => setBoostModal(null)}
+        onChanged={onChanged}
+      />
 
       {/* 展开详情：刷流 / 账号 / 索引 / 授权 四段 */}
       {expanded && (
@@ -887,6 +820,172 @@ function SiteDetail({
           </span>
         )}
       </DetailSection>
+    </div>
+  );
+}
+
+/* —— 刷流设置弹窗：预算 + 汰换保留期同窗设置，开启确认与运行中调整共用 —— */
+
+function BoostSettingsModal({
+  open,
+  mode,
+  siteName,
+  site,
+  onClose,
+  onChanged,
+}: {
+  open: boolean;
+  /** enable=开启前的二次确认（讲清将发生什么），adjust=运行中调整 */
+  mode: "enable" | "adjust";
+  siteName: string;
+  site: ConfiguredSite;
+  onClose: () => void;
+  onChanged: (site: ConfiguredSite) => void;
+}) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [budgetGib, setBudgetGib] = useState("");
+  const [holdDays, setHoldDays] = useState("");
+  // 每次打开按当前生效值重置表单（上次输入不残留）
+  useEffect(() => {
+    if (!open) return;
+    setError(null);
+    setBudgetGib(String(Math.round(site.boost_budget_bytes / GIB)));
+    setHoldDays(String(site.boost_hold_days));
+  }, [open, site.boost_budget_bytes, site.boost_hold_days]);
+
+  async function save() {
+    const gib = Math.round(Number(budgetGib.trim()));
+    if (!Number.isFinite(gib) || gib < 1) {
+      setError("刷流预算必须是不小于 1 的整数（单位 GiB）");
+      return;
+    }
+    const days = Math.round(Number(holdDays.trim()));
+    if (!Number.isFinite(days) || days < 0 || days > 30) {
+      setError("汰换保留期须是 0～30 之间的整数（天）");
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    try {
+      onChanged(await setSiteRatioBoost(site.site_id, true, gib * GIB, days));
+      onClose();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Modal
+      open={open}
+      onClose={onClose}
+      label={mode === "enable" ? "开启自动刷分享率" : "刷流设置"}
+      width="lg"
+      topmost
+    >
+      <div className="space-y-4 p-6">
+        <div>
+          <h2 className="text-title font-bold text-[var(--text)]">
+            {mode === "enable" ? `开启「${siteName}」的自动刷分享率？` : `刷流设置 · ${siteName}`}
+          </h2>
+          <p className="mt-1 text-sub leading-6 text-[var(--text-muted)]">
+            {mode === "enable"
+              ? "开启后将自动抢该站新发布的免费种子做种以提升分享率，占用空间在预算内自动汰换" +
+                "（下载完成、入池满保留期且上传效率过低的任务才会被连数据删除），" +
+                "该站的索引同步会提速到约 5 分钟一次。"
+              : "调小预算不会立刻删种——引擎按汰换规则逐步收敛，保留期内的任务绝不会被删除。"}
+          </p>
+        </div>
+
+        {error && (
+          <div className="rounded-xl border border-[#ff6b6b]/30 bg-[#ff6b6b]/10 px-4 py-3 text-body text-[#ff6b6b]">
+            {error}
+          </div>
+        )}
+
+        <div className="grid grid-cols-2 gap-3 max-md:grid-cols-1">
+          <BoostField
+            label="存储预算"
+            value={budgetGib}
+            unit="GiB"
+            min={1}
+            disabled={busy}
+            onChange={setBudgetGib}
+            hint="刷流任务占用磁盘的上限，预算内自动汰换"
+          />
+          <BoostField
+            label="汰换保留期"
+            value={holdDays}
+            unit="天"
+            min={0}
+            disabled={busy}
+            onChange={setHoldDays}
+            hint="H&R 安全垫：有考核的站不小于考核时长；无考核可调 0 自由汰换"
+          />
+        </div>
+
+        <div className="flex justify-end gap-2.5 pt-1">
+          <button
+            type="button"
+            onClick={onClose}
+            disabled={busy}
+            className="btn-glass px-4 py-2 text-sub font-medium"
+          >
+            取消
+          </button>
+          <button
+            type="button"
+            onClick={() => void save()}
+            disabled={busy}
+            className="btn-accent rounded-full px-4 py-2 text-sub font-semibold disabled:opacity-60"
+          >
+            {busy ? "保存中…" : mode === "enable" ? "开启刷流" : "保存"}
+          </button>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+/** 带单位后缀与说明的数字输入（弹窗内两枚字段共用）。 */
+function BoostField({
+  label,
+  value,
+  unit,
+  min,
+  disabled,
+  onChange,
+  hint,
+}: {
+  label: string;
+  value: string;
+  unit: string;
+  min: number;
+  disabled?: boolean;
+  onChange: (value: string) => void;
+  hint: string;
+}) {
+  return (
+    <div>
+      <label className="mb-1.5 block text-caption font-medium text-[var(--text-muted)]">
+        {label}
+      </label>
+      <div className="relative">
+        <input
+          type="number"
+          min={min}
+          value={value}
+          disabled={disabled}
+          onChange={(e) => onChange(e.target.value)}
+          className="w-full rounded-lg border border-white/10 bg-white/[0.06] px-3 py-2 pr-12 text-ui text-white outline-none transition [appearance:textfield] focus:border-white/25 [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
+        />
+        <span className="pointer-events-none absolute inset-y-0 right-3 flex items-center text-caption font-medium text-[var(--text-faint)]">
+          {unit}
+        </span>
+      </div>
+      <p className="mt-1 text-caption leading-4 text-[var(--text-faint)]">{hint}</p>
     </div>
   );
 }
@@ -1068,8 +1167,7 @@ interface SiteActionsMenuProps {
   onSetProtected: (next: boolean) => void;
   onEnableBoost: () => void;
   onDisableBoost: () => void;
-  onAdjustBudget: () => void;
-  onAdjustHold: () => void;
+  onBoostSettings: () => void;
   onEditAuth: () => void;
   onReverify: () => void;
   onDelete: () => void;
@@ -1082,8 +1180,7 @@ function SiteActionsMenu({
   onSetProtected,
   onEnableBoost,
   onDisableBoost,
-  onAdjustBudget,
-  onAdjustHold,
+  onBoostSettings,
   onEditAuth,
   onReverify,
   onDelete,
@@ -1140,18 +1237,9 @@ function SiteActionsMenu({
             {site.boost_enabled ? "关闭刷流…" : "开启刷流…"}
           </DropdownMenu.Item>
           {site.boost_enabled && (
-            <>
-              <DropdownMenu.Item
-                onSelect={onAdjustBudget}
-                disabled={busy}
-                className={itemClass}
-              >
-                调整刷流预算…
-              </DropdownMenu.Item>
-              <DropdownMenu.Item onSelect={onAdjustHold} disabled={busy} className={itemClass}>
-                调整汰换保留期…
-              </DropdownMenu.Item>
-            </>
+            <DropdownMenu.Item onSelect={onBoostSettings} disabled={busy} className={itemClass}>
+              刷流设置…
+            </DropdownMenu.Item>
           )}
           <DropdownMenu.Item onSelect={onEditAuth} disabled={busy} className={itemClass}>
             编辑授权
