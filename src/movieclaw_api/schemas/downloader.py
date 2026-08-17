@@ -194,6 +194,8 @@ class DownloadTaskView(BaseModel):
     size_bytes: int | None = None
     dlspeed_bytes: int | None = None
     upspeed_bytes: int | None = None
+    uploaded_bytes: int | None = Field(default=None, description="累计上传量；刷流分组汇总用")
+    completed_bytes: int | None = Field(default=None, description="已完成字节；刷流分组汇总用")
     eta_seconds: int | None = None
     state: Literal[
         "downloading",
@@ -206,7 +208,8 @@ class DownloadTaskView(BaseModel):
         "missing",
         "unknown",
     ]
-    source: Literal["subscription", "manual", "external"]
+    # boost = 自动刷分享率抢下的种子：无媒体身份与入库流转，前端折叠为独立分组
+    source: Literal["subscription", "manual", "boost", "external"]
     # -- 种子来源与规格（movieclaw 投递的任务才有）：站点身份、详情页入口
     # 与投递时的质量快照，供任务中心展示"这个种子从哪来、什么规格"。
     site_id: str | None = None

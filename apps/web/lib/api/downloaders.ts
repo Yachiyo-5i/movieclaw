@@ -129,9 +129,14 @@ export interface DownloadTask {
   dlspeed_bytes: number | null;
   /** 当前上传速度（字节/秒）；未知为 null */
   upspeed_bytes: number | null;
+  /** 累计上传量（字节）；刷流分组汇总用，未知为 null */
+  uploaded_bytes: number | null;
+  /** 已完成字节；刷流分组汇总用，未知为 null */
+  completed_bytes: number | null;
   eta_seconds: number | null;
   state: DownloadTaskState;
-  source: "subscription" | "manual" | "external";
+  /** boost = 自动刷分享率抢下的种子：无媒体身份与入库流转，折叠为独立分组 */
+  source: "subscription" | "manual" | "boost" | "external";
   /** 来源站点 ID / 显示名；movieclaw 投递的任务才有，外部任务为 null */
   site_id: string | null;
   site_name: string | null;

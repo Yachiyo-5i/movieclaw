@@ -23,6 +23,7 @@ from sqlmodel import select
 from movieclaw_api.exceptions import NotFoundException, UpstreamServiceException
 from movieclaw_api.services.network_egress import effective_tmdb_image_base_url
 from movieclaw_db.models import (
+    BoostTaskState,
     ConfigStatus,
     DownloadAttemptStatus,
     DownloaderClient,
@@ -31,6 +32,7 @@ from movieclaw_db.models import (
     LibraryFile,
     ManualDownloadIntent,
     MediaItem,
+    RatioBoostTask,
     SiteTorrent,
     Subscription,
     SubscriptionDownloadAttempt,
@@ -604,9 +606,16 @@ def _task_dict(
     downloader: DownloaderClient | None,
     subscriptions: list[dict[str, Any]],
     manual: dict[str, Any] | None,
+    boost: dict[str, Any] | None = None,
     absent_state: str = "missing",
 ) -> dict[str, Any]:
-    source = "subscription" if subscriptions else "manual" if manual else "external"
+    # 来源优先级：订阅/手动（媒体下载语义）> 刷流台账 > 外部。被订阅接管的
+    # 刷流种子台账已置 missing（不在 boost 映射里），不会出现双重归属
+    source = (
+        "subscription"
+        if subscriptions
+        else "manual" if manual else "boost" if boost else "external"
+    )
     media = subscriptions[0] if subscriptions else manual
     rescue = next(
         (entry for entry in subscriptions if entry.get("_attempt_status") is not None),
@@ -614,10 +623,12 @@ def _task_dict(
     )
     completed = bool(torrent and torrent.completed)
     state = absent_state if torrent is None else "completed" if completed else torrent.state
-    # 站点/质量信息取自投递台账（订阅任务）或手动身份锚；外部任务两者皆无
-    site_id = next(
-        (entry["_site_id"] for entry in subscriptions if entry.get("_site_id")), None
-    ) or (manual or {}).get("site_id")
+    # 站点/质量信息取自投递台账（订阅任务）、手动身份锚或刷流台账；外部任务皆无
+    site_id = (
+        next((entry["_site_id"] for entry in subscriptions if entry.get("_site_id")), None)
+        or (manual or {}).get("site_id")
+        or (boost or {}).get("site_id")
+    )
     quality = next(
         (entry["_quality"] for entry in subscriptions if entry.get("_quality")), None
     ) or {}
@@ -647,7 +658,11 @@ def _task_dict(
     return {
         "id": task_id,
         "info_hash": info_hash,
-        "name": torrent.name if torrent is not None else (media or {}).get("media_title"),
+        "name": (
+            torrent.name
+            if torrent is not None
+            else (media or {}).get("media_title") or (boost or {}).get("title")
+        ),
         "downloader_id": (
             downloader.id
             if downloader is not None
@@ -659,6 +674,9 @@ def _task_dict(
         "size_bytes": torrent.size_bytes if torrent is not None else None,
         "dlspeed_bytes": torrent.dlspeed_bytes if torrent is not None else None,
         "upspeed_bytes": torrent.upspeed_bytes if torrent is not None else None,
+        # 累计上传/已完成字节：刷流分组的汇总原料（其它来源同样受益于展示）
+        "uploaded_bytes": torrent.uploaded_bytes if torrent is not None else None,
+        "completed_bytes": torrent.completed_bytes if torrent is not None else None,
         "eta_seconds": torrent.eta_seconds if torrent is not None else None,
         "state": state,
         "source": source,
@@ -667,7 +685,8 @@ def _task_dict(
         "page_url": next(
             (entry["_page_url"] for entry in subscriptions if entry.get("_page_url")), None
         )
-        or (manual or {}).get("_page_url"),
+        or (manual or {}).get("_page_url")
+        or (boost or {}).get("_page_url"),
         "resolution": quality.get("resolution"),
         "media_source": quality.get("media_source"),
         "media_item_id": (media or {}).get("media_item_id"),
@@ -855,9 +874,55 @@ async def delete_download_task(
         await session.commit()
 
 
+async def _boost_relations(session: AsyncSession) -> dict[str, dict[str, Any]]:
+    """刷流台账关联：info_hash → 站点/标题/详情页。
+
+    只取 ACTIVE——被订阅/手动接管或已汰换的任务台账已是终态，不再属于
+    刷流来源（接管的会经订阅/手动关联现身，双重归属天然不存在）。
+    """
+    rows = (
+        (
+            await session.execute(
+                select(RatioBoostTask).where(RatioBoostTask.state == BoostTaskState.ACTIVE)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    boost = {
+        row.info_hash.lower(): {
+            "site_id": row.site_id,
+            "torrent_id": row.torrent_id,
+            "title": row.title,
+        }
+        for row in rows
+    }
+    pairs = {(meta["site_id"], meta["torrent_id"]) for meta in boost.values()}
+    if pairs:
+        detail_rows = await session.execute(
+            select(SiteTorrent.site_id, SiteTorrent.torrent_id, SiteTorrent.detail_url).where(
+                or_(
+                    *(
+                        and_(SiteTorrent.site_id == site_id, SiteTorrent.torrent_id == torrent_id)
+                        for site_id, torrent_id in pairs
+                    )
+                )
+            )
+        )
+        page_urls = {
+            (site_id, torrent_id): detail_url
+            for site_id, torrent_id, detail_url in detail_rows
+            if detail_url
+        }
+        for meta in boost.values():
+            meta["_page_url"] = page_urls.get((meta["site_id"], meta["torrent_id"]))
+    return boost
+
+
 async def download_task_snapshot(session: AsyncSession) -> dict[str, list[dict[str, Any]]]:
     """并行读取下载器，返回活跃下载与仍在业务管线内的完成/缺失任务。"""
     subscriptions, manual = await _relations(session)
+    boost = await _boost_relations(session)
     repository = DownloaderRepository(session)
     downloaders = await repository.list_all()
 
@@ -952,9 +1017,16 @@ async def download_task_snapshot(session: AsyncSession) -> dict[str, list[dict[s
             info_hash = torrent.info_hash.lower()
             linked_subscriptions = subscriptions.get(info_hash, [])
             linked_manual = manual.get(info_hash)
+            linked_boost = boost.get(info_hash)
             # 做种历史可能有上千条：任务中心只看未完成任务，以及仍等待
-            # MovieClaw 入库收尾的订阅/手动任务。
-            if torrent.completed and not linked_subscriptions and not linked_manual:
+            # MovieClaw 入库收尾的订阅/手动任务。刷流在池任务例外——做种
+            # 中的才是刷流的主体，前端把它们折叠成独立分组展示汇总。
+            if (
+                torrent.completed
+                and not linked_subscriptions
+                and not linked_manual
+                and linked_boost is None
+            ):
                 continue
             seen_hashes.add(info_hash)
             visible_count += 1
@@ -966,6 +1038,7 @@ async def download_task_snapshot(session: AsyncSession) -> dict[str, list[dict[s
                     downloader=row,
                     subscriptions=linked_subscriptions,
                     manual=linked_manual,
+                    boost=linked_boost,
                 )
             )
         sources.append({**source_view, "task_count": visible_count})
