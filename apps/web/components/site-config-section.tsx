@@ -191,8 +191,10 @@ export function SiteConfigSection() {
     hasInProgress ? 2500 : null,
   );
 
-  // 有站点开着刷流时轻轮询运行统计（引擎 5 分钟一个 tick，30 秒刷新足够跟上），
-  // 让「已用 / 近 24h 上传」在页面停留期间自己长，不需要用户手动刷新
+  // 有站点开着刷流时轻轮询关键数据（引擎 5 分钟一个 tick、同步最快 5 分钟一轮，
+  // 30 秒刷新足够跟上）：刷流统计（行级产出读数、详情用量）与索引同步节奏
+  // （详情里的上次/下次同步）在页面停留期间自己长，不需要用户手动刷新。
+  // 两个请求都是本地聚合查询，不触达任何站点。
   const anyBoosting = configured.some((s) => s.boost_enabled);
   useVisiblePolling(
     () => {
@@ -200,6 +202,11 @@ export function SiteConfigSection() {
         .then(setBoostStats)
         .catch(() => {
           /* 轮询失败静默重试，不打断页面 */
+        });
+      void listSiteSyncStats()
+        .then(setSyncStats)
+        .catch(() => {
+          /* 同上 */
         });
     },
     anyBoosting ? 30000 : null,
@@ -875,8 +882,33 @@ function BoostReadout({ boost }: { boost?: SiteBoostStats }) {
    落盘缓存后浏览器不再反复触达站点。刻意不走 Google/DuckDuckGo 的 favicon
    聚合服务：目标用户网络环境里那些域名普遍不可达。 */
 
+/** favicon 失败负缓存的 TTL：站点 favicon 挂了不该每次进页面都重试一发。
+ *  成功端有浏览器一年 immutable 缓存，失败端靠 localStorage 记一天，
+ *  一天后自动重试（站点修好后最多一天恢复图标）。 */
+const _FAVICON_FAIL_TTL_MS = 24 * 60 * 60 * 1000;
+
+function faviconFailKey(origin: string): string {
+  return `mc:favicon-fail:${origin}`;
+}
+
+function faviconRecentlyFailed(origin: string): boolean {
+  try {
+    const at = Number(localStorage.getItem(faviconFailKey(origin)));
+    return Number.isFinite(at) && Date.now() - at < _FAVICON_FAIL_TTL_MS;
+  } catch {
+    return false; // 隐私模式等 localStorage 不可用：退化为每次尝试
+  }
+}
+
+function rememberFaviconFailure(origin: string): void {
+  try {
+    localStorage.setItem(faviconFailKey(origin), String(Date.now()));
+  } catch {
+    /* 记不住就算了，只损失负缓存 */
+  }
+}
+
 function SiteBadge({ item }: { item: CatalogItem }) {
-  const [failed, setFailed] = useState(false);
   const origin = useMemo(() => {
     if (!item.base_url) return null;
     try {
@@ -885,6 +917,8 @@ function SiteBadge({ item }: { item: CatalogItem }) {
       return null;
     }
   }, [item.base_url]);
+  // 初始态就吃负缓存：一天内失败过的站直接出字母徽标，连请求都不发
+  const [failed, setFailed] = useState(() => (origin ? faviconRecentlyFailed(origin) : false));
 
   if (!origin || failed) {
     return (
@@ -901,7 +935,10 @@ function SiteBadge({ item }: { item: CatalogItem }) {
         alt=""
         loading="lazy"
         className="size-5"
-        onError={() => setFailed(true)}
+        onError={() => {
+          rememberFaviconFailure(origin);
+          setFailed(true);
+        }}
       />
     </span>
   );
