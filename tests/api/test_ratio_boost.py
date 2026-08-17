@@ -14,6 +14,7 @@ from movieclaw_api.services.ratio_boost import (
     assess_candidate,
     evictable,
     free_window_sufficient,
+    hand_over_if_claimed,
     pick_evictions,
 )
 from movieclaw_db.models import BoostTaskState, RatioBoostTask, SiteTorrent, TorrentSource
@@ -216,3 +217,31 @@ class TestEviction:
         protected_by_hold = _task(created_at=_NOW - timedelta(hours=1), size_bytes=50 * _GIB)
         small = _task(torrent_id="s", upload_rate_ema=0.0, size_bytes=5 * _GIB)
         assert pick_evictions([protected_by_hold, small], need_bytes=20 * _GIB, now=_NOW) is None
+
+
+# ---------------------------------------------------------------------------
+# 与订阅/手动下载的碰撞：认领转出
+# ---------------------------------------------------------------------------
+
+
+class TestHandOverIfClaimed:
+    def test_claimed_task_leaves_pool_without_deletion(self) -> None:
+        """被订阅认领的任务转出管理：让出预算、绝不删数据，之后归订阅状态机管。"""
+        task = _task()
+        assert hand_over_if_claimed(task, {task.info_hash}, _NOW)
+        assert task.state == BoostTaskState.MISSING
+        assert task.evicted_at == _NOW
+        assert "认领" in (task.evict_reason or "")
+        # 转出的任务不再是汰换候选——数据安全的关键断言
+        assert not evictable(task, _NOW)
+
+    def test_unclaimed_task_stays(self) -> None:
+        task = _task()
+        assert not hand_over_if_claimed(task, {"f" * 40}, _NOW)
+        assert task.state == BoostTaskState.ACTIVE
+
+    def test_terminal_states_untouched(self) -> None:
+        """已终态（evicted/missing）的任务不重复转出，保留原始结论。"""
+        task = _task(state=BoostTaskState.EVICTED, evict_reason="原始原因")
+        assert not hand_over_if_claimed(task, {task.info_hash}, _NOW)
+        assert task.evict_reason == "原始原因"

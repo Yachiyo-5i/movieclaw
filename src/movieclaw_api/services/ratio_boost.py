@@ -36,9 +36,11 @@ from movieclaw_db.engine import get_database
 from movieclaw_db.models import (
     BoostTaskState,
     DownloaderClient,
+    ManualDownloadIntent,
     RatioBoostTask,
     SiteCredential,
     SiteTorrent,
+    SubscriptionDownloadAttempt,
     utcnow,
 )
 from movieclaw_db.models.scheduled_task import TriggerType
@@ -162,6 +164,26 @@ def apply_observation(
     task.updated_at = now
 
 
+def hand_over_if_claimed(
+    task: RatioBoostTask, claimed_hashes: set[str], now: datetime
+) -> bool:
+    """种子被订阅投递/手动下载认领时，把刷流任务转出管理。返回是否发生转出。
+
+    与订阅的碰撞是双向的，这里处理「刷流先抢、订阅后到」的方向：订阅投递
+    命中同一 infohash 时下载器幂等返回 already_exists，工单照常记账——此后
+    这份数据是订阅的依赖，刷流**绝不能再把它连数据汰换掉**。转出 = 置
+    MISSING 让出预算、任务与数据原样保留，之后归订阅的所有权/H&R 状态机
+    管辖（反方向「订阅先抢、刷流后到」由准入排除 + already_exists 双重拦截）。
+    """
+    if task.state != BoostTaskState.ACTIVE or task.info_hash not in claimed_hashes:
+        return False
+    task.state = BoostTaskState.MISSING
+    task.evicted_at = now
+    task.evict_reason = "已被订阅/手动下载认领，移出刷流管理（预算让出，任务与数据保留）"
+    task.updated_at = now
+    return True
+
+
 def evictable(task: RatioBoostTask, now: datetime) -> bool:
     """任务是否可被汰换：下载完成 + 过了最低保留期 + 上传效率低于地板。
 
@@ -256,11 +278,28 @@ class _DownloaderPool:
                     await adapter.close()
 
 
+async def _claimed_hashes(session: AsyncSession) -> set[str]:
+    """被订阅投递或手动下载认领的全部 infohash（统一小写）。"""
+    attempt_rows = (
+        (await session.execute(select(SubscriptionDownloadAttempt.info_hash))).scalars().all()
+    )
+    intent_rows = (await session.execute(select(ManualDownloadIntent.info_hash))).scalars().all()
+    return {h.lower() for h in [*attempt_rows, *intent_rows] if h}
+
+
 async def _refresh_tasks(
     session: AsyncSession, pool: _DownloaderPool, tasks: list[RatioBoostTask], now: datetime
 ) -> None:
-    """第一步对账：把下载器观测写回台账，找不到的标记 missing。"""
+    """第一步对账：把下载器观测写回台账，找不到的标记 missing。
+
+    对账前先做认领转出（见 hand_over_if_claimed）：被订阅/手动下载认领的
+    任务立即脱离刷流管理，从根上杜绝后续任何汰换触碰它的数据。
+    """
+    claimed = await _claimed_hashes(session)
     for task in tasks:
+        if hand_over_if_claimed(task, claimed, now):
+            logger.info("刷流任务已被认领，转出管理：%s（%s）", task.title, task.site_id)
+            continue
         if task.downloader_id is None:
             # 下载器配置已被删除（外键 SET NULL）：任务无从管理，让出预算
             task.state = BoostTaskState.MISSING
@@ -364,6 +403,21 @@ async def _admit_candidates(
         .scalars()
         .all()
     )
+    # 订阅投递 / 手动下载已认领的同站种子也不抢：那是媒体下载的领地，刷流
+    # 抢过去只会制造 already_exists 空转（「订阅先抢、刷流后到」方向的拦截）
+    for model in (SubscriptionDownloadAttempt, ManualDownloadIntent):
+        tracked.update(
+            (
+                await session.execute(
+                    select(model.torrent_id).where(
+                        model.site_id == site_id,
+                        model.torrent_id != None,  # noqa: E711 -- SQL 表达式需用 !=
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
 
     # SQL 粗筛（免费 + 新发布 + 有下载者 + 非明确 H&R），完整判据在 assess_candidate
     rows = (
