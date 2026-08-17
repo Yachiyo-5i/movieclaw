@@ -339,8 +339,9 @@ function PosterCardContent({
         {/* 右上：洗版徽标（订阅墙专属，posterFooter 才会带 upgradingCount；
             订阅墙不渲染评分徽章，右上角位无冲突）。青色与详情页洗版色同源 */}
         {item.posterFooter?.upgrading && item.posterFooter.upgradingCount != null && (
-          // 无底色贴海报：文字阴影保证亮色海报上可读，青点自带辉光
-          <span className="tnum absolute right-2 top-2 z-10 flex items-center gap-1 text-caption font-semibold text-[#2dd4bf] [text-shadow:0_1px_3px_rgba(0,0,0,0.85)]">
+          // 淡暗底把徽标从海报里衬出来（全透明会融进画面），浓度压到 40%
+          // 保持轻盈；不用 backdrop-blur（海报墙的 GPU 成本约束见上方注释）
+          <span className="tnum absolute right-2 top-2 z-10 flex items-center gap-1 rounded-md bg-black/40 px-1.5 py-0.5 text-caption font-semibold text-[#2dd4bf] [text-shadow:0_1px_2px_rgba(0,0,0,0.6)]">
             <span
               aria-hidden="true"
               className="size-1.5 rounded-full bg-[#2dd4bf] shadow-[0_0_6px_rgba(45,212,191,0.7)]"
