@@ -89,10 +89,11 @@ def _adapt_interval(
     - 完全没有新增：间隔 ×1.5——这个站很冷，放疏省资源。
     - 其余（有新增但没到「满页全新」）：稳态，维持当前间隔。
 
-    ``pinned``（开启刷流的站点）：成功时钉在 MIN 不参与放疏——刷流抢免费
-    新种拼的是发现速度，冷站退避到小时级会错过整个免费窗口；失败退避不受
-    钉住影响（对挂掉的站高频重试没有意义）。关闭刷流后不再钉住，间隔按
-    冷热自然漂回。
+    ``pinned``：成功时钉在 MIN 不参与放疏——刷流抢免费新种拼的是发现速度，
+    冷站退避到小时级会错过整个免费窗口。是否钉住由 ``ratio_boost.wants_fast_sync``
+    **动态判定**：开着刷流且有准入余量才钉；预算满且无可汰换时发现了也下
+    不了，高频刷索引纯属浪费，自动回落到正常自适应。失败退避不受钉住影响
+    （对挂掉的站高频重试没有意义）。
     """
     if consecutive_failures > 0:
         if consecutive_failures == 1:
@@ -385,12 +386,17 @@ async def _sync_one_site(cred: SiteCredential) -> None:
     # 计算下次节奏并回写游标（出错也要排下次，避免卡死不再重试）
     failures = 0 if error is None else prev_failures + 1
     tripped = error is not None and not transient and failures >= _BREAKER_THRESHOLD
+    # 刷流快节奏是动态的：开着刷流且有准入余量才钉住（见 wants_fast_sync）
+    from movieclaw_api.services.ratio_boost import wants_fast_sync
+
+    async with db.session() as session:
+        pinned = await wants_fast_sync(session, cred)
     next_interval = _adapt_interval(
         current_interval,
         new_count=new_count,
         full_page=full_page,
         consecutive_failures=failures,
-        pinned=cred.boost_enabled,
+        pinned=pinned,
     )
     if error is not None and transient:
         # 瞬时故障对用户是「不用管」的：把重试计划写进原因里，安抚而非报警

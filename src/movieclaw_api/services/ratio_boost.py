@@ -82,6 +82,12 @@ _MAX_SIZE_BUDGET_FRACTION = 4
 _MAX_ADMIT_PER_TICK = 3
 # 提交后宽限：刚提交的任务可能还没出现在下载器列表里，不能立刻判 missing
 _MISSING_GRACE = timedelta(minutes=10)
+# 最小准入余量：余量（剩余预算 + 可汰换容量）低于此值时视为"没有能力接新种"——
+# 准入扫描跳过，索引同步也回落到正常自适应节奏（值得抢的免费种极少小于 1 GiB）
+_MIN_ADMISSION_HEADROOM = 1024**3
+# 余量恢复后推同步一把的阈值：游标排期还在 15 分钟开外才值得打断
+#（刚回落不久/本来就快的排期没必要动）
+_NUDGE_THRESHOLD = timedelta(minutes=15)
 # 刷流任务的下载器分类与保存子目录：与媒体下载（movieclaw）彻底隔离，
 # 不落媒体库、不进监听导入规则的视野
 BOOST_CATEGORY = "movieclaw-boost"
@@ -233,6 +239,20 @@ def evictable(task: RatioBoostTask, now: datetime) -> bool:
         and now - task.created_at >= _MIN_HOLD
         and task.upload_rate_ema < _EVICT_RATE_FLOOR
     )
+
+
+def admission_headroom(
+    tasks: list[RatioBoostTask], budget_bytes: int, now: datetime
+) -> int:
+    """当前的准入余量 = 剩余预算 + 可汰换任务的占用。
+
+    这是"刷流还有没有能力接新种"的统一判据：预算满但有低效老种可换时，
+    发现新种仍有意义（会触发汰换腾位）；满且换不动时，发现了也下不了——
+    准入扫描与索引同步的快节奏（wants_fast_sync）都以它为开关。
+    """
+    used = sum(t.size_bytes for t in tasks if t.state == BoostTaskState.ACTIVE)
+    reclaimable = sum(t.size_bytes for t in tasks if evictable(t, now))
+    return budget_bytes - used + reclaimable
 
 
 def pick_evictions(
@@ -415,6 +435,24 @@ def _boost_save_path(downloader: DownloaderClient) -> str | None:
     return downloader.save_path.rstrip("/") + "/" + _BOOST_SUBDIR
 
 
+async def _nudge_slow_cursor(session: AsyncSession, site_id: str, now: datetime) -> None:
+    """准入余量恢复后，把还在慢排期的同步游标标记到期，发现速度立刻回升。
+
+    无余量期间同步回落到自适应节奏（可能已放疏到小时级）；余量恢复的信号
+    只有刷流引擎自己知道，不推这一把就要等旧排期走完才重新钉住。排期在
+    15 分钟内的不动——马上就要同步了，没必要打断。
+    """
+    from movieclaw_db.repositories.torrent_repo import TorrentRepository
+
+    repo = TorrentRepository(session)
+    cursor = await repo.get_cursor(site_id)
+    if cursor is not None and cursor.next_sync_at is not None and (
+        cursor.next_sync_at - now > _NUDGE_THRESHOLD
+    ):
+        await repo.expire_cursor(site_id)
+        logger.info("刷流余量恢复，站点 %s 的索引同步已提前", site_id)
+
+
 async def _admit_candidates(
     session: AsyncSession,
     pool: _DownloaderPool,
@@ -433,6 +471,13 @@ async def _admit_candidates(
     site_id = cred.site_id
     budget = cred.boost_budget_bytes
     used = sum(t.size_bytes for t in site_tasks if t.state == BoostTaskState.ACTIVE)
+
+    # 余量开关：池子满且换不动时不扫候选（发现了也下不了）；同步端由
+    # wants_fast_sync 同一判据回落节奏。有余量时若游标还在慢排期（此前
+    # 无余量回落遗留的），推一把让发现速度立刻恢复
+    if admission_headroom(site_tasks, budget, now) < _MIN_ADMISSION_HEADROOM:
+        return
+    await _nudge_slow_cursor(session, site_id, now)
 
     # 抢过的不再抢（任何状态都算：missing/evicted 是明确结论，不能反复拉扯）
     tracked = set(
@@ -641,6 +686,34 @@ async def run_ratio_boost() -> None:
                 await _admit_candidates(session, pool, cred, site_tasks, now)
         finally:
             await pool.close()
+
+
+async def wants_fast_sync(session: AsyncSession, cred: SiteCredential) -> bool:
+    """站点索引同步是否应钉在最快节奏（供 torrent_sync 每轮同步后询问）。
+
+    动态判定，而非"开了刷流就一直快"：预算满且无可汰换时，发现新种也没
+    机会下，高频刷索引纯属浪费站点请求——此时回 False，同步回到正常的
+    冷热自适应/指数退避；余量恢复（汰换解锁、用户调大预算、任务转出）后
+    自动回 True 重新钉住。
+    """
+    if not cred.boost_enabled:
+        return False
+    tasks = (
+        (
+            await session.execute(
+                select(RatioBoostTask).where(
+                    RatioBoostTask.site_id == cred.site_id,
+                    RatioBoostTask.state == BoostTaskState.ACTIVE,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return (
+        admission_headroom(list(tasks), cred.boost_budget_bytes, utcnow())
+        >= _MIN_ADMISSION_HEADROOM
+    )
 
 
 async def release_site_tasks(session: AsyncSession, site_id: str) -> int:

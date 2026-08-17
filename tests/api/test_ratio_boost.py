@@ -10,6 +10,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 
 from movieclaw_api.services.ratio_boost import (
+    admission_headroom,
     apply_observation,
     assess_candidate,
     evictable,
@@ -226,6 +227,29 @@ class TestEviction:
         protected_by_hold = _task(created_at=_NOW - timedelta(hours=1), size_bytes=50 * _GIB)
         small = _task(torrent_id="s", upload_rate_ema=0.0, size_bytes=5 * _GIB)
         assert pick_evictions([protected_by_hold, small], need_bytes=20 * _GIB, now=_NOW) is None
+
+
+class TestAdmissionHeadroom:
+    """准入余量 = 剩余预算 + 可汰换容量——准入扫描与同步快节奏的统一开关。"""
+
+    def test_empty_pool_full_headroom(self) -> None:
+        assert admission_headroom([], _BUDGET, _NOW) == _BUDGET
+
+    def test_evictable_capacity_counts_as_headroom(self) -> None:
+        """预算被占满但有低效老种可换：发现新种仍有意义（会触发汰换腾位）。"""
+        hot = _task(size_bytes=60 * _GIB, upload_rate_ema=100 * 1024)  # 高效，不可换
+        idle = _task(torrent_id="i", size_bytes=40 * _GIB, upload_rate_ema=0.0)  # 可换
+        assert admission_headroom([hot, idle], _BUDGET, _NOW) == 40 * _GIB
+
+    def test_full_pool_within_hold_has_no_headroom(self) -> None:
+        """池子满且全在 72 小时保留期内：换不动，余量为 0——此时准入跳过、
+        索引同步回落到正常自适应（不再为发现新种白打站点）。"""
+        young = _task(size_bytes=100 * _GIB, created_at=_NOW - timedelta(hours=10))
+        assert admission_headroom([young], _BUDGET, _NOW) == 0
+
+    def test_terminal_states_do_not_occupy(self) -> None:
+        gone = _task(state=BoostTaskState.MISSING, size_bytes=30 * _GIB)
+        assert admission_headroom([gone], _BUDGET, _NOW) == _BUDGET
 
 
 # ---------------------------------------------------------------------------
