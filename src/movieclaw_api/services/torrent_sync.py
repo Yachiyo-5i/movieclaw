@@ -45,7 +45,7 @@ from movieclaw_db.repositories.torrent_repo import (
 )
 from movieclaw_enrich import ENRICH_VERSION, enrich
 from movieclaw_scheduler.registry import register_task
-from movieclaw_tracker.exceptions import TrackerParseError
+from movieclaw_tracker.exceptions import TrackerAuthError, TrackerParseError
 from movieclaw_tracker.models import TorrentListItem
 
 logger = logging.getLogger("movieclaw_api.torrent_sync")
@@ -70,6 +70,12 @@ _MAX_FUTURE_SKEW = timedelta(minutes=15)
 # 瞬时故障（宕机/网络/限流）永不触发熔断：维持封顶 6 小时的退避重试，
 # 站点自愈后同步自动恢复，不需要用户做任何事。
 _BREAKER_THRESHOLD = 10
+# 认证类失败（TrackerAuthError：账号停用、Key 失效、密码错误等）的快速熔断阈值。
+# 站点已明确宣判凭据不可用，再宽容 10 轮毫无意义，只会让用户误以为一切正常
+#（状态仍显示已验证）。但不在第 1 次就熔断：共享会话过期也会表现为认证失败，
+# 失败后会话已被作废，下一轮会用存储的凭据重建并重新登录——真过期这轮就自愈了；
+# 连续第 2 次仍是认证失败，才能确认凭据本身已死。
+_AUTH_BREAKER_THRESHOLD = 2
 
 
 def _adapt_interval(
@@ -349,6 +355,7 @@ async def _sync_one_site(cred: SiteCredential) -> None:
     full_page = False
     error: str | None = None
     transient = False
+    auth_failed = False
     newest_pt: datetime | None = None
     newest_tid: str | None = None
     try:
@@ -376,6 +383,7 @@ async def _sync_one_site(cred: SiteCredential) -> None:
     except Exception as exc:  # noqa: BLE001 -- 背景任务吞掉异常并记录可读原因
         error = friendly_error(exc)
         transient = is_transient_error(exc)
+        auth_failed = isinstance(exc, TrackerAuthError)
         logger.warning("站点 %s 同步失败：%s", site_id, error, exc_info=True)
         if not transient:
             # 非瞬时失败（认证/解析类）可能是会话过期：作废共享缓存，下一个 tick
@@ -385,7 +393,9 @@ async def _sync_one_site(cred: SiteCredential) -> None:
 
     # 计算下次节奏并回写游标（出错也要排下次，避免卡死不再重试）
     failures = 0 if error is None else prev_failures + 1
-    tripped = error is not None and not transient and failures >= _BREAKER_THRESHOLD
+    # 认证类失败走快速阈值：站点已明确拒绝凭据，无需再宽容 10 轮
+    threshold = _AUTH_BREAKER_THRESHOLD if auth_failed else _BREAKER_THRESHOLD
+    tripped = error is not None and not transient and failures >= threshold
     # 刷流快节奏是动态的：开着刷流且有准入余量才钉住（见 wants_fast_sync）
     from movieclaw_api.services.ratio_boost import wants_fast_sync
 
@@ -404,10 +414,17 @@ async def _sync_one_site(cred: SiteCredential) -> None:
             f"；将于约 {max(1, next_interval // 60)} 分钟后自动重试（已连续失败 {failures} 次）"
         )
     if tripped:
-        error += (
-            f"；已连续失败 {failures} 次，同步已暂停。"
-            "站点可能已关站、改版或封禁了你的账号，确认站点可用后请重新验证以恢复同步"
-        )
+        if auth_failed:
+            error += (
+                f"；已连续 {failures} 次认证失败，同步已暂停。"
+                "站点明确拒绝了当前凭据（账号可能被停用或凭据已失效），"
+                "请到「设置 → 站点」更新凭据并重新验证以恢复同步"
+            )
+        else:
+            error += (
+                f"；已连续失败 {failures} 次，同步已暂停。"
+                "站点可能已关站、改版或封禁了你的账号，确认站点可用后请重新验证以恢复同步"
+            )
     async with db.session() as session:
         await TorrentRepository(session).update_cursor_after_sync(
             site_id,
@@ -424,6 +441,21 @@ async def _sync_one_site(cred: SiteCredential) -> None:
             # 恢复路径复用既有机制：用户在站点页「重新验证」成功转 ACTIVE 即恢复
             await CredentialRepository(session).update_status(
                 site_id, ConfigStatus.FAILED, last_error=error
+            )
+            # 与验证失败共用同一盏全局红灯（dedupe_key 一致）：熔断意味着该站点
+            # 已静默退出搜索与投递，必须被用户感知；重新验证成功后红灯自动熄灭
+            from movieclaw_api.services.system_notice import upsert_notice
+            from movieclaw_db.models import NoticeSeverity
+
+            await upsert_notice(
+                session,
+                dedupe_key=f"site:{site_id}",
+                severity=NoticeSeverity.ERROR,
+                source="site",
+                title=f"站点「{site_id}」同步已熔断",
+                message=f"站点「{site_id}」{error or '原因未知'}。"
+                "该站点已不参与搜索与投递，请到「设置 → 站点」检查凭据并重新验证",
+                payload={"site_id": site_id},
             )
     if tripped:
         logger.warning(

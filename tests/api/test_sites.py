@@ -685,6 +685,62 @@ async def test_breaker_ignores_transient_failures(db, monkeypatch) -> None:
     assert "自动重试" in (await _cursor_error(db, "mteam"))
 
 
+async def test_auth_failure_trips_breaker_fast(db, monkeypatch) -> None:
+    """认证类失败（如账号已停用）第 2 次即熔断，不必等满 10 次。
+
+    同时熔断要点亮全局系统通知——站点静默退出搜索/投递必须被用户感知。
+    """
+    from sqlmodel import select
+
+    import movieclaw_api.services.torrent_sync as torrent_sync
+    from movieclaw_db.models import NoticeStatus, SystemNotice
+    from movieclaw_tracker.exceptions import TrackerAuthError
+
+    cred = await _make_active_with_failures(db, "mteam", failures=1)
+    monkeypatch.setattr(
+        torrent_sync,
+        "get_site_access",
+        lambda: _FailingAccess(TrackerAuthError("M-Team 接口返回错误：帳號已停用")),
+    )
+    monkeypatch.setattr(torrent_sync, "invalidate_site_access", _noop_invalidate)
+
+    await torrent_sync._sync_one_site(cred)
+
+    async with db.session() as session:
+        row = await CredentialRepository(session).get_by_site("mteam")
+        notice = (
+            await session.execute(
+                select(SystemNotice).where(SystemNotice.dedupe_key == "site:mteam")
+            )
+        ).scalar_one()
+    assert row.status == ConfigStatus.FAILED
+    assert "帳號已停用" in row.last_error
+    assert "同步已暂停" in row.last_error
+    assert "重新验证" in row.last_error
+    assert notice.status == NoticeStatus.ACTIVE
+
+
+async def test_first_auth_failure_leaves_selfheal_chance(db, monkeypatch) -> None:
+    """首次认证失败不熔断：可能只是共享会话过期，下一轮重建会话即可自愈。"""
+    import movieclaw_api.services.torrent_sync as torrent_sync
+    from movieclaw_db.repositories.torrent_repo import TorrentRepository
+    from movieclaw_tracker.exceptions import TrackerAuthError
+
+    cred = await _make_active_with_failures(db, "mteam", failures=0)
+    monkeypatch.setattr(
+        torrent_sync, "get_site_access", lambda: _FailingAccess(TrackerAuthError())
+    )
+    monkeypatch.setattr(torrent_sync, "invalidate_site_access", _noop_invalidate)
+
+    await torrent_sync._sync_one_site(cred)
+
+    async with db.session() as session:
+        row = await CredentialRepository(session).get_by_site("mteam")
+        cursor = await TorrentRepository(session).get_cursor("mteam")
+    assert row.status == ConfigStatus.ACTIVE
+    assert cursor.consecutive_failures == 1
+
+
 async def test_breaker_not_tripped_below_threshold(db, monkeypatch) -> None:
     """非瞬时失败但未达阈值：只累计失败数与退避，不动凭据状态。"""
     import movieclaw_api.services.torrent_sync as torrent_sync

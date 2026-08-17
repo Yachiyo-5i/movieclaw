@@ -35,7 +35,7 @@ from typing import Any
 
 from movieclaw_tracker.base import BaseSite
 from movieclaw_tracker.datetime_utils import DEFAULT_SITE_TIMEZONE
-from movieclaw_tracker.exceptions import TrackerParseError
+from movieclaw_tracker.exceptions import TrackerAuthError, TrackerParseError
 from movieclaw_tracker.models import (
     SearchQuery,
     SearchResult,
@@ -68,6 +68,26 @@ _UPLOAD_2X_DISCOUNTS = {"_2X", "_2X_FREE", "_2X_PERCENT_50"}
 
 # 每页请求数量，与原实现一致取 100
 _PAGE_SIZE = 100
+
+# API 业务错误中「凭据/账号已不可用」的特征词（统一按小写匹配）。
+# 命中即抛 TrackerAuthError 而非 TrackerParseError——两者对上层含义完全不同：
+# 解析异常可能只是站点改版，同步链路会宽容地累计多次才熔断；而账号停用、
+# Key 失效这类错误是站点明确宣判凭据死亡，应尽快置为验证失败并提醒用户。
+_AUTH_ERROR_KEYWORDS = (
+    "停用",  # 帳號已停用
+    "封禁",
+    "禁用",
+    "banned",
+    "unauthorized",
+    "forbidden",
+    "請先登入",
+    "请先登录",
+    "凭证",
+    "憑證",
+    "api key",
+    "apikey",
+    "x-api-key",
+)
 
 # 种子列表接口默认拉取的一级分类（等价于「浏览全部非成人内容」）
 _DEFAULT_LIST_CATEGORIES = [
@@ -143,10 +163,16 @@ class MTeamSite(BaseSite):
 
         message = str(payload.get("message", "")).upper()
         if message not in ("SUCCESS", "OK", "0", ""):
-            # 常见原因：API-Key 失效、未认证、触发风控
+            raw_message = str(payload.get("message"))
+            details = {"url": url, "code": payload.get("code")}
+            # 账号停用、Key 失效等凭据类错误抛认证异常，让上层快速熔断并
+            # 提示用户处理；其余（参数错误、风控等）仍视为响应异常
+            if any(kw in raw_message.lower() for kw in _AUTH_ERROR_KEYWORDS):
+                raise TrackerAuthError(
+                    f"M-Team 接口返回错误：{raw_message}", details=details
+                )
             raise TrackerParseError(
-                f"M-Team 接口返回错误：{payload.get('message')}",
-                details={"url": url, "code": payload.get("code")},
+                f"M-Team 接口返回错误：{raw_message}", details=details
             )
         return payload.get("data")
 
