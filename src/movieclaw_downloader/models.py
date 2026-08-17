@@ -71,6 +71,11 @@ class SubmitResult(BaseModel):
     name: str = ""
     # 该种子提交前已存在于下载器中（幂等：不视为错误，也不会重复添加）。
     already_exists: bool = False
+    # already_exists 的特例：已存在的任务是**刷流引擎自己抢下的**，提交层
+    # 已把它迁到本次请求的目标目录并从刷流台账转出。对调用方而言等同于
+    # 一次成功的全新投递（数据在正确位置、任务归 movieclaw 所有），订阅
+    # 侧据此把 owned_by_movieclaw 记为 True。
+    reclaimed_from_boost: bool = False
 
 
 class DownloaderInfo(BaseModel):
@@ -113,6 +118,11 @@ class TorrentBrief(BaseModel):
     size_bytes: int | None = None
     dlspeed_bytes: int | None = None
     upspeed_bytes: int | None = None
+    # 累计上传量与分享率：刷流引擎按 tick 差分累计上传量计算上传效率。
+    # None 表示旧适配器没有提供——消费方必须跳过该 tick，不能当 0 参与差分
+    # （会把效率 EMA 错误地打到 0 而触发误汰换）。
+    uploaded_bytes: int | None = None
+    ratio: float | None = None
     eta_seconds: int | None = None
     state: str = "unknown"
 

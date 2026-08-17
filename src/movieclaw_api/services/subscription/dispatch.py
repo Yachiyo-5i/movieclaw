@@ -209,6 +209,10 @@ async def dispatch(
                     )
                 )
             ).scalar_one_or_none()
+            # 所有权：全新提交归我们；「已存在」通常是用户自己的任务（不碰），
+            # 但刷流引擎抢下后被接管的（reclaimed_from_boost）本来就是
+            # movieclaw 的，数据也已迁到目标目录——按自有任务记
+            owned = not submit_result.already_exists or submit_result.reclaimed_from_boost
             values = {
                 "downloader_id": downloader_row.id,
                 "site_id": candidate.site_id,
@@ -217,7 +221,7 @@ async def dispatch(
                 "units": [[w.season_number, w.episode_number] for w in all_targets],
                 "quality": candidate.attrs.model_dump(exclude_defaults=True),
                 "hit_and_run": candidate.hit_and_run,
-                "owned_by_movieclaw": not submit_result.already_exists,
+                "owned_by_movieclaw": owned,
                 # 一旦承担过洗版语义就保持 upgrade（入库验证与旧版清理据此定位）
                 "purpose": (
                     "upgrade"
@@ -233,10 +237,10 @@ async def dispatch(
                     if attempt_alive
                     else DownloadAttemptStatus.CANCELLED
                 ),
-                "baseline_completed_bytes": 0 if not submit_result.already_exists else None,
-                "last_completed_bytes": 0 if not submit_result.already_exists else None,
-                "baseline_downloaded_bytes": 0 if not submit_result.already_exists else None,
-                "last_downloaded_bytes": 0 if not submit_result.already_exists else None,
+                "baseline_completed_bytes": 0 if owned else None,
+                "last_completed_bytes": 0 if owned else None,
+                "baseline_downloaded_bytes": 0 if owned else None,
+                "last_downloaded_bytes": 0 if owned else None,
                 "last_progress_at": now,
                 "stalled_notified_at": None,
                 "missing_observations": 0,
@@ -268,9 +272,7 @@ async def dispatch(
                 values["units"] = [[season, episode] for season, episode in sorted(existing_units)]
                 # 同一 hash 是同一份内容的续用，不抹掉首次投递时已经证明的
                 # 所有权/来源/品质历史；旧字段缺失时才用本次更完整的证据回填。
-                values["owned_by_movieclaw"] = (
-                    existing_attempt.owned_by_movieclaw or not submit_result.already_exists
-                )
+                values["owned_by_movieclaw"] = existing_attempt.owned_by_movieclaw or owned
                 if existing_attempt.site_id:
                     values["site_id"] = existing_attempt.site_id
                     values["torrent_id"] = existing_attempt.torrent_id

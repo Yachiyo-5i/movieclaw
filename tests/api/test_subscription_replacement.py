@@ -151,7 +151,7 @@ async def test_real_search_distinguishes_no_candidate_from_site_failure(db, monk
 
     searched_keywords: list[str] = []
 
-    async def empty_search(keyword, *, categories=None):
+    async def empty_search(keyword, *, categories=None, exclude_protected=False):
         searched_keywords.append(keyword)
         return SimpleNamespace(
             sites=[SimpleNamespace(error=None, site_name="测试站")],
@@ -172,7 +172,7 @@ async def test_real_search_distinguishes_no_candidate_from_site_failure(db, monk
         attempt.next_search_at = utcnow()
         await session.commit()
 
-    async def failed_search(keyword, *, categories=None):
+    async def failed_search(keyword, *, categories=None, exclude_protected=False):
         return SimpleNamespace(
             sites=[SimpleNamespace(error="连接超时", site_name="故障站")],
             items=[],

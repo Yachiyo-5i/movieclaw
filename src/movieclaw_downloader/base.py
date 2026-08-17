@@ -61,6 +61,17 @@ class BaseDownloader(abc.ABC):
         """
 
     @abc.abstractmethod
+    async def set_location(self, info_hash: str, save_path: str) -> None:
+        """把下载任务的保存目录改为 ``save_path``（下载器视角），并移动已有数据。
+
+        用途：刷流抢下的种子被订阅/手动下载认领时，把数据从刷流目录迁到
+        媒体的目标目录，让入库监听能看见它（docs/design/
+        site-protection-ratio-boost.md 2.5）。两端实现都由下载器自行搬移
+        文件（qB set_location / Transmission move_torrent_data），跨盘时
+        是真实拷贝，调用方不应假设瞬间完成。
+        """
+
+    @abc.abstractmethod
     async def test_connection(self) -> DownloaderInfo:
         """验证连通性与凭证，返回下载器版本信息。"""
 

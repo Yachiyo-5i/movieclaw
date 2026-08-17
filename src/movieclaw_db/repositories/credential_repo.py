@@ -211,6 +211,33 @@ class CredentialRepository:
         await self._session.commit()
         return True
 
+    async def set_protected(self, site_id: str, protected: bool) -> bool:
+        """打开/关闭站点保护（订阅链路绕开该站）。返回是否命中记录。"""
+        row = await self.get_by_site(site_id)
+        if row is None:
+            return False
+        row.protected = protected
+        row.updated_at = utcnow()
+        await self._session.commit()
+        return True
+
+    async def set_ratio_boost(
+        self, site_id: str, *, enabled: bool, budget_bytes: int | None = None
+    ) -> bool:
+        """设置自动刷分享率开关与存储预算。budget_bytes 为 None 时不改预算。
+
+        返回是否命中记录（False 表示站点不存在）。
+        """
+        row = await self.get_by_site(site_id)
+        if row is None:
+            return False
+        row.boost_enabled = enabled
+        if budget_bytes is not None:
+            row.boost_budget_bytes = budget_bytes
+        row.updated_at = utcnow()
+        await self._session.commit()
+        return True
+
     async def delete(self, site_id: str) -> bool:
         """删除某站点凭据。返回是否命中记录。"""
         row = await self.get_by_site(site_id)

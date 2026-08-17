@@ -44,6 +44,8 @@ class FakeQbtClient:
         self.add_response = add_response
         self.add_calls: list[dict] = []
         self.delete_calls: list[dict] = []
+        self.location_calls: list[dict] = []
+        self.autotmm_calls: list[dict] = []
         # 添加成功后自动登记到 store 的 (hash, name)，模拟下载器注册行为
         self.register_on_add: tuple[str, str] | None = (TORRENT_HASH, "test.mkv")
 
@@ -63,6 +65,12 @@ class FakeQbtClient:
     def torrents_delete(self, **kwargs):
         self.delete_calls.append(kwargs)
         self.store.pop(kwargs["torrent_hashes"], None)
+
+    def torrents_set_auto_management(self, **kwargs):
+        self.autotmm_calls.append(kwargs)
+
+    def torrents_set_location(self, **kwargs):
+        self.location_calls.append(kwargs)
 
     def torrents_files(self, *, torrent_hash):
         return self.files.get(torrent_hash, [])
@@ -168,6 +176,30 @@ class TestConnection:
 
         with pytest.raises(DownloaderAuthError):
             await downloader.test_connection()
+
+
+class TestSetLocation:
+    async def test_set_location_disables_autotmm_and_moves(self):
+        """迁移目录前必须关 auto-TMM（与 submit 同理，分类规则会抢走目录控制权）。"""
+        fake = FakeQbtClient()
+
+        await make_downloader(fake).set_location(TORRENT_HASH, "/downloads/movies")
+
+        assert fake.autotmm_calls == [{"torrent_hashes": TORRENT_HASH, "enable": False}]
+        assert fake.location_calls == [
+            {"torrent_hashes": TORRENT_HASH, "location": "/downloads/movies"}
+        ]
+
+    async def test_set_location_error_translated(self):
+        fake = FakeQbtClient()
+
+        def raise_api_error(**kwargs):
+            raise qbittorrentapi.APIError("permission denied")
+
+        fake.torrents_set_location = raise_api_error
+
+        with pytest.raises(DownloaderSubmitError):
+            await make_downloader(fake).set_location(TORRENT_HASH, "/nope")
 
 
 class TestDeleteTorrent:

@@ -327,6 +327,8 @@ async def run_replacement_search(attempt_id: int, *, force: bool = False) -> boo
                 response = await search_all_sites(
                     keyword,
                     categories=_SEARCH_CATEGORIES.get(item_kind),
+                    # 换源同属订阅链路：受保护站点不参与自动拉种
+                    exclude_protected=True,
                 )
             except Exception as exc:  # noqa: BLE001 -- 全局搜索故障按技术失败短重试
                 errors.append(f"{type(exc).__name__}: {exc}")

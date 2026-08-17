@@ -249,6 +249,18 @@ class TransmissionDownloader(BaseDownloader):
                     size_bytes=int(torrent.fields.get("sizeWhenDone", 0)) or None,
                     dlspeed_bytes=int(torrent.fields.get("rateDownload", 0)),
                     upspeed_bytes=int(torrent.fields.get("rateUpload", 0)),
+                    # uploadedEver 是本任务的累计上传字节；uploadRatio 的 -1
+                    # （Transmission 表示"未定义"）归一为 None
+                    uploaded_bytes=(
+                        int(torrent.fields["uploadedEver"])
+                        if torrent.fields.get("uploadedEver") is not None
+                        else None
+                    ),
+                    ratio=(
+                        float(torrent.fields["uploadRatio"])
+                        if float(torrent.fields.get("uploadRatio", -1)) >= 0
+                        else None
+                    ),
                     eta_seconds=eta if eta > 0 else None,
                     state=_normalize_state(torrent, completed=completed),
                 )
@@ -268,6 +280,16 @@ class TransmissionDownloader(BaseDownloader):
             "并删除数据文件" if delete_files else "并保留数据文件",
             info_hash,
         )
+
+    async def set_location(self, info_hash: str, save_path: str) -> None:
+        await asyncio.to_thread(self._set_location_sync, info_hash, save_path)
+
+    def _set_location_sync(self, info_hash: str, save_path: str) -> None:
+        """改保存目录并由 Transmission 自行搬移数据（move_torrent_data）。"""
+        client = self._client()
+        with _translate_errors(self.config.url, operation="submit"):
+            client.move_torrent_data(info_hash.lower(), location=save_path)
+        logger.info("已移动 Transmission 任务目录: hash=%s -> %s", info_hash, save_path)
 
     async def test_connection(self) -> DownloaderInfo:
         return await asyncio.to_thread(self._test_connection_sync)

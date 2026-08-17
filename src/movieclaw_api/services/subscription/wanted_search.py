@@ -207,7 +207,10 @@ async def _search_one_media(media_id: int) -> None:
     categories = _SEARCH_CATEGORIES.get(item.kind)
     for keyword in keywords:
         searched_keyword = keyword
-        response = await search_all_sites(keyword, categories=categories)
+        # exclude_protected：受保护站点不参与订阅链路的自动拉种（保护开关语义）
+        response = await search_all_sites(
+            keyword, categories=categories, exclude_protected=True
+        )
         sites_ok = sum(1 for s in response.sites if s.error is None)
         site_errors = [f"{s.site_name}：{s.error}" for s in response.sites if s.error]
         hits = response.items

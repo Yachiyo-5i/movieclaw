@@ -134,6 +134,7 @@ def build_lifespan(settings: Settings):
                 app_update,  # noqa: F401  应用更新每日检查任务注册
                 download_progress,
                 media_refresh,
+                ratio_boost,  # noqa: F401  自动刷分享率任务注册
                 torrent_matcher,
                 torrent_sync,  # noqa: F401  触发种子同步任务注册
             )
