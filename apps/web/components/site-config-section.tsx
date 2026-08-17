@@ -521,7 +521,10 @@ function SiteRow({
     const raw = await prompt({
       ...options,
       initialValue: String(Math.round(site.boost_budget_bytes / GIB)),
-      placeholder: "存储预算（GiB）",
+      placeholder: "存储预算",
+      kind: "number",
+      min: 1,
+      unit: "GiB",
     });
     if (raw == null) return null; // 用户取消
     const gib = Math.round(Number(raw.trim()));
