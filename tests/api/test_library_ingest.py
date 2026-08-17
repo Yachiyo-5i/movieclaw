@@ -1397,6 +1397,96 @@ async def test_explicit_e00_pilot_skipped_without_blocking(db, tmp_path, monkeyp
 
 
 @pytest.mark.asyncio
+async def test_all_dup_skipped_still_closes_fulfilled_wanted(db, tmp_path, monkeypatch):
+    """整包都被同档跳过时也要做库存对账：工单集早已由别的源入库的投递，
+    结论「无需整理」的同时必须关闭已满足的工单——否则下载任务永远挂在
+    「等待入库」（NAS 实测 S06E11）。"""
+    from movieclaw_db.models import RuleSet, Subscription, WantedItem, WantedStatus
+    from movieclaw_downloader import TorrentBrief
+
+    root, watch = tmp_path / "tv", tmp_path / "watch"
+    watch.mkdir()
+    library_id = await _make_library(db, kind=MediaKind.TV, root=root)
+    item = await _make_item(db, kind=MediaKind.TV, title="测试剧集", year=2024)
+    monkeypatch.setattr(ingest_mod, "probe_media", lambda _path: _FAKE_SPEC)
+    monkeypatch.setattr(ingest_mod, "_unit", lambda _file, _entry: (1, 1))
+
+    async def identify_none(session, kind, watch_root, main, spec):
+        return None
+
+    monkeypatch.setattr(ingest_mod, "_identify", identify_none)
+
+    # E01 已由别的源入库（同档 .mkv），本次投递的 .mp4 将整包被同档跳过
+    season_dir = root / "测试剧集 (2024)" / "Season 01"
+    season_dir.mkdir(parents=True)
+    existing = season_dir / "测试剧集 (2024) - S01E01.mkv"
+    existing.write_bytes(b"existing-e01")
+    async with db.session() as session:
+        rule_set = RuleSet(name="默认", spec={})
+        session.add(rule_set)
+        await session.commit()
+        await session.refresh(rule_set)
+        sub = Subscription(
+            media_item_id=item.id, kind="tv", rule_set_id=rule_set.id, library_id=library_id
+        )
+        session.add(sub)
+        await session.commit()
+        await session.refresh(sub)
+        session.add_all(
+            [
+                WantedItem(
+                    subscription_id=sub.id,
+                    media_item_id=item.id,
+                    season_number=1,
+                    episode_number=1,
+                    status=WantedStatus.GRABBED,
+                    info_hash="hash-dup",
+                ),
+                LibraryFile(
+                    library_id=library_id,
+                    media_item_id=item.id,
+                    season_number=1,
+                    episode_number=1,
+                    file_path=str(existing),
+                    size_bytes=existing.stat().st_size,
+                    resolution="1080p",
+                    media_source="WEB-DL",
+                    source=FileSource.IMPORTED,
+                ),
+            ]
+        )
+        await session.commit()
+
+    brief = TorrentBrief(
+        name="测试剧集.S01E01.AltGroup",
+        content_name="测试剧集.S01E01.AltGroup",
+        completed=True,
+        info_hash="hash-dup",
+    )
+
+    async def briefs():
+        return [brief]
+
+    monkeypatch.setattr(ingest_mod, "_downloader_briefs", briefs)
+
+    entry = watch / "测试剧集.S01E01.AltGroup"
+    entry.mkdir()
+    (entry / "ep1.mp4").write_bytes(b"same-tier-from-other-source")
+
+    library = await _get_library(db, library_id)
+    await ingest_mod._sweep_dir(
+        _fixed_rule(watch, library_id=library_id), library, execute_inline=True
+    )
+
+    async with db.session() as session:
+        record = (await session.execute(select(IngestEntry))).scalar_one()
+        wanted = (await session.execute(select(WantedItem))).scalar_one()
+    assert record.status == IngestStatus.IMPORTED
+    assert "已有同档或更高版本" in (record.message or "")
+    assert wanted.status == WantedStatus.IMPORTED
+
+
+@pytest.mark.asyncio
 async def test_upgrade_retries_legacy_partial_import_through_job(db, tmp_path, monkeypatch):
     """旧版误标 imported 的部分入库记录在升级补扫后新建 Job，并补齐漏集。"""
     root, watch = tmp_path / "tv", tmp_path / "watch"

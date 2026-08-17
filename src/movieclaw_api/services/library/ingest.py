@@ -1839,7 +1839,15 @@ async def _ingest_entry(
         return await conclude(IngestStatus.FAILED if env_error else IngestStatus.PENDING, message)
     elif dup_skipped or pilot_skipped:
         # 季包附带内容全部与库存同档重复（换源后两个包先后投递最常见），
-        # 或只剩 E00 先导占位：正常闭环，不是异常
+        # 或只剩 E00 先导占位：正常闭环，不是异常。
+        # 同档跳过=单元内容已在库，必须与正常入库一样做库存对账关闭已
+        # 满足的订阅工单——否则"整包都被同档跳过"的投递（工单集早已由
+        # 别的源入库）会让下载任务永远挂在"等待入库"（NAS 实测 S06E11）
+        if dup_skipped and staging is None:
+            from movieclaw_api.services.subscription import close_fulfilled_wanted
+
+            assert item.id is not None
+            await close_fulfilled_wanted(session, item.id)
         parts = []
         if dup_skipped:
             parts.append(f"《{item.title}》的内容在库中已有同档或更高版本")
