@@ -362,6 +362,16 @@ class SubscriptionDownloadAttempt(TimestampMixin, table=True):
         sa_column=Column(JSON, nullable=False),
         description="分辨率/片源/HDR 等质量属性快照，换源时作为不降级底线",
     )
+    # 内容核验的负面记忆：种子下完后文件清单里**明确没有**的单元。
+    # 没有它，"退回重找 → 又选中同一个种子 → 秒完成 → 再退回"会无限循环
+    # （真实教训：S04 全集包不含被 TMDB 编号为 S04E14 的特别篇，工单每
+    # 30 分钟空转一轮）。``sources`` 记下投递过这份内容的站点条目，匹配层
+    # 据此在**选种阶段**就跳过——同一发布在多站镜像，逐个证伪一次即收敛。
+    content_missing: dict = Field(
+        default_factory=dict,
+        sa_column=Column(JSON, nullable=False, server_default=text("'{}'")),
+        description='实测不含的单元与来源：{"units": [[季, 集]], "sources": [[站点, 种子ID]]}',
+    )
     hit_and_run: bool | None = Field(default=None, description="投递时观测到的 H&R 状态")
     owned_by_movieclaw: bool = Field(
         default=False,

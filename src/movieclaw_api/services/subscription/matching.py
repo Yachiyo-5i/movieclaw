@@ -123,6 +123,10 @@ class MediaContext:
     subscription: Subscription
     spec: RuleSetSpec
     open_wanted: dict[tuple[int, int], WantedItem]
+    # 内容核验的负面记忆：{(季, 集): {(站点, 种子ID), ...}}——这些发布下完后
+    # 被证明不含该集，选种阶段直接跳过，否则会无限重抓（见
+    # SubscriptionDownloadAttempt.content_missing）
+    content_missing: dict[tuple[int, int], set[tuple[str, str]]] = field(default_factory=dict)
     upgrade_wanted: dict[tuple[int, int], WantedItem] = field(default_factory=dict)
     upgrade_snapshots: dict[tuple[int, int], QualitySnapshot] = field(default_factory=dict)
     upgrade_excluded: frozenset[tuple[str, str]] = frozenset()
@@ -251,6 +255,44 @@ async def load_match_context(session: AsyncSession) -> dict[int, MediaContext]:
         if ctx is None:
             continue
         ctx.open_wanted[(wanted.season_number, wanted.episode_number)] = wanted
+
+    # -- 内容核验的负面记忆 ---------------------------------------------------
+    # 下完后被证明"包里根本没有这一集"的发布不再参与该集的选种。缺了这一步，
+    # 退回重找会立刻再次选中同一个种子（它还在下载器里且已完成），秒完成 →
+    # 再核验 → 再退回，无限循环。
+    gap_subscriptions = {
+        ctx.subscription.id
+        for ctx in contexts.values()
+        if ctx.open_wanted and ctx.subscription.id is not None
+    }
+    if gap_subscriptions:
+        from movieclaw_db.models import SubscriptionDownloadAttempt
+
+        proven: dict[int, dict[tuple[int, int], set[tuple[str, str]]]] = {}
+        attempts = (
+            await session.execute(
+                select(SubscriptionDownloadAttempt).where(
+                    SubscriptionDownloadAttempt.subscription_id.in_(gap_subscriptions),  # type: ignore[union-attr]
+                )
+            )
+        ).scalars()
+        for attempt in attempts:
+            memory = attempt.content_missing or {}
+            sources = {
+                (str(source[0]), str(source[1]))
+                for source in memory.get("sources", [])
+                if isinstance(source, list) and len(source) == 2
+            }
+            if not sources:
+                continue
+            for unit in memory.get("units", []):
+                if isinstance(unit, list) and len(unit) == 2:
+                    proven.setdefault(attempt.subscription_id, {}).setdefault(
+                        (int(unit[0]), int(unit[1])), set()
+                    ).update(sources)
+        for ctx in contexts.values():
+            if ctx.subscription.id is not None:
+                ctx.content_missing = proven.get(ctx.subscription.id, {})
 
     # -- 洗版单元（quality-upgrade.md §5）------------------------------------
     upgrade_rule_ids = {
@@ -442,6 +484,25 @@ def covered_units(
     return result
 
 
+def drop_proven_missing(
+    ctx: MediaContext, candidate: TorrentCandidate, covered: list[WantedItem]
+) -> list[WantedItem]:
+    """剔除"这份发布下完后被证明没有"的集。
+
+    负面记忆按 (季, 集) 记，不是整个候选一票否决：全集包缺一集特别篇时，它对
+    其余集仍然有效——真实教训是"缺 1 集"把整包重抓无数遍，不是包本身没用。
+    """
+    if not ctx.content_missing:
+        return covered
+    source = (candidate.site_id, candidate.torrent_id)
+    return [
+        wanted
+        for wanted in covered
+        if source
+        not in ctx.content_missing.get((wanted.season_number, wanted.episode_number), ())
+    ]
+
+
 async def _resolve_upgrade(
     repo: SubscriptionRepository,
     ctx: MediaContext,
@@ -519,7 +580,9 @@ async def evaluate_and_dispatch(
             match = match_identity(candidate, ctx.identity)
             if match is None:
                 continue
-            covered = covered_units(match, ctx.open_wanted, published=published)
+            covered = drop_proven_missing(
+                ctx, candidate, covered_units(match, ctx.open_wanted, published=published)
+            )
             upgrade_covered, _ = await _resolve_upgrade(
                 repo, ctx, candidate, match, ctx.upgrade_wanted, published, source
             )
@@ -545,7 +608,9 @@ async def evaluate_and_dispatch(
         remaining_upgrade = dict(ctx.upgrade_wanted)
         for candidate, match, verdict in entries:
             published = publish_calendar_date(candidate.publish_time)
-            targets = covered_units(match, remaining, published=published)
+            targets = drop_proven_missing(
+                ctx, candidate, covered_units(match, remaining, published=published)
+            )
             upgrade_targets, upgrade_labels = await _resolve_upgrade(
                 repo, ctx, candidate, match, remaining_upgrade, published, source, quiet=True
             )

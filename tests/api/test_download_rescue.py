@@ -24,7 +24,14 @@ from movieclaw_api.services.subscription import SubscriptionService
 from movieclaw_api.services.subscription.matching import covered_units
 from movieclaw_db.engine import dispose_db, get_database, init_db
 from movieclaw_db.migrations import run_migrations
-from movieclaw_db.models import ActivityType, SubscriptionActivity, WantedItem, WantedStatus
+from movieclaw_db.models import (
+    ActivityType,
+    DownloadAttemptStatus,
+    SubscriptionActivity,
+    SubscriptionDownloadAttempt,
+    WantedItem,
+    WantedStatus,
+)
 from movieclaw_db.models.base import utcnow
 from movieclaw_downloader import TorrentStatus
 from movieclaw_downloader.models import TorrentFile
@@ -362,6 +369,55 @@ async def test_grace_period_defers_judgement(db, tmp_path, monkeypatch) -> None:
     async with db.session() as session:
         wanted = await _wanted_map(session, sub_id)
         assert all(w.status == WantedStatus.GRABBED for w in wanted.values())
+
+
+@pytest.mark.asyncio
+async def test_missing_episodes_recorded_on_attempt(db, tmp_path, monkeypatch) -> None:
+    """真实教训回归：只退回工单不够——下一轮搜索会再次选中同一个种子（它还在
+    下载器里且已完成），秒完成 → 再核验 → 再退回，无限循环。缺失结论必须写进
+    台账的负面记忆，来源含历次投递过这份内容的站点条目。"""
+    async with db.session() as session:
+        sub_id = await _grabbed_subscription(session, MediaKind.TV, 300, selected_seasons=[0, 1])
+        session.add(
+            SubscriptionDownloadAttempt(
+                subscription_id=sub_id,
+                info_hash=_HASH,
+                site_id="ssd",
+                torrent_id="302480",
+                units=[[0, 1], [0, 2], [1, 1], [1, 2]],
+                last_progress_at=utcnow(),
+                status=DownloadAttemptStatus.COMPLETED,
+            )
+        )
+        # 同一份内容也曾从别的站点投递过：跨站镜像同样要进排除清单
+        session.add(
+            SubscriptionActivity(
+                subscription_id=sub_id,
+                type=ActivityType.GRABBED,
+                message="已投递",
+                payload={"info_hash": _HASH, "site_id": "chdbits", "torrent_id": "126352"},
+            )
+        )
+        await session.commit()
+    _stub_query(
+        monkeypatch,
+        _completed_status(tmp_path, ["Show/Show.S01E01.mkv", "Show/Show.S01E02.mkv"]),
+    )
+    await _rescue_group(sub_id, _HASH, [(object(), object())])
+
+    async with db.session() as session:
+        attempt = (
+            await session.execute(
+                select(SubscriptionDownloadAttempt).where(
+                    SubscriptionDownloadAttempt.subscription_id == sub_id
+                )
+            )
+        ).scalar_one()
+        assert attempt.content_missing["units"] == [[0, 1], [0, 2]]
+        assert attempt.content_missing["sources"] == [
+            ["chdbits", "126352"],
+            ["ssd", "302480"],
+        ]
 
 
 @pytest.mark.asyncio

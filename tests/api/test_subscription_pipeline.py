@@ -630,6 +630,69 @@ async def test_pack_covers_only_aired_by_publish_time(db) -> None:
         assert wanted[(2, 3)].status == WantedStatus.WANTED  # 未定档：无证据不覆盖
 
 
+async def _proven_missing_attempt(session, sub_id: int, units: list[list[int]], source) -> None:
+    """写入内容核验的负面记忆：这份发布下完后被证明不含 ``units``。"""
+    session.add(
+        SubscriptionDownloadAttempt(
+            subscription_id=sub_id,
+            info_hash="a" * 40,
+            site_id=source[0],
+            torrent_id=source[1],
+            units=units,
+            last_progress_at=utcnow(),
+            status=DownloadAttemptStatus.COMPLETED,
+            content_missing={"units": units, "sources": [list(source)]},
+        )
+    )
+    await session.commit()
+
+
+async def test_proven_missing_release_not_grabbed_again(db) -> None:
+    """真实教训回归：全集包下完后被证明不含某一集，退回重找时又选中同一个种子
+    ——它还在下载器里且已完成，于是秒完成 → 再核验 → 再退回，无限循环。
+    证伪过的发布不再参与该集选种。"""
+    async with db.session() as session:
+        sub = await _service(session).create(MediaKind.TV, 200, selected_seasons=[1])
+        await _proven_missing_attempt(session, sub.id, [[1, 1], [1, 2]], ("testsite", "pack"))
+        pack = await _insert_torrent(
+            session, "pack", "Test Show S01 2160p WEB-DL", _S1_PACK_ATTRS
+        )
+        await evaluate_and_dispatch(session, [pack], source="主动搜索")
+
+        wanted = await _wanted_map(session, sub.id)
+        assert all(w.status == WantedStatus.WANTED for w in wanted.values())
+        assert [a for a in await _activities(session, sub.id) if a.type == "grabbed"] == []
+
+
+async def test_proven_missing_is_per_unit_not_per_release(db) -> None:
+    """负面记忆按集记：包里确实存在的集照常投递，只有被证伪的那一集被跳过。"""
+    async with db.session() as session:
+        sub = await _service(session).create(MediaKind.TV, 200, selected_seasons=[1])
+        await _proven_missing_attempt(session, sub.id, [[1, 2]], ("testsite", "pack"))
+        pack = await _insert_torrent(
+            session, "pack", "Test Show S01 2160p WEB-DL", _S1_PACK_ATTRS
+        )
+        await evaluate_and_dispatch(session, [pack], source="主动搜索")
+
+        wanted = await _wanted_map(session, sub.id)
+        assert wanted[(1, 1)].status == WantedStatus.GRABBED
+        assert wanted[(1, 2)].status == WantedStatus.WANTED
+
+
+async def test_proven_missing_does_not_block_other_releases(db) -> None:
+    """换一个发布仍可满足该集：负面记忆只针对被证伪的那份内容。"""
+    async with db.session() as session:
+        sub = await _service(session).create(MediaKind.TV, 200, selected_seasons=[1])
+        await _proven_missing_attempt(session, sub.id, [[1, 1], [1, 2]], ("testsite", "pack"))
+        other = await _insert_torrent(
+            session, "other", "Test Show S01 2160p WEB-DL-OTHER", _S1_PACK_ATTRS
+        )
+        await evaluate_and_dispatch(session, [other], source="主动搜索")
+
+        wanted = await _wanted_map(session, sub.id)
+        assert all(w.status == WantedStatus.GRABBED for w in wanted.values())
+
+
 async def test_old_pack_cannot_cover_future_show(db) -> None:
     """发布时间早于所有集播出日期的整季包（同名他剧的典型形态）：覆盖为零，
     整次投递不发生。"""

@@ -982,6 +982,58 @@ async def _verify_content(
     )
 
 
+async def _record_content_missing(
+    session: AsyncSession,
+    repo: SubscriptionRepository,
+    rows: list[WantedItem],
+    info_hash: str,
+) -> None:
+    """把"这份内容里没有这些集"写进 attempt 的负面记忆。
+
+    只退回工单是不够的：下一轮搜索会再次选中同一个种子，而它早已躺在下载器
+    里完成，于是"秒完成 → 再核验 → 再退回"无限循环（真实教训：十三邀 S04
+    全集包不含 TMDB 编号为 S04E14 的夏日特别版，工单每 30 分钟空转一轮）。
+
+    来源清单取自本 hash 的历次投递活动——同一份内容常在多站镜像，attempt 上
+    的 site/torrent 只保留首次投递者，拦不住换个站点的同一发布。
+    """
+    attempt = (
+        await session.execute(
+            select(SubscriptionDownloadAttempt).where(
+                SubscriptionDownloadAttempt.subscription_id == rows[0].subscription_id,
+                SubscriptionDownloadAttempt.info_hash == info_hash.lower(),
+            )
+        )
+    ).scalar_one_or_none()
+    if attempt is None:  # 手动投递等无台账路径：没有可挂载记忆的行，跳过
+        return
+    memory = dict(attempt.content_missing or {})
+    units = {
+        (int(unit[0]), int(unit[1]))
+        for unit in memory.get("units", [])
+        if isinstance(unit, list) and len(unit) == 2
+    }
+    units.update((row.season_number, row.episode_number) for row in rows)
+    sources = {
+        (str(source[0]), str(source[1]))
+        for source in memory.get("sources", [])
+        if isinstance(source, list) and len(source) == 2
+    }
+    if attempt.site_id and attempt.torrent_id:
+        sources.add((attempt.site_id, attempt.torrent_id))
+    for activity in await repo.list_activities(rows[0].subscription_id, limit=200):
+        payload = activity.payload or {}
+        if payload.get("info_hash") != info_hash.lower():
+            continue
+        if payload.get("site_id") and payload.get("torrent_id"):
+            sources.add((str(payload["site_id"]), str(payload["torrent_id"])))
+    attempt.content_missing = {
+        "units": [[season, episode] for season, episode in sorted(units)],
+        "sources": [[site_id, torrent_id] for site_id, torrent_id in sorted(sources)],
+    }
+    session.add(attempt)
+
+
 async def _requeue(
     session: AsyncSession,
     repo: SubscriptionRepository,
@@ -994,6 +1046,8 @@ async def _requeue(
 ) -> None:
     """只把物理内容缺失的工单退回 wanted，保留同种子中实际存在的单元。"""
     now = utcnow()
+    if reason == "content_missing":
+        await _record_content_missing(session, repo, rows, info_hash)
     retry_at = now + timedelta(minutes=_MISSING_RETRY_MINUTES)
     for row in rows:
         await session.execute(
@@ -1019,7 +1073,11 @@ async def _requeue(
             wanted_item_id=rows[0].id,
             type=ActivityType.DISPATCH_FAILED,
             message=message,
-            payload={"info_hash": info_hash, "reason": reason},
+            payload={
+                "info_hash": info_hash,
+                "reason": reason,
+                "units": [[row.season_number, row.episode_number] for row in rows],
+            },
         )
     )
     logger.warning("《%s》的种子 %s 已退回缺失单元：%s", item.title, info_hash, reason)
