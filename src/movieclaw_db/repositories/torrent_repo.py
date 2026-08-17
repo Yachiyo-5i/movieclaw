@@ -410,6 +410,24 @@ class TorrentRepository:
         await self._session.commit()
         return True
 
+    async def reset_failure_state(self, site_id: str) -> bool:
+        """重新验证成功后复位同步失败状态：清错误文案、清失败计数、立即到期。
+
+        熔断/连续失败后游标里留着失败原因与小时级的退避排期。凭据重验成功
+        若不复位，页面会一直挂着「上次同步失败/已暂停」的旧错误，且要等退避
+        排期走完才真正恢复同步——用户明明已经修好了凭据，看到的却还是红字。
+        游标不存在时返回 False（从未同步过的新站点无需复位）。
+        """
+        cursor = await self.get_cursor(site_id)
+        if cursor is None:
+            return False
+        cursor.last_error = None
+        cursor.consecutive_failures = 0
+        cursor.next_sync_at = None  # NULL = 立即到期，下一个 tick（≤2 分钟）即恢复同步
+        cursor.updated_at = utcnow()
+        await self._session.commit()
+        return True
+
     async def delete_site_data(self, site_id: str) -> int:
         """删除某站点的全部快照与同步游标——用户移除站点时调用。
 

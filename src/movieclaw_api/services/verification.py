@@ -143,6 +143,12 @@ async def verify_site(site_id: str) -> None:
 
         if status == ConfigStatus.ACTIVE:
             await resolve_notices(session, dedupe_key=f"site:{site_id}")
+            # 复位同步游标的失败状态：熔断/连续失败留下的旧错误文案与小时级
+            # 退避排期，在凭据重验成功后已无意义——清掉并标记立即到期，
+            # 下一个 tick（≤2 分钟）即恢复同步，页面不再挂着过时的失败提示
+            from movieclaw_db.repositories.torrent_repo import TorrentRepository
+
+            await TorrentRepository(session).reset_failure_state(site_id)
         else:
             await upsert_notice(
                 session,

@@ -604,6 +604,60 @@ async def test_cursor_tracks_failure_streak_and_last_success(db) -> None:
         assert cursor.last_success_at >= success_at
 
 
+async def test_reverify_success_resets_sync_cursor(db, monkeypatch) -> None:
+    """重新验证成功后复位同步游标：清旧错误、清失败计数、标记立即到期。
+
+    覆盖真实场景：熔断后用户更新凭据并重验成功，页面不应继续挂着
+    「同步已暂停」的旧文案，也不应等熔断时排下的数小时退避走完才恢复同步。
+    """
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    import movieclaw_api.services.verification as verification
+    from movieclaw_db.repositories.torrent_repo import TorrentRepository
+
+    await _make_active_with_failures(db, "mteam", failures=4)
+
+    profile = SimpleNamespace(
+        user_id="1",
+        username="tester",
+        user_class=None,
+        uploaded_bytes=0,
+        downloaded_bytes=0,
+        ratio=None,
+        bonus=None,
+        seeding_count=None,
+        leeching_count=None,
+        avatar_url=None,
+        join_date=None,
+    )
+    fake_site = SimpleNamespace(
+        authenticate=AsyncMock(return_value=SimpleNamespace(success=True, message=None)),
+        get_user_profile=AsyncMock(return_value=profile),
+        client=SimpleNamespace(close=AsyncMock()),
+    )
+
+    async def _fake_create_site(site_id, **kwargs):
+        return fake_site
+
+    async def _noop_invalidate(site_id):
+        pass
+
+    monkeypatch.setattr(verification, "build_auth_provider", lambda cred: None)
+    monkeypatch.setattr(verification, "create_site", _fake_create_site)
+    monkeypatch.setattr(verification, "invalidate_site_access", _noop_invalidate)
+
+    await verification.verify_site("mteam")
+
+    async with db.session() as session:
+        row = await CredentialRepository(session).get_by_site("mteam")
+        cursor = await TorrentRepository(session).get_cursor("mteam")
+    assert row.status == ConfigStatus.ACTIVE
+    assert cursor.last_error is None
+    assert cursor.consecutive_failures == 0
+    assert cursor.next_sync_at is None  # NULL = 立即到期，下一个 tick 即恢复同步
+
+
 # ---------------------------------------------------------------------------
 # 熔断：连续非瞬时失败达阈值 → 凭据置 FAILED、同步暂停；瞬时失败永不熔断
 # ---------------------------------------------------------------------------
