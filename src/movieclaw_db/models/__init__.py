@@ -36,6 +36,7 @@ from movieclaw_db.models.media_metadata import MediaEpisode, MediaMetadata
 from movieclaw_db.models.member import Member, MemberLibraryAccess, MemberSiteAccess
 from movieclaw_db.models.person import MediaItemPerson, Person
 from movieclaw_db.models.playback_state import PlaybackState
+from movieclaw_db.models.ratio_boost_stat import RatioBoostStat
 from movieclaw_db.models.ratio_boost_task import BoostTaskState, RatioBoostTask
 from movieclaw_db.models.rule_set import RuleSet
 from movieclaw_db.models.scheduled_task import (
@@ -112,6 +113,7 @@ __all__ = [
     "PlaybackState",
     "MediaSeason",
     "BoostTaskState",
+    "RatioBoostStat",
     "RatioBoostTask",
     "RuleSet",
     "Subscription",

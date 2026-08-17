@@ -29,7 +29,7 @@ import logging
 import math
 from datetime import datetime, timedelta
 
-from sqlalchemy import case, func, or_
+from sqlalchemy import case, delete, func, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
@@ -38,6 +38,7 @@ from movieclaw_db.models import (
     BoostTaskState,
     DownloaderClient,
     ManualDownloadIntent,
+    RatioBoostStat,
     RatioBoostTask,
     SiteCredential,
     SiteTorrent,
@@ -96,6 +97,8 @@ _MIN_ADMISSION_HEADROOM = 1024**3
 # 余量恢复后推同步一把的阈值：游标排期还在 15 分钟开外才值得打断
 #（刚回落不久/本来就快的排期没必要动）
 _NUDGE_THRESHOLD = timedelta(minutes=15)
+# 小时桶统计的保留时长：展示窗口最长 7 天，30 天留足余量后清理
+_STAT_RETENTION = timedelta(days=30)
 # 刷流任务的下载器分类与保存子目录：与媒体下载（movieclaw）彻底隔离，
 # 不落媒体库、不进监听导入规则的视野
 BOOST_CATEGORY = "movieclaw-boost"
@@ -378,12 +381,14 @@ async def _claimed_hashes(session: AsyncSession) -> set[str]:
 
 async def _refresh_tasks(
     session: AsyncSession, pool: _DownloaderPool, tasks: list[RatioBoostTask], now: datetime
-) -> None:
+) -> dict[str, int]:
     """第一步对账：把下载器观测写回台账，找不到的标记 missing。
+    返回本 tick 各站点的上传增量（site_id → 字节），供小时桶统计累加。
 
     对账前先做认领转出（见 hand_over_if_claimed）：被订阅/手动下载认领的
     任务立即脱离刷流管理，从根上杜绝后续任何汰换触碰它的数据。
     """
+    deltas: dict[str, int] = {}
     claimed = await _claimed_hashes(session)
     for task in tasks:
         if hand_over_if_claimed(task, claimed, now):
@@ -407,14 +412,20 @@ async def _refresh_tasks(
             task.evict_reason = "任务已从下载器中消失（通常是用户手动删除），让出刷流预算"
             logger.info("刷流任务失踪，让出预算：%s（%s）", task.title, task.site_id)
             continue
+        uploaded_before = task.uploaded_bytes
         apply_observation(
             task, uploaded_bytes=brief.uploaded_bytes, completed=brief.completed, now=now
         )
+        # 上传增量按站点归集（下载器重建导致的负差分已在 apply_observation 归零基线）
+        gained = max(0, task.uploaded_bytes - uploaded_before)
+        if gained:
+            deltas[task.site_id] = deltas.get(task.site_id, 0) + gained
         # 未完成任务的止损：免费窗口过期 / 长期卡死 → 连数据删除，让出预算
         reason = stop_loss_reason(task, brief.progress or 0.0, now)
         if reason is not None:
             await _evict(pool, task, now, reason=reason)
     await session.commit()
+    return deltas
 
 
 async def _evict(pool: _DownloaderPool, task: RatioBoostTask, now: datetime, reason: str) -> bool:
@@ -467,6 +478,47 @@ def _boost_save_path(downloader: DownloaderClient) -> str | None:
     if not downloader.save_path:
         return None
     return downloader.save_path.rstrip("/") + "/" + _BOOST_SUBDIR
+
+
+async def _record_stats(
+    session: AsyncSession,
+    *,
+    deltas: dict[str, int],
+    used_by_site: dict[str, int],
+    now: datetime,
+) -> None:
+    """把本 tick 的观测累进小时桶：上传增量 + 在池占用采样。
+
+    覆盖「有在池任务 ∪ 有上传增量」的站点——占用采样必须每 tick 都记
+    （平均在池体积 = 采样和 / 采样数），不能只在有上传时记，否则安静时段
+    会把平均值虚高。顺手清理超过保留期的旧桶。
+    """
+    sites = set(used_by_site) | set(deltas)
+    if not sites:
+        return
+    bucket = now.replace(minute=0, second=0, microsecond=0)
+    for site_id in sites:
+        row = (
+            await session.execute(
+                select(RatioBoostStat).where(
+                    RatioBoostStat.site_id == site_id,
+                    RatioBoostStat.bucket_start == bucket,
+                )
+            )
+        ).scalar_one_or_none()
+        if row is None:
+            row = RatioBoostStat(site_id=site_id, bucket_start=bucket)
+            session.add(row)
+        row.uploaded_bytes += deltas.get(site_id, 0)
+        row.used_bytes_sum += used_by_site.get(site_id, 0)
+        row.tick_count += 1
+        row.updated_at = now
+    await session.execute(
+        delete(RatioBoostStat).where(
+            RatioBoostStat.bucket_start < now - _STAT_RETENTION  # type: ignore[arg-type]
+        )
+    )
+    await session.commit()
 
 
 async def _nudge_slow_cursor(session: AsyncSession, site_id: str, now: datetime) -> None:
@@ -698,7 +750,13 @@ async def run_ratio_boost() -> None:
         pool = _DownloaderPool(session)
         try:
             # ① 对账：即使站点已关掉刷流，在池任务仍继续追踪（它们还在做种）
-            await _refresh_tasks(session, pool, list(active_tasks), now)
+            deltas = await _refresh_tasks(session, pool, list(active_tasks), now)
+            # 小时桶统计：上传增量 + 在池占用采样（转出/汰换后的任务不计占用）
+            used_by_site: dict[str, int] = {}
+            for t in active_tasks:
+                if t.state == BoostTaskState.ACTIVE:
+                    used_by_site[t.site_id] = used_by_site.get(t.site_id, 0) + t.size_bytes
+            await _record_stats(session, deltas=deltas, used_by_site=used_by_site, now=now)
 
             for cred in boost_creds:
                 site_tasks = [
@@ -790,8 +848,36 @@ async def collect_boost_stats(session: AsyncSession) -> dict:
 
     覆盖两类站点的并集：台账里出现过的 ∪ 当前开着刷流的（后者可能还没有
     任何任务，也要让前端拿到预算数字画进度条）。
+
+    近期窗口指标来自小时桶（ratio_boost_stat）：近 24 小时 / 近 7 天的
+    上传量与**平均在池体积**（采样和/采样数），支撑"用 X GB 种子贡献了
+    Y GB 上传"的过程展示。
     """
     from movieclaw_api.schemas.site import SiteBoostStatsView
+
+    now = utcnow()
+
+    async def window(since: datetime) -> dict[str, tuple[int, int]]:
+        """窗口聚合：site_id → (上传量, 平均在池体积)。"""
+        rows = (
+            await session.execute(
+                select(
+                    RatioBoostStat.site_id,
+                    func.sum(RatioBoostStat.uploaded_bytes),
+                    func.sum(RatioBoostStat.used_bytes_sum),
+                    func.sum(RatioBoostStat.tick_count),
+                )
+                .where(RatioBoostStat.bucket_start >= since)  # type: ignore[arg-type]
+                .group_by(RatioBoostStat.site_id)
+            )
+        ).all()
+        return {
+            site_id: (int(up or 0), int((used_sum or 0) / ticks) if ticks else 0)
+            for site_id, up, used_sum, ticks in rows
+        }
+
+    day_window = await window(now - timedelta(hours=24))
+    week_window = await window(now - timedelta(days=7))
 
     rows = (
         await session.execute(
@@ -817,17 +903,39 @@ async def collect_boost_stats(session: AsyncSession) -> dict:
         c.site_id: c
         for c in (await session.execute(select(SiteCredential))).scalars().all()
     }
-    stats: dict[str, SiteBoostStatsView] = {}
-    for site_id, active_count, used_bytes, uploaded_total, evicted_count in rows:
-        cred = budgets.get(site_id)
-        stats[site_id] = SiteBoostStatsView(
-            active_count=int(active_count or 0),
-            used_bytes=int(used_bytes or 0),
-            budget_bytes=cred.boost_budget_bytes if cred else 0,
-            uploaded_bytes_total=int(uploaded_total or 0),
-            evicted_count=int(evicted_count or 0),
+    ledger = {
+        site_id: (
+            int(active_count or 0),
+            int(used_bytes or 0),
+            int(uploaded_total or 0),
+            int(evicted_count or 0),
         )
-    for site_id, cred in budgets.items():
-        if cred.boost_enabled and site_id not in stats:
-            stats[site_id] = SiteBoostStatsView(budget_bytes=cred.boost_budget_bytes)
+        for site_id, active_count, used_bytes, uploaded_total, evicted_count in rows
+    }
+    # 三源并集：台账里出现过的 ∪ 近期窗口有数据的 ∪ 当前开着刷流的——
+    # 任一来源的站点都要出现在结果里（如任务全部转出但窗口内仍有上传贡献）
+    site_ids = (
+        set(ledger)
+        | set(week_window)
+        | {sid for sid, c in budgets.items() if c.boost_enabled}
+    )
+    stats: dict[str, SiteBoostStatsView] = {}
+    for site_id in site_ids:
+        cred = budgets.get(site_id)
+        active_count, used_bytes, uploaded_total, evicted_count = ledger.get(
+            site_id, (0, 0, 0, 0)
+        )
+        day = day_window.get(site_id, (0, 0))
+        week = week_window.get(site_id, (0, 0))
+        stats[site_id] = SiteBoostStatsView(
+            active_count=active_count,
+            used_bytes=used_bytes,
+            budget_bytes=cred.boost_budget_bytes if cred else 0,
+            uploaded_bytes_total=uploaded_total,
+            evicted_count=evicted_count,
+            uploaded_bytes_24h=day[0],
+            avg_used_bytes_24h=day[1],
+            uploaded_bytes_7d=week[0],
+            avg_used_bytes_7d=week[1],
+        )
     return stats

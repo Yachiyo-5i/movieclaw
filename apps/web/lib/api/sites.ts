@@ -152,6 +152,14 @@ export interface SiteBoostStats {
   uploaded_bytes_total: number;
   /** 累计汰换任务数 */
   evicted_count: number;
+  /** 近 24 小时上传量（字节） */
+  uploaded_bytes_24h: number;
+  /** 近 24 小时平均在池体积（字节） */
+  avg_used_bytes_24h: number;
+  /** 近 7 天上传量（字节） */
+  uploaded_bytes_7d: number;
+  /** 近 7 天平均在池体积（字节） */
+  avg_used_bytes_7d: number;
 }
 
 /** 按 site_id 返回各站点的刷流统计；从未刷流且未开启的站点没有条目。 */

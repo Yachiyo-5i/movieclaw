@@ -1,4 +1,5 @@
-"""自动刷分享率引擎的纯决策逻辑测试：候选评估、免费窗口、效率 EMA、汰换。
+"""自动刷分享率引擎的决策逻辑与统计测试：候选评估、免费窗口、效率 EMA、
+汰换、小时桶过程指标。
 
 引擎的 IO 编排（下载器对账/提交）依赖真实下载器，属集成范畴；这里锁死的是
 全部安全约束与决策规则——H&R 绝不碰、保留期绝不删、预算腾不出就放弃。
@@ -9,6 +10,9 @@ from __future__ import annotations
 
 import math
 from datetime import datetime, timedelta
+
+import pytest
+import pytest_asyncio
 
 from movieclaw_api.services.ratio_boost import (
     _EMA_WINDOW_SECONDS,
@@ -355,3 +359,80 @@ class TestHandOverIfClaimed:
         task = _task(state=BoostTaskState.EVICTED, evict_reason="原始原因")
         assert not hand_over_if_claimed(task, {task.info_hash}, _NOW)
         assert task.evict_reason == "原始原因"
+
+
+# ---------------------------------------------------------------------------
+# 小时桶过程指标：近 24h/7d 用 X GB 种子贡献 Y GB 上传
+# ---------------------------------------------------------------------------
+
+
+@pytest_asyncio.fixture
+async def db(tmp_path, monkeypatch):
+    from movieclaw_api.core.config import get_settings
+    from movieclaw_db.engine import dispose_db, get_database, init_db
+    from movieclaw_db.migrations import run_migrations
+
+    monkeypatch.setenv("DATABASE_URL", f"sqlite+aiosqlite:///{tmp_path / 'boost.db'}")
+    get_settings.cache_clear()
+    init_db(get_settings().database_url, echo=False)
+    await run_migrations()
+    yield get_database()
+    await dispose_db()
+    get_settings.cache_clear()
+
+
+@pytest.mark.asyncio
+async def test_hourly_buckets_accumulate_and_windows_aggregate(db) -> None:
+    """同一小时内多个 tick 累进同一桶；窗口聚合给出上传量与平均在池体积。"""
+    from movieclaw_api.services.ratio_boost import _record_stats, collect_boost_stats
+    from movieclaw_db.models import AuthType, SiteCredential, utcnow
+
+    now = utcnow()
+    async with db.session() as session:
+        session.add(
+            SiteCredential(site_id="demo", auth_type=AuthType.COOKIE, boost_enabled=True)
+        )
+        await session.commit()
+
+        # 两个 tick：上传 3 GiB + 1 GiB，在池占用恒为 40 GiB
+        for gained in (3 * _GIB, 1 * _GIB):
+            await _record_stats(
+                session, deltas={"demo": gained}, used_by_site={"demo": 40 * _GIB}, now=now
+            )
+        stats = await collect_boost_stats(session)
+
+    view = stats["demo"]
+    assert view.uploaded_bytes_24h == 4 * _GIB
+    assert view.avg_used_bytes_24h == 40 * _GIB  # 平均在池 = (40+40)/2
+    # 7 天窗口包含 24 小时窗口的数据
+    assert view.uploaded_bytes_7d == 4 * _GIB
+    assert view.avg_used_bytes_7d == 40 * _GIB
+
+
+@pytest.mark.asyncio
+async def test_stat_windows_exclude_old_buckets(db) -> None:
+    """8 天前的桶不进 7 天窗口；昨天的桶进 7 天窗口但不进 24 小时窗口。"""
+    from movieclaw_api.services.ratio_boost import collect_boost_stats
+    from movieclaw_db.models import AuthType, RatioBoostStat, SiteCredential, utcnow
+
+    now = utcnow()
+    async with db.session() as session:
+        session.add(
+            SiteCredential(site_id="demo", auth_type=AuthType.COOKIE, boost_enabled=True)
+        )
+        for age, uploaded in ((timedelta(days=8), 7 * _GIB), (timedelta(days=2), 2 * _GIB)):
+            session.add(
+                RatioBoostStat(
+                    site_id="demo",
+                    bucket_start=(now - age).replace(minute=0, second=0, microsecond=0),
+                    uploaded_bytes=uploaded,
+                    used_bytes_sum=10 * _GIB,
+                    tick_count=1,
+                )
+            )
+        await session.commit()
+        stats = await collect_boost_stats(session)
+
+    view = stats["demo"]
+    assert view.uploaded_bytes_24h == 0
+    assert view.uploaded_bytes_7d == 2 * _GIB

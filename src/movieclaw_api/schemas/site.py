@@ -271,3 +271,8 @@ class SiteBoostStatsView(BaseModel):
         default=0, description="刷流累计上传量（含已汰换任务的历史贡献，字节）"
     )
     evicted_count: int = Field(default=0, description="累计汰换任务数")
+    # 近期窗口指标（来自小时桶统计）：支撑"近 24 小时用 X GB 种子贡献 Y GB 上传"
+    uploaded_bytes_24h: int = Field(default=0, description="近 24 小时上传量（字节）")
+    avg_used_bytes_24h: int = Field(default=0, description="近 24 小时平均在池体积（字节）")
+    uploaded_bytes_7d: int = Field(default=0, description="近 7 天上传量（字节）")
+    avg_used_bytes_7d: int = Field(default=0, description="近 7 天平均在池体积（字节）")

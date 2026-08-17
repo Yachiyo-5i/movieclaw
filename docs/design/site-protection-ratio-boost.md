@@ -178,8 +178,12 @@ H&R 违规。
 - `PATCH /sites/{site_id}/protection`：`{"protected": bool}`；
 - `PATCH /sites/{site_id}/ratio-boost`：`{"enabled": bool, "budget_bytes": int}`；
 - `GET /sites/boost-stats`：按 site_id 返回 `{active_count, used_bytes,
-  budget_bytes, uploaded_bytes_total, evicted_count}`，站点卡片展示
-  「已用 X / 预算 Y，累计上传 Z」。
+  budget_bytes, uploaded_bytes_total, evicted_count, uploaded_bytes_24h,
+  avg_used_bytes_24h, uploaded_bytes_7d, avg_used_bytes_7d}`。近期窗口
+  指标来自小时桶统计表 `ratio_boost_stat`（每站每小时一行：上传增量 +
+  在池占用采样，保留 30 天），站点卡片据此展示过程一句话：
+  「近 24 小时：X GB 在池种子贡献了 Y GB 上传 · 近 7 天：…」——比终身
+  累计值更能回答"现在还有没有在产出"。
 
 三个端点都返回/配合 `ConfiguredSite` 视图新增的 `protected / boost_enabled /
 boost_budget_bytes` 字段。

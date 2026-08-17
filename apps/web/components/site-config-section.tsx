@@ -774,6 +774,17 @@ function SiteGuardBand({ site, boost, onChanged, onError }: SiteGuardBandProps) 
           )}
         </div>
       )}
+
+      {/* 过程一句话：近期投入产出（来自小时桶统计）。刚开启还没有数据时不显示，
+          避免一排 0 引发"是不是坏了"的困惑 */}
+      {site.boost_enabled && boost && boost.avg_used_bytes_24h > 0 && (
+        <p className="text-caption text-[var(--text-muted)]">
+          近 24 小时：{formatBytes(boost.avg_used_bytes_24h)} 在池种子贡献了{" "}
+          {formatBytes(boost.uploaded_bytes_24h)} 上传
+          {boost.avg_used_bytes_7d > 0 &&
+            ` · 近 7 天：${formatBytes(boost.avg_used_bytes_7d)} 贡献 ${formatBytes(boost.uploaded_bytes_7d)}`}
+        </p>
+      )}
     </div>
   );
 }
