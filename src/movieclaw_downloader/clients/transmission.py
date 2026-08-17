@@ -249,6 +249,18 @@ class TransmissionDownloader(BaseDownloader):
                     size_bytes=int(torrent.fields.get("sizeWhenDone", 0)) or None,
                     dlspeed_bytes=int(torrent.fields.get("rateDownload", 0)),
                     upspeed_bytes=int(torrent.fields.get("rateUpload", 0)),
+                    # uploadedEver 是本任务的累计上传字节；uploadRatio 的 -1
+                    # （Transmission 表示"未定义"）归一为 None
+                    uploaded_bytes=(
+                        int(torrent.fields["uploadedEver"])
+                        if torrent.fields.get("uploadedEver") is not None
+                        else None
+                    ),
+                    ratio=(
+                        float(torrent.fields["uploadRatio"])
+                        if float(torrent.fields.get("uploadRatio", -1)) >= 0
+                        else None
+                    ),
                     eta_seconds=eta if eta > 0 else None,
                     state=_normalize_state(torrent, completed=completed),
                 )

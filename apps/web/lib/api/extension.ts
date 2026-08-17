@@ -61,6 +61,12 @@ export interface ConfiguredSite {
   enabled: boolean;
   status: SiteStatus;
   usable: boolean;
+  /** 站点保护开关：打开后订阅链路绕开该站，手动搜索/下载不受影响 */
+  protected: boolean;
+  /** 自动刷分享率开关 */
+  boost_enabled: boolean;
+  /** 刷流存储预算（字节） */
+  boost_budget_bytes: number;
   last_verified_at: string | null;
   last_checked_at: string | null;
   last_error: string | null;

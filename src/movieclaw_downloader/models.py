@@ -113,6 +113,11 @@ class TorrentBrief(BaseModel):
     size_bytes: int | None = None
     dlspeed_bytes: int | None = None
     upspeed_bytes: int | None = None
+    # 累计上传量与分享率：刷流引擎按 tick 差分累计上传量计算上传效率。
+    # None 表示旧适配器没有提供——消费方必须跳过该 tick，不能当 0 参与差分
+    # （会把效率 EMA 错误地打到 0 而触发误汰换）。
+    uploaded_bytes: int | None = None
+    ratio: float | None = None
     eta_seconds: int | None = None
     state: str = "unknown"
 

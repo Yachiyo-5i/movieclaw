@@ -13,15 +13,19 @@ import type { ConfiguredSite, SiteAuthType, SiteStatus } from "@/lib/api/extensi
 import {
   type AuthTypeRequirement,
   type CatalogItem,
+  type SiteBoostStats,
   type SiteConfigPayload,
   type SiteSyncStats,
   configureSite,
   deleteSite,
   listConfiguredSites,
+  listSiteBoostStats,
   listSiteCatalog,
   listSiteSyncStats,
   reverifySite,
   setSiteEnabled,
+  setSiteProtection,
+  setSiteRatioBoost,
   updateSite,
 } from "@/lib/api/sites";
 import { formatBytes, formatCompact, formatDuration, formatRatio } from "@/lib/format";
@@ -90,6 +94,8 @@ export function SiteConfigSection() {
   const [configured, setConfigured] = useState<ConfiguredSite[]>([]);
   // 各站点的种子缓存统计（定时同步任务维护），key 为 site_id；从未同步过的站点没有条目
   const [syncStats, setSyncStats] = useState<Record<string, SiteSyncStats>>({});
+  // 各站点的刷流运行统计；从未刷流且未开启刷流的站点没有条目
+  const [boostStats, setBoostStats] = useState<Record<string, SiteBoostStats>>({});
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   // 是否展开「添加站点」面板
@@ -118,14 +124,16 @@ export function SiteConfigSection() {
   const load = useCallback(async () => {
     setError(null);
     try {
-      const [cat, cfg, stats] = await Promise.all([
+      const [cat, cfg, stats, boost] = await Promise.all([
         listSiteCatalog(),
         listConfiguredSites(),
         listSiteSyncStats(),
+        listSiteBoostStats(),
       ]);
       setCatalog(cat);
       setConfigured(cfg);
       setSyncStats(stats);
+      setBoostStats(boost);
     } catch (e) {
       setError((e as Error).message);
     } finally {
@@ -263,6 +271,7 @@ export function SiteConfigSection() {
                   item={catalogMap.get(site.site_id) ?? fallbackItem(site.site_id)}
                   site={site}
                   stats={syncStats[site.site_id]}
+                  boost={boostStats[site.site_id]}
                   expanded={editing === site.site_id}
                   onToggleForm={(open) => setEditing(open ? site.site_id : null)}
                   onChanged={upsertConfigured}
@@ -414,6 +423,8 @@ interface SiteCardProps {
   site: ConfiguredSite;
   /** 该站点的种子缓存统计；定时同步任务从未跑过该站时为 undefined */
   stats?: SiteSyncStats;
+  /** 该站点的刷流运行统计；从未刷流且未开启时为 undefined */
+  boost?: SiteBoostStats;
   expanded: boolean;
   onToggleForm: (open: boolean) => void;
   onChanged: (site: ConfiguredSite) => void;
@@ -425,6 +436,7 @@ function SiteCard({
   item,
   site,
   stats,
+  boost,
   expanded,
   onToggleForm,
   onChanged,
@@ -489,6 +501,18 @@ function SiteCard({
               <span className="size-1.5 rounded-full" style={{ background: meta.color }} />
               {meta.label}
             </span>
+            {site.protected && (
+              <span
+                className="shrink-0 rounded-full px-2 py-0.5 text-caption font-medium"
+                style={{
+                  background: "color-mix(in oklab, var(--info) 12%, transparent)",
+                  color: "var(--info)",
+                }}
+                title="保护中：订阅不会自动从该站拉种，手动搜索下载不受影响"
+              >
+                保护中
+              </span>
+            )}
           </div>
           <p className="mt-0.5 truncate text-caption text-[var(--text-faint)]">
             {site.status === "failed" && site.last_error
@@ -585,6 +609,10 @@ function SiteCard({
         </p>
       )}
 
+      {/* 保护与刷流带：新站养号的两个机制（docs/design/site-protection-ratio-boost.md）。
+          开关即时提交（与启用开关同款节奏），预算失焦即存。 */}
+      <SiteGuardBand site={site} boost={boost} onChanged={onChanged} onError={onError} />
+
       {/* 展开态：授权表单 */}
       {expanded && (
         <div className="border-t border-white/[0.06] p-4">
@@ -599,6 +627,137 @@ function SiteCard({
               })
             }
           />
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* —— 保护与刷流带：站点保护开关 + 自动刷分享率（开关 / 预算 / 运行统计） —— */
+
+const GIB = 1024 ** 3;
+
+interface SiteGuardBandProps {
+  site: ConfiguredSite;
+  boost?: SiteBoostStats;
+  onChanged: (site: ConfiguredSite) => void;
+  onError: (message: string) => void;
+}
+
+function SiteGuardBand({ site, boost, onChanged, onError }: SiteGuardBandProps) {
+  const { backdrop } = useBackdrop();
+  const [busy, setBusy] = useState(false);
+  // 预算输入（GiB 为单位）：失焦即存；site 变化（别处保存成功）时回同步
+  const [budgetGib, setBudgetGib] = useState(() => String(Math.round(site.boost_budget_bytes / GIB)));
+  useEffect(() => {
+    setBudgetGib(String(Math.round(site.boost_budget_bytes / GIB)));
+  }, [site.boost_budget_bytes]);
+
+  async function guard(fn: () => Promise<void>) {
+    setBusy(true);
+    try {
+      await fn();
+    } catch (e) {
+      onError((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function commitBudget() {
+    const gib = Math.round(Number(budgetGib));
+    if (!Number.isFinite(gib) || gib < 1) {
+      // 非法输入回弹为当前生效值，不发请求
+      setBudgetGib(String(Math.round(site.boost_budget_bytes / GIB)));
+      return;
+    }
+    const bytes = gib * GIB;
+    if (bytes === site.boost_budget_bytes) return;
+    void guard(async () =>
+      onChanged(await setSiteRatioBoost(site.site_id, site.boost_enabled, bytes)),
+    );
+  }
+
+  return (
+    <div className="space-y-3 border-t border-white/[0.06] px-4 py-3">
+      {/* 站点保护开关 */}
+      <div className="flex items-center justify-between gap-4">
+        <div className="min-w-0">
+          <p className="text-ui font-medium text-[var(--text)]">站点保护</p>
+          <p className="mt-0.5 text-caption text-[var(--text-faint)]">
+            打开后订阅不会自动从该站拉种（下载量归零），手动搜索和下载不受影响。适合分享率还没养起来的新站。
+          </p>
+        </div>
+        <LiquidGlassButton
+          backgroundImage={backdrop}
+          variant="dark"
+          checked={site.protected}
+          disabled={busy}
+          aria-label={site.protected ? "保护中，点击取消保护" : "未保护，点击开启保护"}
+          onCheckedChange={(next) =>
+            void guard(async () => onChanged(await setSiteProtection(site.site_id, next)))
+          }
+          className="!min-h-0 !w-auto shrink-0 !gap-0 !bg-transparent !p-0"
+        >
+          <span className="sr-only">{site.protected ? "保护中" : "未保护"}</span>
+        </LiquidGlassButton>
+      </div>
+
+      {/* 自动刷分享率开关 */}
+      <div className="flex items-center justify-between gap-4">
+        <div className="min-w-0">
+          <p className="text-ui font-medium text-[var(--text)]">自动刷分享率</p>
+          <p className="mt-0.5 text-caption text-[var(--text-faint)]">
+            自动抢该站新发布的免费种做种提升分享率；在预算内自动汰换上传效率低的，保留期 72 小时内绝不删。
+          </p>
+        </div>
+        <LiquidGlassButton
+          backgroundImage={backdrop}
+          variant="dark"
+          checked={site.boost_enabled}
+          disabled={busy}
+          aria-label={site.boost_enabled ? "刷流已开启，点击关闭" : "刷流已关闭，点击开启"}
+          onCheckedChange={(next) =>
+            void guard(async () => onChanged(await setSiteRatioBoost(site.site_id, next)))
+          }
+          className="!min-h-0 !w-auto shrink-0 !gap-0 !bg-transparent !p-0"
+        >
+          <span className="sr-only">{site.boost_enabled ? "刷流已开启" : "刷流已关闭"}</span>
+        </LiquidGlassButton>
+      </div>
+
+      {/* 开启后：预算设置 + 运行统计 */}
+      {site.boost_enabled && (
+        <div className="flex flex-wrap items-center gap-x-7 gap-y-2">
+          <div className="flex items-center gap-2">
+            <span className="text-micro text-[var(--text-faint)]">存储预算</span>
+            <input
+              type="number"
+              min={1}
+              value={budgetGib}
+              disabled={busy}
+              onChange={(e) => setBudgetGib(e.target.value)}
+              onBlur={commitBudget}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") (e.target as HTMLInputElement).blur();
+              }}
+              className="w-20 rounded-lg border border-white/[0.08] bg-white/[0.04] px-2 py-1 text-right text-ui text-[var(--text)] outline-none focus:border-[var(--accent)]/60"
+            />
+            <span className="text-caption text-[var(--text-muted)]">GiB</span>
+          </div>
+          {boost && (
+            <>
+              <ProfileStat
+                label="已用 / 预算"
+                value={`${formatBytes(boost.used_bytes)} / ${formatBytes(boost.budget_bytes)}`}
+              />
+              <ProfileStat label="在池做种" value={String(boost.active_count)} />
+              <ProfileStat label="累计上传" value={formatBytes(boost.uploaded_bytes_total)} />
+              {boost.evicted_count > 0 && (
+                <ProfileStat label="已汰换" value={String(boost.evicted_count)} />
+              )}
+            </>
+          )}
         </div>
       )}
     </div>

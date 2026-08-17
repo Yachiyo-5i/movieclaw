@@ -148,6 +148,7 @@ async def submit_torrent(
     save_path: str | None = None,
     subtitle: str | None = None,
     downloader_id: int | None = None,
+    category: str = "movieclaw",
 ) -> tuple[SubmitResult, DownloaderClient]:
     """从站点取回种子并提交到下载器，返回（提交结果, 所用下载器记录）。
 
@@ -159,6 +160,8 @@ async def submit_torrent(
     **条目级**目录时传入，锚到库主根会波及根下所有文件。
     downloader_id 指定投递目标（手动下载配了多台按需分流用）；缺省仍走
     默认下载器——订阅投递路径不传该参数，行为不变。
+    category 是下载器分类：媒体下载固定 movieclaw；刷流传 movieclaw-boost
+    与媒体任务隔离（不进监听导入的视野）。
     """
     if not download_url:
         raise BadRequestException("该种子没有可用的下载入口（download_url 缺失）")
@@ -229,7 +232,7 @@ async def submit_torrent(
             DownloadRequest(
                 torrent_bytes=torrent_bytes,
                 save_path=submit_save_path,
-                category="movieclaw",
+                category=category,
                 tags=tags,
             )
         )

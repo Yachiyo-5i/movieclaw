@@ -241,6 +241,17 @@ class QBittorrentDownloader(BaseDownloader):
                     size_bytes=int(getattr(torrent, "size", 0) or 0) or None,
                     dlspeed_bytes=int(getattr(torrent, "dlspeed", 0) or 0),
                     upspeed_bytes=int(getattr(torrent, "upspeed", 0) or 0),
+                    # uploaded 是本任务的累计上传字节；缺失（极老版本）保持 None
+                    uploaded_bytes=(
+                        int(torrent.uploaded)
+                        if getattr(torrent, "uploaded", None) is not None
+                        else None
+                    ),
+                    ratio=(
+                        float(torrent.ratio)
+                        if getattr(torrent, "ratio", None) is not None
+                        else None
+                    ),
                     eta_seconds=eta if 0 < eta < 8640000 else None,
                     state=_normalize_state(str(getattr(torrent, "state", "")), completed=completed),
                 )

@@ -741,7 +741,9 @@ def _fake_search(monkeypatch, *, sites_ok: int, hits: list, calls: list | None =
     from movieclaw_api.schemas.search import SearchResponse, SiteSearchStatus
     from movieclaw_api.services import site_search
 
-    async def fake(keyword, categories=None, site_ids=None, label=None, page=1):
+    async def fake(
+        keyword, categories=None, site_ids=None, label=None, page=1, exclude_protected=False
+    ):
         if calls is not None:
             calls.append({"keyword": keyword, "categories": categories})
         statuses = [

@@ -7,8 +7,11 @@ from movieclaw_api.schemas.response import ApiResponse, ok
 from movieclaw_api.schemas.site import (
     CatalogItem,
     ConfiguredSite,
+    SiteBoostStatsView,
     SiteConfigCreate,
     SiteConfigUpdate,
+    SiteProtectionUpdate,
+    SiteRatioBoostUpdate,
     SiteStatusUpdate,
     SiteSyncStatsView,
 )
@@ -93,6 +96,25 @@ async def list_sync_stats(
         for site_id in counts.keys() | cursors.keys()
     }
     return ok(stats)
+
+
+@router.get(
+    "/boost-stats",
+    response_model=ApiResponse[dict[str, SiteBoostStatsView]],
+    summary="各站点的刷流运行统计",
+    operation_id="site.boostStats",
+)
+async def list_boost_stats(
+    session: AsyncSession = Depends(get_session),
+) -> ApiResponse[dict[str, SiteBoostStatsView]]:
+    """按 site_id 返回刷流台账聚合：在池任务数/占用、累计上传、汰换数。
+
+    从未有过刷流任务且未开刷流的站点不会出现在结果里。
+    注意：本路由必须注册在 ``/{site_id}`` 之前，否则会被当成站点 ID 匹配。
+    """
+    from movieclaw_api.services.ratio_boost import collect_boost_stats
+
+    return ok(await collect_boost_stats(session))
 
 
 @router.get(
@@ -182,6 +204,44 @@ async def set_site_status(
 ) -> ApiResponse[ConfiguredSite]:
     service = SiteConfigService(session)
     row = await service.set_enabled(site_id, payload.enabled)
+    return ok(await _to_view(service, row))
+
+
+@router.patch(
+    "/{site_id}/protection",
+    response_model=ApiResponse[ConfiguredSite],
+    summary="打开 / 关闭站点保护",
+    operation_id="site.protection.set",
+)
+async def set_site_protection(
+    site_id: str,
+    payload: SiteProtectionUpdate,
+    session: AsyncSession = Depends(get_session),
+) -> ApiResponse[ConfiguredSite]:
+    """保护开关：打开后订阅链路（被动匹配/缺口搜索/换源/洗版）不再选中该站点，
+    但手动搜索、手动下载、种子同步照常。用于分享率尚未养起来的新站点。"""
+    service = SiteConfigService(session)
+    row = await service.set_protected(site_id, payload.protected)
+    return ok(await _to_view(service, row))
+
+
+@router.patch(
+    "/{site_id}/ratio-boost",
+    response_model=ApiResponse[ConfiguredSite],
+    summary="设置自动刷分享率（开关与存储预算）",
+    operation_id="site.ratioBoost.set",
+)
+async def set_site_ratio_boost(
+    site_id: str,
+    payload: SiteRatioBoostUpdate,
+    session: AsyncSession = Depends(get_session),
+) -> ApiResponse[ConfiguredSite]:
+    """开启后引擎自动抢站点新发布的免费种子做种，在预算内汰换低效任务。
+    机制与安全约束见 docs/design/site-protection-ratio-boost.md。"""
+    service = SiteConfigService(session)
+    row = await service.set_ratio_boost(
+        site_id, enabled=payload.enabled, budget_bytes=payload.budget_bytes
+    )
     return ok(await _to_view(service, row))
 
 
