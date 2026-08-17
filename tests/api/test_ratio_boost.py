@@ -19,6 +19,7 @@ from movieclaw_api.services.ratio_boost import (
     admission_headroom,
     apply_observation,
     assess_candidate,
+    budget_evictable,
     downloader_congested,
     evictable,
     free_window_sufficient,
@@ -394,6 +395,40 @@ class TestEviction:
         protected_by_hold = _task(created_at=_NOW - timedelta(hours=1), size_bytes=50 * _GIB)
         small = _task(torrent_id="s", upload_rate_ema=0.0, size_bytes=5 * _GIB)
         assert pick_evictions([protected_by_hold, small], need_bytes=20 * _GIB, now=_NOW) is None
+
+
+class TestBudgetConvergence:
+    """预算收敛的判据（budget_evictable）：用户调小预算必须收敛到位，
+    高效不是免死金牌；只有保留期是铁律。"""
+
+    def test_efficient_task_is_evictable_under_budget_pressure(self) -> None:
+        """周转 5 天的高效种子：日常汰换（evictable）不会碰它，但预算
+        收敛可以——否则 1000G 调 100G 时高效种子占着 900G 永不归还。"""
+        efficient = _task(upload_rate_ema=(10 * _GIB) / (5 * 86400))
+        assert not evictable(efficient, _NOW)
+        assert budget_evictable(efficient, _NOW)
+
+    def test_hold_remains_inviolable(self) -> None:
+        """保留期铁律在预算压力下依然成立（H&R 安全垫不因用户调预算失效）。"""
+        young = _task(created_at=_NOW - timedelta(hours=10))
+        assert not budget_evictable(young, _NOW)
+        assert budget_evictable(young, _NOW, hold=timedelta(hours=1))
+
+    def test_hr_hold_applies_under_budget_pressure(self) -> None:
+        """明确 H&R 的任务按真实考核时长保底，预算收敛也不能提前动。"""
+        hr_task = _task(hit_and_run=True, created_at=_NOW - timedelta(days=4))
+        assert not budget_evictable(hr_task, _NOW, hr_hold=timedelta(days=5))
+        assert budget_evictable(hr_task, _NOW, hr_hold=timedelta(days=3))
+
+    def test_uncompleted_not_touched(self) -> None:
+        """下载中的任务不参与预算收敛（由止损逻辑按免费窗口/卡死处理）。"""
+        assert not budget_evictable(_task(completed=False), _NOW)
+
+    def test_completion_windows_do_not_delay_convergence(self) -> None:
+        """完成后判定窗（6h/12h）是效率判定的质量门槛，不适用于预算收敛：
+        刚下完的种子只要过了保留期就可为收敛让位。"""
+        just_done = _task(completed_at=_NOW - timedelta(hours=1), swarm_leechers=5)
+        assert budget_evictable(just_done, _NOW)
 
 
 class TestAdmissionHeadroom:

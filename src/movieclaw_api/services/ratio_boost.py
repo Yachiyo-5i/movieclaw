@@ -332,6 +332,15 @@ def swarm_dead(task: RatioBoostTask) -> bool:
     return task.swarm_leechers == 0
 
 
+def _effective_hold(
+    task: RatioBoostTask, hold: timedelta, hr_hold: timedelta | None
+) -> timedelta:
+    """任务的实际保留期：明确标注 H&R 的任务按真实考核时长保底（取大）。"""
+    if task.hit_and_run and hr_hold is not None:
+        return max(hold, hr_hold)
+    return hold
+
+
 def evictable(
     task: RatioBoostTask,
     now: datetime,
@@ -362,13 +371,10 @@ def evictable(
     - **公平判定窗**（完成满 12 小时）——EMA 已覆盖足够长的观测（含下载
       阶段），周转仍慢就是真慢。
     """
-    effective_hold = hold
-    if task.hit_and_run and hr_hold is not None:
-        effective_hold = max(hold, hr_hold)
     if not (
         task.state == BoostTaskState.ACTIVE
         and task.completed
-        and now - task.created_at >= effective_hold
+        and now - task.created_at >= _effective_hold(task, hold, hr_hold)
         and turnover_seconds(task) > _EVICT_TURNOVER_DAYS * 86400
     ):
         return False
@@ -380,6 +386,29 @@ def evictable(
     if since_complete >= _ZERO_YIELD_AFTER and task.uploaded_bytes < _ZERO_YIELD_BYTES:
         return True
     return since_complete >= _JUDGMENT_AFTER_COMPLETE
+
+
+def budget_evictable(
+    task: RatioBoostTask,
+    now: datetime,
+    *,
+    hold: timedelta = _DEFAULT_MIN_HOLD,
+    hr_hold: timedelta | None = None,
+) -> bool:
+    """预算收敛路径的可汰换判据：用户显式调小预算是明确指令，必须让占用
+    收敛到新预算——因此只保留两条铁律（下载已完成 + 已过保留期），
+    **不设** ``evictable`` 的周转地板与完成后判定窗。
+
+    区别的道理：日常"为新种腾位"的汰换是引擎自己的效率权衡，删掉还在
+    产出的高效种子换新种是真亏，所以有 10 天周转门槛；而预算收敛是用户
+    要磁盘，高效不是免死金牌——但汰换顺序（eviction_order_key）保证
+    死种和低效的先走，高效的排最后、只在必要时牺牲。
+    """
+    return (
+        task.state == BoostTaskState.ACTIVE
+        and task.completed
+        and now - task.created_at >= _effective_hold(task, hold, hr_hold)
+    )
 
 
 def admission_headroom(
@@ -927,22 +956,28 @@ async def run_ratio_boost() -> None:
                     for t in active_tasks
                     if t.site_id == cred.site_id and t.state == BoostTaskState.ACTIVE
                 ]
-                # ② 预算收敛：用户调小预算后逐步退到预算内（绝不动保留期内任务）
+                # ② 预算收敛：用户调小预算是明确指令，必须收敛到位——判据用
+                # budget_evictable（不设周转地板，高效不是免死金牌），顺序仍是
+                # 死种优先、再按周转从慢到快（高效的排最后、只在必要时牺牲）；
+                # 保留期内的任务不动，等到期后在后续 tick 里继续收敛
                 used = sum(t.size_bytes for t in site_tasks)
                 if used > cred.boost_budget_bytes:
-                    # 死种优先，再按周转从慢到快（单位存储产出最低的先走）
                     site_hr_hold = hr_hold_for(cred.site_id)
                     for victim in sorted(
                         (
                             t
                             for t in site_tasks
-                            if evictable(t, now, hold=hold_for(cred), hr_hold=site_hr_hold)
+                            if budget_evictable(
+                                t, now, hold=hold_for(cred), hr_hold=site_hr_hold
+                            )
                         ),
                         key=eviction_order_key,
                     ):
                         if used <= cred.boost_budget_bytes:
                             break
-                        if await _evict(pool, victim, now, reason="预算调小后收敛（上传效率过低）"):
+                        if await _evict(
+                            pool, victim, now, reason="预算调小后收敛（按上传效率从低到高让出空间）"
+                        ):
                             used -= victim.size_bytes
                     await session.commit()
                 # ③ 准入

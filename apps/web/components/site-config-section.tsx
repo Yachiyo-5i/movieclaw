@@ -842,6 +842,7 @@ function BoostSettingsModal({
   onClose: () => void;
   onChanged: (site: ConfiguredSite) => void;
 }) {
+  const confirm = useConfirm();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [budgetGib, setBudgetGib] = useState("");
@@ -864,6 +865,22 @@ function BoostSettingsModal({
     if (!Number.isFinite(days) || days < 0 || days > 30) {
       setError("汰换保留期须是 0～30 之间的整数（天）");
       return;
+    }
+    // 调小预算的后果不可逆（超出部分连数据删除），保存前二次确认讲清楚
+    const currentGib = Math.round(site.boost_budget_bytes / GIB);
+    if (mode === "adjust" && gib < currentGib) {
+      const ok = await confirm({
+        title: `将「${siteName}」的刷流预算从 ${currentGib} GiB 调小到 ${gib} GiB？`,
+        bullets: [
+          "在池占用超出新预算的部分将被汰换：连同已下载的数据一起删除，且同一种子不会再抢回",
+          "按上传效率从低到高删——死种和低效的先走，高效种子最后才会被动",
+          "汰换保留期内的任务不受影响，到期后才继续收敛",
+          "收敛期间暂停接新的免费种",
+        ],
+        confirmLabel: "确认调小",
+        tone: "danger",
+      });
+      if (!ok) return;
     }
     setBusy(true);
     setError(null);
@@ -895,7 +912,8 @@ function BoostSettingsModal({
               ? "开启后将自动抢该站新发布的免费种子做种以提升分享率，占用空间在预算内自动汰换" +
                 "（下载完成、入池满保留期且上传效率过低的任务才会被连数据删除），" +
                 "该站的索引同步会提速到约 5 分钟一次。"
-              : "调小预算不会立刻删种——引擎按汰换规则逐步收敛，保留期内的任务绝不会被删除。"}
+              : "调小预算会按上传效率从低到高汰换在池任务（连数据删除），直到占用回到新预算内；" +
+                "保留期内的任务绝不会被提前删除。"}
           </p>
         </div>
 
