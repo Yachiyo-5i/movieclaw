@@ -17,16 +17,17 @@ import { formatDateTime } from "@/lib/time";
 /**
  * 浏览器插件卡片：嵌在「资源站点」分区底部（插件是站点 Cookie 同步的配套工具，
  * 不单设分区）。
- * - 安装引导：自动检测是否已安装（见 lib/extension-install.ts），未安装时提供 zip
- *   下载与加载步骤（Chrome 政策不允许商店外插件一键静默安装，下载后需在
- *   chrome://extensions 手动加载，卡片把步骤讲清楚）；
- * - 同步令牌：设完即用、极少回访的配置，不占第一屏——收进「同步令牌」按钮的
- *   弹窗里管理（生成 / 查看 / 复制 / 重新生成 / 关闭）。
+ * 卡面保持极简（一段说明 + 状态点 + 两个按钮）：
+ * - 安装引导收进「安装插件」按钮的弹窗——Chrome 政策不允许商店外插件一键
+ *   静默安装，必须手动加载，四步指引在弹窗里讲清楚，不平铺占版面；
+ * - 同步令牌：设完即用、极少回访的配置，收进「同步令牌」按钮的弹窗里管理。
  * 各站点的同步与验证状态直接看上方站点列表，不在这里重复展示。
+ * 视觉与站点列表同款扁平面板（配置页不用玻璃质感）。
  */
 export function ExtensionCard() {
   const { installed } = useExtensionInstalled();
   const [tokenOpen, setTokenOpen] = useState(false);
+  const [installOpen, setInstallOpen] = useState(false);
 
   const badge =
     installed === null
@@ -36,7 +37,7 @@ export function ExtensionCard() {
         : { label: "未检测到", color: "#c0c4cc" };
 
   return (
-    <section className="css-glass !rounded-2xl p-6">
+    <section className="rounded-xl border border-white/[0.08] bg-white/[0.03] p-5">
       <div className="flex items-start justify-between gap-4">
         <div className="flex items-start gap-3.5">
           <span className="icon-chip size-10 shrink-0 !rounded-xl">
@@ -59,40 +60,16 @@ export function ExtensionCard() {
         </span>
       </div>
 
-      {installed ? (
-        <p className="mt-4 rounded-xl bg-white/[0.03] px-4 py-3 text-body text-[var(--text-muted)]">
-          <CheckIcon className="mr-1.5 inline size-4 text-[var(--ok)]" />
-          插件已就绪。打开支持的站点页面，点击浏览器工具栏的 MovieClaw
-          图标即可同步该站 Cookie；首次使用请先点下方「同步令牌」生成并填入插件。
-        </p>
-      ) : (
-        <ol className="mt-4 space-y-2 rounded-xl bg-white/[0.03] px-4 py-3.5 text-ui leading-6 text-[var(--text-muted)]">
-          <li>
-            <b className="text-[var(--text)]">1.</b> 点击下方按钮下载插件包，解压得到{" "}
-            <code className="rounded bg-white/[0.06] px-1 font-mono text-sub">chrome-mv3</code> 文件夹。
-          </li>
-          <li>
-            <b className="text-[var(--text)]">2.</b> 浏览器打开{" "}
-            <code className="rounded bg-white/[0.06] px-1 font-mono text-sub">chrome://extensions</code>
-            ，右上角开启「开发者模式」。
-          </li>
-          <li>
-            <b className="text-[var(--text)]">3.</b>{" "}
-            点「加载已解压的扩展程序」选择该文件夹，切回本页即自动识别为「已安装」。
-          </li>
-        </ol>
-      )}
-
       <div className="mt-4 flex flex-wrap items-center gap-3">
         {!installed && (
-          <a
-            href={EXTENSION_ZIP_URL}
-            download
+          <button
+            type="button"
+            onClick={() => setInstallOpen(true)}
             className="btn-accent flex items-center gap-1.5 rounded-full px-4 py-2 text-sub font-semibold"
           >
             <DownloadIcon className="size-4" />
-            下载插件包
-          </a>
+            安装插件
+          </button>
         )}
         <button
           type="button"
@@ -102,15 +79,129 @@ export function ExtensionCard() {
           <ShieldIcon className="size-4" />
           同步令牌
         </button>
-        {!installed && (
+        {installed && (
           <p className="text-caption text-[var(--text-faint)]">
-            支持 Chrome / Edge 等 Chromium 内核浏览器；安装检测同样仅对 Chromium 生效。
+            <CheckIcon className="mr-1 inline size-3.5 text-[var(--ok)]" />
+            打开站点页面，点浏览器工具栏的 MovieClaw 图标即可同步；首次使用先生成同步令牌填入插件。
           </p>
         )}
       </div>
 
+      <InstallModal
+        open={installOpen}
+        onClose={() => setInstallOpen(false)}
+        onOpenToken={() => {
+          setInstallOpen(false);
+          setTokenOpen(true);
+        }}
+      />
       <TokenModal open={tokenOpen} onClose={() => setTokenOpen(false)} />
     </section>
+  );
+}
+
+/**
+ * 安装指引弹窗：四步明确操作。Chrome 政策不允许商店外插件静默安装，
+ * 下载后须在 chrome://extensions 手动加载——步骤只在用户点「安装插件」
+ * 时才展开，不在卡面平铺。
+ */
+function InstallModal({
+  open,
+  onClose,
+  onOpenToken,
+}: {
+  open: boolean;
+  onClose: () => void;
+  onOpenToken: () => void;
+}) {
+  const steps: { text: React.ReactNode; action?: React.ReactNode }[] = [
+    {
+      text: (
+        <>
+          下载插件包并解压，得到{" "}
+          <code className="rounded bg-white/[0.06] px-1 font-mono text-sub">chrome-mv3</code>{" "}
+          文件夹。
+        </>
+      ),
+      action: (
+        <a
+          href={EXTENSION_ZIP_URL}
+          download
+          className="btn-accent flex w-fit items-center gap-1.5 rounded-full px-3.5 py-1.5 text-sub font-semibold"
+        >
+          <DownloadIcon className="size-4" />
+          下载插件包
+        </a>
+      ),
+    },
+    {
+      text: (
+        <>
+          浏览器地址栏打开{" "}
+          <code className="rounded bg-white/[0.06] px-1 font-mono text-sub">
+            chrome://extensions
+          </code>
+          ，右上角开启「开发者模式」。
+        </>
+      ),
+    },
+    {
+      text: <>点「加载已解压的扩展程序」，选择第 1 步解压出的文件夹。</>,
+    },
+    {
+      text: <>生成同步令牌并填入插件设置，之后切回本页会自动识别为「已安装」。</>,
+      action: (
+        <button
+          type="button"
+          onClick={onOpenToken}
+          className="btn-glass flex w-fit items-center gap-1.5 px-3.5 py-1.5 text-sub font-medium"
+        >
+          <ShieldIcon className="size-4" />
+          去生成令牌
+        </button>
+      ),
+    },
+  ];
+
+  return (
+    <Modal open={open} onClose={onClose} label="安装浏览器插件" width="lg">
+      <div className="space-y-4 p-6">
+        <div>
+          <h2 className="text-title font-bold text-[var(--text)]">安装浏览器插件</h2>
+          <p className="mt-1 text-sub leading-5 text-[var(--text-muted)]">
+            按下面四步操作，全程约一分钟。Chrome 应用商店政策不允许商店外插件一键安装，
+            所以需要手动加载一次，之后升级会自动提示。
+          </p>
+        </div>
+
+        <ol className="space-y-3">
+          {steps.map((step, i) => (
+            <li key={i} className="flex gap-3 rounded-xl bg-white/[0.03] px-4 py-3">
+              <span className="flex size-6 shrink-0 items-center justify-center rounded-full bg-white/[0.08] text-sub font-semibold text-[var(--text)]">
+                {i + 1}
+              </span>
+              <div className="min-w-0 space-y-2 pt-0.5 text-ui leading-6 text-[var(--text-muted)]">
+                <p>{step.text}</p>
+                {step.action}
+              </div>
+            </li>
+          ))}
+        </ol>
+
+        <div className="flex items-center justify-between gap-3 pt-1">
+          <p className="text-caption text-[var(--text-faint)]">
+            支持 Chrome / Edge 等 Chromium 内核浏览器；安装检测同样仅对 Chromium 生效。
+          </p>
+          <button
+            type="button"
+            onClick={onClose}
+            className="btn-glass shrink-0 px-4 py-2 text-sub font-medium"
+          >
+            完成
+          </button>
+        </div>
+      </div>
+    </Modal>
   );
 }
 

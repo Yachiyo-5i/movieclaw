@@ -15,7 +15,7 @@ import { MembersSection } from "@/components/members-section";
 import { LlmConfigSection } from "@/components/llm-config-section";
 import { ImPushSection } from "@/components/im-push-section";
 import { NetworkConfigSection } from "@/components/network-config-section";
-import { SiteConfigSection } from "@/components/site-config-section";
+import { SiteConfigSection, SitesSectionSubtitle } from "@/components/site-config-section";
 import { SubscriptionSettingsSection } from "@/components/subscription-settings-section";
 import { SystemLogsSection } from "@/components/system-logs-section";
 import { WebhookSection } from "@/components/webhook-section";
@@ -152,7 +152,12 @@ export function SettingsPanel({ active }: SettingsPanelProps) {
               {section.label}
             </h1>
             <p className="text-on-image mt-0.5 text-ui text-[var(--text-muted)]">
-              {section.description}
+              {/* 资源站点分区的副标题是活的：有站点时显示健康统计，无站点回落介绍 */}
+              {section.id === "sites" ? (
+                <SitesSectionSubtitle fallback={section.description} />
+              ) : (
+                section.description
+              )}
             </p>
           </div>
         </header>

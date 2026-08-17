@@ -5,7 +5,7 @@ import { useEffect, useRef, useState } from "react";
 import { LiquidGlassButton } from "@/vendor/liquid-glass";
 
 import { useConfirm } from "@/components/feedback";
-import { GripIcon, PlusIcon } from "@/components/icons";
+import { GripIcon } from "@/components/icons";
 import { listConfiguredSites, listSiteCatalog } from "@/lib/api/sites";
 import { useBackdrop } from "@/lib/backdrop";
 import {
@@ -83,8 +83,9 @@ interface SiteOption {
  * 一个统一混排的标签列表：内置分类（不可删只可隐藏）与自定义分类（可增删改）
  * 同列拖拽排序、同款显隐开关；「全部」固定在搜索面板首位，不在此列表中。
  *
- * 自定义分类 = 命名的「分类组合 × 站点组合」预设：底部「新建自定义分类」
- * 打开编辑器（名称 + 分类勾选 + 站点勾选），分类/站点都不勾选表示「不限」。
+ * 自定义分类 = 命名的「分类组合 × 站点组合」预设：新建入口在父分区的工具栏
+ * （与「添加站点」同位同款主按钮），经 ``createRequest`` 信号触发本组件打开
+ * 编辑器（名称 + 分类勾选 + 站点勾选），分类/站点都不勾选表示「不限」。
  * 站点勾选器只列**已配置**站点；暂时不可用（禁用/验证未通过）的照样可勾选，
  * 搜索时会自动跳过。
  *
@@ -94,7 +95,7 @@ interface SiteOption {
  * 拖拽用原生 Pointer Events 手写（约 60 行），不为此引入 dnd 库：
  * 场景是单列定长小列表，库的能力（多容器、虚拟滚动、传感器抽象）全用不上。
  */
-export function SearchSection() {
+export function SearchSection({ createRequest = 0 }: { createRequest?: number }) {
   const { backdrop } = useBackdrop();
   const confirm = useConfirm();
   const { tabs, loading, saveTabs } = useSearchPrefs();
@@ -103,6 +104,12 @@ export function SearchSection() {
   const [drag, setDrag] = useState<DragState | null>(null);
   const [editor, setEditor] = useState<EditorState | null>(null);
   const rowRefs = useRef<(HTMLDivElement | null)[]>([]);
+
+  // 父分区工具栏的「新建自定义分类」按钮：每点一次计数 +1，这里响应信号
+  // 打开空白编辑器（初始 0 不触发，避免挂载即弹编辑器）
+  useEffect(() => {
+    if (createRequest > 0) openEditor(null);
+  }, [createRequest]);
 
   /** 统一的保存包装：清错误 + busy 防抖 + 中文错误回显；返回是否成功。 */
   const apply = async (next: SearchTab[]): Promise<boolean> => {
@@ -366,18 +373,6 @@ export function SearchSection() {
           ))}
         </div>
 
-        {/* 新建入口：编辑器打开时收起，避免两个入口打架 */}
-        {!editor && (
-          <button
-            type="button"
-            onClick={() => openEditor(null)}
-            disabled={busy || loading}
-            className="btn-glass mt-3 px-3.5 py-2 text-sub font-medium disabled:opacity-40"
-          >
-            <PlusIcon className="size-4" />
-            <span>新建自定义分类</span>
-          </button>
-        )}
       </section>
 
       {editor && (
