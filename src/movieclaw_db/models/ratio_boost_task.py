@@ -76,5 +76,10 @@ class RatioBoostTask(TimestampMixin, table=True):
     last_checked_at: datetime | None = Field(
         default=None, description="最近一次与下载器对账时间"
     )
+    # 蜂群快照（每 tick 由下载器回报刷新）：汰换的第二信源——EMA 只说
+    # "过去传得快不快"，蜂群说"未来还有没有人要"。leechers=0 的死种
+    # 不必等测量成熟即可汰换；NULL=下载器未提供（旧适配器/无 tracker 数据）
+    swarm_seeders: int | None = Field(default=None, description="蜂群做种数；NULL=未知")
+    swarm_leechers: int | None = Field(default=None, description="蜂群下载数；NULL=未知")
     evicted_at: datetime | None = Field(default=None, description="汰换/失踪的时间")
     evict_reason: str | None = Field(default=None, description="汰换原因（中文，展示用）")

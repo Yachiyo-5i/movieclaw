@@ -222,9 +222,14 @@ class CredentialRepository:
         return True
 
     async def set_ratio_boost(
-        self, site_id: str, *, enabled: bool, budget_bytes: int | None = None
+        self,
+        site_id: str,
+        *,
+        enabled: bool,
+        budget_bytes: int | None = None,
+        hold_days: int | None = None,
     ) -> bool:
-        """设置自动刷分享率开关与存储预算。budget_bytes 为 None 时不改预算。
+        """设置自动刷分享率开关、存储预算与汰换保留期。None 的字段不修改。
 
         返回是否命中记录（False 表示站点不存在）。
         """
@@ -234,6 +239,8 @@ class CredentialRepository:
         row.boost_enabled = enabled
         if budget_bytes is not None:
             row.boost_budget_bytes = budget_bytes
+        if hold_days is not None:
+            row.boost_hold_days = hold_days
         row.updated_at = utcnow()
         await self._session.commit()
         return True

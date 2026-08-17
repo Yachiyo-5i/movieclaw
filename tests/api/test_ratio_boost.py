@@ -232,11 +232,49 @@ class TestEviction:
         assert math.isinf(turnover_seconds(_task(upload_rate_ema=0.0)))
 
     def test_hold_period_is_inviolable(self) -> None:
-        """入池不满 72 小时的任务在任何条件下不可汰换（H&R 安全垫）。"""
+        """入池不满保留期（默认 3 天）的任务在任何条件下不可汰换（H&R 安全垫）。"""
         young = _task(created_at=_NOW - timedelta(hours=71), upload_rate_ema=0.0)
         assert not evictable(young, _NOW)
         old = _task(created_at=_NOW - timedelta(hours=73), upload_rate_ema=0.0)
         assert evictable(old, _NOW)
+
+    def test_hold_is_per_site_configurable(self) -> None:
+        """保留期每站可配：7 天的站 5 天龄任务仍受保护；0 天 = 不设 H&R 保护。"""
+        aged_5d = _task(created_at=_NOW - timedelta(days=5), upload_rate_ema=0.0)
+        assert not evictable(aged_5d, _NOW, hold=timedelta(days=7))
+        assert evictable(aged_5d, _NOW, hold=timedelta(days=0))
+
+    def test_hold_zero_still_needs_mature_measurement(self) -> None:
+        """hold=0 关闭的是 H&R 保护，不是判定质量：刚下完 EMA 还没暖起来的
+        种子（蜂群还有下载者）不可因"看起来慢"被误杀；测量满 24h 后慢就是真慢。"""
+        fresh = _task(
+            created_at=_NOW - timedelta(hours=2),
+            upload_rate_ema=0.0,
+            swarm_leechers=5,
+        )
+        assert not evictable(fresh, _NOW, hold=timedelta(0))
+        measured = _task(
+            created_at=_NOW - timedelta(hours=25),
+            upload_rate_ema=0.0,
+            swarm_leechers=5,
+        )
+        assert evictable(measured, _NOW, hold=timedelta(0))
+
+    def test_dead_swarm_skips_maturity_wait(self) -> None:
+        """蜂群已死（tracker 汇报 0 下载者）= 未来注定零产出，不必等测量成熟
+        即可汰换（仍须过保留期）；蜂群未知（None）不算死，宁可多留。"""
+        dead_fresh = _task(
+            created_at=_NOW - timedelta(hours=2),
+            upload_rate_ema=0.0,
+            swarm_leechers=0,
+        )
+        assert evictable(dead_fresh, _NOW, hold=timedelta(0))
+        unknown_fresh = _task(
+            created_at=_NOW - timedelta(hours=2),
+            upload_rate_ema=0.0,
+            swarm_leechers=None,
+        )
+        assert not evictable(unknown_fresh, _NOW, hold=timedelta(0))
 
     def test_uncompleted_and_fast_turnover_are_kept(self) -> None:
         assert not evictable(_task(completed=False), _NOW)
@@ -265,6 +303,19 @@ class TestEviction:
         picked = pick_evictions([dense, sparse], need_bytes=30 * _GIB, now=_NOW)
         assert picked is not None
         assert [t.torrent_id for t in picked] == ["sparse"]
+
+    def test_dead_swarm_evicted_before_slower_alive(self) -> None:
+        """死种最先走：蜂群 0 下载者的种子未来注定零产出，优先于周转更慢
+        但蜂群里还有人的种子——后者可能只是暂时安静。"""
+        alive_slower = _task(
+            torrent_id="alive", size_bytes=10 * _GIB, upload_rate_ema=100.0, swarm_leechers=3
+        )
+        dead_faster = _task(
+            torrent_id="dead", size_bytes=10 * _GIB, upload_rate_ema=500.0, swarm_leechers=0
+        )
+        picked = pick_evictions([alive_slower, dead_faster], need_bytes=10 * _GIB, now=_NOW)
+        assert picked is not None
+        assert [t.torrent_id for t in picked] == ["dead"]
 
     def test_insufficient_space_returns_none(self) -> None:
         """可汰换的加起来腾不出所需空间 → 返回 None，放弃准入而非删更多。"""

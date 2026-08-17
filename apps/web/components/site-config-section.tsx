@@ -556,8 +556,9 @@ function SiteRow({
       title: `开启「${item.display_name}」的自动刷分享率？`,
       description:
         "开启后将自动抢该站新发布的免费种子做种以提升分享率；占用空间在下方预算内" +
-        "自动汰换（只有下载完成、入池满 72 小时且上传效率过低的任务才会被连数据删除）；" +
-        "该站的索引同步会提速到约 5 分钟一次。请确认本次刷流的存储预算：",
+        `自动汰换（下载完成、入池满保留期（当前 ${site.boost_hold_days} 天，菜单可调）` +
+        "且上传效率过低的任务才会被连数据删除）；该站的索引同步会提速到约 5 分钟一次。" +
+        "请确认本次刷流的存储预算：",
       confirmLabel: "开启刷流",
     });
     if (budget == null) return;
@@ -586,11 +587,38 @@ function SiteRow({
       title: `调整「${item.display_name}」的刷流预算`,
       description:
         `当前预算 ${formatBytes(site.boost_budget_bytes)}。调小预算不会立刻删种——` +
-        "引擎按汰换规则逐步收敛到新预算，72 小时保留期内的任务绝不会被删除。",
+        "引擎按汰换规则逐步收敛到新预算，保留期内的任务绝不会被删除。",
       confirmLabel: "保存",
     });
     if (budget == null || budget === site.boost_budget_bytes) return;
     await guard(async () => onChanged(await setSiteRatioBoost(site.site_id, true, budget)));
+  }
+
+  /** 调整汰换保留期（仅开启时可见）：H&R 安全垫，无考核的站可调 0。 */
+  async function adjustHold() {
+    const raw = await prompt({
+      title: `调整「${item.display_name}」的汰换保留期`,
+      description:
+        `当前 ${site.boost_hold_days} 天。刷流任务入池满该天数才可被汰换——这是 H&R ` +
+        "考核的安全垫，有考核的站点务必不小于考核要求的做种时长。该站没有 H&R 时" +
+        "可调为 0：不设保护、自由汰换（引擎仍会避免误杀刚下完还没测出效率的种子）。",
+      initialValue: String(site.boost_hold_days),
+      placeholder: "保留天数",
+      kind: "number",
+      min: 0,
+      unit: "天",
+      confirmLabel: "保存",
+    });
+    if (raw == null) return;
+    const days = Math.round(Number(raw.trim()));
+    if (!Number.isFinite(days) || days < 0 || days > 30) {
+      onError("汰换保留期须是 0～30 之间的整数（天）");
+      return;
+    }
+    if (days === site.boost_hold_days) return;
+    await guard(async () =>
+      onChanged(await setSiteRatioBoost(site.site_id, true, undefined, days)),
+    );
   }
 
   return (
@@ -685,6 +713,7 @@ function SiteRow({
             onEnableBoost={() => void enableBoost()}
             onDisableBoost={() => void disableBoost()}
             onAdjustBudget={() => void adjustBudget()}
+            onAdjustHold={() => void adjustHold()}
             onEditAuth={() => {
               onOpen();
               setEditingAuth(true);
@@ -771,6 +800,10 @@ function SiteDetail({
             <DetailStat
               label="累计上传"
               value={formatBytes(boost?.uploaded_bytes_total ?? 0)}
+            />
+            <DetailStat
+              label="汰换保留期"
+              value={site.boost_hold_days > 0 ? `${site.boost_hold_days} 天` : "不保护"}
             />
             {boost && boost.evicted_count > 0 && (
               <DetailStat label="已汰换" value={String(boost.evicted_count)} />
@@ -1036,6 +1069,7 @@ interface SiteActionsMenuProps {
   onEnableBoost: () => void;
   onDisableBoost: () => void;
   onAdjustBudget: () => void;
+  onAdjustHold: () => void;
   onEditAuth: () => void;
   onReverify: () => void;
   onDelete: () => void;
@@ -1049,6 +1083,7 @@ function SiteActionsMenu({
   onEnableBoost,
   onDisableBoost,
   onAdjustBudget,
+  onAdjustHold,
   onEditAuth,
   onReverify,
   onDelete,
@@ -1105,9 +1140,18 @@ function SiteActionsMenu({
             {site.boost_enabled ? "关闭刷流…" : "开启刷流…"}
           </DropdownMenu.Item>
           {site.boost_enabled && (
-            <DropdownMenu.Item onSelect={onAdjustBudget} disabled={busy} className={itemClass}>
-              调整刷流预算…
-            </DropdownMenu.Item>
+            <>
+              <DropdownMenu.Item
+                onSelect={onAdjustBudget}
+                disabled={busy}
+                className={itemClass}
+              >
+                调整刷流预算…
+              </DropdownMenu.Item>
+              <DropdownMenu.Item onSelect={onAdjustHold} disabled={busy} className={itemClass}>
+                调整汰换保留期…
+              </DropdownMenu.Item>
+            </>
           )}
           <DropdownMenu.Item onSelect={onEditAuth} disabled={busy} className={itemClass}>
             编辑授权

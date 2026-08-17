@@ -74,8 +74,9 @@ _STUCK_AFTER = timedelta(hours=48)
 # 免费窗口安全垫：按保守下载速度估算下载时长，窗口不足即放弃
 _ASSUMED_DL_SPEED = 5 * 1024 * 1024  # 5 MiB/s
 _MIN_FREE_MARGIN = timedelta(hours=2)
-# 汰换三条件：下载完成 + 入池满 72 小时（H&R 安全垫）+ 周转太慢（见下）
-_MIN_HOLD = timedelta(hours=72)
+# 汰换的最低保留期（H&R 安全垫）默认值：每站可配（boost_hold_days），
+# 默认 3 天覆盖多数站点考核时长；无 H&R 的站可调 0 = 自由汰换
+_DEFAULT_MIN_HOLD = timedelta(days=3)
 # 效率的衡量单位是「周转」= 单位存储的上传速度（rate/size）。预算约束的是
 # 存储×时间，最大化总上传是个背包问题，按密度（rate/size）贪心保留/汰换
 # 即近似最优——绝对速度会留错资产：200 GiB 跑 10 KiB/s（周转 240 天）远差于
@@ -175,12 +176,19 @@ def assess_candidate(
     return True, score
 
 
+def hold_for(cred: SiteCredential) -> timedelta:
+    """站点的汰换保留期（H&R 安全垫）：boost_hold_days，0 = 不设保护。"""
+    return timedelta(days=max(0, cred.boost_hold_days))
+
+
 def apply_observation(
     task: RatioBoostTask,
     *,
     uploaded_bytes: int | None,
     completed: bool,
     now: datetime,
+    swarm_seeders: int | None = None,
+    swarm_leechers: int | None = None,
 ) -> None:
     """把下载器的一次观测写回台账：完成位 + 上传量差分 → 上传速度 EMA。
 
@@ -199,6 +207,11 @@ def apply_observation(
             alpha = 1 - math.exp(-dt / _EMA_WINDOW_SECONDS)
             task.upload_rate_ema = alpha * rate + (1 - alpha) * task.upload_rate_ema
         task.uploaded_bytes = max(uploaded_bytes, 0)
+    # 蜂群快照只在下载器有汇报时覆盖（None 保留上次已知值，不可当 0）
+    if swarm_seeders is not None:
+        task.swarm_seeders = swarm_seeders
+    if swarm_leechers is not None:
+        task.swarm_leechers = swarm_leechers
     task.last_checked_at = now
     task.updated_at = now
 
@@ -276,26 +289,50 @@ def turnover_seconds(task: RatioBoostTask) -> float:
     return task.size_bytes / task.upload_rate_ema
 
 
-def evictable(task: RatioBoostTask, now: datetime) -> bool:
-    """任务是否可被汰换：下载完成 + 过了最低保留期 + 周转太慢。
+def swarm_dead(task: RatioBoostTask) -> bool:
+    """蜂群是否已死：tracker 明确汇报 0 个下载者。
+
+    这是「未来还有没有人要」的直接证据——EMA 只能说明过去。None（下载器
+    未提供蜂群数据）不算死，宁可多留不误杀。
+    """
+    return task.swarm_leechers == 0
+
+
+def evictable(
+    task: RatioBoostTask, now: datetime, *, hold: timedelta = _DEFAULT_MIN_HOLD
+) -> bool:
+    """任务是否可被汰换：下载完成 + 过了保留期 + 周转太慢 + 判定成熟。
 
     「周转太慢」= 按当前上传 EMA，10 天都传不出自己体积的一遍（rate/size
     密度地板）。用周转而非绝对速度：预算约束的是存储×时间，留下的应该是
-    单位存储产出高的资产——大种子必须跑出与体积相称的速度才配占着位置。
+    单位存储产出高的资产。
 
-    72 小时保留期是 H&R 的安全垫（候选虽排除了明确 H&R，但多数站点不提供
-    标记），任何预算压力下都不能绕过。
+    双信源的判定成熟度（对 hold=0 的站尤其关键）：EMA 窗口是 24 小时，
+    刚下完的种子 EMA 还没暖起来，只看它必然误杀。因此周转慢还要满足其一：
+
+    - **蜂群已死**（tracker 汇报 0 下载者）——未来也不会有产出，立即可换；
+    - **测量已成熟**（入池 ≥ 24 小时）——EMA 已是公平读数，慢就是真慢。
+
+    ``hold`` 是每站可配的 H&R 安全垫（boost_hold_days），0 = 站点无考核、
+    不设保护；成熟度门槛与它独立——那不是保护，是判定质量。
     """
-    return (
+    if not (
         task.state == BoostTaskState.ACTIVE
         and task.completed
-        and now - task.created_at >= _MIN_HOLD
+        and now - task.created_at >= hold
         and turnover_seconds(task) > _EVICT_TURNOVER_DAYS * 86400
-    )
+    ):
+        return False
+    mature = (now - task.created_at).total_seconds() >= _EMA_WINDOW_SECONDS
+    return mature or swarm_dead(task)
 
 
 def admission_headroom(
-    tasks: list[RatioBoostTask], budget_bytes: int, now: datetime
+    tasks: list[RatioBoostTask],
+    budget_bytes: int,
+    now: datetime,
+    *,
+    hold: timedelta = _DEFAULT_MIN_HOLD,
 ) -> int:
     """当前的准入余量 = 剩余预算 + 可汰换任务的占用。
 
@@ -304,20 +341,34 @@ def admission_headroom(
     准入扫描与索引同步的快节奏（wants_fast_sync）都以它为开关。
     """
     used = sum(t.size_bytes for t in tasks if t.state == BoostTaskState.ACTIVE)
-    reclaimable = sum(t.size_bytes for t in tasks if evictable(t, now))
+    reclaimable = sum(t.size_bytes for t in tasks if evictable(t, now, hold=hold))
     return budget_bytes - used + reclaimable
 
 
+def eviction_order_key(task: RatioBoostTask) -> tuple[int, float]:
+    """汰换顺序：蜂群已死的最先走（未来注定零产出），其余按周转从慢到快。
+
+    死种排最前是双信源策略的核心收益——同样"周转 30 天"的两个种子，
+    蜂群 0 下载者的那个没有任何翻身可能，而还有下载者的那个可能只是
+    暂时安静，应该后走。
+    """
+    return (0 if swarm_dead(task) else 1, -turnover_seconds(task))
+
+
 def pick_evictions(
-    tasks: list[RatioBoostTask], need_bytes: int, now: datetime
+    tasks: list[RatioBoostTask],
+    need_bytes: int,
+    now: datetime,
+    *,
+    hold: timedelta = _DEFAULT_MIN_HOLD,
 ) -> list[RatioBoostTask] | None:
-    """从可汰换任务里按周转从慢到快（单位存储产出从低到高）挑出足够腾出
-    need_bytes 的一批。
+    """从可汰换任务里按汰换顺序（死种优先，再按单位存储产出从低到高）挑出
+    足够腾出 need_bytes 的一批。
 
     腾不够返回 None——调用方放弃准入，**绝不提前动保留期内的任务**。
     """
     candidates = sorted(
-        (t for t in tasks if evictable(t, now)), key=turnover_seconds, reverse=True
+        (t for t in tasks if evictable(t, now, hold=hold)), key=eviction_order_key
     )
     picked: list[RatioBoostTask] = []
     freed = 0
@@ -433,7 +484,12 @@ async def _refresh_tasks(
             continue
         uploaded_before = task.uploaded_bytes
         apply_observation(
-            task, uploaded_bytes=brief.uploaded_bytes, completed=brief.completed, now=now
+            task,
+            uploaded_bytes=brief.uploaded_bytes,
+            completed=brief.completed,
+            now=now,
+            swarm_seeders=brief.swarm_seeders,
+            swarm_leechers=brief.swarm_leechers,
         )
         # 上传增量按站点归集（下载器重建导致的负差分已在 apply_observation 归零基线）
         gained = max(0, task.uploaded_bytes - uploaded_before)
@@ -596,7 +652,8 @@ async def _admit_candidates(
     # 余量开关：池子满且换不动时不扫候选（发现了也下不了）；同步端由
     # wants_fast_sync 同一判据回落节奏。有余量时若游标还在慢排期（此前
     # 无余量回落遗留的），推一把让发现速度立刻恢复
-    if admission_headroom(site_tasks, budget, now) < _MIN_ADMISSION_HEADROOM:
+    hold = hold_for(cred)
+    if admission_headroom(site_tasks, budget, now, hold=hold) < _MIN_ADMISSION_HEADROOM:
         return
     await _nudge_slow_cursor(session, site_id, now)
 
@@ -672,7 +729,7 @@ async def _admit_candidates(
         space = budget - used
         if size > space:
             # 预算不够：尝试汰换低效任务腾位；腾不出就看下一个（更小的）候选
-            plan = pick_evictions(site_tasks, size - space, now)
+            plan = pick_evictions(site_tasks, size - space, now, hold=hold)
             if plan is None:
                 continue
             for victim in plan:
@@ -802,11 +859,10 @@ async def run_ratio_boost() -> None:
                 # ② 预算收敛：用户调小预算后逐步退到预算内（绝不动保留期内任务）
                 used = sum(t.size_bytes for t in site_tasks)
                 if used > cred.boost_budget_bytes:
-                    # 周转最慢（单位存储产出最低）的先走
+                    # 死种优先，再按周转从慢到快（单位存储产出最低的先走）
                     for victim in sorted(
-                        (t for t in site_tasks if evictable(t, now)),
-                        key=turnover_seconds,
-                        reverse=True,
+                        (t for t in site_tasks if evictable(t, now, hold=hold_for(cred))),
+                        key=eviction_order_key,
                     ):
                         if used <= cred.boost_budget_bytes:
                             break
@@ -842,7 +898,7 @@ async def wants_fast_sync(session: AsyncSession, cred: SiteCredential) -> bool:
         .all()
     )
     return (
-        admission_headroom(list(tasks), cred.boost_budget_bytes, utcnow())
+        admission_headroom(list(tasks), cred.boost_budget_bytes, utcnow(), hold=hold_for(cred))
         >= _MIN_ADMISSION_HEADROOM
     )
 

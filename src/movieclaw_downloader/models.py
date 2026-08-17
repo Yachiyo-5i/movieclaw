@@ -150,6 +150,10 @@ class TorrentBrief(BaseModel):
     # （会把效率 EMA 错误地打到 0 而触发误汰换）。
     uploaded_bytes: int | None = None
     ratio: float | None = None
+    # 蜂群规模（tracker 汇报的全网数字，非已连接 peer 数）：刷流汰换的第二
+    # 信源——leechers=0 的死种可立即汰换。None=下载器未提供，不可当 0
+    swarm_seeders: int | None = None
+    swarm_leechers: int | None = None
     eta_seconds: int | None = None
     state: str = "unknown"
 

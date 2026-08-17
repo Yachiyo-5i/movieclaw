@@ -221,6 +221,22 @@ class TransmissionDownloader(BaseDownloader):
     async def list_torrents(self) -> list[TorrentBrief]:
         return await asyncio.to_thread(self._list_torrents_sync)
 
+    @staticmethod
+    def _swarm_counts(torrent) -> tuple[int | None, int | None]:  # noqa: ANN001
+        """从 trackerStats 取蜂群规模（全网 seeder/leecher 数，跨 tracker 取最大）。
+
+        -1 表示该 tracker 未汇报，跳过；一个都没有 → None（未知，不可当 0）。
+        """
+        stats = torrent.fields.get("trackerStats") or []
+        seeders = [int(s.get("seederCount", -1)) for s in stats]
+        leechers = [int(s.get("leecherCount", -1)) for s in stats]
+        valid_seeders = [v for v in seeders if v >= 0]
+        valid_leechers = [v for v in leechers if v >= 0]
+        return (
+            max(valid_seeders) if valid_seeders else None,
+            max(valid_leechers) if valid_leechers else None,
+        )
+
     def _list_torrents_sync(self) -> list[TorrentBrief]:
         client = self._client()
         with _translate_errors(self.config.url):
@@ -231,6 +247,7 @@ class TransmissionDownloader(BaseDownloader):
             progress = float(torrent.percent_done)
             completed = progress >= 1.0
             eta = int(torrent.fields.get("eta", -1))
+            swarm_seeders, swarm_leechers = self._swarm_counts(torrent)
             briefs.append(
                 TorrentBrief(
                     name=torrent.name,
@@ -262,6 +279,8 @@ class TransmissionDownloader(BaseDownloader):
                         if float(torrent.fields.get("uploadRatio", -1)) >= 0
                         else None
                     ),
+                    swarm_seeders=swarm_seeders,
+                    swarm_leechers=swarm_leechers,
                     eta_seconds=eta if eta > 0 else None,
                     state=_normalize_state(torrent, completed=completed),
                 )

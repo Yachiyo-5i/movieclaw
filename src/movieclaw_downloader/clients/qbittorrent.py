@@ -253,6 +253,17 @@ class QBittorrentDownloader(BaseDownloader):
                         if getattr(torrent, "ratio", None) is not None
                         else None
                     ),
+                    # num_complete/num_incomplete 是 tracker 汇报的全网蜂群规模
+                    swarm_seeders=(
+                        int(torrent.num_complete)
+                        if getattr(torrent, "num_complete", None) is not None
+                        else None
+                    ),
+                    swarm_leechers=(
+                        int(torrent.num_incomplete)
+                        if getattr(torrent, "num_incomplete", None) is not None
+                        else None
+                    ),
                     eta_seconds=eta if 0 < eta < 8640000 else None,
                     state=_normalize_state(str(getattr(torrent, "state", "")), completed=completed),
                 )
