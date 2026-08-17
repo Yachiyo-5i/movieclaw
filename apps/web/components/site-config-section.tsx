@@ -224,33 +224,40 @@ export function SiteConfigSection() {
     [configured],
   );
 
-  // 顶部健康摘要：站点总数 / 异常数 / 保护数 / 刷流近 24h 总产出
-  const failedCount = configured.filter((s) => s.status === "failed").length;
-  const protectedCount = configured.filter((s) => s.protected).length;
-  const boost24h = Object.values(boostStats).reduce(
-    (sum, s) => sum + (s.uploaded_bytes_24h || 0),
-    0,
-  );
-
   return (
     <div className="space-y-5">
-      {/* 胶囊标签切换：与「外观」分区同一交互语言 */}
-      <div className="flex gap-1.5">
-        {TABS.map((t) => (
+      {/* 工具栏行：左侧胶囊标签切换视图，右侧主操作——描述（分区副标题）之下
+          的第一行。接入统计已上移到分区副标题，这里不再重复；刷新按钮省去
+          （验证轮询 + 操作后回写已覆盖刷新诉求）。 */}
+      <div className="flex items-center justify-between gap-3">
+        <div className="flex gap-1.5">
+          {TABS.map((t) => (
+            <button
+              key={t.id}
+              type="button"
+              aria-pressed={t.id === tab}
+              onClick={() => setTab(t.id)}
+              className={`rounded-full px-3.5 py-1.5 text-sub font-medium transition-colors ${
+                t.id === tab
+                  ? "bg-white/[0.14] text-white"
+                  : "text-[var(--text-muted)] hover:bg-white/[0.07] hover:text-[var(--text)]"
+              }`}
+            >
+              {t.label}
+            </button>
+          ))}
+        </div>
+        {tab === "sites" && (
           <button
-            key={t.id}
             type="button"
-            aria-pressed={t.id === tab}
-            onClick={() => setTab(t.id)}
-            className={`rounded-full px-3.5 py-1.5 text-sub font-medium transition-colors ${
-              t.id === tab
-                ? "bg-white/[0.14] text-white"
-                : "text-[var(--text-muted)] hover:bg-white/[0.07] hover:text-[var(--text)]"
-            }`}
+            onClick={() => setAdding((v) => !v)}
+            disabled={loading}
+            className="btn-accent flex shrink-0 items-center gap-1 rounded-full py-1.5 pl-2.5 pr-3.5 text-sub font-semibold disabled:opacity-60"
           >
-            {t.label}
+            <PlusIcon className="size-4" />
+            添加站点
           </button>
-        ))}
+        )}
       </div>
 
       {tab === "search" ? (
@@ -262,47 +269,6 @@ export function SiteConfigSection() {
               {error}
             </div>
           )}
-
-          <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2">
-            <p className="text-sub text-[var(--text-muted)]">
-              {loading ? (
-                "加载中…"
-              ) : (
-                <>
-                  已接入 {configured.length} 个站点
-                  {failedCount > 0 && (
-                    <>
-                      {" · "}
-                      <span className="font-medium text-[var(--danger)]">
-                        {failedCount} 个异常
-                      </span>
-                    </>
-                  )}
-                  {protectedCount > 0 && ` · ${protectedCount} 个保护中`}
-                  {boost24h > 0 && ` · 刷流近24h ↑${formatBytes(boost24h)}`}
-                </>
-              )}
-            </p>
-            <div className="flex shrink-0 items-center gap-2.5">
-              <button
-                type="button"
-                onClick={() => void load()}
-                disabled={loading}
-                className="btn-glass px-3.5 py-1.5 text-sub font-medium"
-              >
-                刷新
-              </button>
-              <button
-                type="button"
-                onClick={() => setAdding((v) => !v)}
-                disabled={loading}
-                className="btn-accent flex items-center gap-1 rounded-full py-1.5 pl-2.5 pr-3.5 text-sub font-semibold disabled:opacity-60"
-              >
-                <PlusIcon className="size-4" />
-                添加站点
-              </button>
-            </div>
-          </div>
 
           {/* 「添加站点」面板：从目录里挑选未配置的站点 */}
           {adding && (
