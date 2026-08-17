@@ -336,6 +336,17 @@ function PosterCardContent({
             {ribbon.label}
           </span>
         )}
+        {/* 右上：洗版徽标（订阅墙专属，posterFooter 才会带 upgradingCount；
+            订阅墙不渲染评分徽章，右上角位无冲突）。青色与详情页洗版色同源 */}
+        {item.posterFooter?.upgrading && item.posterFooter.upgradingCount != null && (
+          <span className="tnum absolute right-2 top-2 z-10 flex items-center gap-1 rounded-md bg-black/70 px-1.5 py-0.5 text-caption font-semibold text-[#2dd4bf]">
+            <span
+              aria-hidden="true"
+              className="size-1.5 rounded-full bg-[#2dd4bf] shadow-[0_0_6px_rgba(45,212,191,0.6)]"
+            />
+            洗 {item.posterFooter.upgradingCount}
+          </span>
+        )}
         {/* 右上：评分徽章（暂无评分时不渲染，避免展示 0.0） */}
         {item.rating > 0 && (
           <span
@@ -366,15 +377,6 @@ function PosterCardContent({
                     className="size-1.5 rounded-full bg-[#2dd4bf] shadow-[0_0_7px_rgba(45,212,191,0.55)]"
                   />
                 ) : null}
-                {item.posterFooter.upgrading &&
-                  item.posterFooter.upgradingCount != null && (
-                    // 点位让给绿点（追更优先），但「洗 N」文字不让：追更中的
-                    // 订阅同样可能挂着大批洗版单元（十三邀实测 59 集），
-                    // 只在完结剧显示会让在播剧的洗版彻底隐形
-                    <span className="font-medium text-[#2dd4bf]">
-                      洗 {item.posterFooter.upgradingCount}
-                    </span>
-                  )}
                 {item.posterFooter.value}
               </span>
             </p>

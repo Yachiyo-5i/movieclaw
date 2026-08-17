@@ -790,6 +790,9 @@ function toVisualItem(
     genres: scope ? [scope] : undefined,
     overlayMeta: configFlow || undefined,
     ribbon: subscriptionFollowRibbon(sub),
+    // 「自动续订」用紧凑左上斜标：右上角让给「洗 N」洗版徽标（常驻状态
+    // 数量比能力开关更值得占主视觉位）
+    ribbonVariant: "compact-left",
     posterFooter: subscriptionCollectionMeta(sub),
   };
 }
