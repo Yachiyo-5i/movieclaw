@@ -100,11 +100,23 @@ async def check_download_progress() -> None:
                 .scalars()
                 .all()
             )
-            if not attempts:
+            # 孤儿在途组：attempt 已终态（imported/failed/superseded/retained，
+            # cancelled 已被 _ensure_attempts 复活）但名下工单仍在途——心跳
+            # 不再照看它们，完成核验轮不到，覆盖虚标的缺集会永久挂起
+            watched_keys = {
+                (a.subscription_id, (a.info_hash or "").lower()) for a in attempts
+            }
+            orphaned = sorted(
+                {(sub_id, h.lower()) for (sub_id, h) in groups} - watched_keys
+            )
+            if not attempts and not orphaned:
                 return
             downloaders = await _usable_downloaders(session)
         if not downloaders:
-            logger.warning("有 %d 个订阅下载等待照看，但没有可用的下载器", len(attempts))
+            logger.warning(
+                "有 %d 个订阅下载等待照看，但没有可用的下载器",
+                len(attempts) + len(orphaned),
+            )
             return
         for attempt in attempts:
             if attempt.id is None:
@@ -124,6 +136,11 @@ async def check_download_progress() -> None:
                     await run_replacement_search(attempt.id)
             except Exception:  # noqa: BLE001 -- 单组失败不拖垮整轮
                 logger.exception("订阅下载尝试 #%s 的换源巡检失败", attempt.id)
+        for sub_id, info_hash in orphaned:
+            try:
+                await _reconcile_orphaned_group(sub_id, info_hash, downloaders)
+            except Exception:  # noqa: BLE001 -- 单组失败不拖垮整轮
+                logger.exception("孤儿在途工单对账失败：订阅 #%s 种子 %s", sub_id, info_hash)
 
 
 async def _pipeline_groups(
@@ -792,6 +809,49 @@ async def _rescue_group(
 # 落点核验宽限期：完成后给下载器归位文件/网络盘可见性留出的窗口
 _LANDING_GRACE_MINUTES = 10
 _MISSING_RETRY_MINUTES = 30
+
+
+async def _reconcile_orphaned_group(
+    subscription_id: int,
+    info_hash: str,
+    downloaders: list[tuple[DownloaderClient, DownloaderConfig]],
+) -> None:
+    """孤儿在途工单的完成对账：attempt 终态、工单还挂着的组。
+
+    洗版的混合投递会在种子仍在下载时就被验证收口——分批入库先交付了洗版
+    目标集，attempt 置 imported、离开心跳照看集合；种子几小时后才下载完成，
+    落点/内容核验永远轮不到它，包里根本不存在的集（覆盖虚标）就以 grabbed
+    永久挂起（真实案例：十三邀 S06 包声明整季、实际只有 E00–E10，E11 工单
+    悬挂一天无人退回）。
+
+    只处理证据充分的一种情况：种子在下载器里且已完成 → 补跑与活跃路径
+    完全相同的落点/内容核验（缺失单元退回重找 + 写负面记忆，存在的单元
+    照常等库存对账关单）。种子不在或未完成一律不动——删种救援、死种换源
+    等语义归活跃尝试的心跳状态机，这里证据不足不猜。
+    """
+    found = await _query_torrent(info_hash, downloaders)
+    if found is None or not found[1].completed:
+        return
+    downloader, status = found
+    db = get_database()
+    async with db.session() as session:
+        rows = list(
+            (
+                await session.execute(
+                    select(WantedItem).where(
+                        WantedItem.subscription_id == subscription_id,
+                        WantedItem.info_hash == info_hash,
+                        WantedItem.status.in_(_IN_FLIGHT),  # type: ignore[attr-defined]
+                        WantedItem.in_scope.is_(True),  # type: ignore[attr-defined]
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        if not rows:
+            return
+        await _verify_completed_download(session, rows, info_hash, downloader, status)
 
 
 async def _verify_completed_download(
