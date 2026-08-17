@@ -58,6 +58,11 @@ class RatioBoostTask(TimestampMixin, table=True):
     # 入池时记录的种子体积，预算占用按它累加（下载器视角的体积可能因未选
     # 文件而略小，刷流不选文件，二者一致）
     size_bytes: int = Field(description="种子体积（字节）")
+    # 准入时从索引快照的免费截止；窗口已过仍未下完的任务由止损逻辑放弃
+    # （继续下载就是付费下载，反而伤分享率）。NULL=无截止/长期免费
+    free_deadline: datetime | None = Field(
+        default=None, description="准入时的免费截止快照；NULL=无截止"
+    )
 
     state: BoostTaskState = Field(
         default=BoostTaskState.ACTIVE, index=True, description="任务状态"

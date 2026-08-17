@@ -60,6 +60,14 @@ logger = logging.getLogger("movieclaw_api.ratio_boost")
 _TICK_SECONDS = 300
 # 候选窗口：只抢发布 24 小时内的免费种（新种 peer 群最活跃，上传机会最大）
 _FRESH_WINDOW = timedelta(hours=24)
+# 促销观测新鲜度：免费/做种数来自索引快照，观测太旧时促销可能已结束，
+# 抢一个"其实已不免费"的种子会产生真实下载量——宁可等下一轮同步再看
+_VOLATILE_FRESHNESS = timedelta(hours=2)
+# 止损：免费窗口已过仍未下完（剩余超过 1/10）→ 继续下就是付费下载，放弃；
+# 下载 48 小时仍未完成 → 死种，放弃让出预算（二者都是未完成任务，
+# 不受 72 小时保留期约束——保留期保护的是已完成的做种）
+_ABANDON_REMAINING_FRACTION = 0.1
+_STUCK_AFTER = timedelta(hours=48)
 # 免费窗口安全垫：按保守下载速度估算下载时长，窗口不足即放弃
 _ASSUMED_DL_SPEED = 5 * 1024 * 1024  # 5 MiB/s
 _MIN_FREE_MARGIN = timedelta(hours=2)
@@ -130,6 +138,11 @@ def assess_candidate(
         return False, 0.0  # 没有下载者就没有上传对象
     if row.publish_time is None or now - row.publish_time > _FRESH_WINDOW:
         return False, 0.0
+    if (
+        row.volatile_refreshed_at is None
+        or now - row.volatile_refreshed_at > _VOLATILE_FRESHNESS
+    ):
+        return False, 0.0  # 促销观测太旧，等同步刷新后再评估
     if not free_window_sufficient(row.size_bytes, row.free_deadline, now):
         return False, 0.0
     score = row.leechers / ((row.seeders or 0) + 1)
@@ -182,6 +195,30 @@ def hand_over_if_claimed(
     task.evict_reason = "已被订阅/手动下载认领，移出刷流管理（预算让出，任务与数据保留）"
     task.updated_at = now
     return True
+
+
+def stop_loss_reason(task: RatioBoostTask, progress: float, now: datetime) -> str | None:
+    """未完成任务的止损判定：该放弃则返回中文原因，否则 None。
+
+    与汰换（针对已完成的做种）不同，止损针对**下载中**的任务，不受 72 小时
+    保留期约束——多数站点的 H&R 考核针对已完成下载，未完成任务放弃的风险
+    远小于"免费窗口过后继续付费下载"的确定伤害：
+
+    - 免费窗口已过、剩余还超过 1/10：每多下一字节都是付费流量，删；
+      已下到 9 成以上则放行下完（删了全白费，剩余付费量很小）；
+    - 下载 48 小时仍未完成：死种/无源，永远占着预算，删。
+    """
+    if task.completed:
+        return None
+    if (
+        task.free_deadline is not None
+        and now > task.free_deadline
+        and (1.0 - progress) > _ABANDON_REMAINING_FRACTION
+    ):
+        return f"免费窗口已过仍未下完（进度 {progress:.0%}），止损放弃避免付费下载"
+    if now - task.created_at >= _STUCK_AFTER:
+        return "下载 48 小时仍未完成（死种或无可用资源），放弃让出预算"
+    return None
 
 
 def evictable(task: RatioBoostTask, now: datetime) -> bool:
@@ -321,6 +358,10 @@ async def _refresh_tasks(
         apply_observation(
             task, uploaded_bytes=brief.uploaded_bytes, completed=brief.completed, now=now
         )
+        # 未完成任务的止损：免费窗口过期 / 长期卡死 → 连数据删除，让出预算
+        reason = stop_loss_reason(task, brief.progress or 0.0, now)
+        if reason is not None:
+            await _evict(pool, task, now, reason=reason)
     await session.commit()
 
 
@@ -515,6 +556,7 @@ async def _admit_candidates(
             downloader_id=downloader.id,
             title=row.title,
             size_bytes=size,
+            free_deadline=row.free_deadline,
         )
         session.add(task)
         await session.commit()
@@ -599,6 +641,37 @@ async def run_ratio_boost() -> None:
                 await _admit_candidates(session, pool, cred, site_tasks, now)
         finally:
             await pool.close()
+
+
+async def release_site_tasks(session: AsyncSession, site_id: str) -> int:
+    """站点配置被删除时，把该站在池的刷流任务全部转出管理，返回转出数。
+
+    预算的主体（站点）已不存在，但任务与数据保留继续做种——删数据太激进
+    （用户可能有意保种），转出后由用户在下载器里按 movieclaw-boost 分类
+    自行处理。供 SiteConfigService.delete 调用，与凭据删除同一事务节奏。
+    """
+    tasks = (
+        (
+            await session.execute(
+                select(RatioBoostTask).where(
+                    RatioBoostTask.site_id == site_id,
+                    RatioBoostTask.state == BoostTaskState.ACTIVE,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    now = utcnow()
+    for task in tasks:
+        task.state = BoostTaskState.MISSING
+        task.evicted_at = now
+        task.evict_reason = "站点配置已删除，转出刷流管理（任务与数据保留做种）"
+        task.updated_at = now
+    if tasks:
+        await session.commit()
+        logger.info("站点 %s 已删除，%d 个刷流任务转出管理（保留做种）", site_id, len(tasks))
+    return len(tasks)
 
 
 async def collect_boost_stats(session: AsyncSession) -> dict:

@@ -158,6 +158,20 @@ export function SiteConfigSection() {
     hasInProgress ? 2500 : null,
   );
 
+  // 有站点开着刷流时轻轮询运行统计（引擎 5 分钟一个 tick，30 秒刷新足够跟上），
+  // 让「已用 / 累计上传」在页面停留期间自己长，不需要用户手动刷新
+  const anyBoosting = configured.some((s) => s.boost_enabled);
+  useVisiblePolling(
+    () => {
+      void listSiteBoostStats()
+        .then(setBoostStats)
+        .catch(() => {
+          /* 轮询失败静默重试，不打断页面 */
+        });
+    },
+    anyBoosting ? 30000 : null,
+  );
+
   // 原地替换已有站点、新站点追加到末尾。
   // 注意：切换启用开关等操作也会走这里，必须保持列表顺序不变，否则被操作的站点会跳位，体验割裂。
   const upsertConfigured = useCallback((next: ConfiguredSite) => {

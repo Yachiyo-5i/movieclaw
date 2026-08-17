@@ -16,6 +16,7 @@ from movieclaw_api.services.ratio_boost import (
     free_window_sufficient,
     hand_over_if_claimed,
     pick_evictions,
+    stop_loss_reason,
 )
 from movieclaw_db.models import BoostTaskState, RatioBoostTask, SiteTorrent, TorrentSource
 
@@ -40,6 +41,7 @@ def _row(**kw) -> SiteTorrent:
         hit_and_run=None,
         download_url="https://demo/download/1",
         source=TorrentSource.LIST,
+        volatile_refreshed_at=_NOW - timedelta(minutes=5),
     )
     defaults.update(kw)
     return SiteTorrent(**defaults)
@@ -102,6 +104,13 @@ class TestAssessCandidate:
     def test_rejects_stale_publish(self) -> None:
         assert not _assess(_row(publish_time=_NOW - timedelta(hours=25)))[0]
         assert not _assess(_row(publish_time=None))[0]
+
+    def test_rejects_stale_promo_observation(self) -> None:
+        """促销观测超过 2 小时（或从未观测）不可信——促销可能已结束，
+        抢一个"其实已不免费"的种子会产生真实下载量。"""
+        assert not _assess(_row(volatile_refreshed_at=_NOW - timedelta(hours=3)))[0]
+        assert not _assess(_row(volatile_refreshed_at=None))[0]
+        assert _assess(_row(volatile_refreshed_at=_NOW - timedelta(hours=1)))[0]
 
     def test_rejects_oversized(self) -> None:
         """单种 > 预算 1/4 会让汰换失去弹性。"""
@@ -217,6 +226,44 @@ class TestEviction:
         protected_by_hold = _task(created_at=_NOW - timedelta(hours=1), size_bytes=50 * _GIB)
         small = _task(torrent_id="s", upload_rate_ema=0.0, size_bytes=5 * _GIB)
         assert pick_evictions([protected_by_hold, small], need_bytes=20 * _GIB, now=_NOW) is None
+
+
+# ---------------------------------------------------------------------------
+# 未完成任务的止损（不受 72 小时保留期约束——保留期保护的是已完成的做种）
+# ---------------------------------------------------------------------------
+
+
+class TestStopLoss:
+    def test_free_expired_with_much_remaining_abandons(self) -> None:
+        """免费窗口已过、还剩 4 成没下：每多下一字节都是付费流量，止损。"""
+        task = _task(
+            completed=False,
+            created_at=_NOW - timedelta(hours=5),
+            free_deadline=_NOW - timedelta(hours=1),
+        )
+        reason = stop_loss_reason(task, progress=0.6, now=_NOW)
+        assert reason is not None and "免费窗口" in reason
+
+    def test_free_expired_but_nearly_done_finishes(self) -> None:
+        """已下到 95%：删了全白费，剩余付费量很小，放行下完。"""
+        task = _task(
+            completed=False,
+            created_at=_NOW - timedelta(hours=5),
+            free_deadline=_NOW - timedelta(hours=1),
+        )
+        assert stop_loss_reason(task, progress=0.95, now=_NOW) is None
+
+    def test_stuck_download_abandons(self) -> None:
+        task = _task(completed=False, created_at=_NOW - timedelta(hours=49))
+        reason = stop_loss_reason(task, progress=0.3, now=_NOW)
+        assert reason is not None and "48 小时" in reason
+
+    def test_healthy_incomplete_and_completed_are_kept(self) -> None:
+        healthy = _task(completed=False, created_at=_NOW - timedelta(hours=2))
+        assert stop_loss_reason(healthy, progress=0.3, now=_NOW) is None
+        # 已完成的任务永远轮不到止损（归汰换与保留期管）
+        done = _task(completed=True, free_deadline=_NOW - timedelta(hours=1))
+        assert stop_loss_reason(done, progress=1.0, now=_NOW) is None
 
 
 # ---------------------------------------------------------------------------

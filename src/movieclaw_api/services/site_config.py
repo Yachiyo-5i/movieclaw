@@ -207,5 +207,9 @@ class SiteConfigService:
         await resolve_notices(self._session, dedupe_key=f"site:{site_id}")
         # 连带清理该站的本地种子快照与同步游标，避免重新添加时命中过期高水位
         await self._torrents.delete_site_data(site_id)
+        # 该站在池的刷流任务转出管理：预算主体已不存在，任务与数据保留做种
+        from movieclaw_api.services.ratio_boost import release_site_tasks
+
+        await release_site_tasks(self._session, site_id)
         # 作废共享客户端缓存并释放其连接
         await invalidate_site_access(site_id)
