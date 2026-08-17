@@ -346,7 +346,7 @@ function PosterCardContent({
               aria-hidden="true"
               className="size-1.5 rounded-full bg-[#2dd4bf] shadow-[0_0_6px_rgba(45,212,191,0.7)]"
             />
-            洗 {item.posterFooter.upgradingCount}
+            洗版 {item.posterFooter.upgradingCount}
           </span>
         )}
         {/* 右上：评分徽章（暂无评分时不渲染，避免展示 0.0） */}
