@@ -34,6 +34,7 @@ import {
   updateSite,
 } from "@/lib/api/sites";
 import { formatBytes, formatCompact, formatDuration, formatRatio } from "@/lib/format";
+import { cachedImageUrl } from "@/lib/image-proxy";
 import { formatRelativeTime } from "@/lib/time";
 import { useVisiblePolling } from "@/lib/use-visible-polling";
 
@@ -842,8 +843,10 @@ function SiteDetail({
 }
 
 /* —— 站点徽标：优先取站点真实 favicon（域名 + /favicon.ico），失败回落首字母 ——
-   刻意不走 Google/DuckDuckGo 的 favicon 聚合服务：目标用户网络环境里那些
-   域名普遍不可达；而用户既然配置了这个 PT 站，浏览器就一定能直连它本身。 */
+   经后端 /images/proxy 统一图片代理回源（cachedImageUrl 收口）：favicon 也是
+   站点流量，必须走 movieclaw_net 统一出口受代理路由与网络策略管控，且服务端
+   落盘缓存后浏览器不再反复触达站点。刻意不走 Google/DuckDuckGo 的 favicon
+   聚合服务：目标用户网络环境里那些域名普遍不可达。 */
 
 function SiteBadge({ item }: { item: CatalogItem }) {
   const [failed, setFailed] = useState(false);
@@ -865,12 +868,11 @@ function SiteBadge({ item }: { item: CatalogItem }) {
   }
   return (
     <span className="flex size-8 shrink-0 items-center justify-center overflow-hidden rounded-lg border border-white/[0.08] bg-white/[0.04]">
-      {/* 外站 favicon，不经 next/image 优化管道 */}
+      {/* 经统一图片代理的外站 favicon，不经 next/image 优化管道 */}
       <img
-        src={`${origin}/favicon.ico`}
+        src={cachedImageUrl(`${origin}/favicon.ico`)}
         alt=""
         loading="lazy"
-        referrerPolicy="no-referrer"
         className="size-5"
         onError={() => setFailed(true)}
       />
