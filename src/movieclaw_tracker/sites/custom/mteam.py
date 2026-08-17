@@ -22,7 +22,8 @@
 2. 站点分类 ID → 应用级 TorrentCategory 的映射来自 YAML 的 ``categories``，
    由注册表解析后通过构造器注入，本类据此构建正向/反向两张映射表。
 3. 促销力度以字符串枚举返回（NORMAL/FREE/PERCENT_70/PERCENT_50），
-   在 ``_DISCOUNT_MAP`` 中转换为下载系数。
+   在 ``_DISCOUNT_MAP`` 中转换为下载系数；积分商城「单种免费」
+   （``status.mallSingleFree``）生效期间视为全免费，见 ``_mall_free_override``。
 """
 
 from __future__ import annotations
@@ -164,6 +165,26 @@ class MTeamSite(BaseSite):
             return None
         return self._reverse_map.get(str(site_cate_id))
 
+    # -- 促销解析 ----------------------------------------------------------
+
+    def _mall_free_override(
+        self,
+        status: dict[str, Any],
+        download_factor: float,
+        free_deadline: datetime.datetime | None,
+    ) -> tuple[float, datetime.datetime | None]:
+        """积分商城「单种免费」（mallSingleFree）生效时覆盖为全免费。
+
+        用户可花积分给单个种子购买限时免费（常与置顶同时生效）。这种免费
+        **叠加在常规促销之上**：生效期间网页显示 FREE 倒计时，但 ``discount``
+        字段保持原促销值不变（如 PERCENT_50）。因此免费判定必须单独看
+        ``mallSingleFree``，否则会把免费种当折扣种处理。
+        """
+        mall = status.get("mallSingleFree") or {}
+        if mall.get("status") != "ONGOING":
+            return download_factor, free_deadline
+        return 0.0, self._parse_datetime(mall.get("endDate")) or free_deadline
+
     # -- 结果解析 ----------------------------------------------------------
 
     def _parse_datetime(self, text: str | None) -> datetime.datetime | None:
@@ -189,6 +210,9 @@ class MTeamSite(BaseSite):
             # 无截止时间的促销由折扣系数表达，deadline 保持 None，避免 9999 年哨兵
             # 进入 API/数据库后参与时区换算或日期比较。
             free_deadline = self._parse_datetime(status.get("discountEndTime"))
+            download_factor, free_deadline = self._mall_free_override(
+                status, download_factor, free_deadline
+            )
 
             # 大小：M-Team 以字节字符串返回
             size_bytes = int(t.get("size") or 0)
@@ -355,6 +379,9 @@ class MTeamSite(BaseSite):
         download_factor = _DISCOUNT_MAP.get(discount, 1.0)
         upload_factor = 2.0 if discount in _UPLOAD_2X_DISCOUNTS else 1.0
         free_deadline = self._parse_datetime(status.get("discountEndTime"))
+        download_factor, free_deadline = self._mall_free_override(
+            status, download_factor, free_deadline
+        )
 
         size_bytes = int(data.get("size") or 0)
         site_cate_id = str(data.get("category")) if data.get("category") is not None else None
