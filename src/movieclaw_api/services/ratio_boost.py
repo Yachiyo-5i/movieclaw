@@ -15,9 +15,11 @@
 
 - **只碰自己的任务**：提交时发现种子已在下载器中（``already_exists``）的
   绝不入台账管理，与订阅管线 ``owned_by_movieclaw`` 同一哲学；
-- **绝不制造 H&R**：候选排除明确标注 H&R 的种子；72 小时最低保留期兜底
-  多数站点不提供 H&R 标记（三态 NULL）的情况——保留期内的任务在任何
-  预算压力下都不会被删；
+- **绝不制造 H&R**：站点未配置 ``hr_seed_hours``（真实考核时长未知）时，
+  候选排除明确标注 H&R 的种子；配置了才敢准入，且该任务的保留期取
+  max(站点保留期, 真实考核时长)——用户设的保留天数只是"标记缺失/未知"
+  时的保底，解析到真实考核要求时以真实为准。保留期内的任务在任何预算
+  压力下都不会被删；
 - **免费窗口内下得完才抢**：免费期过后继续下载会产生真实下载量，反而
   伤害分享率，宁可放弃。
 """
@@ -75,7 +77,9 @@ _STUCK_AFTER = timedelta(hours=48)
 _ASSUMED_DL_SPEED = 5 * 1024 * 1024  # 5 MiB/s
 _MIN_FREE_MARGIN = timedelta(hours=2)
 # 汰换的最低保留期（H&R 安全垫）默认值：每站可配（boost_hold_days），
-# 默认 3 天覆盖多数站点考核时长；无 H&R 的站可调 0 = 自由汰换
+# 默认 3 天覆盖多数站点考核时长；无 H&R 的站可调 0 = 自由汰换。
+# 注意这只是"考核时长未知"时的保底：站点配置了 hr_seed_hours 且种子明确
+# 标注 H&R 时，该任务的保留期取 max(保底, 真实考核时长)，真实值优先
 _DEFAULT_MIN_HOLD = timedelta(days=3)
 # 效率的衡量单位是「周转」= 单位存储的上传速度（rate/size）。预算约束的是
 # 存储×时间，最大化总上传是个背包问题，按密度（rate/size）贪心保留/汰换
@@ -83,10 +87,19 @@ _DEFAULT_MIN_HOLD = timedelta(days=3)
 # 2 GiB 跑 8 KiB/s（周转 3 天）。地板：10 天内传不出自己体积一遍的可替换
 _EVICT_TURNOVER_DAYS = 10
 # 上传速度 EMA 的时间窗口：PT 上传以「天」为周期突发（晚高峰猛、白天静），
-# 短窗口会把昨晚狂传的种子在今天下午误判成死种。24 小时窗配合 72 小时
-# 保留期，汰换判断建立在约 3 天的公平测量上。α 按时距计算（1-e^(-dt/W)），
+# 短窗口会把昨晚狂传的种子在今天下午误判成死种。α 按时距计算（1-e^(-dt/W)），
 # tick 间隔漂移也不影响窗口语义
 _EMA_WINDOW_SECONDS = 24 * 3600
+# 汰换判定分层，均从**下载完成时刻**起算——完成前是在下载，谈不上传得慢；
+# 完成后才是做种表现的考场（EMA 从入池就在积累，含下载阶段的边下边传）：
+# - 零产出速汰：完成 6 小时累计上传仍不足 64 MiB → 蜂群根本不来要数据，
+#   不必等公平测量窗走完，及时淘汰"下完却一直起不来"的种子；
+# - 公平判定窗：完成满 12 小时（此时已观测入池至少 12 小时以上），
+#   周转仍然太慢就是真慢，进入常规汰换候选。
+# 蜂群已死（tracker 汇报 0 下载者）不受这两个窗口约束，随时可换。
+_ZERO_YIELD_AFTER = timedelta(hours=6)
+_ZERO_YIELD_BYTES = 64 * 1024**2
+_JUDGMENT_AFTER_COMPLETE = timedelta(hours=12)
 # 单种体积上限 = 预算的 1/4：单种吃掉大半预算会让汰换失去弹性
 _MAX_SIZE_BUDGET_FRACTION = 4
 # 每站每 tick 最多提交数：对站点保持克制
@@ -134,6 +147,7 @@ def assess_candidate(
     now: datetime,
     budget_bytes: int,
     tracked_torrent_ids: set[str],
+    hr_hold: timedelta | None = None,
 ) -> tuple[bool, float]:
     """评估一个索引行是否值得抢，返回（是否合格, 评分）。
 
@@ -145,6 +159,9 @@ def assess_candidate(
     每字节期望回报 ≈ L/(S+1)，体积恰好消掉。小体积的真正优势是敏捷性
     （下得快、免费窗口风险小、汰换颗粒度细），由准入排序的同分决胜体现
     （见 _admit_candidates），不在评分里重复计价。
+    ``hr_hold`` 是站点的真实 H&R 考核时长（配置文件 hr_seed_hours）：已知
+    考核要求才敢准入明确标注 H&R 的种子（其保留期按真实时长保底，见
+    evictable）；None=未知，明确 H&R 的一律拒绝。
     SQL 侧已做粗筛，这里是完整判据（防御性重复 + 可单测）。
     """
     if row.torrent_id in tracked_torrent_ids:
@@ -157,8 +174,8 @@ def assess_candidate(
         return False, 0.0
     if row.is_free is not True:
         return False, 0.0
-    if row.hit_and_run is True:
-        return False, 0.0  # 明确标注 H&R 考核的绝不碰
+    if row.hit_and_run is True and hr_hold is None:
+        return False, 0.0  # 站点考核时长未知时，明确标注 H&R 的绝不碰
     if not row.leechers or row.leechers < 1:
         return False, 0.0  # 没有下载者就没有上传对象
     if row.publish_time is None or now - row.publish_time > _FRESH_WINDOW:
@@ -181,6 +198,20 @@ def hold_for(cred: SiteCredential) -> timedelta:
     return timedelta(days=max(0, cred.boost_hold_days))
 
 
+def hr_hold_for(site_id: str) -> timedelta | None:
+    """站点的真实 H&R 考核时长（配置文件 hr_seed_hours）；未配置/站点未注册
+    返回 None。这是站点级政策事实（规则页明示），与用户设的保留天数
+    （boost_hold_days，未知时的保底）分属两个来源，取值时二者取大。"""
+    from movieclaw_tracker.exceptions import SiteNotFoundError
+    from movieclaw_tracker.registry import get_site_config
+
+    try:
+        hours = get_site_config(site_id).hr_seed_hours
+    except SiteNotFoundError:
+        return None
+    return timedelta(hours=hours) if hours and hours > 0 else None
+
+
 def apply_observation(
     task: RatioBoostTask,
     *,
@@ -196,6 +227,9 @@ def apply_observation(
     参与差分——会把 EMA 错误打到 0 触发误汰换。
     差分为负说明下载器重建过任务（重新校验/换实例），重置基线不更新 EMA。
     """
+    if completed and not task.completed:
+        # 首次观测到完成：汰换判定窗口（零产出速汰/公平判定）从此刻起算
+        task.completed_at = now
     task.completed = task.completed or completed
     if uploaded_bytes is not None:
         baseline_at = task.last_checked_at or task.created_at
@@ -299,32 +333,53 @@ def swarm_dead(task: RatioBoostTask) -> bool:
 
 
 def evictable(
-    task: RatioBoostTask, now: datetime, *, hold: timedelta = _DEFAULT_MIN_HOLD
+    task: RatioBoostTask,
+    now: datetime,
+    *,
+    hold: timedelta = _DEFAULT_MIN_HOLD,
+    hr_hold: timedelta | None = None,
 ) -> bool:
-    """任务是否可被汰换：下载完成 + 过了保留期 + 周转太慢 + 判定成熟。
+    """任务是否可被汰换：下载完成 + 过了保留期 + 周转太慢 + 完成后表现分层判定。
 
     「周转太慢」= 按当前上传 EMA，10 天都传不出自己体积的一遍（rate/size
     密度地板）。用周转而非绝对速度：预算约束的是存储×时间，留下的应该是
     单位存储产出高的资产。
 
-    双信源的判定成熟度（对 hold=0 的站尤其关键）：EMA 窗口是 24 小时，
-    刚下完的种子 EMA 还没暖起来，只看它必然误杀。因此周转慢还要满足其一：
+    保留期（在此期间任何预算压力都不删）取两个来源之大者：
 
-    - **蜂群已死**（tracker 汇报 0 下载者）——未来也不会有产出，立即可换；
-    - **测量已成熟**（入池 ≥ 24 小时）——EMA 已是公平读数，慢就是真慢。
+    - ``hold``：用户配置的站点保留天数（boost_hold_days）——H&R 标记缺失/
+      考核时长未知时的保底，0 = 不设保护；
+    - ``hr_hold``：站点真实 H&R 考核时长（hr_seed_hours），只约束准入时
+      明确标注 H&R 的任务——解析到真实要求时以真实为准，哪怕用户把保底
+      调成了 0。
 
-    ``hold`` 是每站可配的 H&R 安全垫（boost_hold_days），0 = 站点无考核、
-    不设保护；成熟度门槛与它独立——那不是保护，是判定质量。
+    过了保留期后，判定窗口从**完成时刻**起算（完成前是在下载，谈不上
+    传得慢），按证据强度分层，越确凿越早放行汰换：
+
+    - **蜂群已死**（tracker 汇报 0 下载者）——未来注定零产出，立即可换；
+    - **零产出速汰**（完成 6 小时累计上传仍不足 64 MiB）——下完却根本
+      起不来的种子不必陪跑公平测量窗，及时淘汰腾位；
+    - **公平判定窗**（完成满 12 小时）——EMA 已覆盖足够长的观测（含下载
+      阶段），周转仍慢就是真慢。
     """
+    effective_hold = hold
+    if task.hit_and_run and hr_hold is not None:
+        effective_hold = max(hold, hr_hold)
     if not (
         task.state == BoostTaskState.ACTIVE
         and task.completed
-        and now - task.created_at >= hold
+        and now - task.created_at >= effective_hold
         and turnover_seconds(task) > _EVICT_TURNOVER_DAYS * 86400
     ):
         return False
-    mature = (now - task.created_at).total_seconds() >= _EMA_WINDOW_SECONDS
-    return mature or swarm_dead(task)
+    if swarm_dead(task):
+        return True
+    # 历史数据（迁移前的已完成任务）无 completed_at，回退用入池时间——
+    # 只会把窗口算得更长（更保守），不会误杀
+    since_complete = now - (task.completed_at or task.created_at)
+    if since_complete >= _ZERO_YIELD_AFTER and task.uploaded_bytes < _ZERO_YIELD_BYTES:
+        return True
+    return since_complete >= _JUDGMENT_AFTER_COMPLETE
 
 
 def admission_headroom(
@@ -333,6 +388,7 @@ def admission_headroom(
     now: datetime,
     *,
     hold: timedelta = _DEFAULT_MIN_HOLD,
+    hr_hold: timedelta | None = None,
 ) -> int:
     """当前的准入余量 = 剩余预算 + 可汰换任务的占用。
 
@@ -341,7 +397,9 @@ def admission_headroom(
     准入扫描与索引同步的快节奏（wants_fast_sync）都以它为开关。
     """
     used = sum(t.size_bytes for t in tasks if t.state == BoostTaskState.ACTIVE)
-    reclaimable = sum(t.size_bytes for t in tasks if evictable(t, now, hold=hold))
+    reclaimable = sum(
+        t.size_bytes for t in tasks if evictable(t, now, hold=hold, hr_hold=hr_hold)
+    )
     return budget_bytes - used + reclaimable
 
 
@@ -361,6 +419,7 @@ def pick_evictions(
     now: datetime,
     *,
     hold: timedelta = _DEFAULT_MIN_HOLD,
+    hr_hold: timedelta | None = None,
 ) -> list[RatioBoostTask] | None:
     """从可汰换任务里按汰换顺序（死种优先，再按单位存储产出从低到高）挑出
     足够腾出 need_bytes 的一批。
@@ -368,7 +427,8 @@ def pick_evictions(
     腾不够返回 None——调用方放弃准入，**绝不提前动保留期内的任务**。
     """
     candidates = sorted(
-        (t for t in tasks if evictable(t, now, hold=hold)), key=eviction_order_key
+        (t for t in tasks if evictable(t, now, hold=hold, hr_hold=hr_hold)),
+        key=eviction_order_key,
     )
     picked: list[RatioBoostTask] = []
     freed = 0
@@ -653,7 +713,11 @@ async def _admit_candidates(
     # wants_fast_sync 同一判据回落节奏。有余量时若游标还在慢排期（此前
     # 无余量回落遗留的），推一把让发现速度立刻恢复
     hold = hold_for(cred)
-    if admission_headroom(site_tasks, budget, now, hold=hold) < _MIN_ADMISSION_HEADROOM:
+    hr_hold = hr_hold_for(site_id)
+    if (
+        admission_headroom(site_tasks, budget, now, hold=hold, hr_hold=hr_hold)
+        < _MIN_ADMISSION_HEADROOM
+    ):
         return
     await _nudge_slow_cursor(session, site_id, now)
 
@@ -683,24 +747,29 @@ async def _admit_candidates(
             .all()
         )
 
-    # SQL 粗筛（免费 + 新发布 + 有下载者 + 非明确 H&R），完整判据在 assess_candidate
+    # SQL 粗筛（免费 + 新发布 + 有下载者），完整判据在 assess_candidate。
+    # 明确 H&R 的种子只在站点考核时长已知（hr_seed_hours 已配）时才进入候选
+    conditions = [
+        SiteTorrent.site_id == site_id,
+        SiteTorrent.is_free == True,  # noqa: E712 -- SQL 表达式需用 ==
+        SiteTorrent.publish_time != None,  # noqa: E711
+        SiteTorrent.publish_time >= now - _FRESH_WINDOW,  # type: ignore[operator]
+        SiteTorrent.leechers != None,  # noqa: E711
+        SiteTorrent.leechers >= 1,  # type: ignore[operator]
+        SiteTorrent.size_bytes != None,  # noqa: E711
+    ]
+    if hr_hold is None:
+        conditions.append(
+            or_(
+                SiteTorrent.hit_and_run == None,  # noqa: E711
+                SiteTorrent.hit_and_run == False,  # noqa: E712
+            )
+        )
     rows = (
         (
             await session.execute(
                 select(SiteTorrent)
-                .where(
-                    SiteTorrent.site_id == site_id,
-                    SiteTorrent.is_free == True,  # noqa: E712 -- SQL 表达式需用 ==
-                    SiteTorrent.publish_time != None,  # noqa: E711
-                    SiteTorrent.publish_time >= now - _FRESH_WINDOW,  # type: ignore[operator]
-                    SiteTorrent.leechers != None,  # noqa: E711
-                    SiteTorrent.leechers >= 1,  # type: ignore[operator]
-                    SiteTorrent.size_bytes != None,  # noqa: E711
-                    or_(
-                        SiteTorrent.hit_and_run == None,  # noqa: E711
-                        SiteTorrent.hit_and_run == False,  # noqa: E712
-                    ),
-                )
+                .where(*conditions)
                 .order_by(SiteTorrent.publish_time.desc())  # type: ignore[union-attr]
                 .limit(200)
             )
@@ -712,7 +781,7 @@ async def _admit_candidates(
     scored: list[tuple[float, SiteTorrent]] = []
     for row in rows:
         ok, score = assess_candidate(
-            row, now=now, budget_bytes=budget, tracked_torrent_ids=tracked
+            row, now=now, budget_bytes=budget, tracked_torrent_ids=tracked, hr_hold=hr_hold
         )
         if ok:
             scored.append((score, row))
@@ -729,7 +798,7 @@ async def _admit_candidates(
         space = budget - used
         if size > space:
             # 预算不够：尝试汰换低效任务腾位；腾不出就看下一个（更小的）候选
-            plan = pick_evictions(site_tasks, size - space, now, hold=hold)
+            plan = pick_evictions(site_tasks, size - space, now, hold=hold, hr_hold=hr_hold)
             if plan is None:
                 continue
             for victim in plan:
@@ -782,6 +851,8 @@ async def _admit_candidates(
             title=row.title,
             size_bytes=size,
             free_deadline=row.free_deadline,
+            # 明确标注 H&R 的任务保留期按真实考核时长保底（见 evictable）
+            hit_and_run=row.hit_and_run is True,
         )
         session.add(task)
         await session.commit()
@@ -860,8 +931,13 @@ async def run_ratio_boost() -> None:
                 used = sum(t.size_bytes for t in site_tasks)
                 if used > cred.boost_budget_bytes:
                     # 死种优先，再按周转从慢到快（单位存储产出最低的先走）
+                    site_hr_hold = hr_hold_for(cred.site_id)
                     for victim in sorted(
-                        (t for t in site_tasks if evictable(t, now, hold=hold_for(cred))),
+                        (
+                            t
+                            for t in site_tasks
+                            if evictable(t, now, hold=hold_for(cred), hr_hold=site_hr_hold)
+                        ),
                         key=eviction_order_key,
                     ):
                         if used <= cred.boost_budget_bytes:
@@ -898,7 +974,13 @@ async def wants_fast_sync(session: AsyncSession, cred: SiteCredential) -> bool:
         .all()
     )
     return (
-        admission_headroom(list(tasks), cred.boost_budget_bytes, utcnow(), hold=hold_for(cred))
+        admission_headroom(
+            list(tasks),
+            cred.boost_budget_bytes,
+            utcnow(),
+            hold=hold_for(cred),
+            hr_hold=hr_hold_for(cred.site_id),
+        )
         >= _MIN_ADMISSION_HEADROOM
     )
 

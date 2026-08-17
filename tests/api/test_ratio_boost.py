@@ -73,9 +73,18 @@ def _task(**kw) -> RatioBoostTask:
     return RatioBoostTask(**defaults)
 
 
-def _assess(row: SiteTorrent, *, tracked: set[str] | None = None):
+def _assess(
+    row: SiteTorrent,
+    *,
+    tracked: set[str] | None = None,
+    hr_hold: timedelta | None = None,
+):
     return assess_candidate(
-        row, now=_NOW, budget_bytes=_BUDGET, tracked_torrent_ids=tracked or set()
+        row,
+        now=_NOW,
+        budget_bytes=_BUDGET,
+        tracked_torrent_ids=tracked or set(),
+        hr_hold=hr_hold,
     )
 
 
@@ -96,10 +105,16 @@ class TestAssessCandidate:
         assert not ok
 
     def test_rejects_explicit_hit_and_run(self) -> None:
-        """明确标注 H&R 考核的种子绝不碰；hit_and_run=None（站点不提供）允许。"""
+        """站点考核时长未知时，明确标注 H&R 的种子绝不碰；
+        hit_and_run=None（站点不提供标记）允许。"""
         assert not _assess(_row(hit_and_run=True))[0]
         assert _assess(_row(hit_and_run=False))[0]
         assert _assess(_row(hit_and_run=None))[0]
+
+    def test_hr_allowed_when_site_hold_known(self) -> None:
+        """站点配置了真实考核时长（hr_seed_hours）后敢准入明确 H&R 的种子
+        ——保留期会按真实时长保底（见 evictable），做满考核再谈汰换。"""
+        assert _assess(_row(hit_and_run=True), hr_hold=timedelta(hours=72))[0]
 
     def test_rejects_non_free(self) -> None:
         assert not _assess(_row(is_free=False))[0]
@@ -218,6 +233,17 @@ class TestApplyObservation:
         apply_observation(task, uploaded_bytes=None, completed=False, now=_NOW)
         assert task.completed is True
 
+    def test_completion_flip_stamps_completed_at(self) -> None:
+        """首次观测到完成时记下 completed_at（汰换判定窗口的起点）；
+        后续观测不得覆盖它。"""
+        task = _task(completed=False, completed_at=None)
+        task.last_checked_at = _NOW - timedelta(seconds=300)
+        apply_observation(task, uploaded_bytes=None, completed=True, now=_NOW)
+        assert task.completed_at == _NOW
+        later = _NOW + timedelta(seconds=300)
+        apply_observation(task, uploaded_bytes=None, completed=True, now=later)
+        assert task.completed_at == _NOW
+
 
 # ---------------------------------------------------------------------------
 # 汰换
@@ -244,21 +270,67 @@ class TestEviction:
         assert not evictable(aged_5d, _NOW, hold=timedelta(days=7))
         assert evictable(aged_5d, _NOW, hold=timedelta(days=0))
 
-    def test_hold_zero_still_needs_mature_measurement(self) -> None:
-        """hold=0 关闭的是 H&R 保护，不是判定质量：刚下完 EMA 还没暖起来的
-        种子（蜂群还有下载者）不可因"看起来慢"被误杀；测量满 24h 后慢就是真慢。"""
-        fresh = _task(
-            created_at=_NOW - timedelta(hours=2),
+    def test_judgment_window_counts_from_completion(self) -> None:
+        """判定窗口从**完成时刻**起算：下了很久才下完的种子，完成后仍有
+        完整的公平测量窗，不因入池早就被立即处决；反过来刚完成的也不可
+        因"看起来慢"被误杀（蜂群还有下载者、上传已起步的情况下）。"""
+        just_done = _task(
+            created_at=_NOW - timedelta(days=5),
+            completed_at=_NOW - timedelta(hours=2),
+            uploaded_bytes=200 * 1024**2,  # 上传已起步，不触发零产出速汰
             upload_rate_ema=0.0,
             swarm_leechers=5,
         )
-        assert not evictable(fresh, _NOW, hold=timedelta(0))
-        measured = _task(
-            created_at=_NOW - timedelta(hours=25),
+        assert not evictable(just_done, _NOW, hold=timedelta(0))
+        judged = _task(
+            created_at=_NOW - timedelta(days=5),
+            completed_at=_NOW - timedelta(hours=13),
+            uploaded_bytes=200 * 1024**2,
             upload_rate_ema=0.0,
             swarm_leechers=5,
         )
-        assert evictable(measured, _NOW, hold=timedelta(0))
+        assert evictable(judged, _NOW, hold=timedelta(0))
+
+    def test_zero_yield_fast_eviction(self) -> None:
+        """零产出速汰：完成 6 小时上传仍不足 64 MiB 的种子不必陪跑完整
+        判定窗——"光下载、上传起不来"的及时淘汰；上传已起步的同龄种子
+        则等公平判定窗走完再说。"""
+        stalled = _task(
+            completed_at=_NOW - timedelta(hours=7),
+            uploaded_bytes=10 * 1024**2,
+            upload_rate_ema=0.0,
+            swarm_leechers=5,
+        )
+        assert evictable(stalled, _NOW, hold=timedelta(0))
+        warming = _task(
+            completed_at=_NOW - timedelta(hours=7),
+            uploaded_bytes=200 * 1024**2,
+            upload_rate_ema=0.0,
+            swarm_leechers=5,
+        )
+        assert not evictable(warming, _NOW, hold=timedelta(0))
+
+    def test_hr_hold_overrides_short_site_hold(self) -> None:
+        """真实考核时长优先：用户把保留期设 0/3 只是未知时的保底，明确
+        标注 H&R 的任务按 max(站点保留期, hr_seed_hours) 保留；非 H&R
+        任务不受 hr_seed_hours 约束。"""
+        hr_task = _task(
+            hit_and_run=True,
+            created_at=_NOW - timedelta(days=4),
+            upload_rate_ema=0.0,
+        )
+        # 站点保底 3 天已过，但真实考核 5 天未满 → 仍受保护
+        assert not evictable(hr_task, _NOW, hr_hold=timedelta(days=5))
+        # 考核 5 天做满后放行
+        aged = _task(
+            hit_and_run=True,
+            created_at=_NOW - timedelta(days=6),
+            upload_rate_ema=0.0,
+        )
+        assert evictable(aged, _NOW, hr_hold=timedelta(days=5))
+        # 非 H&R 任务只看站点保留期
+        plain = _task(created_at=_NOW - timedelta(days=4), upload_rate_ema=0.0)
+        assert evictable(plain, _NOW, hr_hold=timedelta(days=5))
 
     def test_dead_swarm_skips_maturity_wait(self) -> None:
         """蜂群已死（tracker 汇报 0 下载者）= 未来注定零产出，不必等测量成熟

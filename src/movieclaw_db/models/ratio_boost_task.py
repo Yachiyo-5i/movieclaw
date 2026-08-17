@@ -69,6 +69,12 @@ class RatioBoostTask(TimestampMixin, table=True):
     )
     # 下载是否已完成（完成才可能进入汰换候选）
     completed: bool = Field(default=False, description="下载是否完成")
+    # 首次观测到下载完成的时间：汰换判定窗口以它起算（完成前是在下载，
+    # 谈不上"传得慢"）。NULL=尚未完成或历史数据（历史数据回退用 created_at）
+    completed_at: datetime | None = Field(default=None, description="下载完成时间")
+    # 准入时该种是否明确标注 H&R 考核：True 的任务保留期取
+    # max(站点保留期, 站点 hr_seed_hours)——真实考核时长优先于保底配置
+    hit_and_run: bool = Field(default=False, description="是否明确标注 H&R 考核")
     # 最近观测的累计上传量；差分驱动 EMA 更新
     uploaded_bytes: int = Field(default=0, description="累计上传量（字节）")
     # 上传速度 EMA（字节/秒），汰换排序的依据

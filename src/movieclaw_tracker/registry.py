@@ -57,6 +57,10 @@ class SiteConfig:
     supported_auth_types: tuple[str, ...] = ()
     # 页面/API 的 naive 时间所属时区；当前全部内置站点默认使用中国标准时间。
     timezone: str = DEFAULT_SITE_TIMEZONE
+    # 该站 H&R 考核要求的做种时长（小时）。站点级政策（NexusPHP 各站规则页
+    # 有明示），None=未知/无考核。刷流引擎据此对 H&R 种子按真实考核时长
+    # 保底保留（覆盖站点保留期设置），并允许准入明确标注 H&R 的免费种。
+    hr_seed_hours: int | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -246,6 +250,7 @@ def _load_site_yaml(
             min_request_interval=raw.get("min_request_interval"),
             supported_auth_types=supported_auth_types,
             timezone=timezone,
+            hr_seed_hours=raw.get("hr_seed_hours"),
         )
     except Exception:
         logger.exception("站点配置文件 %s 解析失败（字段写法有误？），已跳过", yaml_file)
