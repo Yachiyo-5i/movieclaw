@@ -91,6 +91,40 @@ function fallbackItem(siteId: string): CatalogItem {
   return { site_id: siteId, display_name: siteId, base_url: "", supported_auth_types: [] };
 }
 
+/**
+ * 「资源站点」分区的动态副标题（设置头部用）：有站点时显示健康统计——
+ * 「已接入 X 个站点，全部正常 / Y 个异常需要关注」；还没接入任何站点时
+ * 回落功能介绍文案（fallback），此时统计没有意义、介绍才有引导价值。
+ */
+export function SitesSectionSubtitle({ fallback }: { fallback: string }) {
+  const [sites, setSites] = useState<ConfiguredSite[] | null>(null);
+  useEffect(() => {
+    let alive = true;
+    listConfiguredSites()
+      .then((rows) => {
+        if (alive) setSites(rows);
+      })
+      .catch(() => {
+        /* 拉取失败保持介绍文案，分区主体会展示具体错误 */
+      });
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  if (!sites || sites.length === 0) return <>{fallback}</>;
+  const failed = sites.filter((s) => s.status === "failed").length;
+  if (failed > 0) {
+    return (
+      <>
+        已接入 {sites.length} 个站点，
+        <span className="font-medium text-[var(--danger)]">{failed} 个异常需要关注</span>
+      </>
+    );
+  }
+  return <>已接入 {sites.length} 个站点，全部正常</>;
+}
+
 export function SiteConfigSection() {
   const [tab, setTab] = useState<SiteTab>("sites");
   const [catalog, setCatalog] = useState<CatalogItem[]>([]);
