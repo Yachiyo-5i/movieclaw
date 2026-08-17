@@ -647,21 +647,8 @@ function SiteRow({
           </p>
         ) : (
           site.boost_enabled && (
-            <div className="order-3 flex basis-full flex-wrap items-center gap-1.5 sm:order-none sm:basis-auto">
-              <span
-                className="rounded-full px-2 py-0.5 text-caption font-medium"
-                style={{
-                  background: "color-mix(in oklab, var(--ok) 12%, transparent)",
-                  color: "var(--ok)",
-                }}
-                title="自动刷分享率运行中：已用/预算 · 近 24 小时上传"
-              >
-                刷流 {boost ? formatBytes(boost.used_bytes) : "0"}/
-                {formatBytes(site.boost_budget_bytes)}
-                {boost && boost.uploaded_bytes_24h > 0 && (
-                  <> · 24h ↑{formatBytes(boost.uploaded_bytes_24h)}</>
-                )}
-              </span>
+            <div className="order-3 basis-full sm:order-none sm:basis-auto">
+              <BoostMeter site={site} boost={boost} />
             </div>
           )
         )}
@@ -852,6 +839,49 @@ function SiteDetail({
           </span>
         )}
       </DetailSection>
+    </div>
+  );
+}
+
+/* —— 刷流用量 meter：预算是容量，用微型进度条表达量级，不用状态色药丸 ——
+   设计依据（dataviz 规范）：状态色（绿）是「已验证」等状态徽章的保留色，
+   刷流信息复用它会与状态混淆；量级用 accent 特性色的细 meter 表达，数字
+   一律穿文本色（muted/faint），颜色只由 meter 条本身携带。无背景药丸，
+   移动端折行后视觉重量也轻得多。 */
+
+function BoostMeter({ site, boost }: { site: ConfiguredSite; boost?: SiteBoostStats }) {
+  const used = boost?.used_bytes ?? 0;
+  const budget = site.boost_budget_bytes;
+  const pct = budget > 0 ? Math.min(100, (used / budget) * 100) : 0;
+  // 超预算（用户调小预算、汰换收敛中）是真实的注意状态，此时才允许状态色
+  const overfull = budget > 0 && used > budget;
+
+  return (
+    <div
+      className="flex min-w-0 items-center gap-2"
+      title={
+        "自动刷分享率运行中：预算用量与近 24 小时上传" +
+        (overfull ? "（超出预算，汰换收敛中）" : "")
+      }
+    >
+      <span className="shrink-0 text-caption font-medium text-[var(--text-faint)]">刷流</span>
+      <span className="h-1 w-14 shrink-0 overflow-hidden rounded-full bg-white/[0.1]">
+        <span
+          className="block h-full rounded-full"
+          style={{
+            width: `${pct}%`,
+            background: overfull ? "var(--danger)" : "var(--accent)",
+          }}
+        />
+      </span>
+      <span className="truncate text-caption text-[var(--text-muted)]">
+        {formatBytes(used)} / {formatBytes(budget)}
+        {boost && boost.uploaded_bytes_24h > 0 && (
+          <span className="text-[var(--text-faint)]">
+            {" · "}24h ↑{formatBytes(boost.uploaded_bytes_24h)}
+          </span>
+        )}
+      </span>
     </div>
   );
 }
