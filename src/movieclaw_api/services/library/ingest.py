@@ -1840,13 +1840,15 @@ async def _ingest_entry(
     elif dup_skipped or pilot_skipped:
         # 季包附带内容全部与库存同档重复（换源后两个包先后投递最常见），
         # 或只剩 E00 先导占位：正常闭环，不是异常
-        message = f"《{item.title}》"
         parts = []
         if dup_skipped:
-            parts.append("的内容在库中已有同档或更高版本")
+            parts.append(f"《{item.title}》的内容在库中已有同档或更高版本")
         if pilot_skipped:
-            parts.append(f"的「{'」「'.join(pilot_skipped)}」是第 0 集（先导/特辑），暂不自动入库")
-        return await conclude(IngestStatus.IMPORTED, message + "，".join(parts) + "，无需整理")
+            prefix = "" if dup_skipped else f"《{item.title}》的"
+            parts.append(
+                f"{prefix}「{'」「'.join(pilot_skipped)}」是第 0 集（先导/特辑），暂不自动入库"
+            )
+        return await conclude(IngestStatus.IMPORTED, "；".join(parts) + "，无需整理")
     elif skipped_owned:
         # 自定义目录条目的全部单元都已回流入库：链路闭环完成，不再搬运
         return await conclude(IngestStatus.IMPORTED, f"《{item.title}》的内容已在媒体库，无需整理")
