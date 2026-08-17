@@ -531,6 +531,41 @@ def test_adapt_interval_backs_off_on_consecutive_failures() -> None:
     assert _adapt_interval(600, consecutive_failures=0, **kw) == 900
 
 
+def test_adapt_interval_pinned_for_boost_sites() -> None:
+    """刷流站点钉在最快节奏：成功时无论冷热都回 MIN（抢免费新种拼发现速度）；
+    失败退避不受钉住影响（对挂掉的站高频重试没有意义）。"""
+    from movieclaw_api.services.torrent_sync import _MIN_INTERVAL, _adapt_interval
+
+    kw = {"new_count": 0, "full_page": False, "pinned": True}
+    # 冷站本会放疏到小时级，钉住后仍回 MIN
+    assert _adapt_interval(21600, consecutive_failures=0, **kw) == _MIN_INTERVAL
+    assert _adapt_interval(600, consecutive_failures=0, **kw) == _MIN_INTERVAL
+    # 失败退避照常：钉住不等于对宕机站点高频硬打
+    assert _adapt_interval(600, consecutive_failures=2, **kw) == 1200
+
+
+async def test_expire_cursor_marks_immediate_due(db) -> None:
+    """开启刷流时游标标记立即到期：next_sync_at 置 NULL，下一个 tick 即同步；
+    游标不存在时返回 False，不隐式建游标（t0 语义归 ensure_cursor）。"""
+    from movieclaw_db.repositories.torrent_repo import TorrentRepository
+
+    async with get_database().session() as session:
+        repo = TorrentRepository(session)
+        await repo.ensure_cursor("mteam")
+        # 先跑出一个"排期在几小时后"的游标
+        await repo.update_cursor_after_sync(
+            "mteam", new_count=0, full_page=False, next_interval_seconds=21600
+        )
+        cursor = await repo.get_cursor("mteam")
+        assert cursor is not None and cursor.next_sync_at is not None
+
+        assert await repo.expire_cursor("mteam")
+        cursor = await repo.get_cursor("mteam")
+        assert cursor is not None and cursor.next_sync_at is None
+
+        assert not await repo.expire_cursor("no-such-site")
+
+
 async def test_cursor_tracks_failure_streak_and_last_success(db) -> None:
     """游标失败台账：失败不动 last_success_at、累计 consecutive_failures；成功双双复位。"""
     from movieclaw_db.repositories.torrent_repo import TorrentRepository

@@ -116,6 +116,57 @@ export function setSiteEnabled(siteId: string, enabled: boolean): Promise<Config
   );
 }
 
+/** 打开 / 关闭站点保护（订阅链路绕开该站，手动搜索/下载不受影响）。 */
+export function setSiteProtection(siteId: string, isProtected: boolean): Promise<ConfiguredSite> {
+  return unwrap(
+    request<ApiEnvelope<ConfiguredSite>>(`/sites/${siteId}/protection`, {
+      method: "PATCH",
+      body: JSON.stringify({ protected: isProtected }),
+    }),
+  );
+}
+
+/** 设置自动刷分享率：开关 + 存储预算（budgetBytes 省略时不改预算）。 */
+export function setSiteRatioBoost(
+  siteId: string,
+  enabled: boolean,
+  budgetBytes?: number,
+): Promise<ConfiguredSite> {
+  return unwrap(
+    request<ApiEnvelope<ConfiguredSite>>(`/sites/${siteId}/ratio-boost`, {
+      method: "PATCH",
+      body: JSON.stringify({ enabled, budget_bytes: budgetBytes ?? null }),
+    }),
+  );
+}
+
+/** 单个站点的刷流运行统计（见 schemas.site.SiteBoostStatsView）。 */
+export interface SiteBoostStats {
+  /** 在池刷流任务数 */
+  active_count: number;
+  /** 在池任务占用的预算（字节） */
+  used_bytes: number;
+  /** 当前预算（字节） */
+  budget_bytes: number;
+  /** 刷流累计上传量（含已汰换任务的历史贡献，字节） */
+  uploaded_bytes_total: number;
+  /** 累计汰换任务数 */
+  evicted_count: number;
+  /** 近 24 小时上传量（字节） */
+  uploaded_bytes_24h: number;
+  /** 近 24 小时平均在池体积（字节） */
+  avg_used_bytes_24h: number;
+  /** 近 7 天上传量（字节） */
+  uploaded_bytes_7d: number;
+  /** 近 7 天平均在池体积（字节） */
+  avg_used_bytes_7d: number;
+}
+
+/** 按 site_id 返回各站点的刷流统计；从未刷流且未开启的站点没有条目。 */
+export function listSiteBoostStats(init?: RequestInit): Promise<Record<string, SiteBoostStats>> {
+  return unwrap(request<ApiEnvelope<Record<string, SiteBoostStats>>>("/sites/boost-stats", init));
+}
+
 /** 手动重新触发一次验证。 */
 export function reverifySite(siteId: string): Promise<ConfiguredSite> {
   return unwrap(

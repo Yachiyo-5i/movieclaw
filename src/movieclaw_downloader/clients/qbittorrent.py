@@ -241,6 +241,17 @@ class QBittorrentDownloader(BaseDownloader):
                     size_bytes=int(getattr(torrent, "size", 0) or 0) or None,
                     dlspeed_bytes=int(getattr(torrent, "dlspeed", 0) or 0),
                     upspeed_bytes=int(getattr(torrent, "upspeed", 0) or 0),
+                    # uploaded 是本任务的累计上传字节；缺失（极老版本）保持 None
+                    uploaded_bytes=(
+                        int(torrent.uploaded)
+                        if getattr(torrent, "uploaded", None) is not None
+                        else None
+                    ),
+                    ratio=(
+                        float(torrent.ratio)
+                        if getattr(torrent, "ratio", None) is not None
+                        else None
+                    ),
                     eta_seconds=eta if 0 < eta < 8640000 else None,
                     state=_normalize_state(str(getattr(torrent, "state", "")), completed=completed),
                 )
@@ -271,6 +282,28 @@ class QBittorrentDownloader(BaseDownloader):
             "并删除数据文件" if delete_files else "并保留数据文件",
             info_hash,
         )
+
+    async def set_location(self, info_hash: str, save_path: str) -> None:
+        await asyncio.to_thread(self._set_location_sync, info_hash, save_path)
+
+    def _set_location_sync(self, info_hash: str, save_path: str) -> None:
+        """改保存目录并由 qBittorrent 自行搬移数据（关 auto-TMM 后 set_location）。"""
+        client = self._client()
+        try:
+            with _translate_errors(self.config.url):
+                # 显式关 auto-TMM，与 submit 同理：开启时分类规则会抢走目录控制权
+                client.torrents_set_auto_management(
+                    torrent_hashes=info_hash.lower(), enable=False
+                )
+                client.torrents_set_location(
+                    torrent_hashes=info_hash.lower(), location=save_path
+                )
+        except qbittorrentapi.APIError as exc:
+            raise DownloaderSubmitError(
+                "移动 qBittorrent 任务目录失败，请检查目标目录是否可写",
+                details={"url": self.config.url, "save_path": save_path, "error": str(exc)},
+            ) from exc
+        logger.info("已移动 qBittorrent 任务目录: hash=%s -> %s", info_hash, save_path)
 
     async def test_connection(self) -> DownloaderInfo:
         return await asyncio.to_thread(self._test_connection_sync)

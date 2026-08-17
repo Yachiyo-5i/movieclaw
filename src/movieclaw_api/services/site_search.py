@@ -153,6 +153,7 @@ async def stream_search_all_sites(
     label: str | None = None,
     page: int = 1,
     allowed_site_ids: set[str] | None = None,
+    exclude_protected: bool = False,
 ) -> AsyncIterator[tuple[str, BaseModel]]:
     """流式跨站搜索：按「站点实际完成的先后」逐个产出事件，供 SSE 端点直接转发。
 
@@ -175,8 +176,13 @@ async def stream_search_all_sites(
     :param allowed_site_ids: 成员的可用站点白名单（None=不受限）。这是站点
         可见性的**服务端强制点**：白名单外的站点静默排除（不产生错误事件，
         白名单外的站点名因此不出现在任何响应里），前端勾选也绕不过。
+    :param exclude_protected: 排除开了保护开关的站点。**订阅链路专用**
+        （缺口搜索/死种换源传 True）——受保护站点不被订阅自动拉种，但用户
+        主动搜索照常，见 docs/design/site-protection-ratio-boost.md。
     """
     sites = await _active_sites()
+    if exclude_protected:
+        sites = [c for c in sites if not c.protected]
     if allowed_site_ids is not None:
         sites = [c for c in sites if c.site_id in allowed_site_ids]
     if site_ids:
@@ -262,6 +268,7 @@ async def search_all_sites(
     label: str | None = None,
     page: int = 1,
     allowed_site_ids: set[str] | None = None,
+    exclude_protected: bool = False,
 ) -> SearchResponse:
     """并发搜索可用站点并合并结果（阻塞版：等全部站点返回后一次性给出）。
 
@@ -277,6 +284,7 @@ async def search_all_sites(
         label=label,
         page=page,
         allowed_site_ids=allowed_site_ids,
+        exclude_protected=exclude_protected,
     ):
         if event == "site_result":
             assert isinstance(payload, SiteStreamResult)

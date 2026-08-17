@@ -41,6 +41,7 @@ class FakeTrClient:
         self.store: dict[str, SimpleNamespace] = {}
         self.add_calls: list[tuple] = []
         self.remove_calls: list[tuple] = []
+        self.move_calls: list[tuple] = []
 
     def get_torrent(self, torrent_id):
         if torrent_id not in self.store:
@@ -60,6 +61,9 @@ class FakeTrClient:
     def remove_torrent(self, torrent_id, *, delete_data=False):
         self.remove_calls.append((torrent_id, delete_data))
         self.store.pop(torrent_id, None)
+
+    def move_torrent_data(self, torrent_id, *, location):
+        self.move_calls.append((torrent_id, location))
 
 
 def make_downloader(fake: FakeTrClient) -> TransmissionDownloader:
@@ -166,6 +170,15 @@ class TestConnection:
         )
         with pytest.raises(DownloaderConnectError):
             downloader._client()
+
+
+class TestSetLocation:
+    async def test_set_location_moves_data(self):
+        fake = FakeTrClient()
+
+        await make_downloader(fake).set_location(TORRENT_HASH, "/downloads/movies")
+
+        assert fake.move_calls == [(TORRENT_HASH, "/downloads/movies")]
 
 
 class TestDeleteTorrent:

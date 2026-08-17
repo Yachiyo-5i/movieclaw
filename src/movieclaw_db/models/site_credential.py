@@ -75,6 +75,20 @@ class SiteCredential(TimestampMixin, table=True):
     enabled: bool = Field(default=True, description="用户启用开关")
 
     # ------------------------------------------------------------------
+    # 站点保护与刷流（设计见 docs/design/site-protection-ratio-boost.md）
+    # ------------------------------------------------------------------
+    # 保护开关：打开后订阅链路（被动匹配/缺口搜索/换源/洗版）不再选中该站点，
+    # 但主动搜索、手动下载、种子同步照常。用于分享率尚未养起来的新站点。
+    # 与 enabled 正交：enabled 是"能不能访问"，protected 是"订阅能不能自动拉"。
+    protected: bool = Field(default=False, description="站点保护开关：订阅链路绕开该站")
+    # 自动刷分享率开关：盯本地索引的免费种第一时间抢下做种，预算内自动汰换
+    boost_enabled: bool = Field(default=False, description="自动刷分享率开关")
+    # 刷流存储预算（字节）：该站刷流任务占用磁盘的上限，默认 100 GiB
+    boost_budget_bytes: int = Field(
+        default=100 * 1024**3, description="刷流存储预算（字节）"
+    )
+
+    # ------------------------------------------------------------------
     # 验证状态机（见 ConfigStatus）
     # ------------------------------------------------------------------
     status: ConfigStatus = Field(

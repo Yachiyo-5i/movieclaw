@@ -25,6 +25,7 @@ from movieclaw_db.models import (
     ActivityType,
     MediaItem,
     RuleSet,
+    SiteCredential,
     SiteTorrent,
     Subscription,
     SubscriptionActivity,
@@ -553,6 +554,32 @@ async def _resolve_upgrade(
     return covered, labels
 
 
+async def drop_protected_sites(
+    session: AsyncSession, torrents: list[SiteTorrent]
+) -> list[SiteTorrent]:
+    """站点保护第二道闸（第一道在搜索扇出）：剔除受保护站点的种子行。
+
+    被动匹配（种子同步照常索引受保护站点）只有这一道闸，绝不可绕过，
+    见 docs/design/site-protection-ratio-boost.md 1.2。
+    """
+    if not torrents:
+        return torrents
+    protected_sites = set(
+        (
+            await session.execute(
+                select(SiteCredential.site_id).where(
+                    SiteCredential.protected == True  # noqa: E712 -- SQL 表达式需用 ==
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if not protected_sites:
+        return torrents
+    return [t for t in torrents if t.site_id not in protected_sites]
+
+
 async def evaluate_and_dispatch(
     session: AsyncSession, torrents: list[SiteTorrent], *, source: str
 ) -> MatchSummary:
@@ -564,6 +591,7 @@ async def evaluate_and_dispatch(
     from movieclaw_api.services.subscription.dispatch import dispatch
 
     summary = MatchSummary(torrents_seen=len(torrents))
+    torrents = await drop_protected_sites(session, torrents)
     contexts = await load_match_context(session)
     if not contexts:
         return summary

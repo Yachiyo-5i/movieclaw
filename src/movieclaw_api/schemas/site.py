@@ -103,6 +103,11 @@ class ConfiguredSite(BaseModel):
     enabled: bool
     status: ConfigStatus
     usable: bool = Field(description="是否可用 = 已启用且验证通过（status=active）")
+    protected: bool = Field(
+        default=False, description="站点保护开关：订阅链路绕开该站，手动搜索/下载不受影响"
+    )
+    boost_enabled: bool = Field(default=False, description="自动刷分享率开关")
+    boost_budget_bytes: int = Field(default=0, description="刷流存储预算（字节）")
     last_verified_at: datetime | None = Field(default=None, description="最近验证成功时间")
     last_checked_at: datetime | None = Field(default=None, description="最近验证尝试时间")
     last_error: str | None = Field(default=None, description="最近验证失败原因（清晰中文）")
@@ -141,6 +146,9 @@ class ConfiguredSite(BaseModel):
             enabled=row.enabled,
             status=row.status,
             usable=row.enabled and row.status == ConfigStatus.ACTIVE,
+            protected=row.protected,
+            boost_enabled=row.boost_enabled,
+            boost_budget_bytes=row.boost_budget_bytes,
             last_verified_at=row.last_verified_at,
             last_checked_at=row.last_checked_at,
             last_error=row.last_error,
@@ -234,3 +242,37 @@ class SiteStatusUpdate(BaseModel):
     """启用/停用请求体。"""
 
     enabled: bool = Field(description="true=启用 / false=停用（停用后不再参与搜索与同步）")
+
+
+class SiteProtectionUpdate(BaseModel):
+    """站点保护开关请求体（语义见 docs/design/site-protection-ratio-boost.md）。"""
+
+    protected: bool = Field(
+        description="true=保护（订阅链路绕开该站，手动搜索/下载不受影响）/ false=取消保护"
+    )
+
+
+class SiteRatioBoostUpdate(BaseModel):
+    """自动刷分享率设置请求体。"""
+
+    enabled: bool = Field(description="true=开启自动刷分享率 / false=关闭")
+    budget_bytes: int | None = Field(
+        default=None, description="刷流存储预算（字节，≥1 GiB）；None=不修改现有预算"
+    )
+
+
+class SiteBoostStatsView(BaseModel):
+    """单个站点的刷流运行统计（数据来源见 RatioBoostTask 台账）。"""
+
+    active_count: int = Field(default=0, description="在池刷流任务数")
+    used_bytes: int = Field(default=0, description="在池任务占用的预算（字节）")
+    budget_bytes: int = Field(default=0, description="当前预算（字节）")
+    uploaded_bytes_total: int = Field(
+        default=0, description="刷流累计上传量（含已汰换任务的历史贡献，字节）"
+    )
+    evicted_count: int = Field(default=0, description="累计汰换任务数")
+    # 近期窗口指标（来自小时桶统计）：支撑"近 24 小时用 X GB 种子贡献 Y GB 上传"
+    uploaded_bytes_24h: int = Field(default=0, description="近 24 小时上传量（字节）")
+    avg_used_bytes_24h: int = Field(default=0, description="近 24 小时平均在池体积（字节）")
+    uploaded_bytes_7d: int = Field(default=0, description="近 7 天上传量（字节）")
+    avg_used_bytes_7d: int = Field(default=0, description="近 7 天平均在池体积（字节）")

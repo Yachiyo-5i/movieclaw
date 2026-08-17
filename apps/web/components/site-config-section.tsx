@@ -5,29 +5,43 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
 
 import { useConfirm } from "@/components/feedback";
-import { MoreIcon, PlusIcon, ServerIcon } from "@/components/icons";
+import { ChevronDownIcon, MoreIcon, PlusIcon, ServerIcon } from "@/components/icons";
 import { ExtensionCard } from "@/components/extension-settings";
 import { SearchSection } from "@/components/search-settings";
-import { useBackdrop } from "@/lib/backdrop";
 import type { ConfiguredSite, SiteAuthType, SiteStatus } from "@/lib/api/extension";
 import {
   type AuthTypeRequirement,
   type CatalogItem,
+  type SiteBoostStats,
   type SiteConfigPayload,
   type SiteSyncStats,
   configureSite,
   deleteSite,
   listConfiguredSites,
+  listSiteBoostStats,
   listSiteCatalog,
   listSiteSyncStats,
   reverifySite,
   setSiteEnabled,
+  setSiteProtection,
+  setSiteRatioBoost,
   updateSite,
 } from "@/lib/api/sites";
 import { formatBytes, formatCompact, formatDuration, formatRatio } from "@/lib/format";
-import { formatDateTime, formatRelativeTime } from "@/lib/time";
+import { formatRelativeTime } from "@/lib/time";
 import { useVisiblePolling } from "@/lib/use-visible-polling";
-import { LiquidGlassButton, LiquidGlassInput } from "@/vendor/liquid-glass";
+
+/*
+ * 页面信息架构（docs/design/site-protection-ratio-boost.md 之外的 UI 决策）：
+ * 每站默认一行，按优先级从左到右排——
+ *   P0 常驻：名称 + 验证状态（异常原因直接吃掉徽章位）；
+ *   P1 条件徽章：保护中 / 刷流用量与近 24h 产出——开了才出现，不开不占版面；
+ *   P2 展开可见：账号统计 / 索引同步 / 刷流设置 / 授权信息；
+ *   操作全收进 ⋯ 菜单（启停 / 保护 / 重验 / 删除），卡面只留信息。
+ * 视觉刻意不用玻璃质感与 WebGL 开关：配置页要的是轻和稳（移动端尤其），
+ * 玻璃留给首页与海报墙等展示面。移动端徽章行自动折到第二行，整行是
+ * 展开热区。异常站点置顶 + 顶部健康摘要，把「是否正常」从逐卡看变成一行知。
+ */
 
 /** 站点验证状态 → 展示文案与颜色 */
 const STATUS_META: Record<SiteStatus, { label: string; color: string }> = {
@@ -63,39 +77,27 @@ const TABS = [
 
 type SiteTab = (typeof TABS)[number]["id"];
 
+const GIB = 1024 ** 3;
+
 /** 目录中缺失该站点时的兜底展示（例如站点已从系统下架但仍有历史配置） */
 function fallbackItem(siteId: string): CatalogItem {
   return { site_id: siteId, display_name: siteId, base_url: "", supported_auth_types: [] };
 }
 
-/**
- * 「资源站点」设置分区，两档胶囊标签：
- *   - 站点接入：已配置站点列表 + 添加入口 + 浏览器插件卡（Cookie 同步工具，
- *     与站点授权表单同屏才有意义，不单独成档）；
- *   - 搜索分类：搜索面板分类栏的配置（见 search-settings.tsx）——分类筛的正是
- *     这里接入的站点，故同页，但使用节奏不同（接入一次性、分类常调），分档。
- *
- * 交互取舍：站点目录可能很多，全部平铺不现实。因此主列表**只展示用户已配置的站点**，
- * 通过「添加站点」入口从目录（GET /sites/catalog）里按需挑选未配置的站点再填表。
- *
- * 数据来自两个接口：
- * - GET /sites/catalog —— 系统支持的可配置站点（含每种授权类型的必填字段）。
- * - GET /sites         —— 用户已配置的站点及其验证状态。
- *
- * 配置/更新后后端异步验证，前端对中间态（pending/verifying）轮询刷新，直到 active / failed。
- */
 export function SiteConfigSection() {
   const [tab, setTab] = useState<SiteTab>("sites");
   const [catalog, setCatalog] = useState<CatalogItem[]>([]);
   const [configured, setConfigured] = useState<ConfiguredSite[]>([]);
   // 各站点的种子缓存统计（定时同步任务维护），key 为 site_id；从未同步过的站点没有条目
   const [syncStats, setSyncStats] = useState<Record<string, SiteSyncStats>>({});
+  // 各站点的刷流运行统计；从未刷流且未开启刷流的站点没有条目
+  const [boostStats, setBoostStats] = useState<Record<string, SiteBoostStats>>({});
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   // 是否展开「添加站点」面板
   const [adding, setAdding] = useState(false);
-  // 当前正在编辑表单的已配置站点 site_id（null 表示没有展开的编辑表单）
-  const [editing, setEditing] = useState<string | null>(null);
+  // 当前展开详情的站点（单开手风琴）
+  const [expandedSite, setExpandedSite] = useState<string | null>(null);
 
   const catalogMap = useMemo(() => new Map(catalog.map((c) => [c.site_id, c])), [catalog]);
 
@@ -109,23 +111,19 @@ export function SiteConfigSection() {
     [catalog, configuredIds],
   );
 
-  // 全部站点的种子缓存总量——头部一句话让用户对"本地存了多少"有整体感知
-  const totalCached = useMemo(
-    () => Object.values(syncStats).reduce((sum, s) => sum + s.torrent_count, 0),
-    [syncStats],
-  );
-
   const load = useCallback(async () => {
     setError(null);
     try {
-      const [cat, cfg, stats] = await Promise.all([
+      const [cat, cfg, stats, boost] = await Promise.all([
         listSiteCatalog(),
         listConfiguredSites(),
         listSiteSyncStats(),
+        listSiteBoostStats(),
       ]);
       setCatalog(cat);
       setConfigured(cfg);
       setSyncStats(stats);
+      setBoostStats(boost);
     } catch (e) {
       setError((e as Error).message);
     } finally {
@@ -150,8 +148,22 @@ export function SiteConfigSection() {
     hasInProgress ? 2500 : null,
   );
 
+  // 有站点开着刷流时轻轮询运行统计（引擎 5 分钟一个 tick，30 秒刷新足够跟上），
+  // 让「已用 / 近 24h 上传」在页面停留期间自己长，不需要用户手动刷新
+  const anyBoosting = configured.some((s) => s.boost_enabled);
+  useVisiblePolling(
+    () => {
+      void listSiteBoostStats()
+        .then(setBoostStats)
+        .catch(() => {
+          /* 轮询失败静默重试，不打断页面 */
+        });
+    },
+    anyBoosting ? 30000 : null,
+  );
+
   // 原地替换已有站点、新站点追加到末尾。
-  // 注意：切换启用开关等操作也会走这里，必须保持列表顺序不变，否则被操作的站点会跳位，体验割裂。
+  // 注意：菜单里的启停/保护等操作也走这里，保持列表基础顺序稳定，避免被操作的站点跳位。
   const upsertConfigured = useCallback((next: ConfiguredSite) => {
     setConfigured((prev) => {
       const idx = prev.findIndex((s) => s.site_id === next.site_id);
@@ -162,12 +174,26 @@ export function SiteConfigSection() {
     });
   }, []);
 
+  // 异常站点置顶（稳定排序：failed 之间与正常站之间保持后端顺序）
+  const ordered = useMemo(
+    () =>
+      [...configured].sort(
+        (a, b) => (a.status === "failed" ? 0 : 1) - (b.status === "failed" ? 0 : 1),
+      ),
+    [configured],
+  );
+
+  // 顶部健康摘要：站点总数 / 异常数 / 保护数 / 刷流近 24h 总产出
+  const failedCount = configured.filter((s) => s.status === "failed").length;
+  const protectedCount = configured.filter((s) => s.protected).length;
+  const boost24h = Object.values(boostStats).reduce(
+    (sum, s) => sum + (s.uploaded_bytes_24h || 0),
+    0,
+  );
+
   return (
     <div className="space-y-5">
-      {/* 胶囊标签切换：与「外观」分区（背景图 / 界面质感）同一交互语言。
-          只分两档——插件是站点 Cookie 的填写工具，必须与站点表单同屏，
-          所以跟着「站点接入」；搜索分类的使用节奏不同（接入是一次性、
-          分类是常调），单独一档，也免得两块内容挤成一条长滚动。 */}
+      {/* 胶囊标签切换：与「外观」分区同一交互语言 */}
       <div className="flex gap-1.5">
         {TABS.map((t) => (
           <button
@@ -196,11 +222,25 @@ export function SiteConfigSection() {
             </div>
           )}
 
-          <div className="flex items-center justify-between gap-4">
+          <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2">
             <p className="text-sub text-[var(--text-muted)]">
-              {loading
-                ? "加载中…"
-                : `已接入 ${configured.length} 个站点 · 本地累计缓存 ${totalCached.toLocaleString("zh-CN")} 条种子，保存后系统会自动验证有效性。`}
+              {loading ? (
+                "加载中…"
+              ) : (
+                <>
+                  已接入 {configured.length} 个站点
+                  {failedCount > 0 && (
+                    <>
+                      {" · "}
+                      <span className="font-medium text-[var(--danger)]">
+                        {failedCount} 个异常
+                      </span>
+                    </>
+                  )}
+                  {protectedCount > 0 && ` · ${protectedCount} 个保护中`}
+                  {boost24h > 0 && ` · 刷流近24h ↑${formatBytes(boost24h)}`}
+                </>
+              )}
             </p>
             <div className="flex shrink-0 items-center gap-2.5">
               <button
@@ -211,7 +251,6 @@ export function SiteConfigSection() {
               >
                 刷新
               </button>
-              {/* 主操作：亮银胶囊，与次级玻璃按钮拉开主次 */}
               <button
                 type="button"
                 onClick={() => setAdding((v) => !v)}
@@ -237,46 +276,49 @@ export function SiteConfigSection() {
             />
           )}
 
-          {/* 已配置站点列表 */}
-          <div className="space-y-2.5">
-            {loading ? (
-              <>
-                <div className="h-[72px] animate-pulse rounded-xl bg-white/[0.04]" />
-                <div className="h-[72px] animate-pulse rounded-xl bg-white/[0.04]" />
-              </>
-            ) : configured.length === 0 ? (
-              <div className="css-glass flex flex-col items-center gap-3 !rounded-2xl px-6 py-12 text-center">
-                <span className="icon-chip size-12 !rounded-2xl">
-                  <ServerIcon className="size-6" />
-                </span>
-                <div>
-                  <p className="text-body font-medium text-[var(--text)]">还没有配置任何站点</p>
-                  <p className="mt-1 text-sub text-[var(--text-muted)]">
-                    点击右上角「添加站点」开始接入。
-                  </p>
-                </div>
+          {/* 站点列表：扁平面板容器，行式布局 */}
+          {loading ? (
+            <div className="space-y-px overflow-hidden rounded-xl border border-white/[0.08]">
+              <div className="h-14 animate-pulse bg-white/[0.04]" />
+              <div className="h-14 animate-pulse bg-white/[0.04]" />
+            </div>
+          ) : configured.length === 0 ? (
+            <div className="flex flex-col items-center gap-3 rounded-xl border border-white/[0.08] bg-white/[0.03] px-6 py-12 text-center">
+              <span className="icon-chip size-12 !rounded-2xl">
+                <ServerIcon className="size-6" />
+              </span>
+              <div>
+                <p className="text-body font-medium text-[var(--text)]">还没有配置任何站点</p>
+                <p className="mt-1 text-sub text-[var(--text-muted)]">
+                  点击右上角「添加站点」开始接入。
+                </p>
               </div>
-            ) : (
-              configured.map((site) => (
-                <SiteCard
+            </div>
+          ) : (
+            <div className="divide-y divide-white/[0.06] overflow-hidden rounded-xl border border-white/[0.08] bg-white/[0.03]">
+              {ordered.map((site) => (
+                <SiteRow
                   key={site.site_id}
                   item={catalogMap.get(site.site_id) ?? fallbackItem(site.site_id)}
                   site={site}
                   stats={syncStats[site.site_id]}
-                  expanded={editing === site.site_id}
-                  onToggleForm={(open) => setEditing(open ? site.site_id : null)}
+                  boost={boostStats[site.site_id]}
+                  expanded={expandedSite === site.site_id}
+                  onToggle={() =>
+                    setExpandedSite((cur) => (cur === site.site_id ? null : site.site_id))
+                  }
                   onChanged={upsertConfigured}
                   onDeleted={(siteId) => {
                     setConfigured((prev) => prev.filter((s) => s.site_id !== siteId));
-                    setEditing((cur) => (cur === siteId ? null : cur));
+                    setExpandedSite((cur) => (cur === siteId ? null : cur));
                   }}
                   onError={setError}
                 />
-              ))
-            )}
-          </div>
+              ))}
+            </div>
+          )}
 
-          {/* 浏览器插件：站点 Cookie 同步的配套工具，安装引导与同步令牌都在这张卡片组里 */}
+          {/* 浏览器插件：站点 Cookie 同步的配套工具 */}
           <ExtensionCard />
         </>
       )}
@@ -294,7 +336,6 @@ interface AddSitePanelProps {
 }
 
 function AddSitePanel({ available, onCreated, onCancel, onError }: AddSitePanelProps) {
-  const { backdrop } = useBackdrop();
   const [query, setQuery] = useState("");
   const [selected, setSelected] = useState<CatalogItem | null>(null);
   const [busy, setBusy] = useState(false);
@@ -313,7 +354,7 @@ function AddSitePanel({ available, onCreated, onCancel, onError }: AddSitePanelP
   // 已选定站点 → 展示授权表单
   if (selected) {
     return (
-      <div className="css-glass !rounded-xl p-4">
+      <div className="rounded-xl border border-white/[0.08] bg-white/[0.03] p-4">
         <div className="mb-3 flex items-center justify-between gap-3">
           <div className="min-w-0">
             <p className="truncate text-body font-semibold text-[var(--text)]">
@@ -351,16 +392,14 @@ function AddSitePanel({ available, onCreated, onCancel, onError }: AddSitePanelP
 
   // 未选定 → 搜索 + 站点列表
   return (
-    <div className="css-glass !rounded-xl p-4">
+    <div className="rounded-xl border border-white/[0.08] bg-white/[0.03] p-4">
       <div className="mb-3 flex items-center justify-between gap-3">
-        {/* 液态玻璃搜索框：与全站其余玻璃组件共享同一背景大图（useBackdrop），折射下方内容 */}
-        <LiquidGlassInput
-          backgroundImage={backdrop}
-          variant="frosted"
+        <input
           value={query}
           onChange={(e) => setQuery(e.target.value)}
           placeholder="搜索站点名称 / 地址"
           autoFocus
+          className="w-full rounded-xl border border-white/[0.08] bg-white/[0.04] px-3 py-2 text-ui text-[var(--text)] outline-none focus:border-[var(--accent)]/60"
         />
         <button
           type="button"
@@ -407,34 +446,35 @@ function AddSitePanel({ available, onCreated, onCancel, onError }: AddSitePanelP
   );
 }
 
-/* —— 单个已配置站点卡片：折叠态展示状态 + 操作，展开态是授权表单 —— */
+/* —— 站点行：一行一站，P0 常驻 + P1 条件徽章；点击展开详情 —— */
 
-interface SiteCardProps {
+interface SiteRowProps {
   item: CatalogItem;
   site: ConfiguredSite;
-  /** 该站点的种子缓存统计；定时同步任务从未跑过该站时为 undefined */
   stats?: SiteSyncStats;
+  boost?: SiteBoostStats;
   expanded: boolean;
-  onToggleForm: (open: boolean) => void;
+  onToggle: () => void;
   onChanged: (site: ConfiguredSite) => void;
   onDeleted: (siteId: string) => void;
   onError: (message: string) => void;
 }
 
-function SiteCard({
+function SiteRow({
   item,
   site,
   stats,
+  boost,
   expanded,
-  onToggleForm,
+  onToggle,
   onChanged,
   onDeleted,
   onError,
-}: SiteCardProps) {
-  const { backdrop } = useBackdrop();
+}: SiteRowProps) {
   const confirm = useConfirm();
   const [busy, setBusy] = useState(false);
   const meta = STATUS_META[site.status];
+  const failed = site.status === "failed" && !!site.last_error;
 
   async function guard(fn: () => Promise<void>) {
     setBusy(true);
@@ -448,86 +488,123 @@ function SiteCard({
   }
 
   return (
-    <div className="css-glass !rounded-xl">
-      {/* 顶部行：首字母徽标 + 站点信息 + 状态 + 操作 */}
-      <div className="flex items-center gap-3.5 p-4">
-        {item.base_url ? (
-          <a
-            href={item.base_url}
-            target="_blank"
-            rel="noreferrer"
-            aria-label={`在新窗口打开 ${item.display_name}`}
-            title="在新窗口打开站点"
-            className="icon-chip size-10 cursor-pointer !rounded-xl text-body font-semibold outline-none hover:bg-white/[0.1] hover:text-[var(--text)] focus-visible:ring-2 focus-visible:ring-[var(--accent-ring)]"
-          >
-            {item.display_name.charAt(0).toUpperCase()}
-          </a>
-        ) : (
-          <span className="icon-chip size-10 !rounded-xl text-body font-semibold">
+    <div className={site.enabled ? "" : "opacity-60"}>
+      {/* 行主体：整行是展开热区。桌面单行；移动端徽章折到第二行（basis-full） */}
+      <div
+        role="button"
+        tabIndex={0}
+        aria-expanded={expanded}
+        onClick={onToggle}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            onToggle();
+          }
+        }}
+        className="flex min-h-[52px] cursor-pointer flex-wrap items-center gap-x-3 gap-y-1.5 px-4 py-2.5 transition-colors hover:bg-white/[0.03]"
+      >
+        {/* P0：徽标 + 名称 + 状态 */}
+        <div className="flex min-w-0 flex-1 items-center gap-2.5">
+          <span className="icon-chip size-8 shrink-0 !rounded-lg text-sub font-semibold">
             {item.display_name.charAt(0).toUpperCase()}
           </span>
-        )}
-        <div className="min-w-0 flex-1">
-          <div className="flex items-center gap-2">
-            {item.base_url ? (
-              <a
-                href={item.base_url}
-                target="_blank"
-                rel="noreferrer"
-                title="在新窗口打开站点"
-                className="truncate text-body font-semibold text-[var(--text)] underline decoration-transparent underline-offset-4 transition-colors hover:cursor-pointer hover:text-white/80 hover:decoration-white/50 focus-visible:outline-none focus-visible:decoration-white/50"
-              >
-                {item.display_name}
-              </a>
-            ) : (
-              <p className="truncate text-body font-semibold text-[var(--text)]">{item.display_name}</p>
-            )}
-            <span
-              className="flex shrink-0 items-center gap-1.5 rounded-full px-2 py-0.5 text-caption font-medium"
-              style={{ background: `color-mix(in oklab, ${meta.color} 12%, transparent)`, color: meta.color }}
+          {item.base_url ? (
+            <a
+              href={item.base_url}
+              target="_blank"
+              rel="noreferrer"
+              title="在新窗口打开站点"
+              onClick={(e) => e.stopPropagation()}
+              className="truncate text-ui font-semibold text-[var(--text)] underline decoration-transparent underline-offset-4 transition-colors hover:text-white/80 hover:decoration-white/50"
             >
-              <span className="size-1.5 rounded-full" style={{ background: meta.color }} />
-              {meta.label}
+              {item.display_name}
+            </a>
+          ) : (
+            <span className="truncate text-ui font-semibold text-[var(--text)]">
+              {item.display_name}
             </span>
-          </div>
-          <p className="mt-0.5 truncate text-caption text-[var(--text-faint)]">
-            {site.status === "failed" && site.last_error
-              ? site.last_error
-              : `${AUTH_TYPE_LABEL[site.auth_type]} · 上次检查 ${formatRelativeTime(site.last_checked_at)}`}
-          </p>
+          )}
+          <span
+            className="flex shrink-0 items-center gap-1.5 rounded-full px-2 py-0.5 text-caption font-medium"
+            style={{
+              background: `color-mix(in oklab, ${meta.color} 12%, transparent)`,
+              color: meta.color,
+            }}
+          >
+            <span className="size-1.5 rounded-full" style={{ background: meta.color }} />
+            {meta.label}
+          </span>
+          {!site.enabled && (
+            <span className="shrink-0 rounded-full bg-white/[0.08] px-2 py-0.5 text-caption font-medium text-[var(--text-muted)]">
+              已停用
+            </span>
+          )}
         </div>
 
-        <div className="flex shrink-0 items-center gap-2">
-          {/* 启用开关：真实 WebGL 液态玻璃开关（LiquidGlassButton 本质就是 toggle）。
-              受控于 site.enabled——切换后先请求后端、拿到结果再回写；请求期间 disabled 防抖，
-              失败时 site.enabled 不变，受控 prop 会把开关动画回弹到原位。
-              用 !w-auto/!p-0/!bg-transparent/!gap-0 剥掉组件默认的整行外壳，只留 64×32 开关本体。 */}
-          <LiquidGlassButton
-            backgroundImage={backdrop}
-            variant="dark"
-            checked={site.enabled}
-            disabled={busy}
-            aria-label={site.enabled ? "已启用，点击停用" : "已停用，点击启用"}
-            onCheckedChange={(enabled) =>
+        {/* P1：条件徽章（异常时错误原因吃掉徽章位——那一刻没有比它更重要的信息） */}
+        {failed ? (
+          <p className="order-3 basis-full truncate text-caption text-[var(--danger)] sm:order-none sm:basis-auto sm:max-w-[45%]">
+            {site.last_error}
+          </p>
+        ) : (
+          (site.protected || site.boost_enabled) && (
+            <div className="order-3 flex basis-full flex-wrap items-center gap-1.5 sm:order-none sm:basis-auto">
+              {site.protected && (
+                <span
+                  className="rounded-full px-2 py-0.5 text-caption font-medium"
+                  style={{
+                    background: "color-mix(in oklab, var(--info) 12%, transparent)",
+                    color: "var(--info)",
+                  }}
+                  title="订阅不会自动从该站拉种，手动搜索下载不受影响"
+                >
+                  保护中
+                </span>
+              )}
+              {site.boost_enabled && (
+                <span
+                  className="rounded-full px-2 py-0.5 text-caption font-medium"
+                  style={{
+                    background: "color-mix(in oklab, var(--ok) 12%, transparent)",
+                    color: "var(--ok)",
+                  }}
+                  title="自动刷分享率运行中：已用/预算 · 近 24 小时上传"
+                >
+                  刷流 {boost ? formatBytes(boost.used_bytes) : "0"}/
+                  {formatBytes(site.boost_budget_bytes)}
+                  {boost && boost.uploaded_bytes_24h > 0 && (
+                    <> · 24h ↑{formatBytes(boost.uploaded_bytes_24h)}</>
+                  )}
+                </span>
+              )}
+            </div>
+          )
+        )}
+
+        {/* 控制区：展开箭头 + 操作菜单 */}
+        <div className="flex shrink-0 items-center gap-1">
+          <ChevronDownIcon
+            className={`size-4 text-[var(--text-faint)] transition-transform ${expanded ? "rotate-180" : ""}`}
+          />
+          <SiteActionsMenu
+            site={site}
+            busy={busy}
+            onSetEnabled={(enabled) =>
               void guard(async () => onChanged(await setSiteEnabled(site.site_id, enabled)))
             }
-            className="!min-h-0 !w-auto !gap-0 !bg-transparent !p-0"
-          >
-            <span className="sr-only">{site.enabled ? "已启用" : "已停用"}</span>
-          </LiquidGlassButton>
-          {/* 编辑/验证/删除收进折叠菜单，顶部行只留启用开关，避免操作平铺显得杂乱 */}
-          <SiteActionsMenu
-            expanded={expanded}
-            busy={busy}
-            canReverify={!IN_PROGRESS.includes(site.status)}
-            onEdit={() => onToggleForm(!expanded)}
-            onReverify={() => void guard(async () => onChanged(await reverifySite(site.site_id)))}
+            onSetProtected={(next) =>
+              void guard(async () => onChanged(await setSiteProtection(site.site_id, next)))
+            }
+            onReverify={() =>
+              void guard(async () => onChanged(await reverifySite(site.site_id)))
+            }
             onDelete={() =>
               void guard(async () => {
                 if (
                   !(await confirm({
                     title: `删除「${item.display_name}」的配置？`,
-                    description: "该站点将不再参与搜索与订阅投递，可随时重新接入。",
+                    description:
+                      "该站点将不再参与搜索与订阅投递；在池的刷流任务会转出管理并继续做种。可随时重新接入。",
                     confirmLabel: "删除",
                     tone: "danger",
                   }))
@@ -542,52 +619,164 @@ function SiteCard({
         </div>
       </div>
 
-      {/* 用户资料统计带：验证成功时抓取（见后端 verify_site），验证失败保留上一次
-          成功的旧快照继续展示 —— 数据新鲜度通过 tooltip 的「资料更新于」体现 */}
-      {site.profile && (
-        <div
-          className="flex flex-wrap gap-x-7 gap-y-2 border-t border-white/[0.06] px-4 py-3"
-          title={`资料更新于 ${formatRelativeTime(site.profile.fetched_at)}`}
-        >
-          <ProfileStat label="账号" value={site.profile.username} />
-          {site.profile.user_class && <ProfileStat label="等级" value={site.profile.user_class} />}
-          <ProfileStat label="上传量" value={formatBytes(site.profile.uploaded_bytes)} />
-          <ProfileStat label="下载量" value={formatBytes(site.profile.downloaded_bytes)} />
-          <ProfileStat label="分享率" value={formatRatio(site.profile.ratio)} />
-          {site.profile.bonus != null && (
-            <ProfileStat label="魔力" value={formatCompact(site.profile.bonus)} />
-          )}
-          <ProfileStat label="做种" value={String(site.profile.seeding_count)} />
-        </div>
-      )}
-
-      {/* 种子缓存统计带：定时同步任务维护的本地缓存感知——存了多少、上次/下次
-          什么时候同步。从未同步过的站点没有这条带（stats 缺失） */}
-      {stats && (
-        <div
-          className="flex flex-wrap gap-x-7 gap-y-2 border-t border-white/[0.06] px-4 py-3"
-          title={`开始跟踪于 ${formatDateTime(stats.tracking_since)}`}
-        >
-          <ProfileStat label="已缓存种子" value={stats.torrent_count.toLocaleString("zh-CN")} />
-          <ProfileStat label="上次同步" value={formatRelativeTime(stats.last_sync_at)} />
-          <ProfileStat label="下次同步" value={nextSyncLabel(stats.next_sync_at)} />
-          {stats.sync_interval_seconds != null && (
-            <ProfileStat label="同步间隔" value={formatDuration(stats.sync_interval_seconds)} />
-          )}
-          {stats.last_new_count != null && (
-            <ProfileStat label="上次新增" value={String(stats.last_new_count)} />
-          )}
-        </div>
-      )}
-      {stats?.last_error && (
-        <p className="border-t border-white/[0.06] px-4 py-2.5 text-caption text-[#ff6b6b]">
-          上次同步失败：{stats.last_error}
-        </p>
-      )}
-
-      {/* 展开态：授权表单 */}
+      {/* 展开详情：刷流 / 账号 / 索引 / 授权 四段 */}
       {expanded && (
-        <div className="border-t border-white/[0.06] p-4">
+        <SiteDetail
+          item={item}
+          site={site}
+          stats={stats}
+          boost={boost}
+          busy={busy}
+          guard={guard}
+          onChanged={onChanged}
+        />
+      )}
+    </div>
+  );
+}
+
+/* —— 展开详情：P2 信息与刷流设置，移动端统计自动折成两列 —— */
+
+interface SiteDetailProps {
+  item: CatalogItem;
+  site: ConfiguredSite;
+  stats?: SiteSyncStats;
+  boost?: SiteBoostStats;
+  busy: boolean;
+  guard: (fn: () => Promise<void>) => Promise<void>;
+  onChanged: (site: ConfiguredSite) => void;
+}
+
+function SiteDetail({ item, site, stats, boost, busy, guard, onChanged }: SiteDetailProps) {
+  const [editingAuth, setEditingAuth] = useState(false);
+  // 预算输入（GiB 为单位）：失焦即存；site 变化（别处保存成功）时回同步
+  const [budgetGib, setBudgetGib] = useState(() =>
+    String(Math.round(site.boost_budget_bytes / GIB)),
+  );
+  useEffect(() => {
+    setBudgetGib(String(Math.round(site.boost_budget_bytes / GIB)));
+  }, [site.boost_budget_bytes]);
+
+  function commitBudget() {
+    const gib = Math.round(Number(budgetGib));
+    if (!Number.isFinite(gib) || gib < 1) {
+      setBudgetGib(String(Math.round(site.boost_budget_bytes / GIB)));
+      return;
+    }
+    const bytes = gib * GIB;
+    if (bytes === site.boost_budget_bytes) return;
+    void guard(async () =>
+      onChanged(await setSiteRatioBoost(site.site_id, site.boost_enabled, bytes)),
+    );
+  }
+
+  return (
+    <div className="space-y-4 border-t border-white/[0.06] bg-white/[0.02] px-4 py-4">
+      {/* ─ 刷流 ─ */}
+      <DetailSection label="刷流">
+        <div className="flex flex-wrap items-center gap-x-5 gap-y-2">
+          <div className="flex items-center gap-2.5">
+            <FlatSwitch
+              checked={site.boost_enabled}
+              disabled={busy}
+              label={site.boost_enabled ? "关闭自动刷分享率" : "开启自动刷分享率"}
+              onChange={(next) =>
+                void guard(async () => onChanged(await setSiteRatioBoost(site.site_id, next)))
+              }
+            />
+            <span className="text-sub text-[var(--text-muted)]">
+              自动抢免费新种做种，预算内汰换低效任务（72 小时保留期内绝不删）
+            </span>
+          </div>
+          {site.boost_enabled && (
+            <div className="flex items-center gap-2">
+              <span className="text-micro text-[var(--text-faint)]">预算</span>
+              <input
+                type="number"
+                min={1}
+                value={budgetGib}
+                disabled={busy}
+                onChange={(e) => setBudgetGib(e.target.value)}
+                onBlur={commitBudget}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") (e.target as HTMLInputElement).blur();
+                }}
+                className="w-20 rounded-lg border border-white/[0.08] bg-white/[0.04] px-2 py-1 text-right text-ui text-[var(--text)] outline-none focus:border-[var(--accent)]/60"
+              />
+              <span className="text-caption text-[var(--text-muted)]">GiB</span>
+            </div>
+          )}
+        </div>
+        {site.boost_enabled && boost && (
+          <>
+            <div className="grid grid-cols-2 gap-x-5 gap-y-2 sm:flex sm:flex-wrap sm:gap-x-7">
+              <DetailStat
+                label="已用 / 预算"
+                value={`${formatBytes(boost.used_bytes)} / ${formatBytes(boost.budget_bytes)}`}
+              />
+              <DetailStat label="在池做种" value={String(boost.active_count)} />
+              <DetailStat label="累计上传" value={formatBytes(boost.uploaded_bytes_total)} />
+              {boost.evicted_count > 0 && (
+                <DetailStat label="已汰换" value={String(boost.evicted_count)} />
+              )}
+            </div>
+            {boost.avg_used_bytes_24h > 0 && (
+              <p className="text-caption text-[var(--text-muted)]">
+                近 24 小时：{formatBytes(boost.avg_used_bytes_24h)} 在池种子贡献了{" "}
+                {formatBytes(boost.uploaded_bytes_24h)} 上传
+                {boost.avg_used_bytes_7d > 0 &&
+                  ` · 近 7 天：${formatBytes(boost.avg_used_bytes_7d)} 贡献 ${formatBytes(boost.uploaded_bytes_7d)}`}
+              </p>
+            )}
+          </>
+        )}
+      </DetailSection>
+
+      {/* ─ 账号 ─ */}
+      {site.profile && (
+        <DetailSection label="账号">
+          <div
+            className="grid grid-cols-2 gap-x-5 gap-y-2 sm:flex sm:flex-wrap sm:gap-x-7"
+            title={`资料更新于 ${formatRelativeTime(site.profile.fetched_at)}`}
+          >
+            <DetailStat label="账号" value={site.profile.username} />
+            {site.profile.user_class && (
+              <DetailStat label="等级" value={site.profile.user_class} />
+            )}
+            <DetailStat label="上传量" value={formatBytes(site.profile.uploaded_bytes)} />
+            <DetailStat label="下载量" value={formatBytes(site.profile.downloaded_bytes)} />
+            <DetailStat label="分享率" value={formatRatio(site.profile.ratio)} />
+            {site.profile.bonus != null && (
+              <DetailStat label="魔力" value={formatCompact(site.profile.bonus)} />
+            )}
+            <DetailStat label="做种" value={String(site.profile.seeding_count)} />
+          </div>
+        </DetailSection>
+      )}
+
+      {/* ─ 索引 ─ */}
+      {stats && (
+        <DetailSection label="索引">
+          <div className="grid grid-cols-2 gap-x-5 gap-y-2 sm:flex sm:flex-wrap sm:gap-x-7">
+            <DetailStat
+              label="已缓存种子"
+              value={stats.torrent_count.toLocaleString("zh-CN")}
+            />
+            <DetailStat label="上次同步" value={formatRelativeTime(stats.last_sync_at)} />
+            <DetailStat label="下次同步" value={nextSyncLabel(stats.next_sync_at)} />
+            {stats.sync_interval_seconds != null && (
+              <DetailStat label="同步间隔" value={formatDuration(stats.sync_interval_seconds)} />
+            )}
+          </div>
+          {stats.last_error && (
+            <p className="text-caption text-[#ff6b6b]">上次同步失败：{stats.last_error}</p>
+          )}
+        </DetailSection>
+      )}
+
+      {/* ─ 授权 ─ */}
+      <DetailSection label="授权">
+        {editingAuth ? (
           <SiteForm
             item={item}
             site={site}
@@ -595,12 +784,46 @@ function SiteCard({
             onSubmit={(payload) =>
               guard(async () => {
                 onChanged(await updateSite(item.site_id, payload));
-                onToggleForm(false);
+                setEditingAuth(false);
               })
             }
           />
-        </div>
-      )}
+        ) : (
+          <div className="flex flex-wrap items-center gap-x-5 gap-y-2">
+            <span className="text-sub text-[var(--text-muted)]">
+              {AUTH_TYPE_LABEL[site.auth_type]} · 上次检查{" "}
+              {formatRelativeTime(site.last_checked_at)}
+            </span>
+            <button
+              type="button"
+              onClick={() => setEditingAuth(true)}
+              disabled={busy}
+              className="btn-glass px-3 py-1 text-sub font-medium"
+            >
+              编辑授权
+            </button>
+          </div>
+        )}
+      </DetailSection>
+    </div>
+  );
+}
+
+/** 详情分段：小标题 + 内容，统一四段的视觉节奏 */
+function DetailSection({ label, children }: { label: string; children: React.ReactNode }) {
+  return (
+    <div className="space-y-2">
+      <p className="text-micro font-medium tracking-wide text-[var(--text-faint)]">{label}</p>
+      {children}
+    </div>
+  );
+}
+
+function DetailStat({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="min-w-0">
+      <p className="text-micro text-[var(--text-faint)]">{label}</p>
+      <p className="mt-0.5 truncate text-ui font-semibold text-[var(--text)]">{value}</p>
     </div>
   );
 }
@@ -612,52 +835,75 @@ function nextSyncLabel(iso: string | null): string {
   return formatRelativeTime(iso);
 }
 
-/* —— 资料统计单元：label 小字 + 数值 semibold，构成卡片内的一行 stat tiles —— */
+/* —— 轻量 CSS 开关：配置页刻意不用 WebGL 玻璃开关（移动端性能与稳定优先） —— */
 
-function ProfileStat({ label, value }: { label: string; value: string }) {
+interface FlatSwitchProps {
+  checked: boolean;
+  disabled?: boolean;
+  label: string;
+  onChange: (next: boolean) => void;
+}
+
+function FlatSwitch({ checked, disabled, label, onChange }: FlatSwitchProps) {
   return (
-    <div className="min-w-0">
-      <p className="text-micro text-[var(--text-faint)]">{label}</p>
-      <p className="mt-0.5 truncate text-ui font-semibold text-[var(--text)]">{value}</p>
-    </div>
+    <button
+      type="button"
+      role="switch"
+      aria-checked={checked}
+      aria-label={label}
+      disabled={disabled}
+      onClick={(e) => {
+        e.stopPropagation();
+        onChange(!checked);
+      }}
+      className={`relative h-6 w-11 shrink-0 rounded-full transition-colors disabled:opacity-50 ${
+        checked ? "bg-[var(--ok)]/70" : "bg-white/[0.14]"
+      }`}
+    >
+      <span
+        className={`absolute left-0.5 top-0.5 size-5 rounded-full bg-white shadow transition-transform ${
+          checked ? "translate-x-5" : ""
+        }`}
+      />
+    </button>
   );
 }
 
-/* —— 站点操作折叠菜单：把编辑/重新验证/删除收进 ⋯ 里，点击外部或选中任一项后关闭 —— */
+/* —— 站点操作折叠菜单：启停 / 保护 / 重验 / 删除 全部收口于此 —— */
 
 interface SiteActionsMenuProps {
-  expanded: boolean;
+  site: ConfiguredSite;
   busy: boolean;
-  /** 处于 pending/verifying 中间态时不允许再次触发验证 */
-  canReverify: boolean;
-  onEdit: () => void;
+  onSetEnabled: (enabled: boolean) => void;
+  onSetProtected: (next: boolean) => void;
   onReverify: () => void;
   onDelete: () => void;
 }
 
 function SiteActionsMenu({
-  expanded,
+  site,
   busy,
-  canReverify,
-  onEdit,
+  onSetEnabled,
+  onSetProtected,
   onReverify,
   onDelete,
 }: SiteActionsMenuProps) {
-  // 用 Radix DropdownMenu：菜单渲染进 body Portal 并由 Floating UI 做碰撞检测，
-  // 靠近视口边缘时自动翻转/收边，绝不会像绝对定位那样把父容器/页面撑开。
-  // 开合状态、点击外部关闭、键盘导航与焦点管理都由 Radix 托管。
+  // Radix DropdownMenu：菜单渲染进 body Portal 并做碰撞检测；
+  // 菜单项加大内边距保证移动端触控目标
   const itemClass =
-    "glass-row nav-item cursor-pointer px-3 py-2 text-sub font-medium outline-none " +
+    "glass-row nav-item cursor-pointer px-3 py-2.5 text-sub font-medium outline-none " +
     "data-[highlighted]:!bg-[var(--glass-fill-hover)] data-[highlighted]:!text-[var(--text)] " +
     "data-[disabled]:pointer-events-none data-[disabled]:opacity-40";
+  const canReverify = !IN_PROGRESS.includes(site.status);
 
   return (
     <DropdownMenu.Root>
       <DropdownMenu.Trigger asChild>
         <button
           type="button"
-          aria-label="更多操作"
-          className="glass-row !w-auto p-1.5 data-[state=open]:!bg-[var(--glass-fill-active)] data-[state=open]:!text-[var(--text)]"
+          aria-label="站点操作"
+          onClick={(e) => e.stopPropagation()}
+          className="glass-row !w-auto p-2 data-[state=open]:!bg-[var(--glass-fill-active)] data-[state=open]:!text-[var(--text)]"
         >
           <MoreIcon className="size-4" />
         </button>
@@ -667,10 +913,22 @@ function SiteActionsMenu({
           align="end"
           sideOffset={6}
           collisionPadding={12}
-          className="menu-surface z-50 min-w-[9rem] !rounded-xl p-1"
+          className="menu-surface z-50 min-w-[10rem] !rounded-xl p-1"
+          onClick={(e) => e.stopPropagation()}
         >
-          <DropdownMenu.Item onSelect={onEdit} className={itemClass}>
-            {expanded ? "收起编辑" : "编辑配置"}
+          <DropdownMenu.Item
+            onSelect={() => onSetEnabled(!site.enabled)}
+            disabled={busy}
+            className={itemClass}
+          >
+            {site.enabled ? "停用站点" : "启用站点"}
+          </DropdownMenu.Item>
+          <DropdownMenu.Item
+            onSelect={() => onSetProtected(!site.protected)}
+            disabled={busy}
+            className={itemClass}
+          >
+            {site.protected ? "取消保护" : "开启保护"}
           </DropdownMenu.Item>
           <DropdownMenu.Item
             onSelect={onReverify}

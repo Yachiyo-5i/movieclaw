@@ -134,6 +134,12 @@ export const ChevronLeftIcon = (p: IconProps) => (
   </Base>
 );
 
+export const ChevronDownIcon = (p: IconProps) => (
+  <Base {...p}>
+    <path d="m6 9 6 6 6-6" />
+  </Base>
+);
+
 /** 拖拽手柄（两列圆点）：实心小点比描边更接近系统级「可拖动」示意 */
 export const GripIcon = (p: IconProps) => (
   <Base fill="currentColor" stroke="none" {...p}>

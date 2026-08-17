@@ -160,6 +160,39 @@ class SiteConfigService:
         await invalidate_site_access(site_id)
         return await self.get_configured(site_id)
 
+    async def set_protected(self, site_id: str, protected: bool) -> SiteCredential:
+        """打开/关闭站点保护；未配置时抛 404。返回更新后的记录。
+
+        保护开关只影响订阅链路的选站（搜索扇出与评估投递两道闸都在读库时
+        取最新值），不涉及站点访问凭据，无需作废共享客户端缓存。
+        """
+        ok = await self._credentials.set_protected(site_id, protected)
+        if not ok:
+            raise NotFoundException(f"站点尚未配置：{site_id}")
+        return await self.get_configured(site_id)
+
+    async def set_ratio_boost(
+        self, site_id: str, *, enabled: bool, budget_bytes: int | None = None
+    ) -> SiteCredential:
+        """设置自动刷分享率开关与预算；未配置时抛 404。返回更新后的记录。
+
+        预算调小不会立刻删种——刷流引擎在下一个 tick 按汰换规则（保留期 +
+        效率下限）逐步收敛到新预算，绝不为了腾空间违反 72 小时保留期。
+        """
+        if budget_bytes is not None and budget_bytes < 1024**3:
+            raise BadRequestException("刷流存储预算不能小于 1 GiB")
+        ok = await self._credentials.set_ratio_boost(
+            site_id, enabled=enabled, budget_bytes=budget_bytes
+        )
+        if not ok:
+            raise NotFoundException(f"站点尚未配置：{site_id}")
+        if enabled:
+            # 立刻生效：游标标记到期，下一个 tick（≤2 分钟）即同步一次索引，
+            # 之后同步节奏被钉在最快档（见 torrent_sync._adapt_interval 的 pinned），
+            # 免费新种的发现延迟收敛到 5 分钟级，而不是等冷站的旧排期走完
+            await self._torrents.expire_cursor(site_id)
+        return await self.get_configured(site_id)
+
     async def delete(self, site_id: str) -> None:
         """删除站点配置，并连带清理其 cookie 缓存。
 
@@ -179,5 +212,9 @@ class SiteConfigService:
         await resolve_notices(self._session, dedupe_key=f"site:{site_id}")
         # 连带清理该站的本地种子快照与同步游标，避免重新添加时命中过期高水位
         await self._torrents.delete_site_data(site_id)
+        # 该站在池的刷流任务转出管理：预算主体已不存在，任务与数据保留做种
+        from movieclaw_api.services.ratio_boost import release_site_tasks
+
+        await release_site_tasks(self._session, site_id)
         # 作废共享客户端缓存并释放其连接
         await invalidate_site_access(site_id)
