@@ -350,7 +350,13 @@ def test_task_center_aggregates_live_downloads_and_subscription_context(client) 
     # 没有 attempt 台账声明覆盖范围时，units 只含在途工单；同 hash 的已
     # 入库集（上面 seed 的 S01E03）不会越过台账口径混进列表
     assert by_hash[linked_hash]["subscriptions"][0]["units"] == [
-        {"season_number": 1, "episode_number": 1, "status": "grabbed"}
+        {
+            "season_number": 1,
+            "episode_number": 1,
+            "status": "grabbed",
+            "replaced": False,
+            "content_missing": False,
+        }
     ]
     assert by_hash[external_hash]["source"] == "external"
     assert by_hash[external_hash]["progress"] == 0.42
@@ -563,13 +569,653 @@ def test_task_center_keeps_full_unit_coverage_during_partial_ingest(client) -> N
     task = next(item for item in items if item["info_hash"] == info_hash)
     # 已入库的 E01 仍留在覆盖列表里，且逐集状态可区分
     assert task["subscriptions"][0]["units"] == [
-        {"season_number": 1, "episode_number": 1, "status": "imported"},
-        {"season_number": 1, "episode_number": 2, "status": "downloaded"},
-        {"season_number": 1, "episode_number": 3, "status": "grabbed"},
+        {
+            "season_number": 1,
+            "episode_number": 1,
+            "status": "imported",
+            "replaced": False,
+            "content_missing": False,
+        },
+        {
+            "season_number": 1,
+            "episode_number": 2,
+            "status": "downloaded",
+            "replaced": False,
+            "content_missing": False,
+        },
+        {
+            "season_number": 1,
+            "episode_number": 3,
+            "status": "grabbed",
+            "replaced": False,
+            "content_missing": False,
+        },
     ]
     # 下载轴不被入库进度污染：种子仍在下载
     assert task["state"] == "downloading"
     assert task["progress"] == 0.19
+
+
+def test_task_center_marks_content_missing_units(client) -> None:
+    """真实事故：「S04 全集包」下完 7.59 GB，但包里根本没有被 TMDB 编号为
+    S04E14 的特别版。工单退回重找后卡片既丢了影片身份（退化成外部任务），
+    又继续挂着「已入库，其余等待下载完成」——和「下载完成」自相矛盾。
+
+    内容核验的结论必须一路透到卡片：关联保留，那一集标成 content_missing。
+    """
+    from movieclaw_db.engine import get_database
+    from movieclaw_db.models import (
+        DownloadAttemptStatus,
+        MediaItem,
+        RuleSet,
+        Subscription,
+        SubscriptionDownloadAttempt,
+        WantedItem,
+        WantedStatus,
+        utcnow,
+    )
+
+    c, _ = client
+    downloader_id = c.post("/api/v1/downloaders", json=_PAYLOAD).json()["data"]["id"]
+    info_hash = "c" * 40
+    _fake_torrents.append(
+        TorrentBrief(
+            name="Missing.Special.S04.Complete",
+            content_name="Missing.Special.S04.Complete",
+            completed=True,
+            info_hash=info_hash,
+            progress=1.0,
+            size_bytes=8149700444,
+            state="completed",
+        )
+    )
+
+    async def seed() -> None:
+        async with get_database().session() as session:
+            media = MediaItem(kind="tv", tmdb_id=4343, title="内容不符剧", original_title="CM")
+            rule = RuleSet(name="内容不符规则")
+            session.add_all([media, rule])
+            await session.flush()
+            subscription = Subscription(
+                media_item_id=media.id, kind="tv", selected_seasons=[4], rule_set_id=rule.id
+            )
+            session.add(subscription)
+            await session.flush()
+            # E01 入库成功；E14 被核验判定不在包里，已退回 wanted（info_hash 清空）
+            session.add_all(
+                [
+                    WantedItem(
+                        subscription_id=subscription.id,
+                        media_item_id=media.id,
+                        season_number=4,
+                        episode_number=1,
+                        status=WantedStatus.IMPORTED,
+                        info_hash=info_hash,
+                    ),
+                    WantedItem(
+                        subscription_id=subscription.id,
+                        media_item_id=media.id,
+                        season_number=4,
+                        episode_number=14,
+                        status=WantedStatus.WANTED,
+                    ),
+                ]
+            )
+            session.add(
+                SubscriptionDownloadAttempt(
+                    subscription_id=subscription.id,
+                    downloader_id=downloader_id,
+                    info_hash=info_hash,
+                    torrent_title="Missing.Special.S04.Complete",
+                    units=[[4, 1], [4, 14]],
+                    status=DownloadAttemptStatus.COMPLETED,
+                    last_progress_at=utcnow(),
+                    content_missing={
+                        "units": [[4, 14]],
+                        "sources": [["chdbits", "126352"]],
+                    },
+                )
+            )
+            await session.commit()
+
+    asyncio.run(seed())
+    items = c.get("/api/v1/downloaders/tasks").json()["data"]["items"]
+    task = next(item for item in items if item["info_hash"] == info_hash)
+    # 工单已退回，关联仍在：卡片保住影片身份，才有地方讲清"为什么等不到"
+    assert task["source"] == "subscription"
+    assert task["media_title"] == "内容不符剧"
+    assert task["subscriptions"][0]["units"] == [
+        {
+            "season_number": 4,
+            "episode_number": 1,
+            "status": "imported",
+            "replaced": False,
+            "content_missing": False,
+        },
+        {
+            "season_number": 4,
+            "episode_number": 14,
+            "status": "wanted",
+            "replaced": False,
+            "content_missing": True,
+        },
+    ]
+
+
+def test_task_center_reports_upgrade_progress_as_replacement(client) -> None:
+    """洗版任务的进度必须按"已替换"讲，不能沿用"已入库"。
+
+    真实事故：整季 2160p 洗版种刚投递、下载 0%，任务中心却显示"（有 16 集
+    已入库）"——洗版单元在投递前就已经是 imported（库里有旧版本），那是洗版
+    的**前提**而不是成果。判据只能是工单 info_hash 是否已被升级流程改指本
+    种子（upgrade.py 确认升级时才改写），未替换的集必须全为 False。
+    """
+    from movieclaw_db.engine import get_database
+    from movieclaw_db.models import (
+        DownloadAttemptStatus,
+        MediaItem,
+        RuleSet,
+        Subscription,
+        SubscriptionDownloadAttempt,
+        WantedItem,
+        WantedStatus,
+        utcnow,
+    )
+
+    c, _ = client
+    downloader_id = c.post("/api/v1/downloaders", json=_PAYLOAD).json()["data"]["id"]
+    old_hash = "a1" * 20
+    new_hash = "b2" * 20
+    _fake_torrents.append(
+        TorrentBrief(
+            name="Upgrade.S07.2160p",
+            content_name="Upgrade.S07.2160p",
+            completed=False,
+            info_hash=new_hash,
+            progress=0.003,
+            size_bytes=14548578304,
+            state="downloading",
+        )
+    )
+
+    async def seed() -> None:
+        async with get_database().session() as session:
+            media = MediaItem(kind="tv", tmdb_id=4343, title="洗版剧", original_title="UP")
+            rule = RuleSet(name="洗版规则", spec={"upgrade_source": "web-dl"})
+            session.add_all([media, rule])
+            await session.flush()
+            subscription = Subscription(
+                media_item_id=media.id, kind="tv", selected_seasons=[7], rule_set_id=rule.id
+            )
+            session.add(subscription)
+            await session.flush()
+            # 三集都早已入库（旧版本），工单 info_hash 仍指向旧种子
+            session.add_all(
+                [
+                    WantedItem(
+                        subscription_id=subscription.id,
+                        media_item_id=media.id,
+                        season_number=7,
+                        episode_number=episode,
+                        status=WantedStatus.IMPORTED,
+                        info_hash=old_hash,
+                        imported_at=utcnow() - timedelta(days=30),
+                    )
+                    for episode in (1, 2, 3)
+                ]
+            )
+            session.add(
+                SubscriptionDownloadAttempt(
+                    subscription_id=subscription.id,
+                    downloader_id=downloader_id,
+                    info_hash=new_hash,
+                    torrent_title="Upgrade.S07.2160p",
+                    units=[[7, 1], [7, 2], [7, 3]],
+                    purpose="upgrade",
+                    status=DownloadAttemptStatus.ACTIVE,
+                    last_progress_at=utcnow(),
+                )
+            )
+            await session.commit()
+
+    asyncio.run(seed())
+    subscription_view = next(
+        item
+        for item in c.get("/api/v1/downloaders/tasks").json()["data"]["items"]
+        if item["info_hash"] == new_hash
+    )["subscriptions"][0]
+    assert subscription_view["purpose"] == "upgrade"
+    # 规则组没开收藏家模式：替换后旧版本会进回收站，卡片据此预告"待回收"
+    assert subscription_view["upgrade_keep_old"] is False
+    # 覆盖列表照常给出全部三集，但一集都还没替换
+    assert subscription_view["units"] == [
+        {
+            "season_number": 7,
+            "episode_number": 1,
+            "status": "imported",
+            "replaced": False,
+            "content_missing": False,
+        },
+        {
+            "season_number": 7,
+            "episode_number": 2,
+            "status": "imported",
+            "replaced": False,
+            "content_missing": False,
+        },
+        {
+            "season_number": 7,
+            "episode_number": 3,
+            "status": "imported",
+            "replaced": False,
+            "content_missing": False,
+        },
+    ]
+
+    async def confirm_first_episode() -> None:
+        """模拟升级确认：E01 的工单改指新种子。"""
+        async with get_database().session() as session:
+            wanted = (
+                await session.execute(
+                    select(WantedItem).where(
+                        WantedItem.season_number == 7, WantedItem.episode_number == 1
+                    )
+                )
+            ).scalar_one()
+            wanted.info_hash = new_hash
+            await session.commit()
+
+    asyncio.run(confirm_first_episode())
+    replaced = [
+        unit["replaced"]
+        for unit in next(
+            item
+            for item in c.get("/api/v1/downloaders/tasks").json()["data"]["items"]
+            if item["info_hash"] == new_hash
+        )["subscriptions"][0]["units"]
+    ]
+    assert replaced == [True, False, False]
+
+
+def test_task_center_predicts_watch_rule_transfer_target(client) -> None:
+    """命中监听导入规则时，卡片要能预告"下载完成后复制/硬链接到哪个库、哪个目录"。
+
+    原来这一步只会说「等待下载完成 · 下一步」——对每条任务都一样，等于没说。
+    落点口径必须与真正投递一致（同走 resolve_save_path），否则会出现"卡片说
+    好、投递却挂"的漂移。
+    """
+    from movieclaw_db.engine import get_database
+    from movieclaw_db.models import (
+        DownloadAttemptStatus,
+        ImportWatch,
+        Library,
+        MediaItem,
+        RuleSet,
+        Subscription,
+        SubscriptionDownloadAttempt,
+        WantedItem,
+        WantedStatus,
+        utcnow,
+    )
+
+    c, _ = client
+    downloader_id = c.post("/api/v1/downloaders", json=_PAYLOAD).json()["data"]["id"]
+    info_hash = "e5" * 20
+    _fake_torrents.append(
+        TorrentBrief(
+            name="Planned.S01",
+            content_name="Planned.S01",
+            completed=False,
+            info_hash=info_hash,
+            progress=0.1,
+            state="downloading",
+        )
+    )
+
+    async def seed() -> None:
+        async with get_database().session() as session:
+            media = MediaItem(
+                kind="tv", tmdb_id=4646, title="落点剧", original_title="PL", year=2024
+            )
+            rule = RuleSet(name="落点规则")
+            library = Library(name="综艺", kind="tv", root_paths=["/media/综艺"])
+            session.add_all([media, rule, library])
+            await session.flush()
+            # 按 kind 的自动路由规则：源目录收下载，完成后 copy 进目标库
+            session.add(ImportWatch(source_path="/download/剧集", strategy="copy", kind="tv"))
+            subscription = Subscription(
+                media_item_id=media.id,
+                kind="tv",
+                selected_seasons=[1],
+                rule_set_id=rule.id,
+                library_id=library.id,
+            )
+            session.add(subscription)
+            await session.flush()
+            session.add(
+                WantedItem(
+                    subscription_id=subscription.id,
+                    media_item_id=media.id,
+                    season_number=1,
+                    episode_number=1,
+                    status=WantedStatus.GRABBED,
+                    info_hash=info_hash,
+                )
+            )
+            session.add(
+                SubscriptionDownloadAttempt(
+                    subscription_id=subscription.id,
+                    downloader_id=downloader_id,
+                    info_hash=info_hash,
+                    torrent_title="Planned.S01",
+                    units=[[1, 1]],
+                    status=DownloadAttemptStatus.ACTIVE,
+                    last_progress_at=utcnow(),
+                )
+            )
+            await session.commit()
+
+    asyncio.run(seed())
+    task = next(
+        item
+        for item in c.get("/api/v1/downloaders/tasks").json()["data"]["items"]
+        if item["info_hash"] == info_hash
+    )
+    assert task["plan"] == {
+        "mode": "watch",
+        "strategy": "copy",
+        "library_name": "综艺",
+        "dest_path": "/media/综艺/落点剧 (2024)",
+        "enters_library": True,
+    }
+
+
+def test_task_center_plan_reports_inplace_and_no_library(client) -> None:
+    """没有监听规则=原地下载进库（无搬运步骤）；库无根路径=根本不会自动入库。"""
+    from movieclaw_db.engine import get_database
+    from movieclaw_db.models import (
+        DownloadAttemptStatus,
+        Library,
+        MediaItem,
+        RuleSet,
+        Subscription,
+        SubscriptionDownloadAttempt,
+        WantedItem,
+        WantedStatus,
+        utcnow,
+    )
+
+    c, _ = client
+    downloader_id = c.post("/api/v1/downloaders", json=_PAYLOAD).json()["data"]["id"]
+    inplace_hash = "f6" * 20
+    orphan_hash = "a7" * 20
+    for name, h in (("Inplace.S01", inplace_hash), ("Orphan.S01", orphan_hash)):
+        _fake_torrents.append(
+            TorrentBrief(
+                name=name,
+                content_name=name,
+                completed=False,
+                info_hash=h,
+                progress=0.1,
+                state="downloading",
+            )
+        )
+
+    async def seed() -> None:
+        async with get_database().session() as session:
+            rule = RuleSet(name="无监听规则")
+            # 有根路径的库 → 原地下载；无根路径的库 → 下载器默认目录
+            rooted = Library(name="纪录片", kind="tv", root_paths=["/media/纪录片"])
+            rootless = Library(name="待配置", kind="tv", root_paths=[])
+            session.add_all([rule, rooted, rootless])
+            await session.flush()
+            for idx, (title, library, info_hash) in enumerate(
+                (("原地剧", rooted, inplace_hash), ("无根剧", rootless, orphan_hash))
+            ):
+                media = MediaItem(
+                    kind="tv", tmdb_id=4700 + idx, title=title, original_title=title, year=2025
+                )
+                session.add(media)
+                await session.flush()
+                subscription = Subscription(
+                    media_item_id=media.id,
+                    kind="tv",
+                    selected_seasons=[1],
+                    rule_set_id=rule.id,
+                    library_id=library.id,
+                )
+                session.add(subscription)
+                await session.flush()
+                session.add(
+                    WantedItem(
+                        subscription_id=subscription.id,
+                        media_item_id=media.id,
+                        season_number=1,
+                        episode_number=1,
+                        status=WantedStatus.GRABBED,
+                        info_hash=info_hash,
+                    )
+                )
+                session.add(
+                    SubscriptionDownloadAttempt(
+                        subscription_id=subscription.id,
+                        downloader_id=downloader_id,
+                        info_hash=info_hash,
+                        units=[[1, 1]],
+                        status=DownloadAttemptStatus.ACTIVE,
+                        last_progress_at=utcnow(),
+                    )
+                )
+            await session.commit()
+
+    asyncio.run(seed())
+    by_hash = {
+        item["info_hash"]: item
+        for item in c.get("/api/v1/downloaders/tasks").json()["data"]["items"]
+    }
+    assert by_hash[inplace_hash]["plan"] == {
+        "mode": "inplace",
+        "strategy": None,
+        "library_name": "纪录片",
+        "dest_path": "/media/纪录片/原地剧 (2025)",
+        "enters_library": True,
+    }
+    # 库没根路径：投递落下载器默认目录，谁也搬不动它
+    assert by_hash[orphan_hash]["plan"]["mode"] == "downloader_default"
+    assert by_hash[orphan_hash]["plan"]["dest_path"] is None
+
+
+def test_task_center_mixed_upgrade_does_not_count_gap_units_as_replaced(client) -> None:
+    """混合投递（同一整季包既洗版又补缺）：缺口集不得被算成"已替换"。
+
+    真实数据教训：S06 整季包洗 E01–E10、顺带补上从没有过的 E11。缺口工单从
+    投递那一刻起 info_hash 就等于这个种子，只看 hash 会把它读成"已完成 1 集
+    替换"——而它其实连下都没下完。判据必须再叠一条：该集要在 attempt 创建前
+    就已入库，才可能是这次洗版的替换对象（与 upgrade.py 认定洗版目标同源）。
+    """
+    from movieclaw_db.engine import get_database
+    from movieclaw_db.models import (
+        DownloadAttemptStatus,
+        MediaItem,
+        RuleSet,
+        Subscription,
+        SubscriptionDownloadAttempt,
+        WantedItem,
+        WantedStatus,
+        utcnow,
+    )
+
+    c, _ = client
+    downloader_id = c.post("/api/v1/downloaders", json=_PAYLOAD).json()["data"]["id"]
+    info_hash = "d4" * 20
+    _fake_torrents.append(
+        TorrentBrief(
+            name="Mixed.S06.2160p",
+            content_name="Mixed.S06.2160p",
+            completed=False,
+            info_hash=info_hash,
+            progress=0.4,
+            state="downloading",
+        )
+    )
+
+    async def seed() -> None:
+        async with get_database().session() as session:
+            media = MediaItem(kind="tv", tmdb_id=4545, title="混合投递剧", original_title="MIX")
+            # 开了收藏家模式：替换后旧版本共存不删，卡片要预告"旧版本保留"
+            rule = RuleSet(
+                name="混合规则", spec={"upgrade_source": "web-dl", "upgrade_keep_old": True}
+            )
+            session.add_all([media, rule])
+            await session.flush()
+            subscription = Subscription(
+                media_item_id=media.id, kind="tv", selected_seasons=[6], rule_set_id=rule.id
+            )
+            session.add(subscription)
+            await session.flush()
+            attempt = SubscriptionDownloadAttempt(
+                subscription_id=subscription.id,
+                downloader_id=downloader_id,
+                info_hash=info_hash,
+                torrent_title="Mixed.S06.2160p",
+                units=[[6, 1], [6, 2]],
+                purpose="upgrade",
+                status=DownloadAttemptStatus.ACTIVE,
+                last_progress_at=utcnow(),
+            )
+            session.add(attempt)
+            await session.flush()
+            created = attempt.created_at
+            session.add_all(
+                [
+                    # 洗版目标：attempt 之前就已入库，且已确认改指本种子
+                    WantedItem(
+                        subscription_id=subscription.id,
+                        media_item_id=media.id,
+                        season_number=6,
+                        episode_number=1,
+                        status=WantedStatus.IMPORTED,
+                        info_hash=info_hash,
+                        imported_at=created - timedelta(days=7),
+                    ),
+                    # 缺口集：同一个包顺带补的，hash 从投递起就指向本种子
+                    WantedItem(
+                        subscription_id=subscription.id,
+                        media_item_id=media.id,
+                        season_number=6,
+                        episode_number=2,
+                        status=WantedStatus.GRABBED,
+                        info_hash=info_hash,
+                    ),
+                ]
+            )
+            await session.commit()
+
+    asyncio.run(seed())
+    subscription_view = next(
+        item
+        for item in c.get("/api/v1/downloaders/tasks").json()["data"]["items"]
+        if item["info_hash"] == info_hash
+    )["subscriptions"][0]
+    assert subscription_view["upgrade_keep_old"] is True
+    units = subscription_view["units"]
+    assert units == [
+        {
+            "season_number": 6,
+            "episode_number": 1,
+            "status": "imported",
+            "replaced": True,
+            "content_missing": False,
+        },
+        {
+            "season_number": 6,
+            "episode_number": 2,
+            "status": "grabbed",
+            "replaced": False,
+            "content_missing": False,
+        },
+    ]
+
+
+def test_task_center_marks_gap_download_units_as_not_replaced(client) -> None:
+    """补缺下载的工单 hash 从投递起就等于本种子，绝不能被读成"已替换"。"""
+    from movieclaw_db.engine import get_database
+    from movieclaw_db.models import (
+        DownloadAttemptStatus,
+        MediaItem,
+        RuleSet,
+        Subscription,
+        SubscriptionDownloadAttempt,
+        WantedItem,
+        WantedStatus,
+        utcnow,
+    )
+
+    c, _ = client
+    downloader_id = c.post("/api/v1/downloaders", json=_PAYLOAD).json()["data"]["id"]
+    info_hash = "c3" * 20
+    _fake_torrents.append(
+        TorrentBrief(
+            name="Gap.S01",
+            content_name="Gap.S01",
+            completed=False,
+            info_hash=info_hash,
+            progress=0.5,
+            state="downloading",
+        )
+    )
+
+    async def seed() -> None:
+        async with get_database().session() as session:
+            media = MediaItem(kind="tv", tmdb_id=4444, title="补缺剧", original_title="GAP")
+            rule = RuleSet(name="补缺规则")
+            session.add_all([media, rule])
+            await session.flush()
+            subscription = Subscription(
+                media_item_id=media.id, kind="tv", selected_seasons=[1], rule_set_id=rule.id
+            )
+            session.add(subscription)
+            await session.flush()
+            session.add(
+                WantedItem(
+                    subscription_id=subscription.id,
+                    media_item_id=media.id,
+                    season_number=1,
+                    episode_number=1,
+                    status=WantedStatus.GRABBED,
+                    info_hash=info_hash,
+                )
+            )
+            session.add(
+                SubscriptionDownloadAttempt(
+                    subscription_id=subscription.id,
+                    downloader_id=downloader_id,
+                    info_hash=info_hash,
+                    torrent_title="Gap.S01",
+                    units=[[1, 1]],
+                    purpose="download",
+                    status=DownloadAttemptStatus.ACTIVE,
+                    last_progress_at=utcnow(),
+                )
+            )
+            await session.commit()
+
+    asyncio.run(seed())
+    subscription_view = next(
+        item
+        for item in c.get("/api/v1/downloaders/tasks").json()["data"]["items"]
+        if item["info_hash"] == info_hash
+    )["subscriptions"][0]
+    assert subscription_view["purpose"] == "download"
+    assert subscription_view["units"] == [
+        {
+            "season_number": 1,
+            "episode_number": 1,
+            "status": "grabbed",
+            "replaced": False,
+            "content_missing": False,
+        }
+    ]
 
 
 def test_task_center_hides_completed_attempt_after_wanted_is_imported(client) -> None:

@@ -83,12 +83,14 @@ library identification list-unidentified-files
 library identification mark-files-as-extras
 library identification resolve-review
 library identification restore-files
+library items annotate-media-source
 library items delete
 library items delete-file
 library items get
 library items get-transfer-status
 library items list
 library items list-episodes
+library items list-media-source-annotation-candidates
 library items preview-reidentification
 library items preview-transfer
 library items purge-file

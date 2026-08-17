@@ -73,12 +73,47 @@ export interface DownloadTaskSubscription {
   media_title: string;
   media_kind: string;
   poster_url: string | null;
+  /**
+   * 投递目的。洗版（upgrade）任务要洗的集在投递前就已入库，"已入库"是前提
+   * 而不是成果——进度必须改用 `units[].replaced` 的替换口径讲，否则会出现
+   * 「有 16 集已入库」配 0% 进度的自相矛盾。
+   */
+  purpose: "download" | "upgrade";
+  /**
+   * 洗版成功后是否保留旧版本共存（规则组的收藏家模式）。
+   * false=旧版本移入回收站、保留期满自动清理——替换发生前就要说清楚。
+   */
+  upgrade_keep_old: boolean;
   /** 种子声明覆盖的**全集**（含已入库的集），不是"还欠哪些集"。 */
   units: {
     season_number: number;
     episode_number: number;
     status: DownloadTaskUnitStatus;
+    /** 洗版任务专用：该集是否已被本种子替换完成；补缺下载恒为 false。 */
+    replaced: boolean;
+    /**
+     * 内容核验证明种子里没有这一集（声明的覆盖范围与实际文件不符）。这一集
+     * 已退回重新寻找资源，等这个种子永远等不到——卡片要显示为需关注。
+     */
+    content_missing: boolean;
   }[];
+}
+
+/**
+ * 下载完成后**还没发生**的那段路，由后端按当前媒体库与监听导入配置推导。
+ * 任务中心据此把「等待入库 · 下一步」换成真实步骤链；推不出时整体为 null。
+ */
+export interface DownloadTaskPlan {
+  /** watch=监听导入搬运；inplace=已在库内目录，扫描即入账；downloader_default=不会自动入库 */
+  mode: "watch" | "inplace" | "downloader_default";
+  /** 搬运策略；mode=watch 才有 */
+  strategy: "hardlink" | "copy" | null;
+  /** 目标库名；库未定或不进库时为 null */
+  library_name: string | null;
+  /** 落点目录 */
+  dest_path: string | null;
+  /** 整理后是否进入媒体库（自定义目录规则为 false） */
+  enters_library: boolean;
 }
 
 /** 下载器实时任务；订阅/手动来源由后端按 infohash 关联，不复制下载状态。 */
@@ -109,6 +144,7 @@ export interface DownloadTask {
   media_title: string | null;
   media_kind: string | null;
   poster_url: string | null;
+  plan: DownloadTaskPlan | null;
   subscriptions: DownloadTaskSubscription[];
   rescue_state:
     | "active"

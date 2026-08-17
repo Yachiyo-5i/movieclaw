@@ -97,6 +97,22 @@ class DownloadTaskUnitView(BaseModel):
     season_number: int
     episode_number: int
     status: Literal["wanted", "grabbed", "downloaded", "imported"] = "grabbed"
+    replaced: bool = Field(
+        default=False,
+        description=(
+            "洗版任务专用：该集是否已被本种子替换完成。洗版单元在投递前就是 "
+            "imported（库里有旧版本），status 无法表达洗版进度，只有工单改指本 "
+            "种子才说明替换真的完成了；补缺下载恒为 false"
+        ),
+    )
+    content_missing: bool = Field(
+        default=False,
+        description=(
+            "内容核验证明种子里没有这一集（声明的覆盖范围与实际文件不符）。这一集"
+            "已退回重新寻找资源，不会再等这个种子——任务中心必须显示为需关注，"
+            "而不是继续挂「等待下载完成」"
+        ),
+    )
 
 
 class DownloadTaskSubscriptionView(BaseModel):
@@ -105,6 +121,9 @@ class DownloadTaskSubscriptionView(BaseModel):
     ``units`` 是**种子声明覆盖的全集**（含已入库的集），不是"还欠哪些集"。
     早期这里按在途工单过滤，导致列表随入库推进不断缩水、末集入库后变成空，
     "覆盖剧集"标签下却少了已入库的集（真实教训）。
+
+    ``purpose`` 区分补缺下载与洗版：两者在任务中心同形，但"已入库"对洗版是
+    前提而非成果，进度必须换成 ``units[].replaced`` 的替换口径来讲。
     """
 
     id: int
@@ -112,7 +131,50 @@ class DownloadTaskSubscriptionView(BaseModel):
     media_title: str
     media_kind: str
     poster_url: str | None = None
+    purpose: Literal["download", "upgrade"] = "download"
+    upgrade_keep_old: bool = Field(
+        default=False,
+        description=(
+            "洗版成功后是否保留旧版本共存（规则组的收藏家模式）。默认 false=旧版本"
+            "移入回收站，保留期满自动清理——这是洗版真正会对磁盘做的事，任务中心"
+            "要在替换发生前就说清楚"
+        ),
+    )
     units: list[DownloadTaskUnitView] = Field(default_factory=list)
+
+
+class DownloadTaskPlanView(BaseModel):
+    """下载完成后**还没发生**的那段路：内容会被搬到哪、进不进库。
+
+    口径来自 ``resolve_save_path``（投递、预检、体检共用的唯一实现），因此
+    卡片上预告的落点与真正投递时的落点必然一致。任务中心据此把"等待入库 ·
+    下一步"这种空话，换成"复制到「综艺」→ 扫描入账"的真实步骤链；推不出
+    落点（外部任务、无业务身份）时整体为 null。
+    """
+
+    mode: Literal["watch", "inplace", "downloader_default"] = Field(
+        description=(
+            "watch=命中监听导入规则，下载完成后按策略搬进目标；"
+            "inplace=直接下载在库内目录，扫描即入账，没有搬运动作；"
+            "downloader_default=没有可用库/库无根路径，落下载器默认目录，不会自动入库"
+        )
+    )
+    strategy: Literal["hardlink", "copy"] | None = Field(
+        default=None, description="监听导入的搬运策略；mode=watch 才有"
+    )
+    library_name: str | None = Field(
+        default=None, description="目标媒体库名；库未定（按收藏范围自动选库）或不进库时为 null"
+    )
+    dest_path: str | None = Field(
+        default=None, description="落点目录（库内条目目录或自定义目录）；推不出时为 null"
+    )
+    enters_library: bool = Field(
+        default=True,
+        description=(
+            "整理后是否进入媒体库。自定义目录规则为 false——文件落规则目录后"
+            "不写库台账，需外部流转后由库根扫描收尾"
+        ),
+    )
 
 
 class DownloadTaskView(BaseModel):
@@ -158,6 +220,7 @@ class DownloadTaskView(BaseModel):
     media_title: str | None = None
     media_kind: str | None = None
     poster_url: str | None = None
+    plan: DownloadTaskPlanView | None = None
     subscriptions: list[DownloadTaskSubscriptionView] = Field(default_factory=list)
     rescue_state: Literal[
         "active",

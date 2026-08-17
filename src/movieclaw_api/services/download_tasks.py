@@ -27,6 +27,7 @@ from movieclaw_db.models import (
     DownloadAttemptStatus,
     DownloaderClient,
     FileState,
+    Library,
     LibraryFile,
     ManualDownloadIntent,
     MediaItem,
@@ -72,6 +73,89 @@ def _poster_url(item: MediaItem) -> str | None:
     return f"{base}/w342{item.poster_path}"
 
 
+def _unit_replaced(
+    *,
+    info_hash: str,
+    attempt_created_at: datetime | None,
+    status: str | None,
+    unit_hash: str | None,
+    imported_at: datetime | None,
+) -> bool:
+    """洗版 attempt 下，这一集是否真的已经被本种子替换完成。
+
+    判据是「工单已改指本种子」：升级确认时 upgrade.py 才会把 ``wanted.info_hash``
+    改写成新种，确认前它一直指向旧版本。
+
+    但只看 hash 会误判**混合投递**——整季包同时洗 E01–E10 又补 E11 这种缺口集
+    时，缺口工单从投递那一刻起 info_hash 就等于本种子，会被当成"已替换"。这里
+    沿用 upgrade.py 判定洗版目标的同一条硬判据：该集必须在 attempt 创建**之前**
+    就已入库，才可能是这次洗版要替换的对象（洗版确认不改写 imported_at，缺口集
+    的入库时间则必然晚于 attempt 创建）。
+    """
+    if unit_hash != info_hash:
+        return False
+    if status != WantedStatus.IMPORTED.value:
+        return False
+    if imported_at is None or attempt_created_at is None:
+        return False
+    return imported_at <= attempt_created_at
+
+
+def _delivery_plan_resolver(session: AsyncSession):
+    """构造带缓存的「下载完成后会发生什么」解析器。
+
+    任务中心是轮询接口，不能逐任务重复打库；但落点推导**必须**走
+    ``resolve_save_path``——它是投递、预检、体检、手动下载共用的唯一实现，
+    在这里另抄一份迟早出现"卡片说好、投递却挂"的口径漂移（见
+    SavePathDecision 的文档）。折中办法是按 (库, 类型, 片名, 年份) 记忆化：
+    同一部作品的多条任务只算一次，组合数被在途作品数封顶。
+    """
+    from movieclaw_api.services.library.routing import resolve_save_path
+
+    libraries: dict[int, Library] = {}
+    cache: dict[tuple[int | None, str, str | None, int | None], dict[str, Any] | None] = {}
+
+    async def resolve(
+        library_id: int | None, kind: str | None, title: str | None, year: int | None
+    ) -> dict[str, Any] | None:
+        if not kind:
+            return None
+        key = (library_id, kind, title, year)
+        if key in cache:
+            return cache[key]
+        if library_id is not None and library_id not in libraries:
+            row = await session.get(Library, library_id)
+            if row is not None:
+                libraries[library_id] = row
+        library = libraries.get(library_id) if library_id is not None else None
+        decision = await resolve_save_path(
+            session, library, kind=kind, title=title, year=year
+        )
+        rule = decision.rule
+        # 自定义目录规则：整理改名后落规则目录、**不进任何库**，后续由库根
+        # 扫描收尾——不能对用户说"入库"
+        custom_dir = rule is not None and rule.target_path is not None
+        if custom_dir:
+            dest_path = rule.target_path
+        elif decision.mode == "watch":
+            # 监听导入的落点是库推导的条目目录；库未定（按收藏范围自动选库）
+            # 时给不出具体路径，如实留空由前端说"按收藏范围自动选库"
+            dest_path = decision.entry_dir
+        else:
+            dest_path = decision.path
+        plan = {
+            "mode": decision.mode,
+            "strategy": rule.strategy if rule is not None else None,
+            "library_name": None if custom_dir else (library.name if library else None),
+            "dest_path": dest_path,
+            "enters_library": not custom_dir,
+        }
+        cache[key] = plan
+        return plan
+
+    return resolve
+
+
 async def _relations(
     session: AsyncSession,
 ) -> tuple[dict[str, list[dict[str, Any]]], dict[str, dict[str, Any]]]:
@@ -106,6 +190,10 @@ async def _relations(
             "media_title": media.title,
             "media_kind": media.kind,
             "poster_url": _poster_url(media),
+            # 推导"下载完成后去哪"的原料：库与类型定规则，片名与年份定条目目录
+            "_library_id": subscription.library_id,
+            "_kind": subscription.kind,
+            "_year": media.year,
         }
         subscription_meta[key] = meta
         base_meta_by_subscription[subscription.id] = meta
@@ -140,6 +228,12 @@ async def _relations(
         attempt.subscription_id for attempt, _subscription, _media in attempt_rows
     }
     unit_status_by_subscription: dict[int, dict[tuple[int, int], str]] = defaultdict(dict)
+    # 工单当前指向的种子 + 入库时间。洗版确认成功时升级流程会把工单的 info_hash
+    # 改写成新种（upgrade.py `wanted.info_hash = attempt.info_hash`），确认之前它
+    # 一直指向旧版本——「工单 hash == 本 attempt hash」是洗版任务唯一可信的完成
+    # 度信号。入库时间用于剔除混合投递里的缺口集，见下面 _unit_replaced
+    unit_hash_by_subscription: dict[int, dict[tuple[int, int], str]] = defaultdict(dict)
+    unit_imported_at_by_subscription: dict[int, dict[tuple[int, int], datetime]] = defaultdict(dict)
     if related_subscription_ids:
         for w in (
             await session.execute(
@@ -149,9 +243,12 @@ async def _relations(
                 )
             )
         ).scalars():
-            unit_status_by_subscription[w.subscription_id][
-                (w.season_number, w.episode_number)
-            ] = str(w.status)
+            unit = (w.season_number, w.episode_number)
+            unit_status_by_subscription[w.subscription_id][unit] = str(w.status)
+            if w.info_hash:
+                unit_hash_by_subscription[w.subscription_id][unit] = w.info_hash.lower()
+            if w.imported_at is not None:
+                unit_imported_at_by_subscription[w.subscription_id][unit] = w.imported_at
     # 洗版 attempt 的关联走升级语义（quality-upgrade.md §6.2）：工单不重开、
     # info_hash 指向旧版本，缺口语义（在途工单 ∩ attempt 单元）对它恒为空——
     # 必须按「attempt 单元 ∩ 已入库 in_scope 工单」关联，否则洗版种子会被
@@ -159,6 +256,15 @@ async def _relations(
     imported_units_by_subscription: dict[int, set[tuple[int, int]]] = {
         subscription_id: {
             unit for unit, status in units.items() if status == WantedStatus.IMPORTED.value
+        }
+        for subscription_id, units in unit_status_by_subscription.items()
+    }
+    # 已退回重找的集：内容核验判定"种子里没有它"后工单立刻回到 wanted，
+    # 于是这个种子在缺口语义下瞬间失去关联、退化成外部任务，用户再也看不到
+    # "为什么等不到这一集"。这些集还没从别处补齐前，关联必须留住
+    open_units_by_subscription: dict[int, set[tuple[int, int]]] = {
+        subscription_id: {
+            unit for unit, status in units.items() if status == WantedStatus.WANTED.value
         }
         for subscription_id, units in unit_status_by_subscription.items()
     }
@@ -172,11 +278,19 @@ async def _relations(
             for unit in attempt.units
             if isinstance(unit, list) and len(unit) == 2
         }
+        content_missing_units = {
+            (int(unit[0]), int(unit[1]))
+            for unit in (attempt.content_missing or {}).get("units", [])
+            if isinstance(unit, list) and len(unit) == 2
+        }
         relevant_units = attempt_units & scoped_units_by_subscription[subscription.id]
         if attempt.purpose == "upgrade":
             relevant_units |= attempt_units & imported_units_by_subscription.get(
                 subscription.id, set()
             )
+        relevant_units |= content_missing_units & open_units_by_subscription.get(
+            subscription.id, set()
+        )
         # 尝试台账只是历史/救援状态，不能单独制造业务任务。主源直接按 hash
         # 关联；试用源和待清理旧源按覆盖单元关联，但都必须仍有入域在途目标
         # （洗版语义下"目标"即它照看的已入库单元）。
@@ -196,9 +310,17 @@ async def _relations(
             "media_title": media.title,
             "media_kind": media.kind,
             "poster_url": _poster_url(media),
+            "_library_id": subscription.library_id,
+            "_kind": subscription.kind,
+            "_year": media.year,
         }
         subscription_meta[key] = {
             **base_meta,
+            # 洗版任务与补缺下载在卡片上完全同形，但"已入库"对它是**前提**而非
+            # 成果（要洗的集本来就在库里）——不透出目的，前端只能按补缺语义把
+            # 存量入库读成任务已完成，与 0% 进度自相矛盾
+            "purpose": attempt.purpose,
+            "_attempt_created_at": attempt.created_at,
             "_site_id": attempt.site_id,
             "_torrent_id": attempt.torrent_id,
             "_quality": attempt.quality,
@@ -207,6 +329,9 @@ async def _relations(
             "_last_progress_at": attempt.last_progress_at,
             "_next_search_at": attempt.next_search_at,
             "_cleanup_note": attempt.cleanup_note,
+            # 内容核验证明本种子不含的集：下载完成 ≠ 这一集会到手，卡片必须
+            # 说"内容不符"而不是继续挂"等待下载完成"
+            "_content_missing": content_missing_units,
             "_show_when_missing": attempt.status
             in (
                 DownloadAttemptStatus.ACTIVE,
@@ -217,13 +342,35 @@ async def _relations(
             ),
         }
 
+    resolve_plan = _delivery_plan_resolver(session)
+    # 洗版替换掉的旧版本去哪，由规则组的「保留共存」开关决定（默认进回收站）。
+    # 复用洗版自己的批量解析器，避免另抄一份 spec 读取逻辑跑偏
+    from movieclaw_api.services.subscription.upgrade import _specs_for_subscriptions
+
+    specs = await _specs_for_subscriptions(
+        session, {subscription_id for _hash, subscription_id in subscription_meta}
+    )
     subscriptions: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for key, meta in subscription_meta.items():
         info_hash, subscription_id = key
         statuses = unit_status_by_subscription.get(subscription_id, {})
+        hashes = unit_hash_by_subscription.get(subscription_id, {})
+        imported_ats = unit_imported_at_by_subscription.get(subscription_id, {})
+        # 只有洗版任务才谈"替换完成"：补缺下载的工单 hash 从投递起就等于本
+        # 种子，拿同一判据会把刚投递的集全标成已替换
+        upgrade = meta.get("purpose") == "upgrade"
+        attempt_created_at = meta.get("_attempt_created_at")
+        spec = specs.get(subscription_id)
         subscriptions[info_hash].append(
             {
                 **meta,
+                "upgrade_keep_old": bool(spec.upgrade_keep_old) if spec is not None else False,
+                "_plan": await resolve_plan(
+                    meta.get("_library_id"),
+                    meta.get("_kind") or meta.get("media_kind"),
+                    meta.get("media_title"),
+                    meta.get("_year"),
+                ),
                 "units": [
                     {
                         "season_number": season,
@@ -231,6 +378,16 @@ async def _relations(
                         # 工单已被换源等路径清理时按"已投递"兜底：任务还在
                         # 下载器里，说明至少已经投递过
                         "status": statuses.get((season, episode), WantedStatus.GRABBED.value),
+                        "replaced": upgrade
+                        and _unit_replaced(
+                            info_hash=info_hash,
+                            attempt_created_at=attempt_created_at,
+                            status=statuses.get((season, episode)),
+                            unit_hash=hashes.get((season, episode)),
+                            imported_at=imported_ats.get((season, episode)),
+                        ),
+                        "content_missing": (season, episode)
+                        in (meta.get("_content_missing") or set()),
                     }
                     for season, episode in sorted(grouped_units[key])
                 ],
@@ -255,6 +412,9 @@ async def _relations(
             "media_title": media.title,
             "media_kind": media.kind,
             "poster_url": _poster_url(media),
+            "_plan": await resolve_plan(
+                intent.library_id, media.kind, media.title, media.year
+            ),
         }
         for intent, media in manual_rows
     }
@@ -514,6 +674,8 @@ def _task_dict(
         "media_title": (media or {}).get("media_title"),
         "media_kind": (media or {}).get("media_kind"),
         "poster_url": (media or {}).get("poster_url"),
+        # 下载完成后的未发生路径：外部任务没有业务身份，推不出落点
+        "plan": (media or {}).get("_plan"),
         "subscriptions": subscriptions,
         "rescue_state": rescue_state,
         "no_progress_seconds": no_progress_seconds,

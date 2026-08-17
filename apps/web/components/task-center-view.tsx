@@ -1022,21 +1022,70 @@ function ingestOwnsTaskState(task: DownloadTask, ingestJob: JobView | null): boo
   return task.state === "completed";
 }
 
-/** 按逐集工单状态汇总入库进度；没有订阅上下文（手动/外部任务）时为 null。 */
-function ingestUnitSummary(task: DownloadTask): { imported: number; total: number } | null {
+/** 这条任务是不是洗版（要洗的集本来就在库里，进度讲的是替换而非入库）。 */
+function isUpgradeTask(task: DownloadTask): boolean {
+  return task.subscriptions[0]?.purpose === "upgrade";
+}
+
+/**
+ * 洗版任务的身份标。洗版与补缺下载在任务中心同形，但读法完全不同——库里
+ * 已有这些集、这个种子是来换掉它们的，没有这个标就只能靠文案猜。青色沿用
+ * 订阅详情页的洗版专属色，跨页面同一概念同一颜色。
+ */
+function UpgradeTaskBadge({ task }: { task: DownloadTask }) {
+  if (!isUpgradeTask(task)) return null;
+  return (
+    <span
+      title="洗版任务：这些集库里已有旧版本，本次下载完成并校验后替换"
+      className="shrink-0 rounded-full border border-[#2dd4bf]/30 bg-[#2dd4bf]/[0.12] px-1.5 py-0.5 text-[11px] font-semibold leading-none text-[#2dd4bf]"
+    >
+      洗版
+    </span>
+  );
+}
+
+/**
+ * 按逐集工单汇总任务的交付进度；没有订阅上下文（手动/外部任务）时为 null。
+ *
+ * 补缺下载数「已入库」，洗版数「已替换」。洗版单元在投递那一刻就全是
+ * imported（库里有旧版本），继续按 imported 汇总会让刚投递的种子直接显示
+ * 「已入库 16/16 集、入库完成」，与 0% 的下载进度自相矛盾（真实教训）。
+ */
+function ingestUnitSummary(
+  task: DownloadTask,
+): { done: number; total: number; upgrade: boolean } | null {
   const subscription = task.subscriptions[0];
   if (!subscription || subscription.units.length === 0) return null;
+  const upgrade = subscription.purpose === "upgrade";
   return {
-    imported: subscription.units.filter((unit) => unit.status === "imported").length,
+    done: subscription.units.filter((unit) => (upgrade ? unit.replaced : unit.status === "imported"))
+      .length,
     total: subscription.units.length,
+    upgrade,
   };
 }
 
-/** 多集资源分批入库时的「已入库 N/M 集」；单集与电影没有分批语义，返回 null。 */
+/**
+ * 内容核验证明种子里没有的集（声明的覆盖范围与实际文件不符）。
+ *
+ * 这些集已经退回重新寻找资源，等这个种子永远等不到——不能再按"其余等待下载
+ * 完成"讲，否则会出现「下载完成 7.59 GB」和「等待下载完成」同框的自相矛盾。
+ */
+function contentMissingLabel(task: DownloadTask): string | null {
+  const units = (task.subscriptions[0]?.units ?? []).filter((unit) => unit.content_missing);
+  if (units.length === 0) return null;
+  const first = units[0];
+  const label = `S${String(first.season_number).padStart(2, "0")}E${String(
+    first.episode_number,
+  ).padStart(2, "0")}`;
+  return units.length === 1 ? label : `${label} 等 ${units.length} 集`;
+}
+
+/** 多集资源分批交付时的「已入库/已替换 N/M 集」；单集与电影没有分批语义，返回 null。 */
 function partialIngestLabel(task: DownloadTask): string | null {
   const summary = ingestUnitSummary(task);
   if (summary == null || summary.total <= 1) return null;
-  return `已入库 ${summary.imported}/${summary.total} 集`;
+  return `${summary.upgrade ? "已替换" : "已入库"} ${summary.done}/${summary.total} 集`;
 }
 
 interface DownloadTaskGroup {
@@ -1082,6 +1131,7 @@ function downloadGroupNeedsAttention(
       task.can_replace ||
       task.state === "error" ||
       task.state === "missing" ||
+      contentMissingLabel(task) != null ||
       (ingestJob != null && ATTENTION_JOB_STATUSES.has(ingestJob.status))
     );
   });
@@ -1244,8 +1294,19 @@ function DownloadTaskFeedItem({
             )}
             <OverflowText className="flex-1">{title}</OverflowText>
           </h3>
+          {/* 覆盖集号紧跟标题：先答"这个种子给的是哪几集"，再看规格与速度。
+              洗版标紧贴集号——它限定的正是这些集的性质（换掉而非新增） */}
+          {firstSubscription && (
+            <div className="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-1 text-caption">
+              <UpgradeTaskBadge task={task} />
+              <EpisodeUnitsLabel
+                units={firstSubscription.units}
+                purpose={firstSubscription.purpose}
+              />
+            </div>
+          )}
           {specs.length > 0 && (
-            <p className="mt-1 flex flex-wrap items-center gap-x-1.5 text-caption text-white/45">
+            <p className="mt-1.5 flex flex-wrap items-center gap-x-1.5 text-caption text-white/88">
               {specs.map((spec, index) => (
                 <span key={spec} className="flex items-center gap-x-1.5">
                   {index > 0 && (
@@ -1288,11 +1349,6 @@ function DownloadTaskFeedItem({
           {downSpeed != null && <span className="tnum">↓ {formatBytes(downSpeed)}/s</span>}
           {upSpeed != null && <span className="tnum">↑ {formatBytes(upSpeed)}/s</span>}
           {etaSeconds != null && <span>剩余约 {formatDuration(etaSeconds)}</span>}
-        </div>
-      )}
-      {firstSubscription && (
-        <div className="mt-2 flex flex-wrap items-center gap-x-2 gap-y-1 text-caption">
-          <EpisodeUnitsLabel units={firstSubscription.units} />
         </div>
       )}
       <DownloadLifecycle task={task} ingestJob={ingestJob} variant="feed" />
@@ -1513,7 +1569,8 @@ function DownloadTaskCard({
         )}
         {firstSubscription && (
           <div className="mt-2.5 flex flex-wrap items-start gap-x-2 gap-y-1.5 text-caption">
-            <EpisodeUnitsLabel units={firstSubscription.units} />
+            <UpgradeTaskBadge task={task} />
+            <EpisodeUnitsLabel units={firstSubscription.units} purpose={firstSubscription.purpose} />
           </div>
         )}
         <div className="mt-2.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-caption text-white/40">
@@ -1613,6 +1670,110 @@ const LIFECYCLE_DETAIL_STYLE: Record<LifecycleTone, string> = {
   future: "text-white/30",
 };
 
+/** Tailwind 要静态类名，列数只能查表拿——步骤数由落点配置决定（3～6 步）。 */
+const GRID_COLS_BY_STEPS: Record<number, string> = {
+  3: "grid-cols-3",
+  4: "grid-cols-4",
+  5: "grid-cols-5",
+  6: "grid-cols-6",
+};
+
+/**
+ * 下载完成后**还没发生**的那几步，按后端推导的落点如实展开。
+ *
+ * 取代原来那句「等待入库 · 下一步」——它对每条任务都一样，等于没说。后端的
+ * plan 来自投递/预检共用的 resolve_save_path，所以这里预告的搬运方式与落点
+ * 就是真正会发生的事；推不出落点时才退回原来的兜底话术。
+ *
+ * 只在"什么都还没开始"时使用：一旦入库 Job 出现，事实源就是 Job 本身，
+ * 步骤链收回到观测态，不再拿预测覆盖已经发生的事。
+ */
+function plannedSteps(
+  task: DownloadTask,
+  { downloaded, upgrade, keepOld }: { downloaded: boolean; upgrade: boolean; keepOld: boolean },
+): LifecycleStep[] {
+  const plan = task.plan;
+  if (!plan) {
+    return [
+      { label: downloaded ? "等待入库" : "等待下载完成", detail: "下一步", tone: "future" },
+    ];
+  }
+  if (plan.mode === "downloader_default") {
+    // 唯一需要用户动手的分支：说清楚"不会自动发生"，别让它看着像在等
+    return [
+      {
+        label: "不会自动入库",
+        detail: "未配置媒体库或库缺少根路径，文件将留在下载器默认目录，需手动处理",
+        tone: "attention",
+      },
+    ];
+  }
+  // 库未定：命中的是按 kind 的自动路由规则，识别出作品后才按收藏范围选库
+  const libraryText = plan.library_name
+    ? `「${plan.library_name}」`
+    : "按收藏范围自动匹配的媒体库";
+  const steps: LifecycleStep[] = [];
+
+  if (plan.mode === "watch") {
+    // 搬运方式完全由监听规则的策略决定，不猜：拿不到策略时只说"整理"，绝不
+    // 默认成某一种——复制与硬链接对磁盘占用的含义完全不同
+    const verb =
+      plan.strategy === "hardlink" ? "硬链接" : plan.strategy === "copy" ? "复制" : "整理";
+    // 路径归搬运步骤、库名归入库步骤：各自回答"文件去哪"与"算进哪个库"，
+    // 同一条链里不重复同一个库名
+    steps.push({
+      label: `待${verb}`,
+      detail: plan.dest_path ? `${verb}到 ${plan.dest_path}` : `${verb}到目标目录`,
+      tone: "future",
+    });
+  }
+
+  if (!plan.enters_library) {
+    // 自定义目录规则：整理完就结束了，后面没有入库这一步
+    steps.push({
+      label: "不直接入库",
+      detail: "按规则整理到该目录后不写库台账，文件出现在库根时由扫描收尾",
+      tone: "future",
+    });
+    return steps;
+  }
+
+  steps.push({
+    label: "待入库",
+    detail:
+      plan.mode === "inplace" && plan.dest_path
+        ? `已下载在库内目录，扫描后入库到${libraryText}：${plan.dest_path}`
+        : `入库到${libraryText}并刮削元数据`,
+    tone: "future",
+  });
+
+  // 洗版的终点不是入库：新版本入库后还要比对档位，确认更优才替换掉旧版本
+  // （校验不通过会保留旧版本），是与入库分开的一次真实事件
+  if (upgrade) {
+    steps.push({
+      label: "待替换",
+      detail: `校验档位，确认新版本更优才替换${libraryText}中的旧版本`,
+      tone: "future",
+    });
+    // 替换真正对磁盘做的事：默认把旧版本移入回收站等待过期清理；开了收藏家
+    // 模式则多版本共存。这一步决定的是"要不要多占一份空间"，不能不说
+    steps.push(
+      keepOld
+        ? {
+            label: "旧版本保留",
+            detail: "按规则组的保留共存设置，旧版本不删除，与新版本并存",
+            tone: "future",
+          }
+        : {
+            label: "待回收",
+            detail: "旧版本移入回收站，保留期内可恢复，到期自动清理释放空间",
+            tone: "future",
+          },
+    );
+  }
+  return steps;
+}
+
 /**
  * 把下载器状态与关联入库 Job 投影成同一条业务过程。这里不生成新状态：每一步
  * 都能回溯到下载快照或 Job，因此刷新、重试与回退仍由原领域负责。
@@ -1658,10 +1819,16 @@ function DownloadLifecycle({
   // 集」依然成立，这一步不能因为 Job 消失就退回「等待入库」
   const partialLabel = partialIngestLabel(task);
   const summary = ingestUnitSummary(task);
+  const missingLabel = contentMissingLabel(task);
   // 拿不到工单上下文（手动/外部任务）时不做分批判断，沿用 Job 的结论
-  const fullyImported = summary == null || summary.imported >= summary.total;
+  const fullyDelivered = summary == null || summary.done >= summary.total;
+  // 洗版任务的终点是"旧版本被换掉"，入库只是中间态：新文件入库后还要经过
+  // 档位校验才算替换成功，因此这一列整体改说替换
+  const upgrade = summary?.upgrade === true;
 
-  let ingestStep: LifecycleStep;
+  // 二选一：要么已经开始了（ingestStep，观测态），要么还没开始（futureSteps，预测态）
+  let ingestStep: LifecycleStep | null = null;
+  let futureSteps: LifecycleStep[] | null = null;
   if (ingestJob && ATTENTION_JOB_STATUSES.has(ingestJob.status)) {
     ingestStep = {
       label: "入库待处理",
@@ -1680,14 +1847,37 @@ function DownloadLifecycle({
       detail: ingestJob.progress.message,
       tone: "waiting",
     };
-  } else if (ingestJob?.status === "succeeded" || (summary != null && summary.imported > 0)) {
-    // 整包下完且全部入库才算走完；分批入库期间如实说明还差几集
-    const done = downloaded && fullyImported;
+  } else if (missingLabel != null) {
+    // 种子里根本没有这一集：继续等这个任务没有意义，说清事实并交代去向
     ingestStep = {
-      label: done ? "入库完成" : "部分入库",
+      label: "内容不符",
+      detail:
+        (partialLabel ? `${partialLabel}；` : "") +
+        `种子里没有 ${missingLabel}，已退回重新寻找资源`,
+      tone: "attention",
+    };
+  } else if (
+    (ingestJob?.status === "succeeded" && !upgrade) ||
+    (summary != null && summary.done > 0)
+  ) {
+    // 整包下完且全部交付才算走完；分批推进期间如实说明还差几集。洗版下
+    // 入库成功 ≠ 替换完成，Job succeeded 不能单独把这一步点亮
+    const done = downloaded && fullyDelivered;
+    ingestStep = {
+      label: done
+        ? upgrade
+          ? "替换完成"
+          : "入库完成"
+        : upgrade
+          ? "部分替换"
+          : "部分入库",
       detail: done
-        ? (ingestJob?.progress.message ?? "已全部入库")
-        : `${partialLabel ?? "已入库"}，其余等待下载完成`,
+        ? upgrade
+          ? "已全部替换为新版本"
+          : (ingestJob?.progress.message ?? "已全部入库")
+        : upgrade
+          ? `${partialLabel ?? "已替换"}，其余等待下载与校验`
+          : `${partialLabel ?? "已入库"}，其余等待下载完成`,
       tone: done ? "done" : "waiting",
     };
   } else if (ingestJob?.status === "cancelled") {
@@ -1696,18 +1886,25 @@ function DownloadLifecycle({
       detail: "等待重新处理",
       tone: "waiting",
     };
-  } else {
+  } else if (upgrade) {
     ingestStep = {
-      label: downloaded ? "等待入库" : "等待下载完成",
-      detail: "下一步",
+      label: downloaded ? "等待替换" : "等待下载完成",
+      detail: downloaded ? "新版本入库后校验档位再替换" : "下一步",
       tone: "future",
     };
+  } else {
+    // 什么都还没开始：把剩下的路按真实配置展开，而不是笼统说"下一步"
+    futureSteps = plannedSteps(task, {
+      downloaded,
+      upgrade,
+      keepOld: task.subscriptions[0]?.upgrade_keep_old === true,
+    });
   }
 
   const steps: LifecycleStep[] = [
     { label: "已投递", detail: source, tone: "done" },
     downloadStep,
-    ingestStep,
+    ...(futureSteps ?? [ingestStep!]),
   ];
   const feed = variant === "feed";
 
@@ -1717,7 +1914,11 @@ function DownloadLifecycle({
       className={
         feed
           ? "mt-3 space-y-1.5"
-          : "mt-3 grid grid-cols-3 gap-2 border-t border-white/[0.06] pt-3 max-md:grid-cols-1"
+          : // 步骤数随落点配置变化（监听规则多一步搬运、洗版再多一步替换），
+            // 列数跟着走；窄屏统一竖排，不挤
+            `mt-3 grid gap-2 border-t border-white/[0.06] pt-3 max-md:grid-cols-1 ${
+              GRID_COLS_BY_STEPS[Math.min(steps.length, 6)] ?? "grid-cols-3"
+            }`
       }
     >
       {steps.map((step, index) => (
@@ -1802,12 +2003,25 @@ function downloadTaskNote(
   task: DownloadTask,
   ingestJob: JobView | null,
 ): string | null {
+  const missingLabel = contentMissingLabel(task);
+  if (missingLabel != null) {
+    // 内容核验的结论优先于入库 Job：Job 成功搬完了包里存在的集，但用户等的
+    // 那一集根本不在包里，这时说"入库已完成"是误导
+    return `种子里没有 ${missingLabel}（声明的覆盖范围与实际内容不符），这部分已退回重新寻找资源；包里其余集不受影响`;
+  }
   if (ingestJob?.status === "succeeded") {
     // 边下边入库：这一批搬完不代表整个种子搬完，剩下的集会在各自下完后
     // 自动接着入库——不能笼统说「入库已完成」
     const summary = ingestUnitSummary(task);
-    if (summary != null && summary.imported < summary.total) {
-      return `已入库 ${summary.imported}/${summary.total} 集，其余等待下载完成后自动入库`;
+    if (summary != null && summary.done < summary.total) {
+      return summary.upgrade
+        ? `已完成 ${summary.done}/${summary.total} 集替换，其余等待下载完成后自动校验替换`
+        : `已入库 ${summary.done}/${summary.total} 集，其余等待下载完成后自动入库`;
+    }
+    if (summary?.upgrade) {
+      return task.state !== "completed"
+        ? "已完成的部分已替换为新版本，其余等待下载完成"
+        : "替换已完成，等待任务中心同步收尾";
     }
     if (task.state !== "completed") return "已完成的部分已入库，其余等待下载完成";
     return "入库已完成，等待任务中心同步收尾";
@@ -1840,26 +2054,36 @@ function downloadTaskNote(
  * 多集资源默认显示连续区间，同一标签内并列入库进度；点击后按季查看完整
  * 集号，已入库的集标绿。原生 details 保留了键盘与读屏交互，也不会为了
  * 这块纯展示状态引入额外 React 状态。
+ *
+ * 收起态刻意做成"带展开箭头的文字"而非按钮：它是行内的一条事实，和规格、
+ * 速度同级，做成描边填充的胶囊会盖过标题。可点击性交给箭头与 hover 提亮，
+ * 键盘焦点另给焦点环（去掉背景后默认 outline 不再可辨）。
  */
 function EpisodeUnitsLabel({
   units,
+  purpose,
 }: {
   units: DownloadTask["subscriptions"][number]["units"];
+  purpose: DownloadTask["subscriptions"][number]["purpose"];
 }) {
   const summary = summarizeEpisodeUnits(units);
   if (!summary) return null;
-  const importedKeys = new Set(
+  // 洗版口径：绿色标的是"已经被这个种子换掉的集"。沿用 imported 会把要洗
+  // 的集全标绿（它们本来就在库里），读起来像任务已完成
+  const upgrade = purpose === "upgrade";
+  const doneKeys = new Set(
     units
-      .filter((unit) => unit.status === "imported")
+      .filter((unit) => (upgrade ? unit.replaced : unit.status === "imported"))
       .map((unit) => `${unit.season_number}:${unit.episode_number}`),
   );
-  const importedCount = importedKeys.size;
+  const doneCount = doneKeys.size;
+  const doneWord = upgrade ? "已替换" : "已入库";
   if (summary.kind === "movie" || summary.episodeCount <= 1) {
     return (
       <span className="tnum">
         {summary.label}
-        {summary.kind === "episodes" && importedCount > 0 && (
-          <span className="text-[var(--ok)]">（已入库）</span>
+        {summary.kind === "episodes" && doneCount > 0 && (
+          <span className="text-[var(--ok)]">（{doneWord}）</span>
         )}
       </span>
     );
@@ -1869,9 +2093,13 @@ function EpisodeUnitsLabel({
     <details className="group min-w-0 max-w-full open:basis-full open:w-full">
       <summary
         aria-label={`覆盖 ${summary.episodeCount} 集：${summary.fullLabel}。${
-          importedCount > 0 ? `其中 ${importedCount} 集已入库。` : ""
+          doneCount > 0
+            ? upgrade
+              ? `已完成 ${doneCount} 集替换。`
+              : `其中 ${doneCount} 集已入库。`
+            : ""
         }展开查看全部集号`}
-        className="flex w-fit max-w-full cursor-pointer list-none items-center gap-1.5 rounded-md border border-[var(--info)]/20 bg-[var(--info)]/[0.07] px-2 py-1 text-[var(--info)] transition-colors hover:bg-[var(--info)]/[0.11] [&::-webkit-details-marker]:hidden"
+        className="flex w-fit max-w-full cursor-pointer list-none items-center gap-1 rounded text-white/88 transition-colors hover:text-white focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-[var(--accent-ring)] [&::-webkit-details-marker]:hidden"
       >
         <OverflowText
           focusable={false}
@@ -1883,12 +2111,12 @@ function EpisodeUnitsLabel({
         >
           {summary.label}
         </OverflowText>
-        {importedCount > 0 && (
+        {doneCount > 0 && (
           <span className="tnum shrink-0 text-[var(--ok)]">
-            （有 {importedCount} 集已入库）
+            {upgrade ? `（已完成 ${doneCount} 集替换）` : `（有 ${doneCount} 集已入库）`}
           </span>
         )}
-        <ChevronRightIcon className="size-3 shrink-0 rotate-90 transition-transform group-open:-rotate-90" />
+        <ChevronRightIcon className="size-3 shrink-0 rotate-90 opacity-45 transition-transform group-open:-rotate-90" />
       </summary>
       <div className="mt-2 max-w-xl space-y-2.5 rounded-xl border border-white/[0.07] bg-white/[0.035] px-3 py-2.5">
         {summary.seasons.map((season) => (
@@ -1899,13 +2127,13 @@ function EpisodeUnitsLabel({
             </div>
             <div className="flex flex-wrap gap-1.5">
               {season.episodes.map((episode) => {
-                const imported = importedKeys.has(`${season.seasonNumber}:${episode}`);
+                const done = doneKeys.has(`${season.seasonNumber}:${episode}`);
                 return (
                   <span
                     key={episode}
-                    title={imported ? "已入库" : undefined}
+                    title={done ? doneWord : undefined}
                     className={`tnum rounded-md px-1.5 py-0.5 text-micro ${
-                      imported
+                      done
                         ? "bg-[var(--ok)]/[0.16] text-[var(--ok)]"
                         : "bg-white/[0.055] text-white/60"
                     }`}

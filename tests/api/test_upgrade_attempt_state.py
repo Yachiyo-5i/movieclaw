@@ -192,9 +192,17 @@ async def test_task_center_relations_associate_upgrade_attempt(db):
         entry = subscriptions["newhash"][0]
         assert entry["id"] == sub_id
         assert entry["media_item_id"] is not None  # 有影片身份 → 前端可分组
-        # 洗版照看的是已入库单元，逐集状态如实反映这一点
+        assert entry["purpose"] == "upgrade"  # 前端据此改用替换口径讲进度
+        # 洗版照看的是已入库单元，逐集状态如实反映这一点；但"已入库"是洗版的
+        # 前提不是成果——工单还指着旧种子，replaced 必须为 False
         assert entry["units"] == [
-            {"season_number": 1, "episode_number": 1, "status": "imported"}
+            {
+                "season_number": 1,
+                "episode_number": 1,
+                "status": "imported",
+                "replaced": False,
+                "content_missing": False,
+            }
         ]
 
 
