@@ -33,6 +33,10 @@ import {
   setSiteRatioBoost,
   updateSite,
 } from "@/lib/api/sites";
+import Link from "next/link";
+import type { Route } from "next";
+
+import { useDownloadTasks } from "@/lib/download-tasks";
 import { formatBytes, formatCompact, formatDuration, formatRatio } from "@/lib/format";
 import { cachedImageUrl } from "@/lib/image-proxy";
 import { formatRelativeTime } from "@/lib/time";
@@ -287,6 +291,10 @@ export function SiteConfigSection() {
               {error}
             </div>
           )}
+
+          {/* 下载器拥堵提示：有任务在排队说明活动位满了——新种提交受限、
+              刷流已自动暂停投放，引导用户去调大队列上限（一键直达弹窗） */}
+          <QueueCongestionTip />
 
           {/* 「添加站点」面板：从目录里挑选未配置的站点 */}
           {adding && (
@@ -846,6 +854,54 @@ function SiteDetail({
           </span>
         )}
       </DetailSection>
+    </div>
+  );
+}
+
+/* —— 下载器拥堵提示条：任务排队 = 活动位满 = 新种提交受限 ——
+   数据来自全站共享的下载任务快照（10 秒可见轮询），零额外请求。点击
+   直达下载器分区并自动打开对应的「限速与队列」弹窗（?limits=<id>）。
+   用 --warn 色：要注意但系统在自己处理（刷流已自动暂停投放）。 */
+
+function QueueCongestionTip() {
+  const { tasks } = useDownloadTasks();
+  const queued = useMemo(() => tasks.filter((t) => t.state === "queued"), [tasks]);
+  if (queued.length === 0) return null;
+  // 拥堵的下载器（取排队任务最多的那台作为跳转目标）
+  const counts = new Map<number, { name: string; count: number }>();
+  for (const task of queued) {
+    if (task.downloader_id == null) continue;
+    const entry = counts.get(task.downloader_id) ?? {
+      name: task.downloader_name ?? `#${task.downloader_id}`,
+      count: 0,
+    };
+    entry.count += 1;
+    counts.set(task.downloader_id, entry);
+  }
+  const worst = [...counts.entries()].sort((a, b) => b[1].count - a[1].count)[0];
+  if (!worst) return null;
+  const [downloaderId, { name }] = worst;
+
+  return (
+    <div
+      className="flex flex-wrap items-center gap-x-3 gap-y-1.5 rounded-xl border px-4 py-3 text-sub"
+      style={{
+        borderColor: "color-mix(in oklab, var(--warn) 30%, transparent)",
+        background: "color-mix(in oklab, var(--warn) 10%, transparent)",
+        color: "var(--warn)",
+      }}
+    >
+      <span className="min-w-0 flex-1">
+        下载器「{name}」有 {queued.length} 个任务在排队——活动任务位已满，新种子提交受限，
+        刷流已自动暂停投放。建议调大「最大活动种子数」等队列上限。
+      </span>
+      <Link
+        href={`/settings/downloaders?limits=${downloaderId}` as Route}
+        className="shrink-0 rounded-full border px-3 py-1 font-medium transition hover:bg-[color-mix(in_oklab,var(--warn)_18%,transparent)]"
+        style={{ borderColor: "color-mix(in oklab, var(--warn) 40%, transparent)" }}
+      >
+        去调整
+      </Link>
     </div>
   );
 }

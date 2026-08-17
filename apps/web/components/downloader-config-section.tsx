@@ -99,6 +99,15 @@ export function DownloaderConfigSection() {
     setEditing(target.id);
   }, [suggestMapping, loading, downloaders]);
 
+  // 拥堵提示跳转（?limits=<id>，与 suggest_mapping 同款参数惯例）：自动打开
+  // 对应下载器的「限速与队列」弹窗，用户落地即在要调的设置上
+  const [autoLimitsId, setAutoLimitsId] = useState<number | null>(null);
+  useEffect(() => {
+    const raw = new URLSearchParams(window.location.search).get("limits");
+    const id = raw == null ? Number.NaN : Number(raw);
+    if (Number.isFinite(id)) setAutoLimitsId(id);
+  }, []);
+
   // 有下载器处于 pending/verifying 时轮询刷新，直到全部落定（页面隐藏时暂停）
   const hasInProgress = downloaders.some((d) => IN_PROGRESS.includes(d.status));
   useVisiblePolling(
@@ -202,6 +211,7 @@ export function DownloaderConfigSection() {
               key={downloader.id}
               downloader={downloader}
               suggestMapping={suggestMapping}
+              autoOpenLimits={autoLimitsId === downloader.id}
               expanded={editing === downloader.id}
               onToggleForm={(open) => setEditing(open ? downloader.id : null)}
               onChanged={upsert}
@@ -227,6 +237,8 @@ interface DownloaderCardProps {
   downloader: ConfiguredDownloader;
   /** 体检跳转建议预填的映射本机侧路径（无建议时为 null） */
   suggestMapping: string | null;
+  /** 拥堵提示跳转（?limits=<id>）：挂载后自动打开「限速与队列」弹窗 */
+  autoOpenLimits?: boolean;
   expanded: boolean;
   onToggleForm: (open: boolean) => void;
   onChanged: (downloader: ConfiguredDownloader) => void;
@@ -239,6 +251,7 @@ interface DownloaderCardProps {
 function DownloaderCard({
   downloader,
   suggestMapping,
+  autoOpenLimits = false,
   expanded,
   onToggleForm,
   onChanged,
@@ -250,6 +263,10 @@ function DownloaderCard({
   const confirm = useConfirm();
   const [busy, setBusy] = useState(false);
   const [limitsOpen, setLimitsOpen] = useState(false);
+  // 拥堵提示跳转落地：打开一次即完成使命，之后开合归用户（关了不复弹）
+  useEffect(() => {
+    if (autoOpenLimits) setLimitsOpen(true);
+  }, [autoOpenLimits]);
   const meta = STATUS_META[downloader.status];
 
   async function guard(fn: () => Promise<void>) {
