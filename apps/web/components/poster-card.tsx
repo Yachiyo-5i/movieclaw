@@ -90,8 +90,15 @@ export interface PosterVisualItem {
   /** 斜标的语义色：已入库为绿色，已订阅为蓝色。 */
   ribbonTone?: "owned" | "subscribed";
   /** 海报底部常显的一行左右信息；订阅墙用来承载剧集范围与收录进度。
-   *  tracking=追更中绿点；upgrading=洗版中青点（绿点优先，同槽位只亮一个）。 */
-  posterFooter?: { label: string; value: string; tracking?: boolean; upgrading?: boolean };
+   *  tracking=追更中绿点；upgrading=洗版中青点（绿点优先，同槽位只亮一个）；
+   *  upgradingCount=青点旁的「洗 N」数量——只有点没有字用户感知不到洗版仍在进行。 */
+  posterFooter?: {
+    label: string;
+    value: string;
+    tracking?: boolean;
+    upgrading?: boolean;
+    upgradingCount?: number;
+  };
   /** 悬浮层的一行紧凑元信息；长内容截断，完整值保留在 title 中。 */
   overlayMeta?: string;
   /** 悬浮层的两行紧凑上下文；不占用海报下方的常显元信息。 */
@@ -235,7 +242,11 @@ export function PosterCardVisual({
       resolveRibbon(item)?.label,
       item.posterFooter
         ? `${item.posterFooter.label}，收录 ${item.posterFooter.value}` +
-          (item.posterFooter.upgrading ? "，洗版中" : "")
+          (item.posterFooter.upgrading
+            ? item.posterFooter.upgradingCount
+              ? `，${item.posterFooter.upgradingCount} 集洗版中`
+              : "，洗版中"
+            : "")
         : undefined,
       item.overlayDetails?.primary,
       item.overlayDetails?.secondary,
@@ -355,6 +366,13 @@ function PosterCardContent({
                     className="size-1.5 rounded-full bg-[#2dd4bf] shadow-[0_0_7px_rgba(45,212,191,0.55)]"
                   />
                 ) : null}
+                {!item.posterFooter.tracking &&
+                  item.posterFooter.upgrading &&
+                  item.posterFooter.upgradingCount != null && (
+                    <span className="font-medium text-[#2dd4bf]">
+                      洗 {item.posterFooter.upgradingCount}
+                    </span>
+                  )}
                 {item.posterFooter.value}
               </span>
             </p>

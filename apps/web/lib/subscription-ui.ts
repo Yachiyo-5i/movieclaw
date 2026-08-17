@@ -54,6 +54,9 @@ export interface SubscriptionCollectionMeta {
   tracking: boolean;
   /** 有单元在洗版：无绿点时以青点呈现（洗版专属色，与详情页同源）。 */
   upgrading?: boolean;
+  /** 洗版中的单元数：青点旁的「洗 N」文字——只有一个无图例的点用户
+   *  感知不到订阅还在洗版（真实反馈），数量让状态可读且可对账。 */
+  upgradingCount?: number;
 }
 
 /**
@@ -67,9 +70,9 @@ export function subscriptionCollectionMeta(
   >,
 ): SubscriptionCollectionMeta | undefined {
   if (sub.media.kind !== "tv") return undefined;
-  // 洗版中（低密度呈现）：不加文字，只在页脚点位上表达——完结剧本来没有
-  // 绿点，青点占的是空槽位；暂停中的订阅洗版也停着，不亮
-  const upgrading = sub.status !== "paused" && (sub.progress.upgrading ?? 0) > 0;
+  // 洗版中：青点 + 「洗 N」数量（暂停中的订阅洗版也停着，不亮）
+  const upgradingCount = sub.status !== "paused" ? (sub.progress.upgrading ?? 0) : 0;
+  const upgrading = upgradingCount > 0;
 
   const allSeasons = sub.season_collection
     .filter((season) => season.season_number > 0)
@@ -108,6 +111,7 @@ export function subscriptionCollectionMeta(
           : `${latest.owned_count} / ${total}`,
       tracking: sub.status === "active",
       upgrading,
+      upgradingCount: upgrading ? upgradingCount : undefined,
     };
   }
 
@@ -119,6 +123,7 @@ export function subscriptionCollectionMeta(
     value: owned >= total ? `${total} 集全` : `${owned} / ${total}`,
     tracking: false,
     upgrading,
+    upgradingCount: upgrading ? upgradingCount : undefined,
   };
 }
 
