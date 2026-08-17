@@ -102,7 +102,7 @@ async def list_sync_stats(
     "/boost-stats",
     response_model=ApiResponse[dict[str, SiteBoostStatsView]],
     summary="各站点的刷流运行统计",
-    operation_id="site.boostStats",
+    operation_id="site.boost-stats",
 )
 async def list_boost_stats(
     session: AsyncSession = Depends(get_session),
@@ -229,7 +229,7 @@ async def set_site_protection(
     "/{site_id}/ratio-boost",
     response_model=ApiResponse[ConfiguredSite],
     summary="设置自动刷分享率（开关与存储预算）",
-    operation_id="site.ratioBoost.set",
+    operation_id="site.ratio-boost.set",
 )
 async def set_site_ratio_boost(
     site_id: str,
