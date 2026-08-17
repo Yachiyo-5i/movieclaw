@@ -648,7 +648,7 @@ function SiteRow({
         ) : (
           site.boost_enabled && (
             <div className="order-3 basis-full sm:order-none sm:basis-auto">
-              <BoostMeter site={site} boost={boost} />
+              <BoostReadout boost={boost} />
             </div>
           )
         )}
@@ -843,44 +843,27 @@ function SiteDetail({
   );
 }
 
-/* —— 刷流用量 meter：预算是容量，用微型进度条表达量级，不用状态色药丸 ——
-   设计依据（dataviz 规范）：状态色（绿）是「已验证」等状态徽章的保留色，
-   刷流信息复用它会与状态混淆；量级用 accent 特性色的细 meter 表达，数字
-   一律穿文本色（muted/faint），颜色只由 meter 条本身携带。无背景药丸，
-   移动端折行后视觉重量也轻得多。 */
+/* —— 刷流行级读数：只回答「刷流在产出吗」——近 24h 上传量一个数字 ——
+   预算用量不上行：池子的稳态就是被填满后汰换周转，「有多满」既非好消息也
+   非坏消息，没有行级信号价值（详情展开区仍有完整的已用/预算）。刚开启还
+   没有产出数据时退回显示已用量，让用户看到引擎确实在动。数字穿文本色，
+   「刷流」小字标签用 accent 特性色标识身份，不与状态徽章的绿色混淆。 */
 
-function BoostMeter({ site, boost }: { site: ConfiguredSite; boost?: SiteBoostStats }) {
+function BoostReadout({ boost }: { boost?: SiteBoostStats }) {
+  const up24 = boost?.uploaded_bytes_24h ?? 0;
   const used = boost?.used_bytes ?? 0;
-  const budget = site.boost_budget_bytes;
-  const pct = budget > 0 ? Math.min(100, (used / budget) * 100) : 0;
-  // 超预算（用户调小预算、汰换收敛中）是真实的注意状态，此时才允许状态色
-  const overfull = budget > 0 && used > budget;
-
   return (
     <div
-      className="flex min-w-0 items-center gap-2"
-      title={
-        "自动刷分享率运行中：预算用量与近 24 小时上传" +
-        (overfull ? "（超出预算，汰换收敛中）" : "")
-      }
+      className="flex min-w-0 items-center gap-1.5"
+      title="自动刷分享率运行中：近 24 小时的上传贡献（完整统计见展开详情）"
     >
-      <span className="shrink-0 text-caption font-medium text-[var(--text-faint)]">刷流</span>
-      <span className="h-1 w-14 shrink-0 overflow-hidden rounded-full bg-white/[0.1]">
-        <span
-          className="block h-full rounded-full"
-          style={{
-            width: `${pct}%`,
-            background: overfull ? "var(--danger)" : "var(--accent)",
-          }}
-        />
-      </span>
+      <span className="shrink-0 text-caption font-medium text-[var(--accent)]">刷流</span>
       <span className="truncate text-caption text-[var(--text-muted)]">
-        {formatBytes(used)} / {formatBytes(budget)}
-        {boost && boost.uploaded_bytes_24h > 0 && (
-          <span className="text-[var(--text-faint)]">
-            {" · "}24h ↑{formatBytes(boost.uploaded_bytes_24h)}
-          </span>
-        )}
+        {up24 > 0
+          ? `24h ↑${formatBytes(up24)}`
+          : used > 0
+            ? `已用 ${formatBytes(used)}`
+            : "等待首个免费种"}
       </span>
     </div>
   );
