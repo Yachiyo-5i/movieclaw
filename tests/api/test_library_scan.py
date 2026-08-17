@@ -2840,8 +2840,8 @@ def test_unit_for_explicit_sxxeyy(tmp_path) -> None:
     assert explicit_unit("some.show.s01e02") == (1, 2)
     assert explicit_unit("Show S01.E02 1080p") == (1, 2)
     assert explicit_unit("Show.S00E03.Special") == (0, 3)
-    # E00 是「无集号」哨兵占位（先导/特辑），交回人工处理，不得当第 0 集入库
-    assert explicit_unit("Thirteen.Talks.S06E00.2021.2160p") is None
+    # E00 原样带出（先导/特辑占位）：入库层据此按占位跳过而非误报解析失败
+    assert explicit_unit("Thirteen.Talks.S06E00.2021.2160p") == (6, 0)
     # 词内片段与数字粘连不误吃，无标记回落原链路
     assert explicit_unit("XS06E01") is None
     assert explicit_unit("Show.S02E051080p") is None

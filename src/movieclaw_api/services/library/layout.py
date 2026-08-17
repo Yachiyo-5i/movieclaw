@@ -123,14 +123,14 @@ def explicit_unit(stem: str) -> tuple[int, int] | None:
 
     NER 模型面向种子标题训练，对纯场景命名的单集文件名会漏抽/错标集号
     （torrent-ner-v2 把 "S06E01" 的 01 标成季号的线上病例），而显式标记的
-    语义是确定的——它在时必须压过模型结果。E00（先导/特辑占位）返回 None：
-    集号 0 在管线里是「无集号」哨兵，这类文件交由人工改名或认领。
+    语义是确定的——它在时必须压过模型结果。E00（先导/特辑占位）原样返回
+    (season, 0)：集号 0 在管线里是「无集号」哨兵，入库层据此识别"这是
+    显式声明的第 0 集"并按占位跳过，而不是误报解析失败。
     """
     match = _EXPLICIT_SXXEYY.search(stem)
     if match is None:
         return None
-    season, episode = int(match.group(1)), int(match.group(2))
-    return (season, episode) if episode >= 1 else None
+    return int(match.group(1)), int(match.group(2))
 
 
 def season_from_dir(directory: Path) -> int | None:

@@ -1368,6 +1368,35 @@ async def test_subscription_extra_same_tier_file_not_imported_as_new_version(
 
 
 @pytest.mark.asyncio
+async def test_explicit_e00_pilot_skipped_without_blocking(db, tmp_path, monkeypatch):
+    """显式 E00（先导/特辑占位）不入库但也不阻塞：正片照常入库、结论 imported、
+    文案如实说明——不再误报「解析不出集号」把含 E00 的季包钉在待处理。"""
+    root, watch = tmp_path / "tv", tmp_path / "watch"
+    watch.mkdir()
+    library_id = await _make_library(db, kind=MediaKind.TV, root=root)
+    item = await _make_item(db, kind=MediaKind.TV, title="测试剧集", year=2024)
+    _stub_identify(monkeypatch, item)
+    monkeypatch.setattr(ingest_mod, "probe_media", lambda _path: _FAKE_SPEC)
+
+    entry = watch / "测试剧集.S01.2160p.Pack"
+    entry.mkdir()
+    # 真实走 _unit 的显式 SxxEyy 解析，不打桩
+    (entry / "Show.S01E00.2160p.mp4").write_bytes(b"pilot-placeholder")
+    (entry / "Show.S01E01.2160p.mp4").write_bytes(b"episode-1-content")
+
+    await _sweep_twice(db, library_id, watch)
+
+    season_dir = root / "测试剧集 (2024)" / "Season 01"
+    assert (season_dir / "测试剧集 (2024) - S01E01.mp4").exists()
+    assert not (season_dir / "测试剧集 (2024) - S01E00.mp4").exists()
+    async with db.session() as session:
+        record = (await session.execute(select(IngestEntry))).scalar_one()
+    assert record.status == IngestStatus.IMPORTED
+    assert "第 0 集（先导/特辑），暂不自动入库" in (record.message or "")
+    assert "解析不出" not in (record.message or "")
+
+
+@pytest.mark.asyncio
 async def test_upgrade_retries_legacy_partial_import_through_job(db, tmp_path, monkeypatch):
     """旧版误标 imported 的部分入库记录在升级补扫后新建 Job，并补齐漏集。"""
     root, watch = tmp_path / "tv", tmp_path / "watch"

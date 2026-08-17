@@ -178,7 +178,9 @@ _INGEST_COPY_CHUNK_BYTES = 64 * 1024 * 1024
 # 修改季集解析/部分入库收口逻辑时必须递增；同一修订内的待处理条目不反复重跑。
 # v4：显式 SxxEyy 标记确定性解析压过模型（torrent-ner-v2 对单集文件名漏抽
 #     集号的线上病例），存量「解析不出集号」的挂起记录升级后自动补偿
-_INGEST_HANDLER_REVISION = "library.ingest.v4"
+# v5：显式 E00（先导/特辑占位）不再误报「解析不出集号」钉住记录，按占位
+#     跳过并如实说明——含 E00 的季包不再每次都进待处理
+_INGEST_HANDLER_REVISION = "library.ingest.v5"
 
 
 def _ingest_handler_revision() -> str:
@@ -1576,6 +1578,7 @@ async def _ingest_entry(
     parser_gap = False
     conflict = False
     dup_skipped = 0
+    pilot_skipped: list[str] = []
     if kind is MediaKind.MOVIE and len(snap.videos) > 1:
         notes.append(f"已取最大文件为正片，忽略其余 {len(snap.videos) - 1} 个视频")
 
@@ -1596,6 +1599,13 @@ async def _ingest_entry(
         else:
             season, episode = _unit(file, entry)
             if not episode:
+                if explicit_unit(file.stem) is not None:
+                    # 显式 E00：先导/特辑占位。集号 0 是管线的「无集号」哨兵，
+                    # 按设计不自动入库；这不是解析缺口——重试和模型升级都改变
+                    # 不了结果，不能把记录钉在待处理，如实说明后跳过即可
+                    pilot_skipped.append(file.name)
+                    completed_bytes += file.stat().st_size
+                    continue
                 notes.append(f"「{file.name}」解析不出集号，未入库")
                 parser_gap = True
                 completed_bytes += file.stat().st_size
@@ -1802,6 +1812,8 @@ async def _ingest_entry(
             message += f"；{skipped_owned} 个文件的内容已在媒体库，跳过"
         if dup_skipped:
             message += f"；{dup_skipped} 个文件在库中已有同档或更高版本，跳过"
+        if pilot_skipped:
+            message += f"；「{'」「'.join(pilot_skipped)}」是第 0 集（先导/特辑），暂不自动入库"
         if notes:
             message += "；" + "；".join(notes)
         status = (
@@ -1815,6 +1827,8 @@ async def _ingest_entry(
     elif notes:
         # 一个文件都没进：环境故障退避重试；纯解析问题进待处理等人拍板/改名
         message = "；".join(notes)
+        if pilot_skipped:
+            message += f"；「{'」「'.join(pilot_skipped)}」是第 0 集（先导/特辑），暂不自动入库"
         if record is not None and record.imported_count:
             # 重跑零新增（此前搬运过的文件都在原位被幂等短路，不计数）时
             # 不能丢掉已入库事实：message 是台账里唯一的人读摘要，只剩失败
@@ -1823,13 +1837,16 @@ async def _ingest_entry(
                 f"已识别为《{item.title}》，此前已入库 {record.imported_count} 个文件；{message}"
             )
         return await conclude(IngestStatus.FAILED if env_error else IngestStatus.PENDING, message)
-    elif dup_skipped:
-        # 季包附带内容全部与库存同档重复（换源后两个包先后投递最常见）：
-        # 正常闭环，不是异常
-        return await conclude(
-            IngestStatus.IMPORTED,
-            f"《{item.title}》的内容在库中已有同档或更高版本，无需整理",
-        )
+    elif dup_skipped or pilot_skipped:
+        # 季包附带内容全部与库存同档重复（换源后两个包先后投递最常见），
+        # 或只剩 E00 先导占位：正常闭环，不是异常
+        message = f"《{item.title}》"
+        parts = []
+        if dup_skipped:
+            parts.append("的内容在库中已有同档或更高版本")
+        if pilot_skipped:
+            parts.append(f"的「{'」「'.join(pilot_skipped)}」是第 0 集（先导/特辑），暂不自动入库")
+        return await conclude(IngestStatus.IMPORTED, message + "，".join(parts) + "，无需整理")
     elif skipped_owned:
         # 自定义目录条目的全部单元都已回流入库：链路闭环完成，不再搬运
         return await conclude(IngestStatus.IMPORTED, f"《{item.title}》的内容已在媒体库，无需整理")
