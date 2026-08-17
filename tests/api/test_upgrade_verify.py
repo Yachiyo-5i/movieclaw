@@ -720,12 +720,12 @@ async def test_old_pack_attempt_kept_while_serving_other_units(db, tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_confirm_keeps_single_link_old_file_in_place(db, tmp_path):
-    """做种保护（§7.1）：唯一硬链接的旧文件（原地下载/复制导入形态）不移入
-    回收站——它可能正是下载器做种的原始文件，改名会打断做种。升级照常
-    确认，台账行同步保留（与磁盘一致），活动如实说明。"""
+async def test_confirm_recycles_single_link_old_file_too(db, tmp_path):
+    """唯一硬链接的旧文件（复制导入形态）同样移入回收站并倒计时
+    （2026-08-17 收敛）：copy 入库下库文件 nlink 恒为 1，旧的做种保护判据
+    必然全命中、旧版本永久滞留；做种原始文件在下载目录，不受库内移动影响。"""
     library, item_id, sub_id, wanted_id, root, old_file = await _seed(db, tmp_path)
-    # 拆掉硬链接副本，模拟原地下载：old_file 变成唯一副本（st_nlink == 1）
+    # 拆掉硬链接副本，模拟复制导入：old_file 变成唯一副本（st_nlink == 1）
     for entry in (root / ".seed-copies").iterdir():
         if entry.name.endswith(old_file.name):
             entry.unlink()
@@ -753,7 +753,11 @@ async def test_confirm_keeps_single_link_old_file_in_place(db, tmp_path):
                 )
             ).scalars()
         )
-        assert len(files) == 2  # 旧行保留：删了行而文件还在，扫描会重新收编
+        assert len(files) == 2  # 旧行保留为待回收行（可恢复）
+        trashed = [f for f in files if f.state == FileState.TRASHED]
+        assert len(trashed) == 1
+        assert trashed[0].purge_after is not None  # 一律按保留期倒计时
+        assert ".movieclaw-trash" in trashed[0].file_path
         activities = list(
             (
                 await session.execute(
@@ -763,8 +767,9 @@ async def test_confirm_keeps_single_link_old_file_in_place(db, tmp_path):
                 )
             ).scalars()
         )
-        assert any(a.payload.get("kept_in_place") == 1 for a in activities)
-    assert old_file.exists()  # 文件原位未动，做种不受影响
+        assert any(a.payload.get("trash_paths") for a in activities)
+        assert all(not a.payload.get("kept_in_place") for a in activities)
+    assert not old_file.exists()  # 旧文件已进回收站
 
 
 @pytest.mark.asyncio

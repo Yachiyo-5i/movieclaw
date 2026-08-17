@@ -6,8 +6,9 @@
 
 四个公共函数是状态迁移的唯一写路径（业务代码不得直接改 state）：
 
-- ``recycle_file``：在位 → 待回收。做种保护判据内化在此（唯一硬链接的
-  文件绝不改名——它可能正是下载器做种的原始文件）；
+- ``recycle_file``：在位 → 待回收。一律移入回收站并按保留期倒计时
+  （2026-08-17 用户拍板收敛：回收站本身就是安全网，想保留由用户「恢复」，
+  机制不再做"做种保护"的猜测）；
 - ``restore_file``：待回收 → 在位（恢复）；
 - ``purge_file``：立即清理（删物理文件 + 删行）；
 - ``purge_due_files``：每小时定时任务，到期清理 + 消失行收敛。
@@ -27,7 +28,7 @@ from typing import Any, Literal
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
-from movieclaw_api.services.library.layout import SCAN_VIDEO_EXTS, STRM_EXT
+from movieclaw_api.services.library.layout import SCAN_VIDEO_EXTS
 from movieclaw_db.engine import get_database
 from movieclaw_db.models import FileState, LibraryFile, utcnow
 from movieclaw_db.models.library import Library
@@ -46,8 +47,8 @@ DEFAULT_RETENTION = timedelta(days=7)
 # 判定规则与 transfer._find_sidecars 同一套约定
 _SIDECAR_SKIP_EXTS = SCAN_VIDEO_EXTS | {".iso"}
 
-# purge_after 的哨兵缺省："由机制决定"——移入回收站的按保留期倒计时，
-# 做种保护原地待回收的不自动删。触发方明确知道安全时可显式传值覆盖
+# purge_after 的哨兵缺省："由机制决定"——一律按保留期倒计时。
+# 触发方有特殊语义（如联动删除）时可显式传值覆盖
 _AUTO = object()
 
 RecycleOutcome = Literal["moved_to_trash", "kept_in_place", "already_gone"]
@@ -118,12 +119,22 @@ async def recycle_file(
 ) -> RecycleOutcome:
     """把在位文件转入待回收（唯一入口）。只改行 + 移文件、不 commit。
 
+    一律移入回收站并按保留期倒计时（2026-08-17 用户拍板收敛）：回收站本身
+    就是安全网，想保留的文件由用户在文件区「恢复」；旧的做种保护判据
+    （唯一硬链接原地留置、永不自动删）在复制入库部署下必然全命中——库文件
+    是 copy 出来的、nlink 恒为 1，做种原始文件在下载目录里根本不受影响，
+    结果是回收站"7 天自动清理"形同虚设、垃圾只增不减（NAS 实测 57 个
+    替换下来的旧文件 53GB 全部永久滞留）。inplace 部署（下载器直接做种
+    库内路径）的断种取舍由触发方与用户操作层承担：洗版是显式 opt-in，
+    副文案已把回收站后果讲在前面。
+
     - ``already_gone``：文件已不在磁盘——无物可回收，**调用方负责删行**
       （行留着会与磁盘不一致）；
-    - ``moved_to_trash``：已移入库根回收站，默认按保留期倒计时；
-    - ``kept_in_place``：做种保护——唯一硬链接（st_nlink ≤ 1）的文件可能
-      正是下载器做种的原始文件，改名会打断做种（PT 站 H&R 风险），文件
-      原地不动、默认不自动删，只打待回收状态。
+    - ``moved_to_trash``：已移入库根回收站，按保留期倒计时；
+    - ``kept_in_place``：原盘目录（内部可能住着其他在案文件行，移动会让
+      那些行的路径失效）与移动失败（权限/只读挂载）的降级形态——文件
+      原地不动、同样按保留期倒计时，到期清理走 purge_file（含目录的
+      爆炸半径保护）。
 
     ``trigger``：审计快照 ``{"kind": "subscription"|"member"|"system",
     "id": ..., "label": "《九门》订阅洗版"}``——存快照不外键，机制不认识
@@ -135,35 +146,23 @@ async def recycle_file(
         return "already_gone"
 
     context = {"reason": reason, "trigger": trigger, "note": note}
+    retention = now + DEFAULT_RETENTION if purge_after is _AUTO else purge_after
 
     def _keep_in_place(why: str) -> RecycleOutcome:
         file.state = FileState.TRASHED
         file.trashed_at = now
         file.trash_original_path = None  # 原地形态：file_path 即原位置
-        file.purge_after = None if purge_after is _AUTO else purge_after
+        file.purge_after = retention
         file.trash_context = context
         file.updated_at = now
-        logger.info("文件原地待回收（%s）：%s", why, src)
+        logger.info("文件原地待回收（%s），按保留期倒计时：%s", why, src)
         return "kept_in_place"
 
     if src.is_dir():
-        # 原盘目录（BDMV/VIDEO_TS）：目录的 st_nlink 天然 ≥2，硬链接判据
-        # 失效；做种任务引用的是目录路径，改名必断种——一律原地待回收
-        return _keep_in_place("原盘目录，改名会打断做种")
-
-    if src.suffix.lower() == STRM_EXT:
-        # strm 占位文件是一行播放 URL 的纯文本，不可能是做种载荷；它天然
-        # 只有一个硬链接，不豁免会被做种保护永远原地留置、无法自动清理
-        seeding_guard = False
-    else:
-        seeding_guard = True
-        try:
-            seeding_guard = src.stat().st_nlink <= 1
-        except OSError:
-            logger.warning("读取文件硬链接数失败，按保守策略原地待回收：%s", src)
-
-    if seeding_guard:
-        return _keep_in_place("唯一硬链接，可能仍在做种")
+        # 原盘目录不改名：内部可能住着其他在案文件行（监听导入按站点目录
+        # 结构落盘的新版本），移动会让那些行的路径悬空；到期清理走
+        # purge_file 的爆炸半径保护，账面未清空的目录会被拒绝
+        return _keep_in_place("原盘目录不改名")
 
     try:
         trash_dir = _trash_dir_for(src, await _library_roots(session, file.library_id))
@@ -173,9 +172,9 @@ async def recycle_file(
             target = trash_dir / f"{now.strftime('%Y%m%d%H%M%S')}-{src.name}"
         shutil.move(str(src), str(target))
     except OSError:
-        # 移动失败（权限/只读挂载等）：降级为原地待回收、不自动删——行必须
-        # 保留（行删了而文件还在，扫描会把它当新文件重新收编），文件去留
-        # 交给「恢复/立即清理」或故障修复后的下一轮触发
+        # 移动失败（权限/只读挂载等）：降级为原地待回收——行必须保留
+        # （行删了而文件还在，扫描会把它当新文件重新收编）。倒计时照常，
+        # 不因一次移动失败失去自动清理承诺
         logger.exception("移入回收站失败，降级为原地待回收：%s", src)
         return _keep_in_place("移动失败降级")
     # 附属文件（字幕/NFO/图片）跟随主文件进回收站，避免留下无主残留；
@@ -185,7 +184,7 @@ async def recycle_file(
     file.file_path = str(target)
     file.state = FileState.TRASHED
     file.trashed_at = now
-    file.purge_after = now + DEFAULT_RETENTION if purge_after is _AUTO else purge_after
+    file.purge_after = retention
     file.trash_context = context
     file.updated_at = now
     logger.info("文件已移入回收站：%s → %s", src, target)

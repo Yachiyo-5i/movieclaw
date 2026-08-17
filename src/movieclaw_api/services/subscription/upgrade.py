@@ -791,8 +791,8 @@ async def _verify_upgrades_locked(session: AsyncSession, media_item_id: int) -> 
                                 "保留做种，可在任务中心手动清理"
                             )
                         old_attempt.updated_at = now
-            # 旧版本文件进回收站（quality-upgrade.md §7.1 / library-file-recycle.md）；
-            # 唯一硬链接的文件受做种保护，原地转入待回收。
+            # 旧版本文件进回收站（quality-upgrade.md §7.1 / library-file-recycle.md），
+            # 一律按保留期倒计时；kept_in_place 仅剩移动失败的降级形态。
             # 「保留共存」（upgrade_keep_old，收藏家模式）：旧版本不进回收站，
             # 多版本并存——升级本身（基线/关联/活动）照常
             kept_in_place = 0
@@ -812,7 +812,7 @@ async def _verify_upgrades_locked(session: AsyncSession, media_item_id: int) -> 
                     elif outcome == "moved_to_trash":
                         trash_paths.append(file.file_path)
                     else:
-                        kept_in_place += 1  # 做种保护：原地待回收
+                        kept_in_place += 1  # 移动失败降级：原地待回收，照常倒计时
             await session.commit()
             await repo.add_activity(
                 SubscriptionActivity(
@@ -823,8 +823,8 @@ async def _verify_upgrades_locked(session: AsyncSession, media_item_id: int) -> 
                         f"{_unit_text(wanted)}已洗版：{old_label} → {new_label}"
                         + ("，旧版本已移入回收站（保留 7 天）" if trash_paths else "")
                         + (
-                            "；旧版本文件可能仍在做种，已原地转入待回收——"
-                            "可在库详情恢复或清理"
+                            "；部分旧版本移入回收站失败，已原地转入待回收"
+                            "（按保留期自动清理）——可在库详情恢复或立即清理"
                             if kept_in_place
                             else ""
                         )

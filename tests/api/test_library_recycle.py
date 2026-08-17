@@ -1,5 +1,6 @@
 """媒体库文件回收机制测试（docs/design/library-file-recycle.md）：
-第三态状态机、做种保护、恢复/立即清理、到期清理任务、复活防线。"""
+第三态状态机、一律倒计时（2026-08-17 收敛）、恢复/立即清理、
+到期清理任务、复活防线。"""
 
 from __future__ import annotations
 
@@ -83,21 +84,23 @@ async def test_recycle_moves_hardlinked_file_to_trash(db, tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_recycle_keeps_unique_copy_in_place(db, tmp_path):
-    """做种保护：唯一硬链接的文件原地待回收——文件不动、不自动删。"""
-    file_id, path, _root = await _seed_file(db, tmp_path, hardlink=False)
+async def test_recycle_moves_unique_copy_to_trash_too(db, tmp_path):
+    """唯一硬链接的文件同样移入回收站并倒计时（2026-08-17 收敛）：copy
+    入库下库文件 nlink 恒为 1，旧做种保护判据必然全命中、垃圾永久滞留；
+    做种原始文件在下载目录，不受库内移动影响。想保留由用户「恢复」。"""
+    file_id, path, root = await _seed_file(db, tmp_path, hardlink=False)
     async with db.session() as session:
         row = await session.get(LibraryFile, file_id)
         outcome = await recycle_file(
             session, row, reason="upgrade_replaced", trigger=_TRIGGER, note="洗版替换"
         )
         await session.commit()
-        assert outcome == "kept_in_place"
+        assert outcome == "moved_to_trash"
         assert row.state == FileState.TRASHED
-        assert path.exists()  # 文件原位未动，做种不受影响
-        assert row.file_path == str(path)
-        assert row.trash_original_path is None
-        assert row.purge_after is None  # 不自动删
+        assert not path.exists()
+        assert row.file_path.startswith(str(root / ".movieclaw-trash"))
+        assert row.trash_original_path == str(path)
+        assert row.purge_after is not None  # 一律按保留期倒计时
 
 
 @pytest.mark.asyncio
@@ -152,8 +155,9 @@ async def test_purge_due_files_expires_and_converges(db, tmp_path):
         await recycle_file(
             session, gone, reason="upgrade_replaced", trigger=_TRIGGER, note="洗版替换"
         )
+        gone_trash = gone.file_path  # 一律移入回收站后的当前位置
         await session.commit()
-    gone_path.unlink()  # 待回收期间文件被外部删除
+    os.unlink(gone_trash)  # 待回收期间文件被外部删除
 
     await purge_due_files()
     async with db.session() as session:
@@ -303,8 +307,8 @@ async def test_item_delete_removes_trash_file_but_keeps_trash_dir(db, tmp_path):
 
 @pytest.mark.asyncio
 async def test_recycle_keeps_disc_dir_in_place_and_purge_removes_it(db, tmp_path):
-    """原盘目录（BDMV/VIDEO_TS）：目录 st_nlink 天然 ≥2、硬链接判据失效，
-    且做种引用的是目录路径——一律原地待回收；立即清理能删整个目录。"""
+    """原盘目录：不改名（内部可能住着其他在案文件行，移动会让路径悬空），
+    原地待回收但照常按保留期倒计时；立即清理能删整个目录。"""
     root = tmp_path / "movies"
     disc = root / "某电影 (2020)" / "BDMV"
     (disc / "STREAM").mkdir(parents=True)
@@ -329,7 +333,7 @@ async def test_recycle_keeps_disc_dir_in_place_and_purge_removes_it(db, tmp_path
         )
         assert outcome == "kept_in_place"  # 目录绝不改名
         assert disc.is_dir()
-        assert row.purge_after is None
+        assert row.purge_after is not None  # 原地形态也照常倒计时
 
         assert await purge_file(session, row) is True  # 立即清理支持目录
         await session.commit()
