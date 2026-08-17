@@ -194,6 +194,8 @@ class DownloadTaskView(BaseModel):
     size_bytes: int | None = None
     dlspeed_bytes: int | None = None
     upspeed_bytes: int | None = None
+    uploaded_bytes: int | None = Field(default=None, description="累计上传量；刷流分组汇总用")
+    completed_bytes: int | None = Field(default=None, description="已完成字节；刷流分组汇总用")
     eta_seconds: int | None = None
     state: Literal[
         "downloading",
@@ -206,7 +208,8 @@ class DownloadTaskView(BaseModel):
         "missing",
         "unknown",
     ]
-    source: Literal["subscription", "manual", "external"]
+    # boost = 自动刷分享率抢下的种子：无媒体身份与入库流转，前端折叠为独立分组
+    source: Literal["subscription", "manual", "boost", "external"]
     # -- 种子来源与规格（movieclaw 投递的任务才有）：站点身份、详情页入口
     # 与投递时的质量快照，供任务中心展示"这个种子从哪来、什么规格"。
     site_id: str | None = None
@@ -250,6 +253,42 @@ class DownloadTaskSourceView(BaseModel):
 class DownloadTaskListView(BaseModel):
     items: list[DownloadTaskView]
     sources: list[DownloadTaskSourceView]
+
+
+class DownloaderLimitsView(BaseModel):
+    """下载器全局限制（实时读自下载器，不落库）。
+
+    - 限速单位**字节/秒**，null = 不限速；
+    - ``alt_speed_enabled``：备用限速档（qB Alternative Speed / Tr Turtle Mode）；
+    - 队列上限决定同时活动的任务数，超限任务进 queued 排队——刷流做种多时
+      最容易撞上的墙；``max_active_torrents``（下载+做种总数上限）为
+      qBittorrent 独有，Transmission 恒为 null。
+    """
+
+    download_limit_bytes: int | None = None
+    upload_limit_bytes: int | None = None
+    alt_speed_enabled: bool | None = None
+    queue_enabled: bool | None = None
+    max_active_downloads: int | None = None
+    max_active_uploads: int | None = None
+    max_active_torrents: int | None = None
+
+
+class DownloaderLimitsUpdate(BaseModel):
+    """写入下载器全局限制的请求体（读-改-写：建议先 GET 再整体提交）。
+
+    - 限速 null = 取消限速，有值 = 限到该字节/秒；
+    - 其余字段 null = 保持下载器现状不修改；
+    - Transmission 不支持 ``max_active_torrents``，传了也会被忽略。
+    """
+
+    download_limit_bytes: int | None = Field(default=None, ge=0)
+    upload_limit_bytes: int | None = Field(default=None, ge=0)
+    alt_speed_enabled: bool | None = None
+    queue_enabled: bool | None = None
+    max_active_downloads: int | None = Field(default=None, ge=-1)
+    max_active_uploads: int | None = Field(default=None, ge=-1)
+    max_active_torrents: int | None = Field(default=None, ge=-1)
 
 
 class DownloadTaskDeleteView(BaseModel):

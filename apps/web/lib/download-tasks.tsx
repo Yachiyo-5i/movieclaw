@@ -82,7 +82,11 @@ export function DownloadTasksProvider({ children }: { children: React.ReactNode 
   const attentionTasks = useMemo(
     () =>
       snapshot.items.filter(
-        (task) => ["error", "missing"].includes(task.state) || task.can_replace,
+        (task) =>
+          // 刷流种子没有救援/入库语义，异常由刷流引擎自身消化（missing 判定、
+          // 止损、汰换），不进"需要关注"清单打扰用户
+          task.source !== "boost" &&
+          (["error", "missing"].includes(task.state) || task.can_replace),
       ),
     [snapshot.items],
   );

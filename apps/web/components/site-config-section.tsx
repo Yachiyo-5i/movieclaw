@@ -4,7 +4,8 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
 
-import { useConfirm, usePrompt } from "@/components/feedback";
+import { useConfirm } from "@/components/feedback";
+import { Modal } from "@/components/modal";
 import {
   ChevronDownIcon,
   MoreIcon,
@@ -33,6 +34,10 @@ import {
   setSiteRatioBoost,
   updateSite,
 } from "@/lib/api/sites";
+import Link from "next/link";
+import type { Route } from "next";
+
+import { useDownloadTasks } from "@/lib/download-tasks";
 import { formatBytes, formatCompact, formatDuration, formatRatio } from "@/lib/format";
 import { cachedImageUrl } from "@/lib/image-proxy";
 import { formatRelativeTime } from "@/lib/time";
@@ -191,8 +196,10 @@ export function SiteConfigSection() {
     hasInProgress ? 2500 : null,
   );
 
-  // 有站点开着刷流时轻轮询运行统计（引擎 5 分钟一个 tick，30 秒刷新足够跟上），
-  // 让「已用 / 近 24h 上传」在页面停留期间自己长，不需要用户手动刷新
+  // 有站点开着刷流时轻轮询关键数据（引擎 5 分钟一个 tick、同步最快 5 分钟一轮，
+  // 30 秒刷新足够跟上）：刷流统计（行级产出读数、详情用量）与索引同步节奏
+  // （详情里的上次/下次同步）在页面停留期间自己长，不需要用户手动刷新。
+  // 两个请求都是本地聚合查询，不触达任何站点。
   const anyBoosting = configured.some((s) => s.boost_enabled);
   useVisiblePolling(
     () => {
@@ -200,6 +207,11 @@ export function SiteConfigSection() {
         .then(setBoostStats)
         .catch(() => {
           /* 轮询失败静默重试，不打断页面 */
+        });
+      void listSiteSyncStats()
+        .then(setSyncStats)
+        .catch(() => {
+          /* 同上 */
         });
     },
     anyBoosting ? 30000 : null,
@@ -280,6 +292,10 @@ export function SiteConfigSection() {
               {error}
             </div>
           )}
+
+          {/* 下载器拥堵提示：有任务在排队说明活动位满了——新种提交受限、
+              刷流已自动暂停投放，引导用户去调大队列上限（一键直达弹窗） */}
+          <QueueCongestionTip />
 
           {/* 「添加站点」面板：从目录里挑选未配置的站点 */}
           {adding && (
@@ -494,10 +510,11 @@ function SiteRow({
   onError,
 }: SiteRowProps) {
   const confirm = useConfirm();
-  const prompt = usePrompt();
   const [busy, setBusy] = useState(false);
   // 授权表单的展开态由行持有：菜单点「编辑授权」时行可能还没展开，需要先展开再亮表单
   const [editingAuth, setEditingAuth] = useState(false);
+  // 刷流设置弹窗（预算 + 保留期同窗）：enable=开启前确认，adjust=运行中调整
+  const [boostModal, setBoostModal] = useState<"enable" | "adjust" | null>(null);
   const meta = STATUS_META[site.status];
   const failed = site.status === "failed" && !!site.last_error;
 
@@ -512,40 +529,6 @@ function SiteRow({
     }
   }
 
-  /** 弹预算输入框并解析；返回字节数，取消返回 null，非法输入报错后返回 null。 */
-  async function askBudget(options: {
-    title: string;
-    description: string;
-    confirmLabel: string;
-  }): Promise<number | null> {
-    const raw = await prompt({
-      ...options,
-      initialValue: String(Math.round(site.boost_budget_bytes / GIB)),
-      placeholder: "存储预算（GiB）",
-    });
-    if (raw == null) return null; // 用户取消
-    const gib = Math.round(Number(raw.trim()));
-    if (!Number.isFinite(gib) || gib < 1) {
-      onError("刷流预算必须是不小于 1 的整数（单位 GiB）");
-      return null;
-    }
-    return gib * GIB;
-  }
-
-  /** 开启刷流（含再次开启）：二次确认讲清将发生什么 + 同窗设置预算。 */
-  async function enableBoost() {
-    const budget = await askBudget({
-      title: `开启「${item.display_name}」的自动刷分享率？`,
-      description:
-        "开启后将自动抢该站新发布的免费种子做种以提升分享率；占用空间在下方预算内" +
-        "自动汰换（只有下载完成、入池满 72 小时且上传效率过低的任务才会被连数据删除）；" +
-        "该站的索引同步会提速到约 5 分钟一次。请确认本次刷流的存储预算：",
-      confirmLabel: "开启刷流",
-    });
-    if (budget == null) return;
-    await guard(async () => onChanged(await setSiteRatioBoost(site.site_id, true, budget)));
-  }
-
   /** 关闭刷流：二次确认讲清后果（不删数据，只停新增）。 */
   async function disableBoost() {
     const ok = await confirm({
@@ -554,25 +537,12 @@ function SiteRow({
         "停止抢该站新发布的免费种子",
         "已在做种的刷流任务全部保留，不删除任何数据",
         "站点索引同步回到正常自适应节奏",
-        "重新开启时会再次确认预算",
+        "重新开启时会再次确认预算与保留期",
       ],
       confirmLabel: "关闭刷流",
     });
     if (!ok) return;
     await guard(async () => onChanged(await setSiteRatioBoost(site.site_id, false)));
-  }
-
-  /** 调整刷流预算（仅开启时可见）。 */
-  async function adjustBudget() {
-    const budget = await askBudget({
-      title: `调整「${item.display_name}」的刷流预算`,
-      description:
-        `当前预算 ${formatBytes(site.boost_budget_bytes)}。调小预算不会立刻删种——` +
-        "引擎按汰换规则逐步收敛到新预算，72 小时保留期内的任务绝不会被删除。",
-      confirmLabel: "保存",
-    });
-    if (budget == null || budget === site.boost_budget_bytes) return;
-    await guard(async () => onChanged(await setSiteRatioBoost(site.site_id, true, budget)));
   }
 
   return (
@@ -644,21 +614,8 @@ function SiteRow({
           </p>
         ) : (
           site.boost_enabled && (
-            <div className="order-3 flex basis-full flex-wrap items-center gap-1.5 sm:order-none sm:basis-auto">
-              <span
-                className="rounded-full px-2 py-0.5 text-caption font-medium"
-                style={{
-                  background: "color-mix(in oklab, var(--ok) 12%, transparent)",
-                  color: "var(--ok)",
-                }}
-                title="自动刷分享率运行中：已用/预算 · 近 24 小时上传"
-              >
-                刷流 {boost ? formatBytes(boost.used_bytes) : "0"}/
-                {formatBytes(site.boost_budget_bytes)}
-                {boost && boost.uploaded_bytes_24h > 0 && (
-                  <> · 24h ↑{formatBytes(boost.uploaded_bytes_24h)}</>
-                )}
-              </span>
+            <div className="order-3 basis-full sm:order-none sm:basis-auto">
+              <BoostReadout boost={boost} />
             </div>
           )
         )}
@@ -677,9 +634,9 @@ function SiteRow({
             onSetProtected={(next) =>
               void guard(async () => onChanged(await setSiteProtection(site.site_id, next)))
             }
-            onEnableBoost={() => void enableBoost()}
+            onEnableBoost={() => setBoostModal("enable")}
             onDisableBoost={() => void disableBoost()}
-            onAdjustBudget={() => void adjustBudget()}
+            onBoostSettings={() => setBoostModal("adjust")}
             onEditAuth={() => {
               onOpen();
               setEditingAuth(true);
@@ -707,6 +664,16 @@ function SiteRow({
           />
         </div>
       </div>
+
+      {/* 刷流设置弹窗：开启确认与运行中调整共用（预算 + 保留期同窗） */}
+      <BoostSettingsModal
+        open={boostModal !== null}
+        mode={boostModal ?? "adjust"}
+        siteName={item.display_name}
+        site={site}
+        onClose={() => setBoostModal(null)}
+        onChanged={onChanged}
+      />
 
       {/* 展开详情：刷流 / 账号 / 索引 / 授权 四段 */}
       {expanded && (
@@ -766,6 +733,10 @@ function SiteDetail({
             <DetailStat
               label="累计上传"
               value={formatBytes(boost?.uploaded_bytes_total ?? 0)}
+            />
+            <DetailStat
+              label="汰换保留期"
+              value={site.boost_hold_days > 0 ? `${site.boost_hold_days} 天` : "不保护"}
             />
             {boost && boost.evicted_count > 0 && (
               <DetailStat label="已汰换" value={String(boost.evicted_count)} />
@@ -853,14 +824,297 @@ function SiteDetail({
   );
 }
 
+/* —— 刷流设置弹窗：预算 + 汰换保留期同窗设置，开启确认与运行中调整共用 —— */
+
+function BoostSettingsModal({
+  open,
+  mode,
+  siteName,
+  site,
+  onClose,
+  onChanged,
+}: {
+  open: boolean;
+  /** enable=开启前的二次确认（讲清将发生什么），adjust=运行中调整 */
+  mode: "enable" | "adjust";
+  siteName: string;
+  site: ConfiguredSite;
+  onClose: () => void;
+  onChanged: (site: ConfiguredSite) => void;
+}) {
+  const confirm = useConfirm();
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [budgetGib, setBudgetGib] = useState("");
+  const [holdDays, setHoldDays] = useState("");
+  // 每次打开按当前生效值重置表单（上次输入不残留）
+  useEffect(() => {
+    if (!open) return;
+    setError(null);
+    setBudgetGib(String(Math.round(site.boost_budget_bytes / GIB)));
+    setHoldDays(String(site.boost_hold_days));
+  }, [open, site.boost_budget_bytes, site.boost_hold_days]);
+
+  async function save() {
+    const gib = Math.round(Number(budgetGib.trim()));
+    if (!Number.isFinite(gib) || gib < 1) {
+      setError("刷流预算必须是不小于 1 的整数（单位 GiB）");
+      return;
+    }
+    const days = Math.round(Number(holdDays.trim()));
+    if (!Number.isFinite(days) || days < 0 || days > 30) {
+      setError("汰换保留期须是 0～30 之间的整数（天）");
+      return;
+    }
+    // 调小预算的后果不可逆（超出部分连数据删除），保存前二次确认讲清楚
+    const currentGib = Math.round(site.boost_budget_bytes / GIB);
+    if (mode === "adjust" && gib < currentGib) {
+      const ok = await confirm({
+        title: `将「${siteName}」的刷流预算从 ${currentGib} GiB 调小到 ${gib} GiB？`,
+        bullets: [
+          "在池占用超出新预算的部分将被汰换：连同已下载的数据一起删除，且同一种子不会再抢回",
+          "按上传效率从低到高删——死种和低效的先走，高效种子最后才会被动",
+          "汰换保留期内的任务不受影响，到期后才继续收敛",
+          "收敛期间暂停接新的免费种",
+        ],
+        confirmLabel: "确认调小",
+        tone: "danger",
+      });
+      if (!ok) return;
+    }
+    setBusy(true);
+    setError(null);
+    try {
+      onChanged(await setSiteRatioBoost(site.site_id, true, gib * GIB, days));
+      onClose();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Modal
+      open={open}
+      onClose={onClose}
+      label={mode === "enable" ? "开启自动刷分享率" : "刷流设置"}
+      width="lg"
+      topmost
+    >
+      <div className="space-y-4 p-6">
+        <div>
+          <h2 className="text-title font-bold text-[var(--text)]">
+            {mode === "enable" ? `开启「${siteName}」的自动刷分享率？` : `刷流设置 · ${siteName}`}
+          </h2>
+          <p className="mt-1 text-sub leading-6 text-[var(--text-muted)]">
+            {mode === "enable"
+              ? "开启后将自动抢该站新发布的免费种子做种以提升分享率，占用空间在预算内自动汰换" +
+                "（下载完成、入池满保留期且上传效率过低的任务才会被连数据删除），" +
+                "该站的索引同步会提速到约 5 分钟一次。"
+              : "调小预算会按上传效率从低到高汰换在池任务（连数据删除），直到占用回到新预算内；" +
+                "保留期内的任务绝不会被提前删除。"}
+          </p>
+        </div>
+
+        {error && (
+          <div className="rounded-xl border border-[#ff6b6b]/30 bg-[#ff6b6b]/10 px-4 py-3 text-body text-[#ff6b6b]">
+            {error}
+          </div>
+        )}
+
+        <div className="grid grid-cols-2 gap-3 max-md:grid-cols-1">
+          <BoostField
+            label="存储预算"
+            value={budgetGib}
+            unit="GiB"
+            min={1}
+            disabled={busy}
+            onChange={setBudgetGib}
+            hint="刷流任务占用磁盘的上限，预算内自动汰换"
+          />
+          <BoostField
+            label="汰换保留期"
+            value={holdDays}
+            unit="天"
+            min={0}
+            disabled={busy}
+            onChange={setHoldDays}
+            hint="H&R 安全垫：有考核的站不小于考核时长；无考核可调 0 自由汰换"
+          />
+        </div>
+
+        <div className="flex justify-end gap-2.5 pt-1">
+          <button
+            type="button"
+            onClick={onClose}
+            disabled={busy}
+            className="btn-glass px-4 py-2 text-sub font-medium"
+          >
+            取消
+          </button>
+          <button
+            type="button"
+            onClick={() => void save()}
+            disabled={busy}
+            className="btn-accent rounded-full px-4 py-2 text-sub font-semibold disabled:opacity-60"
+          >
+            {busy ? "保存中…" : mode === "enable" ? "开启刷流" : "保存"}
+          </button>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+/** 带单位后缀与说明的数字输入（弹窗内两枚字段共用）。 */
+function BoostField({
+  label,
+  value,
+  unit,
+  min,
+  disabled,
+  onChange,
+  hint,
+}: {
+  label: string;
+  value: string;
+  unit: string;
+  min: number;
+  disabled?: boolean;
+  onChange: (value: string) => void;
+  hint: string;
+}) {
+  return (
+    <div>
+      <label className="mb-1.5 block text-caption font-medium text-[var(--text-muted)]">
+        {label}
+      </label>
+      <div className="relative">
+        <input
+          type="number"
+          min={min}
+          value={value}
+          disabled={disabled}
+          onChange={(e) => onChange(e.target.value)}
+          className="w-full rounded-lg border border-white/10 bg-white/[0.06] px-3 py-2 pr-12 text-ui text-white outline-none transition [appearance:textfield] focus:border-white/25 [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
+        />
+        <span className="pointer-events-none absolute inset-y-0 right-3 flex items-center text-caption font-medium text-[var(--text-faint)]">
+          {unit}
+        </span>
+      </div>
+      <p className="mt-1 text-caption leading-4 text-[var(--text-faint)]">{hint}</p>
+    </div>
+  );
+}
+
+/* —— 下载器拥堵提示条：任务排队 = 活动位满 = 新种提交受限 ——
+   数据来自全站共享的下载任务快照（10 秒可见轮询），零额外请求。点击
+   直达下载器分区并自动打开对应的「限速与队列」弹窗（?limits=<id>）。
+   用 --warn 色：要注意但系统在自己处理（刷流已自动暂停投放）。 */
+
+function QueueCongestionTip() {
+  const { tasks } = useDownloadTasks();
+  const queued = useMemo(() => tasks.filter((t) => t.state === "queued"), [tasks]);
+  if (queued.length === 0) return null;
+  // 拥堵的下载器（取排队任务最多的那台作为跳转目标）
+  const counts = new Map<number, { name: string; count: number }>();
+  for (const task of queued) {
+    if (task.downloader_id == null) continue;
+    const entry = counts.get(task.downloader_id) ?? {
+      name: task.downloader_name ?? `#${task.downloader_id}`,
+      count: 0,
+    };
+    entry.count += 1;
+    counts.set(task.downloader_id, entry);
+  }
+  const worst = [...counts.entries()].sort((a, b) => b[1].count - a[1].count)[0];
+  if (!worst) return null;
+  const [downloaderId, { name }] = worst;
+
+  return (
+    <div
+      className="flex flex-wrap items-center gap-x-3 gap-y-1.5 rounded-xl border px-4 py-3 text-sub"
+      style={{
+        borderColor: "color-mix(in oklab, var(--warn) 30%, transparent)",
+        background: "color-mix(in oklab, var(--warn) 10%, transparent)",
+        color: "var(--warn)",
+      }}
+    >
+      <span className="min-w-0 flex-1">
+        下载器「{name}」有 {queued.length} 个任务在排队——活动任务位已满，新种子提交受限，
+        刷流已自动暂停投放。建议调大「最大活动种子数」等队列上限。
+      </span>
+      <Link
+        href={`/settings/downloaders?limits=${downloaderId}` as Route}
+        className="shrink-0 rounded-full border px-3 py-1 font-medium transition hover:bg-[color-mix(in_oklab,var(--warn)_18%,transparent)]"
+        style={{ borderColor: "color-mix(in oklab, var(--warn) 40%, transparent)" }}
+      >
+        去调整
+      </Link>
+    </div>
+  );
+}
+
+/* —— 刷流行级读数：只回答「刷流在产出吗」——近 24h 上传量一个数字 ——
+   预算用量不上行：池子的稳态就是被填满后汰换周转，「有多满」既非好消息也
+   非坏消息，没有行级信号价值（详情展开区仍有完整的已用/预算）。刚开启还
+   没有产出数据时退回显示已用量，让用户看到引擎确实在动。数字穿文本色，
+   「刷流」小字标签用 accent 特性色标识身份，不与状态徽章的绿色混淆。 */
+
+function BoostReadout({ boost }: { boost?: SiteBoostStats }) {
+  const up24 = boost?.uploaded_bytes_24h ?? 0;
+  const used = boost?.used_bytes ?? 0;
+  return (
+    <div
+      className="flex min-w-0 items-center gap-1.5"
+      title="自动刷分享率运行中：近 24 小时的上传贡献（完整统计见展开详情）"
+    >
+      <span className="shrink-0 text-caption font-medium text-[var(--accent)]">刷流</span>
+      <span className="truncate text-caption text-[var(--text-muted)]">
+        {up24 > 0
+          ? `24h ↑${formatBytes(up24)}`
+          : used > 0
+            ? `已用 ${formatBytes(used)}`
+            : "等待首个免费种"}
+      </span>
+    </div>
+  );
+}
+
 /* —— 站点徽标：优先取站点真实 favicon（域名 + /favicon.ico），失败回落首字母 ——
    经后端 /images/proxy 统一图片代理回源（cachedImageUrl 收口）：favicon 也是
    站点流量，必须走 movieclaw_net 统一出口受代理路由与网络策略管控，且服务端
    落盘缓存后浏览器不再反复触达站点。刻意不走 Google/DuckDuckGo 的 favicon
    聚合服务：目标用户网络环境里那些域名普遍不可达。 */
 
+/** favicon 失败负缓存的 TTL：站点 favicon 挂了不该每次进页面都重试一发。
+ *  成功端有浏览器一年 immutable 缓存，失败端靠 localStorage 记一天，
+ *  一天后自动重试（站点修好后最多一天恢复图标）。 */
+const _FAVICON_FAIL_TTL_MS = 24 * 60 * 60 * 1000;
+
+function faviconFailKey(origin: string): string {
+  return `mc:favicon-fail:${origin}`;
+}
+
+function faviconRecentlyFailed(origin: string): boolean {
+  try {
+    const at = Number(localStorage.getItem(faviconFailKey(origin)));
+    return Number.isFinite(at) && Date.now() - at < _FAVICON_FAIL_TTL_MS;
+  } catch {
+    return false; // 隐私模式等 localStorage 不可用：退化为每次尝试
+  }
+}
+
+function rememberFaviconFailure(origin: string): void {
+  try {
+    localStorage.setItem(faviconFailKey(origin), String(Date.now()));
+  } catch {
+    /* 记不住就算了，只损失负缓存 */
+  }
+}
+
 function SiteBadge({ item }: { item: CatalogItem }) {
-  const [failed, setFailed] = useState(false);
   const origin = useMemo(() => {
     if (!item.base_url) return null;
     try {
@@ -869,6 +1123,8 @@ function SiteBadge({ item }: { item: CatalogItem }) {
       return null;
     }
   }, [item.base_url]);
+  // 初始态就吃负缓存：一天内失败过的站直接出字母徽标，连请求都不发
+  const [failed, setFailed] = useState(() => (origin ? faviconRecentlyFailed(origin) : false));
 
   if (!origin || failed) {
     return (
@@ -885,7 +1141,10 @@ function SiteBadge({ item }: { item: CatalogItem }) {
         alt=""
         loading="lazy"
         className="size-5"
-        onError={() => setFailed(true)}
+        onError={() => {
+          rememberFaviconFailure(origin);
+          setFailed(true);
+        }}
       />
     </span>
   );
@@ -926,7 +1185,7 @@ interface SiteActionsMenuProps {
   onSetProtected: (next: boolean) => void;
   onEnableBoost: () => void;
   onDisableBoost: () => void;
-  onAdjustBudget: () => void;
+  onBoostSettings: () => void;
   onEditAuth: () => void;
   onReverify: () => void;
   onDelete: () => void;
@@ -939,7 +1198,7 @@ function SiteActionsMenu({
   onSetProtected,
   onEnableBoost,
   onDisableBoost,
-  onAdjustBudget,
+  onBoostSettings,
   onEditAuth,
   onReverify,
   onDelete,
@@ -996,8 +1255,8 @@ function SiteActionsMenu({
             {site.boost_enabled ? "关闭刷流…" : "开启刷流…"}
           </DropdownMenu.Item>
           {site.boost_enabled && (
-            <DropdownMenu.Item onSelect={onAdjustBudget} disabled={busy} className={itemClass}>
-              调整刷流预算…
+            <DropdownMenu.Item onSelect={onBoostSettings} disabled={busy} className={itemClass}>
+              刷流设置…
             </DropdownMenu.Item>
           )}
           <DropdownMenu.Item onSelect={onEditAuth} disabled={busy} className={itemClass}>

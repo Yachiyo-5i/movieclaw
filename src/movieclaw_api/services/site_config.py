@@ -172,17 +172,25 @@ class SiteConfigService:
         return await self.get_configured(site_id)
 
     async def set_ratio_boost(
-        self, site_id: str, *, enabled: bool, budget_bytes: int | None = None
+        self,
+        site_id: str,
+        *,
+        enabled: bool,
+        budget_bytes: int | None = None,
+        hold_days: int | None = None,
     ) -> SiteCredential:
-        """设置自动刷分享率开关与预算；未配置时抛 404。返回更新后的记录。
+        """设置自动刷分享率开关、预算与汰换保留期；未配置时抛 404。
 
         预算调小不会立刻删种——刷流引擎在下一个 tick 按汰换规则（保留期 +
-        效率下限）逐步收敛到新预算，绝不为了腾空间违反 72 小时保留期。
+        效率下限）逐步收敛到新预算，绝不为了腾空间违反保留期。
+        保留期 0 = 站点无 H&R 考核、不设保护（判定成熟度仍由引擎测量窗保证）。
         """
         if budget_bytes is not None and budget_bytes < 1024**3:
             raise BadRequestException("刷流存储预算不能小于 1 GiB")
+        if hold_days is not None and not (0 <= hold_days <= 30):
+            raise BadRequestException("刷流汰换保留期须在 0～30 天之间（0=不保护）")
         ok = await self._credentials.set_ratio_boost(
-            site_id, enabled=enabled, budget_bytes=budget_bytes
+            site_id, enabled=enabled, budget_bytes=budget_bytes, hold_days=hold_days
         )
         if not ok:
             raise NotFoundException(f"站点尚未配置：{site_id}")

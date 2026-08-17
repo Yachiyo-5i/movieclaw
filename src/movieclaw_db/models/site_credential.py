@@ -87,6 +87,10 @@ class SiteCredential(TimestampMixin, table=True):
     boost_budget_bytes: int = Field(
         default=100 * 1024**3, description="刷流存储预算（字节）"
     )
+    # 刷流汰换的最低保留天数（H&R 安全垫）：任务入池满该天数才可被汰换。
+    # 默认 3 天覆盖多数站点的考核时长；无 H&R 考核的站可调 0 = 自由汰换
+    #（判定成熟度仍由引擎的测量窗保证，见 ratio_boost.evictable）
+    boost_hold_days: int = Field(default=3, description="刷流汰换最低保留天数；0=不保护")
 
     # ------------------------------------------------------------------
     # 验证状态机（见 ConfigStatus）

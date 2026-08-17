@@ -240,7 +240,10 @@ async def set_site_ratio_boost(
     机制与安全约束见 docs/design/site-protection-ratio-boost.md。"""
     service = SiteConfigService(session)
     row = await service.set_ratio_boost(
-        site_id, enabled=payload.enabled, budget_bytes=payload.budget_bytes
+        site_id,
+        enabled=payload.enabled,
+        budget_bytes=payload.budget_bytes,
+        hold_days=payload.hold_days,
     )
     return ok(await _to_view(service, row))
 

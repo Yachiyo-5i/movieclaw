@@ -102,6 +102,12 @@ export interface PromptOptions {
   placeholder?: string;
   confirmLabel?: string;
   maxLength?: number;
+  /** number 时渲染数字输入（数字键盘、隐藏原生步进钮），仍以字符串返回由调用方解析 */
+  kind?: "text" | "number";
+  /** 数字输入的下限（透传给 input min） */
+  min?: number;
+  /** 单位后缀（如 "GiB"）：常驻在输入框内部右侧，与输入值视觉上同框不粘连 */
+  unit?: string;
 }
 
 type DialogRequest =
@@ -395,14 +401,32 @@ function PromptDialog({
         {options.description && (
           <p className="mt-2 text-sub leading-6 text-[var(--text-muted)]">{options.description}</p>
         )}
-        <input
-          ref={inputRef}
-          value={value}
-          maxLength={options.maxLength}
-          placeholder={options.placeholder}
-          onChange={(e) => setValue(e.target.value)}
-          className="mt-4 w-full rounded-lg border border-white/10 bg-white/[0.06] px-3.5 py-2.5 text-ui text-white outline-none transition focus:border-white/25"
-        />
+        {/* 单位后缀方案：input 包进 relative 容器，单位常驻输入框内部右侧
+            （用 padding-right 给它留位），数字模式隐藏原生步进钮保持简洁 */}
+        <div className="relative mt-4">
+          <input
+            ref={inputRef}
+            value={value}
+            type={options.kind === "number" ? "number" : "text"}
+            inputMode={options.kind === "number" ? "numeric" : undefined}
+            min={options.kind === "number" ? options.min : undefined}
+            maxLength={options.maxLength}
+            placeholder={options.placeholder}
+            onChange={(e) => setValue(e.target.value)}
+            className={`w-full rounded-lg border border-white/10 bg-white/[0.06] px-3.5 py-2.5 text-ui text-white outline-none transition focus:border-white/25 ${
+              options.unit ? "pr-14" : ""
+            } ${
+              options.kind === "number"
+                ? "[appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
+                : ""
+            }`}
+          />
+          {options.unit && (
+            <span className="pointer-events-none absolute inset-y-0 right-3.5 flex items-center text-sub font-medium text-[var(--text-faint)]">
+              {options.unit}
+            </span>
+          )}
+        </div>
         <div className="mt-5 flex justify-end gap-2.5">
           <button type="button" onClick={() => onSettle(null)} className={CANCEL_BTN_CLS}>
             取消

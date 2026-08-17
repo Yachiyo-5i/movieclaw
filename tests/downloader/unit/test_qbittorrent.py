@@ -72,6 +72,42 @@ class FakeQbtClient:
     def torrents_set_location(self, **kwargs):
         self.location_calls.append(kwargs)
 
+    # -- 全局限制（get_limits / set_limits） --
+    def transfer_download_limit(self):
+        return getattr(self, "_dl_limit", 0)
+
+    def transfer_upload_limit(self):
+        return getattr(self, "_up_limit", 0)
+
+    def transfer_speed_limits_mode(self):
+        return getattr(self, "_alt_mode", "0")
+
+    def transfer_set_download_limit(self, limit):
+        self._dl_limit = limit
+
+    def transfer_set_upload_limit(self, limit):
+        self._up_limit = limit
+
+    def transfer_set_speed_limits_mode(self, *, intended_state):
+        self._alt_mode = "1" if intended_state else "0"
+
+    def app_preferences(self):
+        return getattr(
+            self,
+            "_prefs",
+            {
+                "queueing_enabled": True,
+                "max_active_downloads": 3,
+                "max_active_uploads": 20,
+                "max_active_torrents": 50,
+            },
+        )
+
+    def app_set_preferences(self, *, prefs):
+        merged = dict(self.app_preferences())
+        merged.update(prefs)
+        self._prefs = merged
+
     def torrents_files(self, *, torrent_hash):
         return self.files.get(torrent_hash, [])
 
@@ -200,6 +236,46 @@ class TestSetLocation:
 
         with pytest.raises(DownloaderSubmitError):
             await make_downloader(fake).set_location(TORRENT_HASH, "/nope")
+
+
+class TestLimits:
+    async def test_get_limits_normalizes_unlimited_to_none(self):
+        """qB 的 0=不限速归一为 None；队列上限从 app 偏好读取。"""
+        fake = FakeQbtClient()
+        fake._dl_limit = 0
+        fake._up_limit = 2 * 1024 * 1024
+
+        limits = await make_downloader(fake).get_limits()
+
+        assert limits.download_limit_bytes is None
+        assert limits.upload_limit_bytes == 2 * 1024 * 1024
+        assert limits.queue_enabled is True
+        assert limits.max_active_torrents == 50
+
+    async def test_set_limits_roundtrip(self):
+        """写入后读回：None 限速落成 0（不限），队列上限进 app 偏好。"""
+        from movieclaw_downloader.models import DownloaderLimits
+
+        fake = FakeQbtClient()
+        downloader = make_downloader(fake)
+
+        await downloader.set_limits(
+            DownloaderLimits(
+                download_limit_bytes=None,
+                upload_limit_bytes=5 * 1024 * 1024,
+                alt_speed_enabled=True,
+                queue_enabled=True,
+                max_active_torrents=200,
+            )
+        )
+        limits = await downloader.get_limits()
+
+        assert limits.download_limit_bytes is None
+        assert limits.upload_limit_bytes == 5 * 1024 * 1024
+        assert limits.alt_speed_enabled is True
+        assert limits.max_active_torrents == 200
+        # 未提供的队列字段保持原值不被覆盖
+        assert limits.max_active_downloads == 3
 
 
 class TestDeleteTorrent:
