@@ -381,6 +381,89 @@ async def db(tmp_path, monkeypatch):
     get_settings.cache_clear()
 
 
+class _FakeDownloader:
+    """set_location 的记录桩；raises 非空时抛错模拟迁移失败。"""
+
+    def __init__(self, raises: Exception | None = None):
+        self.raises = raises
+        self.calls: list[tuple[str, str]] = []
+
+    async def set_location(self, info_hash: str, save_path: str) -> None:
+        if self.raises is not None:
+            raise self.raises
+        self.calls.append((info_hash, save_path))
+
+
+@pytest.mark.asyncio
+async def test_reclaim_moves_data_and_hands_over(db) -> None:
+    """「刷流先抢、订阅后到」的接管：迁目录 + 台账转出 + 标记 reclaimed。"""
+    from movieclaw_api.services.torrent_submit import _reclaim_boost_task
+    from movieclaw_downloader.models import SubmitResult
+
+    # downloader_id 置空：测试库没有下载器配置行，接管逻辑也不依赖它
+    task = _task(downloader_id=None)
+    async with db.session() as session:
+        session.add(task)
+        await session.commit()
+
+        fake = _FakeDownloader()
+        result = await _reclaim_boost_task(
+            session,
+            fake,
+            SubmitResult(info_hash=task.info_hash, already_exists=True),
+            save_path="/downloads/movies/Show",
+        )
+        await session.refresh(task)
+
+    assert result.reclaimed_from_boost
+    assert fake.calls == [(task.info_hash, "/downloads/movies/Show")]
+    assert task.state == BoostTaskState.MISSING
+    assert "接管" in (task.evict_reason or "")
+
+
+@pytest.mark.asyncio
+async def test_reclaim_leaves_user_torrents_alone(db) -> None:
+    """已存在的任务不是刷流的（用户自己加的）：不迁目录、不标 reclaimed。"""
+    from movieclaw_api.services.torrent_submit import _reclaim_boost_task
+    from movieclaw_downloader.models import SubmitResult
+
+    async with db.session() as session:
+        fake = _FakeDownloader()
+        result = await _reclaim_boost_task(
+            session,
+            fake,
+            SubmitResult(info_hash="f" * 40, already_exists=True),
+            save_path="/downloads/movies",
+        )
+
+    assert not result.reclaimed_from_boost
+    assert fake.calls == []
+
+
+@pytest.mark.asyncio
+async def test_reclaim_move_failure_keeps_boost_ownership(db) -> None:
+    """迁移失败不接管：台账保持 active（由认领转出兜底），提交结果原样返回。"""
+    from movieclaw_api.services.torrent_submit import _reclaim_boost_task
+    from movieclaw_downloader.models import SubmitResult
+
+    task = _task(downloader_id=None)
+    async with db.session() as session:
+        session.add(task)
+        await session.commit()
+
+        fake = _FakeDownloader(raises=RuntimeError("目标目录不可写"))
+        result = await _reclaim_boost_task(
+            session,
+            fake,
+            SubmitResult(info_hash=task.info_hash, already_exists=True),
+            save_path="/nope",
+        )
+        await session.refresh(task)
+
+    assert not result.reclaimed_from_boost
+    assert task.state == BoostTaskState.ACTIVE
+
+
 @pytest.mark.asyncio
 async def test_hourly_buckets_accumulate_and_windows_aggregate(db) -> None:
     """同一小时内多个 tick 累进同一桶；窗口聚合给出上传量与平均在池体积。"""

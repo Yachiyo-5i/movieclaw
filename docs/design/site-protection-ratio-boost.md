@@ -143,13 +143,15 @@ H&R 违规。
   `subscription_download_attempt` / `manual_download_intent` 认领的种子
   （按 site_id + torrent_id）；即便漏网（如认领记录缺 torrent_id），提交时
   下载器幂等返回 `already_exists`，刷流按所有权铁律不纳入管理。
-- **刷流先抢、订阅后到**：订阅投递命中同一 infohash 时下载器幂等返回
-  already_exists、工单照常记账（`owned_by_movieclaw=False`，订阅侧不会
-  自动删它）。刷流侧每 tick 对账前做**认领转出**（`hand_over_if_claimed`）：
-  发现自己的任务 infohash 出现在订阅工单/手动意图里，立即置 missing 让出
-  预算——任务与数据原样保留，此后归订阅的所有权/H&R 状态机管辖，刷流的
-  汰换永远不会再碰它的数据。文件留在刷流目录（不在库监听视野内），订阅的
-  内容核验/换源兜底机制按「下载器中已存在的非自有任务」的既有路径处理。
+- **刷流先抢、订阅后到**：提交层就地**接管**（`_reclaim_boost_task`）——
+  订阅/手动投递发现已存在的任务是刷流引擎自己抢下的，调下载器
+  `set_location` 把数据从刷流目录**迁到媒体的目标目录**（入库监听由此
+  能看见它；种子往往已下载完成，相当于零流量秒到），台账转出、
+  `SubmitResult.reclaimed_from_boost=True`，订阅侧据此把
+  `owned_by_movieclaw` 记为 True（本来就是 movieclaw 的任务，享受完整的
+  换源/洗版清理状态机）。迁移失败不连累提交：台账保持 active，由每 tick
+  的**认领转出**（`hand_over_if_claimed`）兜底所有权——此时文件留在刷流
+  目录，订阅按「下载器中已存在的非自有任务」的既有核验/换源路径处理。
 
 ### 2.6 与既有机制的关系
 

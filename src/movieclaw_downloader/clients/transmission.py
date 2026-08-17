@@ -281,6 +281,16 @@ class TransmissionDownloader(BaseDownloader):
             info_hash,
         )
 
+    async def set_location(self, info_hash: str, save_path: str) -> None:
+        await asyncio.to_thread(self._set_location_sync, info_hash, save_path)
+
+    def _set_location_sync(self, info_hash: str, save_path: str) -> None:
+        """改保存目录并由 Transmission 自行搬移数据（move_torrent_data）。"""
+        client = self._client()
+        with _translate_errors(self.config.url, operation="submit"):
+            client.move_torrent_data(info_hash.lower(), location=save_path)
+        logger.info("已移动 Transmission 任务目录: hash=%s -> %s", info_hash, save_path)
+
     async def test_connection(self) -> DownloaderInfo:
         return await asyncio.to_thread(self._test_connection_sync)
 

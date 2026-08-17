@@ -236,6 +236,14 @@ async def submit_torrent(
                 tags=tags,
             )
         )
+        # 「已存在」且是刷流引擎自己抢下的种子 → 接管：把数据迁到本次请求
+        # 的目标目录（否则文件留在刷流目录，入库监听永远看不见），台账转出。
+        # 迁移失败不连累提交——留给刷流的认领转出兜底，订阅按"非自有任务"
+        # 的既有路径处理
+        if submit_result.already_exists and category != "movieclaw-boost":
+            submit_result = await _reclaim_boost_task(
+                session, downloader, submit_result, save_path=submit_save_path
+            )
     except Exception as exc:
         raise UpstreamServiceException(f"提交到下载器「{row.name}」失败：{exc}") from exc
     finally:
@@ -268,6 +276,60 @@ async def submit_torrent(
                 "下载线索写入失败（目录 %s），副标题识别信号将缺失", save_path, exc_info=True
             )
     return submit_result, row
+
+
+async def _reclaim_boost_task(
+    session: AsyncSession,
+    downloader,  # noqa: ANN001 -- BaseDownloader，避免顶层引入适配器依赖
+    submit_result: SubmitResult,
+    *,
+    save_path: str | None,
+) -> SubmitResult:
+    """已存在的任务若是刷流引擎抢下的，就地接管：迁目录 + 台账转出。
+
+    这是「刷流先抢、订阅/手动后到」碰撞的正确收尾（docs/design/
+    site-protection-ratio-boost.md 2.5）：数据迁到媒体的目标目录后，入库
+    监听就能看见它——完整的种子往往已经下载完成，相当于零流量秒到。
+    迁移成功返回带 ``reclaimed_from_boost=True`` 的新结果；不满足条件或
+    迁移失败原样返回（刷流侧的认领转出仍会兜底所有权，不留双头管理）。
+    """
+    from movieclaw_db.models import BoostTaskState, RatioBoostTask
+
+    if not submit_result.info_hash:
+        return submit_result
+    task = (
+        await session.execute(
+            select(RatioBoostTask).where(
+                RatioBoostTask.info_hash == submit_result.info_hash.lower(),
+                RatioBoostTask.state == BoostTaskState.ACTIVE,
+            )
+        )
+    ).scalar_one_or_none()
+    if task is None:
+        return submit_result  # 已存在的任务不是刷流的（用户自己加的），不碰
+    if save_path:
+        try:
+            await downloader.set_location(submit_result.info_hash, save_path)
+        except Exception:  # noqa: BLE001 -- 迁移失败不连累提交，走既有兜底路径
+            logger.warning(
+                "刷流任务接管时迁移目录失败（hash=%s → %s），保留原目录",
+                submit_result.info_hash,
+                save_path,
+                exc_info=True,
+            )
+            return submit_result
+    task.state = BoostTaskState.MISSING
+    task.evicted_at = utcnow()
+    task.evict_reason = "已被订阅/手动下载接管，数据已迁至媒体目标目录"
+    task.updated_at = utcnow()
+    await session.commit()
+    logger.info(
+        "刷流任务已被接管：%s（hash=%s，目录迁至 %s）",
+        task.title,
+        submit_result.info_hash,
+        save_path or "（下载器默认）",
+    )
+    return submit_result.model_copy(update={"reclaimed_from_boost": True})
 
 
 async def anchor_manual_download(
