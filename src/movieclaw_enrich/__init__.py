@@ -26,7 +26,6 @@ import logging
 import re
 
 from movieclaw_enrich.extractors import (
-    _NO_SUBTITLE_RE,
     EXTRACTORS,
     extract_subtitle_languages,
 )
@@ -71,7 +70,10 @@ logger = logging.getLogger("movieclaw_enrich")
 #     audio_languages；旧模型部署自动回落 v13 正则行为（仅 zh-Hans）；
 #     老否定正则转为护栏（模型判有+正则判无 → 否决并告警，供 guard_audit）。
 #     随 torrent-ner-v2 镜像基线一起发布，发布日志需提醒镜像升级
-ENRICH_VERSION = 15
+# v16: 字幕否定护栏按审计退役（生产 4 天零触发；语料 test 2532 零触发、
+#      holdout 986 唯一触发为误杀，不满足 killed_correct=0 的存留条件）；
+#      zh-Hans 双向校准保留，待 torrent-ner-v3 shadow 期后另行审计
+ENRICH_VERSION = 16
 
 # 场景命名的两类粘连（站点生成器丢空格所致），喂模型前拆开：
 # ① 季号紧贴分辨率："S021080p" → "S02 1080p"
@@ -134,16 +136,10 @@ def enrich(title: str, subtitle: str = "", category: str | None = None) -> Torre
 
     merged_text = "\n".join(filter(None, (title, subtitle)))
     if model_decl:
-        # 模型通道产出字幕/音轨字段。老正则的**否定判定**保留为确定性护栏跑一个
-        # 版本周期：模型给出语言但正则认定"无字幕"时否决并告警——冲突样本是
-        # guard_audit 四象限的素材，护栏存废由审计裁决（guard_killed_correct=0 后退役）
-        if fields.get("subtitle_languages") and _NO_SUBTITLE_RE.search(merged_text):
-            logger.warning(
-                "字幕护栏否决：模型判有字幕 %s 但否定正则命中：%.80r",
-                fields["subtitle_languages"], merged_text,
-            )
-            fields["subtitle_languages"] = []
-            fields["subtitle_carriers"] = []
+        # v15 曾在此保留老否定正则作确定性护栏（模型判有字幕+正则判无 → 否决）。
+        # v16 按审计裁决退役：v2 服役 4 天生产零触发；语料审计 test 2532 条
+        # 零触发、holdout 986 条唯一一次触发是误杀（guard_killed_correct=1、
+        # saved=0），不满足自身存留条件（killed_correct 必须为 0）。
 
         # v2 把字幕语言扩展为完整集合，但简体中文这一维已有一套经过线上病例
         # 打磨的高精度规则。模型在极短拉丁标签（CHS / ZHS / zh-Hans）上会

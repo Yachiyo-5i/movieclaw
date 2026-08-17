@@ -393,7 +393,7 @@ class TestGluedTokens:
 
 
 class TestModelDeclChannel:
-    """模型通道（torrent-ner v2+）的装配路径与护栏否决——测试环境挂 R9 走不到
+    """模型通道（torrent-ner v2+）的装配路径——测试环境挂 R9 走不到
     这些分支，用 monkeypatch 模拟模型输出补齐 CI 覆盖。"""
 
     def _patch_model(self, monkeypatch, payload: dict):
@@ -415,7 +415,7 @@ class TestModelDeclChannel:
         assert attrs.subtitle_carriers == ["embedded"]
         assert attrs.audio_languages == ["cmn"]
 
-    def test_negation_guard_vetoes_model_output(self, monkeypatch, caplog):
+    def test_negation_text_no_longer_vetoes_model_output(self, monkeypatch):
         from movieclaw_enrich import enrich
 
         self._patch_model(monkeypatch, {
@@ -424,12 +424,14 @@ class TestModelDeclChannel:
             "subtitle_carriers": ["embedded"],
             "audio_languages": ["ja"],
         })
-        # 合并文本命中否定正则：模型判有字幕 → 护栏否决字幕，音轨不受影响
+        # v16 护栏退役（审计：生产 4 天零触发；holdout 唯一触发为误杀）：
+        # 整体否决不复存在——carriers/其它语言不再被清空。仍在服役的
+        # zh-Hans 双向校准会按旧规则摘掉 zh-Hans（否定文本里旧规则判无
+        # 简中），该校准待 torrent-ner-v3 shadow 期后另行审计退役
         attrs = enrich("Concert.2021.1080p.BluRay", "演唱会 | 无字幕")
-        assert attrs.subtitle_languages == []
-        assert attrs.subtitle_carriers == []
+        assert attrs.subtitle_languages == []  # zh-Hans 被校准摘除，非整体否决
+        assert attrs.subtitle_carriers == ["embedded"]  # 护栏时代会被清空，现保留
         assert attrs.audio_languages == ["ja"]
-        assert any("字幕护栏否决" in r.message for r in caplog.records)
 
     def test_legacy_fallback_without_capability(self, monkeypatch):
         from movieclaw_enrich import enrich
