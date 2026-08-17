@@ -581,9 +581,7 @@ function SiteRow({
       >
         {/* P0：徽标 + 名称 + 状态 */}
         <div className="flex min-w-0 flex-1 items-center gap-2.5">
-          <span className="icon-chip size-8 shrink-0 !rounded-lg text-sub font-semibold">
-            {item.display_name.charAt(0).toUpperCase()}
-          </span>
+          <SiteBadge item={item} />
           {site.protected && (
             <span
               className="flex shrink-0 items-center"
@@ -772,24 +770,28 @@ function SiteDetail({
         </DetailSection>
       )}
 
-      {/* ─ 账号 ─ */}
+      {/* ─ 账号 ─ 两行分组：身份与持有（用户名/等级/做种/魔力）、流量指标（上传/下载/分享率） */}
       {site.profile && (
         <DetailSection label="账号">
           <div
-            className="grid grid-cols-2 gap-x-5 gap-y-2 sm:flex sm:flex-wrap sm:gap-x-7"
+            className="space-y-2.5"
             title={`资料更新于 ${formatRelativeTime(site.profile.fetched_at)}`}
           >
-            <DetailStat label="用户名" value={site.profile.username} />
-            {site.profile.user_class && (
-              <DetailStat label="等级" value={site.profile.user_class} />
-            )}
-            <DetailStat label="上传量" value={formatBytes(site.profile.uploaded_bytes)} />
-            <DetailStat label="下载量" value={formatBytes(site.profile.downloaded_bytes)} />
-            <DetailStat label="分享率" value={formatRatio(site.profile.ratio)} />
-            {site.profile.bonus != null && (
-              <DetailStat label="魔力" value={formatCompact(site.profile.bonus)} />
-            )}
-            <DetailStat label="做种" value={String(site.profile.seeding_count)} />
+            <div className="grid grid-cols-2 gap-x-5 gap-y-2 sm:flex sm:flex-wrap sm:gap-x-7">
+              <DetailStat label="用户名" value={site.profile.username} />
+              {site.profile.user_class && (
+                <DetailStat label="等级" value={site.profile.user_class} />
+              )}
+              <DetailStat label="做种" value={String(site.profile.seeding_count)} />
+              {site.profile.bonus != null && (
+                <DetailStat label="魔力" value={formatCompact(site.profile.bonus)} />
+              )}
+            </div>
+            <div className="grid grid-cols-2 gap-x-5 gap-y-2 sm:flex sm:flex-wrap sm:gap-x-7">
+              <DetailStat label="上传量" value={formatBytes(site.profile.uploaded_bytes)} />
+              <DetailStat label="下载量" value={formatBytes(site.profile.downloaded_bytes)} />
+              <DetailStat label="分享率" value={formatRatio(site.profile.ratio)} />
+            </div>
           </div>
         </DetailSection>
       )}
@@ -836,6 +838,43 @@ function SiteDetail({
         )}
       </DetailSection>
     </div>
+  );
+}
+
+/* —— 站点徽标：优先取站点真实 favicon（域名 + /favicon.ico），失败回落首字母 ——
+   刻意不走 Google/DuckDuckGo 的 favicon 聚合服务：目标用户网络环境里那些
+   域名普遍不可达；而用户既然配置了这个 PT 站，浏览器就一定能直连它本身。 */
+
+function SiteBadge({ item }: { item: CatalogItem }) {
+  const [failed, setFailed] = useState(false);
+  const origin = useMemo(() => {
+    if (!item.base_url) return null;
+    try {
+      return new URL(item.base_url).origin;
+    } catch {
+      return null;
+    }
+  }, [item.base_url]);
+
+  if (!origin || failed) {
+    return (
+      <span className="icon-chip size-8 shrink-0 !rounded-lg text-sub font-semibold">
+        {item.display_name.charAt(0).toUpperCase()}
+      </span>
+    );
+  }
+  return (
+    <span className="flex size-8 shrink-0 items-center justify-center overflow-hidden rounded-lg border border-white/[0.08] bg-white/[0.04]">
+      {/* 外站 favicon，不经 next/image 优化管道 */}
+      <img
+        src={`${origin}/favicon.ico`}
+        alt=""
+        loading="lazy"
+        referrerPolicy="no-referrer"
+        className="size-5"
+        onError={() => setFailed(true)}
+      />
+    </span>
   );
 }
 
