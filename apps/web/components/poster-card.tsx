@@ -366,9 +366,11 @@ function PosterCardContent({
                     className="size-1.5 rounded-full bg-[#2dd4bf] shadow-[0_0_7px_rgba(45,212,191,0.55)]"
                   />
                 ) : null}
-                {!item.posterFooter.tracking &&
-                  item.posterFooter.upgrading &&
+                {item.posterFooter.upgrading &&
                   item.posterFooter.upgradingCount != null && (
+                    // 点位让给绿点（追更优先），但「洗 N」文字不让：追更中的
+                    // 订阅同样可能挂着大批洗版单元（十三邀实测 59 集），
+                    // 只在完结剧显示会让在播剧的洗版彻底隐形
                     <span className="font-medium text-[#2dd4bf]">
                       洗 {item.posterFooter.upgradingCount}
                     </span>
