@@ -54,6 +54,10 @@ class JobView(BaseModel):
     max_attempts: int
     revision: int
     cancel_requested_at: datetime | None
+    cancel_requested_by: str | None = Field(
+        default=None,
+        description="取消发起方；system: 前缀代表系统自动收口，前端据此隐藏「重新执行」",
+    )
     created_at: datetime
     updated_at: datetime
     started_at: datetime | None

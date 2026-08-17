@@ -40,7 +40,13 @@ import {
   type IngestHistoryDetail,
 } from "@/lib/ingest-history";
 import { shouldOfferInlineReplacement } from "@/lib/download-task-actions";
-import { cancelJob, retryJob, type JobStatus, type JobView } from "@/lib/api/jobs";
+import {
+  cancelJob,
+  isSystemCancelled,
+  retryJob,
+  type JobStatus,
+  type JobView,
+} from "@/lib/api/jobs";
 import { useJobs } from "@/lib/jobs";
 import type { TaskCenterViewName } from "@/lib/task-center";
 import {
@@ -824,7 +830,7 @@ function HistoricalJobFeedItem({
           </OverflowText>
           {ingestDetail && <IngestHistoryFiles detail={ingestDetail} />}
         </div>
-        {job.status === "cancelled" && (
+        {job.status === "cancelled" && !isSystemCancelled(job) && (
           <button
             type="button"
             onClick={onRetry}

@@ -455,8 +455,13 @@ async def _record_transition(
 
 
 async def request_cancel(
-    session: AsyncSession, job_id: str, *, requested_by: str
+    session: AsyncSession, job_id: str, *, requested_by: str, reason: str | None = None
 ) -> tuple[Job | None, bool]:
+    """请求取消任务。``reason`` 是面向用户的取消原因，会直接显示在任务中心；
+
+    只在排队/挂起态的立即取消分支生效——运行中任务要等安全停止点，
+    期间处理器仍会整体覆盖 progress，理由留不住。
+    """
     job = await session.get(Job, job_id)
     if job is None:
         return None, False
@@ -478,7 +483,7 @@ async def request_cancel(
             **job.progress,
             "mode": "paused",
             "phase": "cancelled",
-            "message": "任务已取消",
+            "message": reason or "任务已取消",
         }
         await _record_transition(session, job, "cancelled", job.progress)
     else:

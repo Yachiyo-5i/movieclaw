@@ -1386,7 +1386,10 @@ async def _ingest_entry(
                 if job_context is not None and stale.id == job_context.job_id:
                     continue  # 防御：绝不取消当前正在执行的作业
                 await jobs.request_cancel(
-                    session, stale.id, requested_by="system:ingest-superseded"
+                    session,
+                    stale.id,
+                    requested_by="system:ingest-superseded",
+                    reason="该条目所有文件已完整入库，本批次任务被新一轮入库取代，系统自动收口",
                 )
                 logger.info(
                     "整树入库完成，收口被取代的分批挂起作业：%s（job=%s）",
@@ -2777,7 +2780,12 @@ async def ignore_entry(session, entry_id: int) -> IngestEntry:
     await session.commit()
     active = await jobs.latest_job_for_resource(session, "ingest_entry", entry_id)
     if active is not None and active.status in ACTIVE_JOB_STATUSES:
-        await jobs.request_cancel(session, active.id, requested_by="监听导入清单")
+        await jobs.request_cancel(
+            session,
+            active.id,
+            requested_by="监听导入清单",
+            reason="条目已在监听导入清单中手动忽略，任务随之取消；如需处理可在清单中恢复",
+        )
     await refresh_source_notice(session, str(Path(record.entry_path).parent))
     return record
 

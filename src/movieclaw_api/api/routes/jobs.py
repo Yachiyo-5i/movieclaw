@@ -75,6 +75,7 @@ def _job_view(job: Job, resources: list[JobResource]) -> JobView:
         max_attempts=job.max_attempts,
         revision=job.revision,
         cancel_requested_at=job.cancel_requested_at,
+        cancel_requested_by=job.cancel_requested_by,
         created_at=job.created_at,
         updated_at=job.updated_at,
         started_at=job.started_at,

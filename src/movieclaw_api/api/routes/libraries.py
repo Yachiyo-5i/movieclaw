@@ -905,7 +905,12 @@ async def _quiesce_scan_for_mutation(
         limit=10,
     )
     for row in active:
-        await jobs.request_cancel(session, row.id, requested_by="媒体库配置变更")
+        await jobs.request_cancel(
+            session,
+            row.id,
+            requested_by="媒体库配置变更",
+            reason="媒体库配置已变更或已删除，按旧配置进行的扫描不再适用，系统自动取消",
+        )
     if phase is not None and not active:
         request_stop_scan(library_id)  # 文件监听/定时对账触发的兼容扫描
     if not active and phase is None:

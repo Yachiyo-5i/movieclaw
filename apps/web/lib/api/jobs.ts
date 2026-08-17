@@ -66,10 +66,17 @@ export interface JobView {
   max_attempts: number;
   revision: number;
   cancel_requested_at: string | null;
+  /** 取消发起方；`system:` 前缀代表系统自动收口，重跑没有意义，界面不给「重新执行」。 */
+  cancel_requested_by: string | null;
   created_at: string;
   updated_at: string;
   started_at: string | null;
   finished_at: string | null;
+}
+
+/** 系统自动收口的取消（如整树入库完成后清理被取代的分批任务）：重跑没有意义，不提供「重新执行」。 */
+export function isSystemCancelled(job: JobView): boolean {
+  return job.status === "cancelled" && (job.cancel_requested_by?.startsWith("system:") ?? false);
 }
 
 export const ACTIVE_JOB_STATUSES = new Set<JobStatus>([

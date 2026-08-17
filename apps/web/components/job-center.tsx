@@ -14,7 +14,13 @@ import {
 import { useLlmCapability } from "@/components/llm-gate";
 import { OverflowText } from "@/components/overflow-text";
 import { useAgentConversations } from "@/lib/agent-conversations";
-import { cancelJob, retryJob, type JobStatus, type JobView } from "@/lib/api/jobs";
+import {
+  cancelJob,
+  isSystemCancelled,
+  retryJob,
+  type JobStatus,
+  type JobView,
+} from "@/lib/api/jobs";
 import { useDownloadTasks } from "@/lib/download-tasks";
 import { formatBytes, formatDuration } from "@/lib/format";
 import { useJobs } from "@/lib/jobs";
@@ -418,7 +424,11 @@ export function JobCard({ job, onNavigate }: { job: JobView; onNavigate: () => v
         llmState === "configured" ||
         llmState === "unavailable"),
   );
-  if (job.status === "cancelled" && !actions.some((action) => action.type === "retry_job")) {
+  if (
+    job.status === "cancelled" &&
+    !isSystemCancelled(job) &&
+    !actions.some((action) => action.type === "retry_job")
+  ) {
     actions.unshift({ type: "retry_job", label: "重新执行" });
   }
 
