@@ -118,9 +118,16 @@ export function subscriptionCollectionMeta(
   const total = scoped.reduce((sum, season) => sum + totalOf(season), 0);
   if (total === 0) return undefined;
   const owned = scoped.reduce((sum, season) => sum + season.owned_count, 0);
+  // 「全/共」语义与媒体库海报一致（library-inventory-summary.ts）：
+  // 订阅覆盖了全部已知正季才叫「全 N 季」，缺季只写「共」；集数措辞同源
+  // （「全 N 集」），同一产品对"收齐"只说一种话
+  const coversAllSeasons = scoped.length === allSeasons.length;
   return {
-    label: scoped.length === 1 ? `第 ${scoped[0].season_number} 季` : `共 ${scoped.length} 季`,
-    value: owned >= total ? `${total} 集全` : `${owned} / ${total}`,
+    label:
+      scoped.length === 1
+        ? `第 ${scoped[0].season_number} 季`
+        : `${coversAllSeasons ? "全" : "共"} ${scoped.length} 季`,
+    value: owned >= total ? `全 ${total} 集` : `${owned} / ${total}`,
     tracking: false,
     upgrading,
     upgradingCount: upgrading ? upgradingCount : undefined,
