@@ -27,6 +27,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import math
+from collections.abc import Iterable
 from datetime import datetime, timedelta
 
 from sqlalchemy import case, delete, func, or_
@@ -222,7 +223,21 @@ def hand_over_if_claimed(
     return True
 
 
-def stop_loss_reason(task: RatioBoostTask, progress: float, now: datetime) -> str | None:
+def downloader_congested(states: Iterable[str]) -> bool:
+    """下载器是否拥堵：存在排队中（queued）的下载任务即视为拥堵。
+
+    队列上限（最大活动种子数等）决定同时活动的任务数——已经有任务在排队
+    说明活动位满了，此时继续准入只是把新种压进队尾：排队吃掉免费窗口、
+    排到 48 小时被止损删掉，全是空转。拥堵时刷流暂停投放，把活动位让给
+    已有任务（含用户自己的下载），队列消化后自动恢复——预算越大越需要
+    这个闸，否则引擎会一口气把队列塞爆。
+    """
+    return any(state == "queued" for state in states)
+
+
+def stop_loss_reason(
+    task: RatioBoostTask, progress: float, now: datetime, *, queued: bool = False
+) -> str | None:
     """未完成任务的止损判定：该放弃则返回中文原因，否则 None。
 
     与汰换（针对已完成的做种）不同，止损针对**下载中**的任务，不受 72 小时
@@ -231,7 +246,9 @@ def stop_loss_reason(task: RatioBoostTask, progress: float, now: datetime) -> st
 
     - 免费窗口已过、剩余还超过 1/10：每多下一字节都是付费流量，删；
       已下到 9 成以上则放行下完（删了全白费，剩余付费量很小）；
-    - 下载 48 小时仍未完成：死种/无源，永远占着预算，删。
+    - 48 小时仍未完成：死种/无源，或一直在队列里排不上（拥堵感知准入
+      挡住了新增，但存量排队任务长期抢不到活动位时也该让出预算）——
+      两种情况动作相同，原因如实区分。
     """
     if task.completed:
         return None
@@ -242,6 +259,8 @@ def stop_loss_reason(task: RatioBoostTask, progress: float, now: datetime) -> st
     ):
         return f"免费窗口已过仍未下完（进度 {progress:.0%}），止损放弃避免付费下载"
     if now - task.created_at >= _STUCK_AFTER:
+        if queued:
+            return "排队 48 小时仍未获得下载机会（下载器活动任务已满），放弃让出预算"
         return "下载 48 小时仍未完成（死种或无可用资源），放弃让出预算"
     return None
 
@@ -420,8 +439,10 @@ async def _refresh_tasks(
         gained = max(0, task.uploaded_bytes - uploaded_before)
         if gained:
             deltas[task.site_id] = deltas.get(task.site_id, 0) + gained
-        # 未完成任务的止损：免费窗口过期 / 长期卡死 → 连数据删除，让出预算
-        reason = stop_loss_reason(task, brief.progress or 0.0, now)
+        # 未完成任务的止损：免费窗口过期 / 长期卡死或排队 → 连数据删除，让出预算
+        reason = stop_loss_reason(
+            task, brief.progress or 0.0, now, queued=brief.state == "queued"
+        )
         if reason is not None:
             await _evict(pool, task, now, reason=reason)
     await session.commit()
@@ -552,6 +573,20 @@ async def _admit_candidates(
     downloader = await _default_downloader(session)
     if downloader is None:
         logger.debug("刷流：没有可用的默认下载器，站点 %s 本轮不准入", cred.site_id)
+        return
+    # 拥堵感知：目标下载器已有任务在排队（活动位满）时暂停准入——继续投放
+    # 只会把新种压进队尾空转（排队吃免费窗口、48h 被止损删）。队列消化后
+    # 自动恢复。列表来自本 tick 已缓存的全量读取，零额外请求
+    assert downloader.id is not None
+    briefs = await pool.briefs(downloader.id)
+    if briefs is None:
+        return  # 下载器不可达，本轮不准入（提交也注定失败）
+    if downloader_congested(brief.state for brief in briefs.values()):
+        logger.debug(
+            "刷流：下载器「%s」存在排队任务（活动位已满），站点 %s 本轮暂停准入",
+            downloader.name,
+            cred.site_id,
+        )
         return
 
     site_id = cred.site_id

@@ -19,6 +19,7 @@ from movieclaw_api.services.ratio_boost import (
     admission_headroom,
     apply_observation,
     assess_candidate,
+    downloader_congested,
     evictable,
     free_window_sufficient,
     hand_over_if_claimed,
@@ -331,6 +332,24 @@ class TestStopLoss:
         # 已完成的任务永远轮不到止损（归汰换与保留期管）
         done = _task(completed=True, free_deadline=_NOW - timedelta(hours=1))
         assert stop_loss_reason(done, progress=1.0, now=_NOW) is None
+
+    def test_queued_48h_gets_honest_reason(self) -> None:
+        """排队 48 小时同样让出预算，但原因如实说是活动位满，不误报死种。"""
+        task = _task(completed=False, created_at=_NOW - timedelta(hours=49))
+        reason = stop_loss_reason(task, progress=0.0, now=_NOW, queued=True)
+        assert reason is not None and "排队" in reason and "死种" not in reason
+
+
+class TestDownloaderCongested:
+    def test_any_queued_download_means_congested(self) -> None:
+        """存在排队中的下载任务 = 活动位满 = 暂停准入；否则放行。
+
+        预算越大越需要这个闸：没有它，引擎会按自己的节奏把下载器队列塞爆，
+        排队任务吃掉免费窗口、48 小时后被止损删掉，全程空转。
+        """
+        assert downloader_congested(["downloading", "queued", "completed"])
+        assert not downloader_congested(["downloading", "completed", "stalled"])
+        assert not downloader_congested([])
 
 
 # ---------------------------------------------------------------------------
