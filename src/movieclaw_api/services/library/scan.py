@@ -63,6 +63,7 @@ from movieclaw_api.services.library.layout import (
     SCAN_VIDEO_EXTS,
     STRM_EXT,
     entry_dirs,
+    explicit_unit,
     is_disc_dir,
     season_from_dir,
     trailing_index_episode,
@@ -3104,7 +3105,9 @@ def _unit_for(kind: MediaKind, file: Path) -> tuple[int, int]:
     证据优先级（NAS 实测《妻子的浪漫旅行》第 9 季文件名同时含「第一季」
     与 S09 两个季信号，整季错挂到第 1 季）：
     1. 视频同名 NFO 的 <season>/<episode>——刮削器写盘的定位，最强证据；
-    2. 文件名解析；解出多个互相矛盾的季号时，父目录（Season 9）在候选中仲裁；
+    2. 文件名解析：显式 SxxEyy 标记确定性解析、压过模型（模型对单集文件名
+       会漏抽集号，见 layout.explicit_unit）；模型解出多个互相矛盾的季号时，
+       父目录（Season 9）在候选中仲裁；
     3. 常规集号（SxxExx/「第N集」）全灭时退回裸尾号兜底（「走向共和01」，
        央视老剧惯例）——否则整目录几十集全坍缩成同一个 E0 单元。
     """
@@ -3113,6 +3116,9 @@ def _unit_for(kind: MediaKind, file: Path) -> tuple[int, int]:
     episode_nfo = read_episode_metadata(file.with_suffix(".nfo"))
     if episode_nfo and episode_nfo.season is not None and episode_nfo.episode is not None:
         return episode_nfo.season, episode_nfo.episode
+    explicit = explicit_unit(file.stem)
+    if explicit is not None:
+        return explicit
     attrs = enrich(file.stem)
     episode = attrs.episodes[0] if attrs.episodes else (trailing_index_episode(file.stem) or 0)
     dir_season = season_from_dir(file.parent)

@@ -2823,6 +2823,31 @@ def test_unit_for_trailing_index_episode(tmp_path) -> None:
     assert trailing_index_episode("01") == 1
 
 
+def test_unit_for_explicit_sxxeyy(tmp_path) -> None:
+    """显式 SxxEyy 标记确定性解析、压过模型：NAS 实测 torrent-ner-v2 对
+    《十三邀》纯场景命名的单集文件名漏抽集号（"S06E01" 的 01 被错标成季号），
+    整个季包挂成「解析不出集号」。显式标记在时季集号不再依赖模型。"""
+    from movieclaw_api.services.library.layout import explicit_unit
+
+    entry = tmp_path / "十三邀第六季.Thirteen.Talks.S06.2021.2160p.WEB-DL.H265.AAC-HHWEB"
+    assert scan_mod._unit_for(
+        MediaKind.TV, entry / "Thirteen.Talks.S06E01.2021.2160p.WEB-DL.H265.AAC-HHWEB.mp4"
+    ) == (6, 1)
+    assert scan_mod._unit_for(
+        MediaKind.TV, entry / "十三邀.第五季.Thirteen.Talks.S05E10.2020.2160p.WEB-DL.mp4"
+    ) == (5, 10)
+    # 大小写/分隔符变体与特别篇季（S00）
+    assert explicit_unit("some.show.s01e02") == (1, 2)
+    assert explicit_unit("Show S01.E02 1080p") == (1, 2)
+    assert explicit_unit("Show.S00E03.Special") == (0, 3)
+    # E00 是「无集号」哨兵占位（先导/特辑），交回人工处理，不得当第 0 集入库
+    assert explicit_unit("Thirteen.Talks.S06E00.2021.2160p") is None
+    # 词内片段与数字粘连不误吃，无标记回落原链路
+    assert explicit_unit("XS06E01") is None
+    assert explicit_unit("Show.S02E051080p") is None
+    assert explicit_unit("走向共和01") is None
+
+
 def test_unit_for_season_conflict(tmp_path) -> None:
     """文件名同时含「第一季」与 S09 两个季信号（NAS 实测《妻子的浪漫旅行》
     第 9 季整季错挂到第 1 季）：分集 NFO 的 <season> 是最强证据须优先；
@@ -2837,12 +2862,12 @@ def test_unit_for_season_conflict(tmp_path) -> None:
     )
     # 有分集 NFO：直接采信 NFO 的季/集号
     assert scan_mod._unit_for(MediaKind.TV, season_dir / f"{stem}.mkv") == (9, 1)
-    # 无 NFO：文件名解析出 [1, 9] 两个季号，父目录 Season 9 仲裁
+    # 无 NFO：显式 S09E02 标记直接定案（「第一季」是片名片段，不参与）
     stem2 = "妻子的浪漫旅行 第一季 S09E02 - 2160p H.265 AAC CHDWEB"
     assert scan_mod._unit_for(MediaKind.TV, season_dir / f"{stem2}.mkv") == (9, 2)
-    # 无 NFO 且父目录帮不上（仲裁不在候选中）：保持取首个季号的旧行为
+    # 无父目录仲裁时显式标记同样定案（旧行为取模型首个季号会错挂第 1 季）
     plain_dir = tmp_path / "某剧"
-    assert scan_mod._unit_for(MediaKind.TV, plain_dir / "某剧 第一季 S09E03.mkv") == (1, 3)
+    assert scan_mod._unit_for(MediaKind.TV, plain_dir / "某剧 第一季 S09E03.mkv") == (9, 3)
     # 单一季号不受影响
     assert scan_mod._unit_for(MediaKind.TV, plain_dir / "某剧 S02E03.mkv") == (2, 3)
 

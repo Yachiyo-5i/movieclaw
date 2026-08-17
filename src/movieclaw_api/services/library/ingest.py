@@ -123,6 +123,7 @@ from movieclaw_api.services.library.layout import (
     IN_PROGRESS_MARKERS,
     VIDEO_EXTS,
     entry_base_name,
+    explicit_unit,
     is_disc_dir,
     season_from_dir,
     trailing_index_episode,
@@ -175,7 +176,9 @@ _INGEST_COPY_CHUNK_BYTES = 64 * 1024 * 1024
 
 # Job 处理逻辑修订号不仅用于审计，也作为“升级后是否值得自动重试”的边界。
 # 修改季集解析/部分入库收口逻辑时必须递增；同一修订内的待处理条目不反复重跑。
-_INGEST_HANDLER_REVISION = "library.ingest.v3"
+# v4：显式 SxxEyy 标记确定性解析压过模型（torrent-ner-v2 对单集文件名漏抽
+#     集号的线上病例），存量「解析不出集号」的挂起记录升级后自动补偿
+_INGEST_HANDLER_REVISION = "library.ingest.v4"
 
 
 def _ingest_handler_revision() -> str:
@@ -221,6 +224,67 @@ _briefs_cache: tuple[float, list | None] = (float("-inf"), None)
 
 class IngestError(Exception):
     """单个文件搬运失败。message 是完整中文句子，直接进台账 message。"""
+
+
+class IngestConflictError(IngestError):
+    """目标同名文件冲突（内容不同、多版本退让名也被占）。
+
+    与环境故障（网络盘瞬断、复制失败）本质不同：冲突是确定性的，退避重试
+    永远得到同一结果，只会在任务中心刷出无限「等待重试」。处理分两级：
+    该单元在库中已有同档或更高版本 → 重复内容，跳过即是完成
+    （见 _covered_by_library）；判不了档位或来件更优 → 待处理等人。
+    """
+
+
+async def _covered_by_library(
+    session,
+    media_item_id: int,
+    season: int,
+    episode: int,
+    *,
+    resolution: str | None,
+    media_source: str | None,
+    remux: bool,
+) -> bool:
+    """同名冲突的去重判据：该单元在位文件里是否已有同档或更高版本。
+
+    典型场景：季包只为补 E14–E15 的缺口投递，附带的 E05 与此前换源包
+    收编的版本同档不同尺寸——基础名与版本退让名全被占，但重复内容本就
+    不值得入库。档位口径与洗版裁决同源（分辨率位次 > 片源档字典序，见
+    upgrade._file_sort_key）；来件分辨率未知（探测不可用）时不判定——
+    宁可进待处理，不做猜测性丢弃。真升级（档位更高）落的是不同版本名，
+    不会走进同名冲突，仍由洗版验证确认后把旧版送待回收。
+    """
+    from movieclaw_matcher import RuleSetSpec
+    from movieclaw_matcher.decision import resolution_rank, source_tier
+
+    neutral = RuleSetSpec()
+    incoming = (
+        resolution_rank(resolution, neutral) or 0,
+        source_tier(media_source, remux) or 0,
+    )
+    if incoming[0] <= 0:
+        return False
+    rows = (
+        await session.execute(
+            select(LibraryFile).where(
+                LibraryFile.media_item_id == media_item_id,
+                LibraryFile.season_number == season,
+                LibraryFile.episode_number == episode,
+                LibraryFile.in_place(),
+                # 意外消失的文件不算覆盖：同档重新投递正是找回它的路径
+                LibraryFile.missing_since.is_(None),  # type: ignore[union-attr]
+            )
+        )
+    ).scalars()
+    keys = [
+        (
+            resolution_rank(row.resolution, neutral) or 0,
+            source_tier(row.media_source, False) or 0,
+        )
+        for row in rows
+    ]
+    return bool(keys) and max(keys) >= incoming
 
 
 class IngestSourceChanged(Exception):
@@ -1425,6 +1489,17 @@ async def _ingest_entry(
             "可在监听导入清单中搜索认领，或把条目改名为「标题 (年份)」形式自动重试",
         )
 
+    # 来源戳：入库文件行必须带上 (site, torrent)，洗版验证的 _file_from_attempt
+    # 才能精确匹配「文件 ↔ 投递」。缺了它只能退化到时间兜底——两个包在同一
+    # 时间窗交错完成时，会把别家包的文件记到自己账上（NAS 实测 HDKWeb 包的
+    # 文件被记成 CHDWEB 投递，qb 里的 CHDWEB 任务白下、清理证据链也锚错）
+    prov_site: str | None = None
+    prov_torrent: str | None = None
+    if manual_intent is not None:
+        prov_site, prov_torrent = manual_intent.site_id, manual_intent.torrent_id
+    elif matched_hashes:
+        prov_site, prov_torrent = await _delivery_provenance(session, matched_hashes)
+
     # auto 规则：识别后决定目标库（docs/design/library-routing.md 2.3）。
     # 订阅/手动下载的已确认身份均沿用提交时定格的库——粘性 + 不让规则
     # 后续变化改写已在下载任务的归属；名称识别的身份才重新走收藏范围路由。
@@ -1496,9 +1571,11 @@ async def _ingest_entry(
     files = [main] if kind is MediaKind.MOVIE else list(snap.videos)
     notes: list[str] = []
     # 逐文件的失败按性质分档：环境故障（探测失败/搬运出错）→ failed 退避
-    # 重试；解析不出季集 → pending 等人（重试改变不了解析结果，改名才行）
+    # 重试；解析不出季集、目标同名冲突 → pending 等人（重试改变不了结果）
     env_error = False
     parser_gap = False
+    conflict = False
+    dup_skipped = 0
     if kind is MediaKind.MOVIE and len(snap.videos) > 1:
         notes.append(f"已取最大文件为正片，忽略其余 {len(snap.videos) - 1} 个视频")
 
@@ -1548,6 +1625,27 @@ async def _ingest_entry(
             notes.append(f"「{file.name}」探测失败（可能不完整），未入库；文件变化后自动重试")
             env_error = True
             continue
+        # 订阅投递的同档预检：单元已有同档或更高版本在库时不再落盘。同名
+        # 幂等只挡得住同扩展名——换组包的 .mp4 会绕过 .mkv 的名字，落成
+        # 一个"同档不构成升级、verify 也不会替换"的多余版本（NAS 实测
+        # 洗版 E04/E06 的 CHDWEB 包把 E01 又入了一份）。真升级档位更高，
+        # 预检拦不住；订阅之外的路径（手工监听/自定义目录）不受影响
+        if (
+            staging is None
+            and identity_source == "subscription"
+            and await _covered_by_library(
+                session,
+                item.id,
+                season,
+                episode,
+                resolution=file_spec.resolution if file_spec else None,
+                media_source=release_attrs.media_source,
+                remux=release_attrs.remux,
+            )
+        ):
+            dup_skipped += 1
+            completed_bytes += file.stat().st_size
+            continue
         label = (file_spec.resolution if file_spec else None) or release_attrs.media_source or "V2"
         try:
             if job_context is None:
@@ -1591,6 +1689,24 @@ async def _ingest_entry(
                     job_context,
                     report_copy,
                 )
+        except IngestConflictError as exc:
+            # 冲突先做同档去重裁决：库里已有同档或更高版本时跳过即是完成，
+            # 不阻塞任务；判不了或来件更优才留给人工
+            if staging is None and await _covered_by_library(
+                session,
+                item.id,
+                season,
+                episode,
+                resolution=file_spec.resolution if file_spec else None,
+                media_source=release_attrs.media_source,
+                remux=release_attrs.remux,
+            ):
+                dup_skipped += 1
+                completed_bytes += file.stat().st_size
+                continue
+            notes.append(str(exc))
+            conflict = True
+            continue
         except IngestError as exc:
             notes.append(str(exc))
             env_error = True
@@ -1630,6 +1746,8 @@ async def _ingest_entry(
                 media_source=release_attrs.media_source,
                 release_group=release_attrs.release_group,
                 source=FileSource.IMPORTED,
+                site_id=prov_site,
+                torrent_id=prov_torrent,
                 added_batch_id=added_batch_id,
             )
         )
@@ -1682,13 +1800,15 @@ async def _ingest_entry(
             message += "；文件进入媒体库根目录后将自动入账"
         if skipped_owned:
             message += f"；{skipped_owned} 个文件的内容已在媒体库，跳过"
+        if dup_skipped:
+            message += f"；{dup_skipped} 个文件在库中已有同档或更高版本，跳过"
         if notes:
             message += "；" + "；".join(notes)
         status = (
             IngestStatus.FAILED
             if env_error
             else IngestStatus.PENDING
-            if parser_gap
+            if parser_gap or conflict
             else IngestStatus.IMPORTED
         )
         return await conclude(status, message, imported)
@@ -1703,6 +1823,13 @@ async def _ingest_entry(
                 f"已识别为《{item.title}》，此前已入库 {record.imported_count} 个文件；{message}"
             )
         return await conclude(IngestStatus.FAILED if env_error else IngestStatus.PENDING, message)
+    elif dup_skipped:
+        # 季包附带内容全部与库存同档重复（换源后两个包先后投递最常见）：
+        # 正常闭环，不是异常
+        return await conclude(
+            IngestStatus.IMPORTED,
+            f"《{item.title}》的内容在库中已有同档或更高版本，无需整理",
+        )
     elif skipped_owned:
         # 自定义目录条目的全部单元都已回流入库：链路闭环完成，不再搬运
         return await conclude(IngestStatus.IMPORTED, f"《{item.title}》的内容已在媒体库，无需整理")
@@ -1750,6 +1877,27 @@ async def _wanted_identity(session, info_hashes: list[str]) -> tuple[MediaItem |
     item, library_id = row
     logger.info("条目按 info_hash 认领了订阅身份：《%s》", item.title)
     return item, library_id
+
+
+async def _delivery_provenance(session, info_hashes: list[str]) -> tuple[str | None, str | None]:
+    """按 info_hash 反查订阅投递记录的 (site_id, torrent_id) 来源戳。
+
+    条目匹配到的 hash 就是这个种子本身，任何同 hash 的投递记录都是它的
+    来源——与身份认领走哪条链无关。查不到（外部种子）返回 (None, None)。
+    """
+    from movieclaw_db.models import SubscriptionDownloadAttempt
+
+    rows = (
+        await session.execute(
+            select(SubscriptionDownloadAttempt).where(
+                SubscriptionDownloadAttempt.info_hash.in_(info_hashes)  # type: ignore[union-attr]
+            )
+        )
+    ).scalars()
+    for attempt in rows:
+        if attempt.site_id:
+            return attempt.site_id, attempt.torrent_id
+    return None, None
 
 
 async def _manual_download_identity(
@@ -1846,11 +1994,16 @@ async def _identify(
 
 
 def _unit(file: Path, entry: Path) -> tuple[int | None, int]:
-    """剧集文件的季集号：文件名 → 父目录 Season 模式 → 条目名季号兜底。
+    """剧集文件的季集号：显式 SxxEyy → 模型解析 → 父目录/条目名季号兜底。
 
     季号三处都拿不到时返回 None（宁可跳过，不默认第 1 季错挂）；
     显式 S00（特别篇）会被文件名解析正常带出，不走兜底。
     """
+    # 显式 SxxEyy 标记语义确定，压过模型：模型漏抽时 seasons 里还可能混入
+    # 被错标成季号的集号数字（"S06E01" → seasons=[1,6]），不能再拿来兜底
+    explicit = explicit_unit(file.stem)
+    if explicit is not None:
+        return explicit
     attrs = enrich(file.stem)
     # 常规集号全灭时退回裸尾号兜底（「走向共和01」，与扫描器 _unit_for 同则）
     episode = attrs.episodes[0] if attrs.episodes else (trailing_index_episode(file.stem) or 0)
@@ -1909,7 +2062,7 @@ def _resolve_transfer_target(src: Path, dst: Path, version_label: str) -> Path |
         if final.exists():
             if _same_payload(src, final):
                 return None
-            raise IngestError(f"目标已存在同名文件，跳过以免覆盖：{final.name}")
+            raise IngestConflictError(f"目标已存在同名文件，跳过以免覆盖：{final.name}")
     try:
         final.parent.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
@@ -1936,7 +2089,7 @@ def _transfer(src: Path, dst: Path, strategy: str, version_label: str) -> Path |
             shutil.copyfile(src, part)
             rename_no_replace(part, final)
         except FileExistsError as exc:
-            raise IngestError(f"目标已存在同名文件，跳过以免覆盖：{final.name}") from exc
+            raise IngestConflictError(f"目标已存在同名文件，跳过以免覆盖：{final.name}") from exc
         except OSError as exc:
             raise IngestError(f"复制失败（{exc.strerror}）：{src.name} → {final}") from exc
         finally:
@@ -1950,7 +2103,7 @@ def _transfer(src: Path, dst: Path, strategy: str, version_label: str) -> Path |
         os.link(src, tmp)
         rename_no_replace(tmp, final)
     except FileExistsError as exc:
-        raise IngestError(f"目标已存在同名文件，跳过以免覆盖：{final.name}") from exc
+        raise IngestConflictError(f"目标已存在同名文件，跳过以免覆盖：{final.name}") from exc
     except OSError as exc:
         if exc.errno == errno.EXDEV:
             raise IngestError(
@@ -2072,7 +2225,7 @@ async def _transfer_for_job(
                 partial.unlink(missing_ok=True)
                 state_path.unlink(missing_ok=True)
                 return None
-            raise IngestError(f"目标已存在同名文件，跳过以免覆盖：{final.name}") from exc
+            raise IngestConflictError(f"目标已存在同名文件，跳过以免覆盖：{final.name}") from exc
         state_path.unlink(missing_ok=True)
         return final
     except IngestSourceChanged:

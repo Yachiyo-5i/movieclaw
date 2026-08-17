@@ -100,6 +100,10 @@ _SPECIALS_DIR = re.compile(r"^(?:specials?|特别篇|特典)$", re.IGNORECASE)
 # 的 "003" 也因前一位是数字而不中）
 _TRAILING_INDEX = re.compile(r"(?<![0-9A-Za-z])(\d{1,3})\s*$")
 
+# 显式 SxxEyy 标记：场景命名里语义最强的季集声明。前界挡住词内片段
+# （"XS06E01"），后界挡住数字粘连（"S02E051080p" 宁可不中，交回模型通道）
+_EXPLICIT_SXXEYY = re.compile(r"(?i)(?<![0-9A-Za-z])S(\d{1,3})[ ._-]?E(\d{1,4})(?!\d)")
+
 
 def trailing_index_episode(stem: str) -> int | None:
     """裸尾号命名声明的集号；解析不出（或为 0）返回 None。
@@ -112,6 +116,21 @@ def trailing_index_episode(stem: str) -> int | None:
         return None
     value = int(match.group(1))
     return value if value >= 1 else None
+
+
+def explicit_unit(stem: str) -> tuple[int, int] | None:
+    """文件名显式 SxxEyy 标记声明的 (季号, 集号)；没有该标记返回 None。
+
+    NER 模型面向种子标题训练，对纯场景命名的单集文件名会漏抽/错标集号
+    （torrent-ner-v2 把 "S06E01" 的 01 标成季号的线上病例），而显式标记的
+    语义是确定的——它在时必须压过模型结果。E00（先导/特辑占位）返回 None：
+    集号 0 在管线里是「无集号」哨兵，这类文件交由人工改名或认领。
+    """
+    match = _EXPLICIT_SXXEYY.search(stem)
+    if match is None:
+        return None
+    season, episode = int(match.group(1)), int(match.group(2))
+    return (season, episode) if episode >= 1 else None
 
 
 def season_from_dir(directory: Path) -> int | None:

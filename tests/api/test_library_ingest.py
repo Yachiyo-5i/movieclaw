@@ -26,6 +26,7 @@ from movieclaw_api.services.import_watch_config import ImportWatchConfigService
 from movieclaw_db.engine import dispose_db, get_database, init_db
 from movieclaw_db.migrations import run_migrations
 from movieclaw_db.models import (
+    FileSource,
     ImportWatch,
     IngestEntry,
     IngestStatus,
@@ -36,6 +37,7 @@ from movieclaw_db.models import (
     ManualDownloadIntent,
     MediaItem,
 )
+from movieclaw_db.models.base import utcnow
 from movieclaw_db.repositories.library_repo import LibraryRepository
 from movieclaw_media.models import MediaKind
 
@@ -1161,6 +1163,208 @@ async def test_partial_episode_parse_stays_pending(db, tmp_path, monkeypatch):
     assert record.imported_count == 1
     assert "硬链接 1 个文件" in (record.message or "")
     assert "ep2.mkv」解析不出集号，未入库" in (record.message or "")
+
+
+@pytest.mark.asyncio
+async def test_name_conflict_concludes_pending_not_failed(db, tmp_path, monkeypatch):
+    """目标同名冲突（基础名与多版本退让名都被占）是确定性冲突：结论必须是
+    pending 等人处理，不能归为环境故障进无限退避重试（NAS 实测洗版季包里
+    一集与库存冲突，任务中心永远「等待重试」刷屏）。"""
+    root, watch = tmp_path / "tv", tmp_path / "watch"
+    watch.mkdir()
+    library_id = await _make_library(db, kind=MediaKind.TV, root=root)
+    item = await _make_item(db, kind=MediaKind.TV, title="测试剧集", year=2024)
+    _stub_identify(monkeypatch, item)
+    monkeypatch.setattr(ingest_mod, "probe_media", lambda _path: _FAKE_SPEC)
+    monkeypatch.setattr(ingest_mod, "_unit", lambda _file, _entry: (1, 1))
+
+    # 基础名与 1080p 退让名都已被不同内容占用（尺寸互不相同 → 非同一载荷）
+    season_dir = root / "测试剧集 (2024)" / "Season 01"
+    season_dir.mkdir(parents=True)
+    (season_dir / "测试剧集 (2024) - S01E01.mkv").write_bytes(b"old")
+    (season_dir / "测试剧集 (2024) - S01E01 - 1080p.mkv").write_bytes(b"other-1080p")
+
+    entry = watch / "测试剧集 S01"
+    entry.mkdir()
+    (entry / "ep1.mkv").write_bytes(b"new-episode-1-longer")
+
+    await _sweep_twice(db, library_id, watch)
+
+    async with db.session() as session:
+        record = (await session.execute(select(IngestEntry))).scalar_one()
+    assert record.status == IngestStatus.PENDING
+    assert "目标已存在同名文件，跳过以免覆盖：测试剧集 (2024) - S01E01 - 1080p.mkv" in (
+        record.message or ""
+    )
+
+
+@pytest.mark.asyncio
+async def test_name_conflict_with_same_tier_version_skips_as_imported(db, tmp_path, monkeypatch):
+    """同名冲突但库里已有同档版本：重复内容跳过即是完成，任务正常闭环
+    （NAS 实测：换源后两个 1080p 季包先后投递，第二包附带的 E05 与第一包
+    收编的版本同档不同尺寸，不能变成待处理/重试）。"""
+    root, watch = tmp_path / "tv", tmp_path / "watch"
+    watch.mkdir()
+    library_id = await _make_library(db, kind=MediaKind.TV, root=root)
+    item = await _make_item(db, kind=MediaKind.TV, title="测试剧集", year=2024)
+    _stub_identify(monkeypatch, item)
+    monkeypatch.setattr(ingest_mod, "probe_media", lambda _path: _FAKE_SPEC)
+    monkeypatch.setattr(ingest_mod, "_unit", lambda _file, _entry: (1, 1))
+
+    # 两个名字都被不同内容占用，且 1080p 版本已入台账（同档在库）
+    season_dir = root / "测试剧集 (2024)" / "Season 01"
+    season_dir.mkdir(parents=True)
+    (season_dir / "测试剧集 (2024) - S01E01.mkv").write_bytes(b"old")
+    versioned = season_dir / "测试剧集 (2024) - S01E01 - 1080p.mkv"
+    versioned.write_bytes(b"other-1080p")
+    async with db.session() as session:
+        session.add(
+            LibraryFile(
+                library_id=library_id,
+                media_item_id=item.id,
+                season_number=1,
+                episode_number=1,
+                file_path=str(versioned),
+                size_bytes=versioned.stat().st_size,
+                resolution="1080p",
+                media_source="WEB-DL",
+                source=FileSource.IMPORTED,
+            )
+        )
+        await session.commit()
+
+    entry = watch / "测试剧集 S01"
+    entry.mkdir()
+    (entry / "ep1.mkv").write_bytes(b"new-episode-1-longer")
+
+    await _sweep_twice(db, library_id, watch)
+
+    async with db.session() as session:
+        record = (
+            await session.execute(select(IngestEntry))
+        ).scalar_one()
+    assert record.status == IngestStatus.IMPORTED
+    assert "已有同档或更高版本" in (record.message or "")
+    # 来件没有落任何新文件
+    assert not (season_dir / "测试剧集 (2024) - S01E01 - 1080p (2).mkv").exists()
+
+
+@pytest.mark.asyncio
+async def test_subscription_extra_same_tier_file_not_imported_as_new_version(
+    db, tmp_path, monkeypatch
+):
+    """订阅投递的季包附带集与库存同档但扩展名不同：不得绕过同名幂等落成
+    多余版本（NAS 实测：洗 E04/E06 的 CHDWEB 包把 E01 的 .mp4 又入了一份，
+    与已有 .mkv 并存成垃圾副本）。目标集照常入库，且文件行带来源戳——
+    洗版验证靠它精确匹配「文件 ↔ 投递」，不再退化到时间兜底误配。"""
+    from movieclaw_db.models import (
+        RuleSet,
+        Subscription,
+        SubscriptionDownloadAttempt,
+        WantedItem,
+        WantedStatus,
+    )
+    from movieclaw_downloader import TorrentBrief
+
+    root, watch = tmp_path / "tv", tmp_path / "watch"
+    watch.mkdir()
+    library_id = await _make_library(db, kind=MediaKind.TV, root=root)
+    item = await _make_item(db, kind=MediaKind.TV, title="测试剧集", year=2024)
+    monkeypatch.setattr(ingest_mod, "probe_media", lambda _path: _FAKE_SPEC)
+    monkeypatch.setattr(
+        ingest_mod, "_unit", lambda file, _entry: (1, int(file.stem.removeprefix("ep")))
+    )
+
+    async def identify_none(session, kind, watch_root, main, spec):
+        return None
+
+    monkeypatch.setattr(ingest_mod, "_identify", identify_none)
+
+    # 库里已有 E01 的同档版本（.mkv）；E02 是本次投递的目标缺口
+    season_dir = root / "测试剧集 (2024)" / "Season 01"
+    season_dir.mkdir(parents=True)
+    existing = season_dir / "测试剧集 (2024) - S01E01.mkv"
+    existing.write_bytes(b"existing-e01")
+    async with db.session() as session:
+        rule_set = RuleSet(name="默认", spec={})
+        session.add(rule_set)
+        await session.commit()
+        await session.refresh(rule_set)
+        sub = Subscription(
+            media_item_id=item.id, kind="tv", rule_set_id=rule_set.id, library_id=library_id
+        )
+        session.add(sub)
+        await session.commit()
+        await session.refresh(sub)
+        session.add_all(
+            [
+                WantedItem(
+                    subscription_id=sub.id,
+                    media_item_id=item.id,
+                    season_number=1,
+                    episode_number=2,
+                    status=WantedStatus.GRABBED,
+                    info_hash="hash-s1",
+                ),
+                SubscriptionDownloadAttempt(
+                    subscription_id=sub.id,
+                    info_hash="hash-s1",
+                    site_id="mteam",
+                    torrent_id="12345",
+                    units=[[1, 2]],
+                    last_progress_at=utcnow(),
+                ),
+                LibraryFile(
+                    library_id=library_id,
+                    media_item_id=item.id,
+                    season_number=1,
+                    episode_number=1,
+                    file_path=str(existing),
+                    size_bytes=existing.stat().st_size,
+                    resolution="1080p",
+                    media_source="WEB-DL",
+                    source=FileSource.IMPORTED,
+                ),
+            ]
+        )
+        await session.commit()
+
+    brief = TorrentBrief(
+        name="测试剧集.S01.Pack",
+        content_name="测试剧集.S01.Pack",
+        completed=True,
+        info_hash="hash-s1",
+    )
+
+    async def briefs():
+        return [brief]
+
+    monkeypatch.setattr(ingest_mod, "_downloader_briefs", briefs)
+
+    entry = watch / "测试剧集.S01.Pack"
+    entry.mkdir()
+    (entry / "ep1.mp4").write_bytes(b"same-tier-duplicate")
+    (entry / "ep2.mp4").write_bytes(b"target-episode-2")
+
+    library = await _get_library(db, library_id)
+    await ingest_mod._sweep_dir(
+        _fixed_rule(watch, library_id=library_id), library, execute_inline=True
+    )
+
+    # 目标集入库；附带的同档 E01 没有落成 .mp4 第二版本
+    assert (season_dir / "测试剧集 (2024) - S01E02.mp4").exists()
+    assert not (season_dir / "测试剧集 (2024) - S01E01.mp4").exists()
+    async with db.session() as session:
+        record = (await session.execute(select(IngestEntry))).scalar_one()
+        imported_row = (
+            await session.execute(
+                select(LibraryFile).where(LibraryFile.episode_number == 2)
+            )
+        ).scalar_one()
+    assert record.status == IngestStatus.IMPORTED
+    assert "1 个文件在库中已有同档或更高版本，跳过" in (record.message or "")
+    # 来源戳：投递入库的文件行必须能精确回溯到 (站点, 种子)
+    assert (imported_row.site_id, imported_row.torrent_id) == ("mteam", "12345")
 
 
 @pytest.mark.asyncio
