@@ -46,6 +46,8 @@ discover list-collections
 dl add
 dl default set
 dl delete
+dl limits
+dl limits set
 dl list
 dl resolve-target
 dl show
@@ -158,9 +160,12 @@ session retry
 session start
 session stop
 site add
+site boost-stats
 site catalog
 site delete
 site list
+site protection set
+site ratio-boost set
 site show
 site stats
 site status set
