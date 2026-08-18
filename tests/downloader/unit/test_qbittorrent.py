@@ -46,6 +46,7 @@ class FakeQbtClient:
         self.delete_calls: list[dict] = []
         self.location_calls: list[dict] = []
         self.autotmm_calls: list[dict] = []
+        self.speed_mode_calls: list[bool] = []
         # 添加成功后自动登记到 store 的 (hash, name)，模拟下载器注册行为
         self.register_on_add: tuple[str, str] | None = (TORRENT_HASH, "test.mkv")
 
@@ -89,6 +90,7 @@ class FakeQbtClient:
         self._up_limit = limit
 
     def transfer_set_speed_limits_mode(self, *, intended_state):
+        self.speed_mode_calls.append(intended_state)
         self._alt_mode = "1" if intended_state else "0"
 
     def app_preferences(self):
@@ -276,6 +278,21 @@ class TestLimits:
         assert limits.max_active_torrents == 200
         # 未提供的队列字段保持原值不被覆盖
         assert limits.max_active_downloads == 3
+
+    async def test_set_limits_skips_alt_speed_when_unchanged(self):
+        """备用限速状态未变时不得调用 set_speed_limits_mode：
+        qbittorrent-api 在 qB < 4.4.0 上此场景会误调不存在的端点返回 404。"""
+        from movieclaw_downloader.models import DownloaderLimits
+
+        fake = FakeQbtClient()
+        fake._alt_mode = "0"
+
+        await make_downloader(fake).set_limits(
+            DownloaderLimits(alt_speed_enabled=False, max_active_downloads=5)
+        )
+
+        assert fake.speed_mode_calls == []
+        assert fake.app_preferences()["max_active_downloads"] == 5
 
 
 class TestDeleteTorrent:

@@ -326,7 +326,14 @@ class QBittorrentDownloader(BaseDownloader):
             client.transfer_set_download_limit(limits.download_limit_bytes or 0)
             client.transfer_set_upload_limit(limits.upload_limit_bytes or 0)
             if limits.alt_speed_enabled is not None:
-                client.transfer_set_speed_limits_mode(intended_state=limits.alt_speed_enabled)
+                # 仅在状态确需变更时才调用：qbittorrent-api 在 Web API < 2.8.14
+                # （qB < 4.4.0）且目标状态与当前一致时，会误调旧版不存在的
+                # setSpeedLimitsMode 端点返回 404；状态一致时本就无需任何调用
+                current_alt = str(client.transfer_speed_limits_mode()) == "1"
+                if current_alt != limits.alt_speed_enabled:
+                    client.transfer_set_speed_limits_mode(
+                        intended_state=limits.alt_speed_enabled
+                    )
             prefs: dict = {}
             if limits.queue_enabled is not None:
                 prefs["queueing_enabled"] = limits.queue_enabled
