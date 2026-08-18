@@ -721,7 +721,9 @@ export function JobCenter({ collapsed, active = false }: { collapsed: boolean; a
   const { activeJobs } = useJobs();
   const { tasks: downloadTasks } = useDownloadTasks();
   if (!isAdmin) return null;
-  const activeCount = activeJobs.length + downloadTasks.length;
+  // 刷流（boost）种子常年大量在跑，计入角标会让数字失去提醒意义，只数真实下载
+  const activeCount =
+    activeJobs.length + downloadTasks.filter((task) => task.source !== "boost").length;
   return (
     <button
       type="button"
