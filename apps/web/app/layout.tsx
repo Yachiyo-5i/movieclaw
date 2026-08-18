@@ -1,5 +1,5 @@
 import type { Metadata, Viewport } from "next";
-import { Inter } from "next/font/google";
+import localFont from "next/font/local";
 
 import { ViewportKeyboard } from "@/components/viewport-keyboard";
 import { appleStartupImages } from "@/lib/apple-splash";
@@ -10,8 +10,10 @@ import "@/vendor/liquid-glass/styles.css";
 import "./globals.css";
 
 // 拉丁字符/数字用 Inter（更克制、专业）；中文由 PingFang SC 等系统字体承接。
-const inter = Inter({
-  subsets: ["latin"],
+// 自托管可变字体（官方 InterVariable.woff2）：构建不再联网拉 Google Fonts，
+// 避免代理不稳时构建长时间僵死。
+const inter = localFont({
+  src: "./fonts/InterVariable.woff2",
   variable: "--font-inter",
   display: "swap",
 });
